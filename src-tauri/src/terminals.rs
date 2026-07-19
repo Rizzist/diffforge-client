@@ -2395,7 +2395,20 @@ fn terminal_canonical_stop_correlates(
         ),
         (Some(previous_session), Some(candidate_session)) if previous_session == candidate_session
     );
+    // Durable ordering identity: hook processing is NOT ordered (independent
+    // tasks + a polled JSONL fallback), so a delayed Stop from an OLDER turn
+    // can arrive after WAITING began. The event's ORIGIN timestamp (stamped
+    // by the hook CLI at fire time) discriminates: only a stop that fired
+    // AFTER the waiting entry (previous.updated_at_ms) may use the exemption.
+    // A missing stamp (synthetic/test events) is treated as current.
+    let event_origin_ms = if payload.hook_timestamp_ms > 0 {
+        payload.hook_timestamp_ms
+    } else {
+        payload.observed_at_ms
+    };
+    let ordered_after_waiting = event_origin_ms == 0 || event_origin_ms >= previous.updated_at_ms;
     let waiting_awaits_future_turn = explicit_session_match
+        && ordered_after_waiting
         && terminal_projection_text(&previous.canonical_state, "") == "waiting";
     generation_matches && session_matches && (turn_matches || waiting_awaits_future_turn)
 }
@@ -2684,10 +2697,12 @@ fn terminal_reduce_canonical_state(
         "idle"
     } else if waiting_accepted {
         "waiting"
-    } else if waiting_event && previous_state == "waiting" {
-        // A repeated background Stop that failed acceptance (id drift) must
-        // hold WAITING — falling through to thinking would flap the state and
-        // adopt unverified identifiers.
+    } else if (waiting_event || completion_event || interrupt_event)
+        && previous_state == "waiting"
+    {
+        // Any Stop-family event that failed acceptance while WAITING (id
+        // drift, stale origin) must hold WAITING — falling through to
+        // thinking would flap the state and adopt unverified identifiers.
         "waiting"
     } else if prompt_ready_recovery {
         "idle"
@@ -19536,15 +19551,32 @@ fn terminal_activity_hook_schedule_final_stop_quiesce(
             && !runtime_turn_id.is_empty()
             && candidate.turn_id != runtime_turn_id
         {
-            log_terminal_status_event(
-                "backend.terminal_activity_hook.idle_quiesce_cancelled",
-                json!({
-                    "instance_id": instance_id,
-                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    "reason": "turn_changed",
-                }),
-            );
-            return;
+            // WAITING awaits a FUTURE turn's stop: the background continuation
+            // mints a new turn id, so a turn mismatch must not cancel the
+            // buffered final Stop when the session is waiting AND the event
+            // FIRED after waiting began (origin ts from the hook CLI). The
+            // session-changed check above already rejected foreign sessions.
+            let runtime_waiting =
+                terminal_projection_text(&runtime.canonical_state, "") == "waiting";
+            let candidate_origin_ms = candidate
+                .event
+                .get("ts_ms")
+                .and_then(Value::as_u64)
+                .or_else(|| candidate.event.get("observed_at_ms").and_then(Value::as_u64))
+                .unwrap_or(0);
+            let ordered_after_waiting =
+                candidate_origin_ms == 0 || candidate_origin_ms >= runtime.updated_at_ms;
+            if !(runtime_waiting && ordered_after_waiting) {
+                log_terminal_status_event(
+                    "backend.terminal_activity_hook.idle_quiesce_cancelled",
+                    json!({
+                        "instance_id": instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "reason": "turn_changed",
+                    }),
+                );
+                return;
+            }
         }
         let Some(delayed_payload) =
             terminal_activity_hook_payload(&current_instance, &candidate.event)
@@ -37561,6 +37593,29 @@ notifications = true
             projection.canonical_state, "idle",
             "a new-turn-id final Stop must settle from waiting"
         );
+        assert!(projection.completion_accepted);
+
+        // Durable ordering: a same-session new-turn Stop whose ORIGIN
+        // timestamp predates the waiting entry is a delayed stale stop and
+        // must NOT settle; the same stop with a fresh origin settles.
+        let mut ordered_runtime = waiting_runtime.clone();
+        ordered_runtime.updated_at_ms = 100;
+        let mut stale_stop = waiting_test_payload("provider-turn-completed", false);
+        stale_stop.provider_turn_id = Some("turn-old".to_string());
+        stale_stop.turn_id = Some("turn-old".to_string());
+        stale_stop.hook_timestamp_ms = 50;
+        let projection =
+            terminal_reduce_canonical_state(&ordered_runtime, &stale_stop, None, false, false);
+        assert_eq!(
+            projection.canonical_state, "waiting",
+            "a pre-waiting-origin stop must not settle the waiting turn"
+        );
+        assert!(!projection.completion_accepted);
+        let mut fresh_stop = stale_stop.clone();
+        fresh_stop.hook_timestamp_ms = 150;
+        let projection =
+            terminal_reduce_canonical_state(&ordered_runtime, &fresh_stop, None, false, false);
+        assert_eq!(projection.canonical_state, "idle");
         assert!(projection.completion_accepted);
 
         // A waiting Stop from a DIFFERENT session must hold waiting (rejected,
