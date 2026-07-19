@@ -19323,13 +19323,20 @@ fn terminal_activity_watchdog_waiting_release_action(
     }
 }
 
-/// interrupted/error decay: settled, turn closed, no open interaction, and
-/// 30s of quiet — project back to idle via the prompt-ready recovery path.
+/// interrupted/error decay: settled, turn closed, no open interaction, the
+/// CLI process alive and NOT visibly stuck in startup, and 30s since the
+/// runtime ENTERED the settled state — then project back to idle via the
+/// prompt-ready recovery path. The age is measured from the runtime's own
+/// update stamp, never the hook/output quiet clock: an interrupt after a
+/// long-quiet turn must still wait the full window.
 fn terminal_activity_watchdog_settled_decay_action(
     runtime: &TerminalRuntimeSnapshot,
-    quiet_age_ms: u64,
+    settled_age_ms: u64,
+    live_process: bool,
+    mcp_startup_visible: bool,
 ) -> Option<TerminalActivityWatchdogAction> {
-    if quiet_age_ms < TERMINAL_SETTLED_DECAY_WATCHDOG_MS {
+    if settled_age_ms < TERMINAL_SETTLED_DECAY_WATCHDOG_MS || !live_process || mcp_startup_visible
+    {
         return None;
     }
     let canonical = terminal_projection_text(&runtime.canonical_state, "");
@@ -21462,11 +21469,15 @@ fn spawn_terminal_activity_hook_watcher(
                 )
             })
             // Also outside the gate: interrupted/error decay applies to every
-            // provider.
+            // provider. Age = time since the runtime last changed (i.e. since
+            // it ENTERED the settled state, plus benign metadata refreshes
+            // which only delay the decay).
             .or_else(|| {
                 terminal_activity_watchdog_settled_decay_action(
                     &runtime,
-                    now_ms.saturating_sub(last_hook_or_output_activity_ms),
+                    now_ms.saturating_sub(runtime.updated_at_ms),
+                    live_process,
+                    mcp_startup_visible,
                 )
             });
             if let Some(action) = watchdog_action {
@@ -39267,13 +39278,40 @@ notifications = true
             terminal_activity_watchdog_settled_decay_action(
                 &runtime,
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                true,
+                false,
             ),
             Some(TerminalActivityWatchdogAction::SettledDecayIdle)
         );
+        // The age is SETTLED-ENTRY age (runtime update stamp), never the
+        // hook/output quiet clock: below the window nothing decays even if
+        // the pane had been quiet long before the interrupt.
         assert_eq!(
             terminal_activity_watchdog_settled_decay_action(
                 &runtime,
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS - 1,
+                true,
+                false,
+            ),
+            None
+        );
+        // A dead process or a visibly stuck MCP startup must never decay to
+        // input-ready (queued work would wake into a stuck CLI).
+        assert_eq!(
+            terminal_activity_watchdog_settled_decay_action(
+                &runtime,
+                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                false,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_activity_watchdog_settled_decay_action(
+                &runtime,
+                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                true,
+                true,
             ),
             None
         );
@@ -39282,6 +39320,8 @@ notifications = true
             terminal_activity_watchdog_settled_decay_action(
                 &runtime,
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                true,
+                false,
             ),
             Some(TerminalActivityWatchdogAction::SettledDecayIdle)
         );
@@ -39291,6 +39331,8 @@ notifications = true
             terminal_activity_watchdog_settled_decay_action(
                 &runtime,
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                true,
+                false,
             ),
             None
         );
@@ -39300,6 +39342,8 @@ notifications = true
             terminal_activity_watchdog_settled_decay_action(
                 &runtime,
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                true,
+                false,
             ),
             None
         );
@@ -39310,6 +39354,8 @@ notifications = true
                 terminal_activity_watchdog_settled_decay_action(
                     &runtime,
                     TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                    true,
+                    false,
                 ),
                 None,
                 "{state}"

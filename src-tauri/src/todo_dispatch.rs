@@ -1075,6 +1075,108 @@ pub(crate) fn todo_dispatch_record_receipt_with_outcome(
     Ok((next, TodoDispatchReceiptWrite::Applied))
 }
 
+/// Requeue coherence: a re-dispatch reuses the todo's command id (history
+/// requeue deliberately preserves command_id/dispatch_id), so the PREVIOUS
+/// attempt's settled receipt must not survive into the new attempt —
+/// settlement (pane close/restart) treats a settled receipt as authoritative
+/// for its command id and would mark the requeued row with the stale outcome
+/// and prune it without execution. Every requeue path that flips a row back to
+/// `queued` calls this first.
+///
+/// The stale entry is DELETED rather than archived under an attempt marker:
+/// the queue store rows are the durable history surface (settled rows are
+/// retained there; see the retention note in the backend settle path), while
+/// this ledger only carries the CURRENT settlement state per command id
+/// (24h TTL, 400-entry cap) for settlement and webview reconciliation — every
+/// reader keys it by command id and expects at most one live entry. Active
+/// (in-flight) receipts are left untouched; only settled outcomes are cleared.
+fn todo_dispatch_clear_settled_receipts_for_requeue(
+    app: Option<&AppHandle>,
+    workspace_id: &str,
+    refs: &[String],
+    reason: &str,
+) -> usize {
+    let workspace_id = workspace_id.trim();
+    let refs = refs
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if workspace_id.is_empty() || refs.is_empty() {
+        return 0;
+    }
+    // Same guard as receipt upserts: hold across load → remove → save so a
+    // racing settler cannot interleave and resurrect the entry being cleared.
+    let upsert_guard = TODO_DISPATCH_RECEIPT_UPSERT_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock();
+    let current = todo_dispatch_load(workspace_id);
+    let removed_ids = current
+        .as_object()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|(command_id, receipt)| {
+                    let status = todo_dispatch_normalize_status(
+                        receipt
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    );
+                    if !todo_dispatch_status_is_settled(&status) {
+                        return false;
+                    }
+                    refs.iter().any(|reference| {
+                        *reference == command_id.as_str()
+                            || [
+                                "command_id",
+                                "item_id",
+                                "todo_id",
+                                "dispatch_id",
+                                "todo_dispatch_id",
+                            ]
+                            .iter()
+                            .any(|key| {
+                                receipt.get(*key).and_then(Value::as_str).map(str::trim)
+                                    == Some(*reference)
+                            })
+                    })
+                })
+                .map(|(command_id, _)| command_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if removed_ids.is_empty() {
+        drop(upsert_guard);
+        return 0;
+    }
+    let mut next = current;
+    if let Some(object) = next.as_object_mut() {
+        for command_id in &removed_ids {
+            object.remove(command_id);
+        }
+    }
+    todo_dispatch_save(workspace_id, &next);
+    drop(upsert_guard);
+    let removed_count = removed_ids.len();
+    log_terminal_status_event(
+        "backend.todo_dispatch.requeue_cleared_settled_receipts",
+        json!({
+            "command_ids": removed_ids,
+            "count": removed_count,
+            "reason": reason,
+            "workspace_id": workspace_id,
+        }),
+    );
+    if let Some(app) = app {
+        let _ = app.emit(
+            TODO_DISPATCH_RECEIPTS_UPDATED_EVENT,
+            todo_dispatch_receipts_payload(workspace_id, &next, reason),
+        );
+    }
+    removed_count
+}
+
 /// Record remote command intake at the websocket loop, before the webview ever
 /// sees the event. Create-task commands land in the ledger as `queued` and
 /// raise the arrival notification even when no window is alive.
@@ -6512,6 +6614,20 @@ async fn todo_store_set_status(
 
     tauri::async_runtime::spawn_blocking(move || {
         let _store_guard = todo_dispatch_queue_store_guard();
+        // Re-dispatch: the history requeue reuses the todo's command id, so
+        // the previous attempt's settled receipt must be cleared BEFORE the
+        // row flips back to queued — no settle pass may ever observe
+        // (queued row + stale settled receipt) and resurrect the old outcome
+        // onto the new attempt (see
+        // todo_dispatch_clear_settled_receipts_for_requeue).
+        if status == "queued" {
+            todo_dispatch_clear_settled_receipts_for_requeue(
+                Some(&app),
+                &workspace_id,
+                &refs,
+                &reason,
+            );
+        }
         let clear_target = clear_target.unwrap_or(false);
         let apply_targets = |item: &mut Value| {
             todo_store_apply_target_fields(
@@ -6745,6 +6861,31 @@ async fn todo_store_queue_all(
             );
 
             if !corrections.is_empty() {
+                // Same requeue coherence as todo_store_set_status: queue-all
+                // re-queues rows that keep their command/dispatch ids, so any
+                // settled receipt left by a previous attempt must be cleared
+                // before the queued rows land (see
+                // todo_dispatch_clear_settled_receipts_for_requeue).
+                let mut requeue_refs = Vec::<String>::new();
+                for item in &corrections {
+                    for value in [
+                        todo_store_item_sync_id(item),
+                        todo_dispatch_queue_item_command_id(item),
+                        todo_dispatch_text(item, &["dispatch_id"]),
+                        todo_dispatch_text(item, &["todo_dispatch_id"]),
+                        todo_dispatch_text(item, &["last_dispatch_id"]),
+                    ] {
+                        if !value.is_empty() && !requeue_refs.contains(&value) {
+                            requeue_refs.push(value);
+                        }
+                    }
+                }
+                todo_dispatch_clear_settled_receipts_for_requeue(
+                    Some(&app),
+                    &workspace_id,
+                    &requeue_refs,
+                    &reason,
+                );
                 todo_dispatch_queue_write(&workspace_id, &stored_items);
                 todo_store_push_corrections(&app, &workspace_id, corrections.clone(), &reason);
                 for item in &corrections {
@@ -9708,6 +9849,138 @@ mod todo_store_tests {
         assert_eq!(
             receipts["command-race-3"]["status"].as_str(),
             Some("interrupted"),
+        );
+
+        if let Some(path) = receipt_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(path) = queue_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Ok(mut cache) = TODO_DISPATCH_RECEIPTS_CACHE
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            cache.remove(&todo_dispatch_safe_workspace_id(&workspace_id));
+        }
+    }
+
+    #[test]
+    fn requeue_clears_stale_settled_receipt_so_new_attempt_settles_fresh() {
+        let workspace_id = format!("test-requeue-receipt-{}", uuid::Uuid::new_v4());
+        let receipt_path = todo_dispatch_store_path(&workspace_id);
+
+        // Attempt 1 ran to completion: its settled receipt is in the ledger.
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-requeue",
+                "item_id": "todo-requeue",
+                "pane_id": "pane-a",
+                "status": "completed",
+                "text": "do the thing",
+            }),
+            "test_first_attempt_completed",
+        )
+        .unwrap();
+        // An unrelated ACTIVE receipt must survive requeue clearing.
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-active",
+                "item_id": "todo-active",
+                "pane_id": "pane-b",
+                "status": "running",
+            }),
+            "test_active_receipt",
+        )
+        .unwrap();
+
+        // History requeue deliberately preserves command_id/dispatch_id; the
+        // queue row resets to queued, and requeue paths clear the previous
+        // attempt's settled receipt so settlement cannot resurrect it.
+        let cleared = todo_dispatch_clear_settled_receipts_for_requeue(
+            None,
+            &workspace_id,
+            &["todo-requeue".to_string(), "command-requeue".to_string()],
+            "todo_queue_manual_queue",
+        );
+        assert_eq!(cleared, 1);
+        let receipts = todo_dispatch_load(&workspace_id);
+        assert!(
+            receipts.get("command-requeue").is_none(),
+            "requeue must drop the previous attempt's settled receipt"
+        );
+        assert_eq!(
+            receipts["command-active"]["status"].as_str(),
+            Some("running"),
+            "active receipts must never be cleared by a requeue"
+        );
+        // Clearing an active receipt's refs is a no-op.
+        assert_eq!(
+            todo_dispatch_clear_settled_receipts_for_requeue(
+                None,
+                &workspace_id,
+                &["command-active".to_string()],
+                "todo_queue_manual_queue",
+            ),
+            0
+        );
+
+        // Pane interruption BEFORE the requeued attempt dispatched must settle
+        // the NEW attempt as interrupted — not resurrect attempt 1's completed
+        // outcome onto the untouched row and prune it without execution.
+        // (Bounded retry: concurrent cloud_mcp tests transiently rescope the
+        // todo-dispatch data root env; broken coherence fails every attempt.)
+        let queue_seed = [json!({
+            "id": "todo-requeue",
+            "remote_command": { "command_id": "command-requeue" },
+            "status": "queued",
+            "target_terminal_id": "pane-a",
+            "text": "do the thing",
+            "todo_status": "queued",
+            "workspace_id": workspace_id,
+        })];
+        let mut queue_path = None;
+        let mut requeued_status = String::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            todo_dispatch_queue_write(&workspace_id, &queue_seed);
+            todo_dispatch_mark_active_for_pane_interrupted(
+                None,
+                &workspace_id,
+                "pane-a",
+                "terminal_closed",
+            );
+            queue_path = todo_dispatch_data_path("queues", &workspace_id);
+            let queue_items = queue_path
+                .as_ref()
+                .map(|path| todo_dispatch_queue_read(path))
+                .and_then(|snapshot| snapshot.get("items").and_then(Value::as_array).cloned())
+                .unwrap_or_default();
+            requeued_status = queue_items
+                .iter()
+                .find(|item| todo_dispatch_queue_item_command_id(item) == "command-requeue")
+                .map(todo_store_item_status)
+                .unwrap_or_default();
+            if !requeued_status.is_empty() && requeued_status != "queued" {
+                break;
+            }
+        }
+        assert_eq!(
+            requeued_status, "interrupted",
+            "the requeued attempt must settle as interrupted, not resurrect \
+             the previous attempt's completed receipt"
+        );
+        assert!(
+            todo_dispatch_load(&workspace_id)
+                .get("command-requeue")
+                .is_none(),
+            "no receipt may reappear for the never-dispatched requeued attempt"
         );
 
         if let Some(path) = receipt_path {

@@ -573,6 +573,12 @@ struct CloudMcpState {
     global_ws_started: Arc<AtomicBool>,
     global_ws_registration_blocked: Arc<AtomicBool>,
     global_ws_epoch: Arc<AtomicU64>,
+    // Bumped whenever the auth/account context changes (the same edge that
+    // clears account-scoped runtime snapshots). In-flight account-scoped
+    // fetches capture the epoch BEFORE their request and drop the response if
+    // it changed across the await — a late response from account A must never
+    // be applied (and union-merged) into account B's runtime.
+    account_epoch: Arc<AtomicU64>,
     global_ws_reconnect: Arc<tokio::sync::Notify>,
     // Reconnect schedule + permanent-offline state. The window clock starts at
     // app launch and after a successful connection drops; retries happen every
@@ -866,6 +872,7 @@ impl CloudMcpState {
             global_ws_started: Arc::new(AtomicBool::new(false)),
             global_ws_registration_blocked: Arc::new(AtomicBool::new(false)),
             global_ws_epoch: Arc::new(AtomicU64::new(0)),
+            account_epoch: Arc::new(AtomicU64::new(0)),
             global_ws_reconnect: Arc::new(tokio::sync::Notify::new()),
             global_ws_perma_offline: Arc::new(AtomicBool::new(false)),
             global_ws_window_start: Arc::new(StdMutex::new(Instant::now())),
@@ -14171,10 +14178,23 @@ fn cloud_mcp_registry_count(registry: &Value) -> u64 {
         .unwrap_or_default()
 }
 
+/// Distinguishable "drop, don't retry" error for a registry response whose
+/// account context changed while the request was in flight.
+const CLOUD_MCP_REGISTRY_REFRESH_STALE_ACCOUNT_ERROR: &str =
+    "Registered devices response belongs to a previous account context.";
+
 async fn cloud_mcp_refresh_registered_device_registry(
     state: &CloudMcpState,
     reason: &str,
 ) -> Result<(), String> {
+    // Account-switch fencing: the bearer token, scope, and eventual response
+    // all belong to the account context captured HERE. A switch mid-flight
+    // clears the live-state snapshot but cannot cancel this request; applying
+    // the late response would seed — and union-merge (the snapshot merge
+    // keeps previous registry items) — account A's devices into account B's
+    // registry. Capture the epoch before any await and drop the response if
+    // it moved.
+    let account_epoch = state.account_epoch.load(Ordering::SeqCst);
     let token = cloud_mcp_authorization_bearer(state)
         .await?
         .ok_or_else(|| "Cloud MCP auth token is not available.".to_string())?;
@@ -14193,6 +14213,9 @@ async fn cloud_mcp_refresh_registered_device_registry(
         .await
         .map_err(|error| format!("Unable to load registered devices: {error}"))?;
     let body = read_api_response(response, "Unable to load registered devices.").await?;
+    if state.account_epoch.load(Ordering::SeqCst) != account_epoch {
+        return Err(CLOUD_MCP_REGISTRY_REFRESH_STALE_ACCOUNT_ERROR.to_string());
+    }
     let mut registry = cloud_mcp_registered_device_registry_from_response(&body)
         .ok_or_else(|| "Registered devices response did not include a registry.".to_string())?;
     if let Some(object) = registry.as_object_mut() {
@@ -14222,8 +14245,30 @@ async fn cloud_mcp_refresh_registered_device_registry(
     Ok(())
 }
 
-/// One registry-refresh retry loop at a time; ready/hello-ack both spawn one.
-static CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// One registry-refresh retry loop per ACCOUNT CONTEXT at a time; ready/
+/// hello-ack both spawn one. Keyed by the account epoch (not a single global
+/// bool) so an account switch mid-loop never suppresses the new account's
+/// refresh: the old context's loop holds only its own epoch key and exits at
+/// its next attempt, while the new context acquires its fresh key immediately.
+static CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT_EPOCHS: OnceLock<StdMutex<HashSet<u64>>> =
+    OnceLock::new();
+
+fn cloud_mcp_registry_refresh_guard_try_acquire(account_epoch: u64) -> bool {
+    CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT_EPOCHS
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+        .map(|mut held| held.insert(account_epoch))
+        .unwrap_or(false)
+}
+
+fn cloud_mcp_registry_refresh_guard_release(account_epoch: u64) {
+    if let Ok(mut held) = CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT_EPOCHS
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+    {
+        held.remove(&account_epoch);
+    }
+}
 
 fn cloud_mcp_spawn_registered_device_registry_refresh(state: &CloudMcpState, reason: &'static str) {
     let state = state.clone();
@@ -14237,10 +14282,8 @@ fn cloud_mcp_spawn_registered_device_registry_refresh(state: &CloudMcpState, rea
         // identity). Retry with backoff until the fetch lands; the web
         // dashboard always has this registry, so device-list parity depends
         // on it.
-        if CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let account_epoch = state.account_epoch.load(Ordering::SeqCst);
+        if !cloud_mcp_registry_refresh_guard_try_acquire(account_epoch) {
             return;
         }
         let retry_delays_ms: [u64; 6] = [0, 1_000, 3_000, 8_000, 20_000, 45_000];
@@ -14248,6 +14291,21 @@ fn cloud_mcp_spawn_registered_device_registry_refresh(state: &CloudMcpState, rea
         for (attempt, delay_ms) in retry_delays_ms.iter().enumerate() {
             if *delay_ms > 0 {
                 sleep(Duration::from_millis(*delay_ms)).await;
+            }
+            // The account switched while this loop slept: stop retrying under
+            // the old context. The refresh spawned for the new context runs
+            // under its own epoch key; this loop's key is released and its
+            // (now unreachable) epoch can never block anyone again.
+            if state.account_epoch.load(Ordering::SeqCst) != account_epoch {
+                log_cloud_sync_event(
+                    "registered_device_registry.refresh_abandoned_stale_account",
+                    json!({
+                        "reason": reason,
+                        "attempt": attempt + 1,
+                    }),
+                );
+                cloud_mcp_registry_refresh_guard_release(account_epoch);
+                return;
             }
             match cloud_mcp_refresh_registered_device_registry(&state, reason).await {
                 Ok(()) => {
@@ -14260,10 +14318,11 @@ fn cloud_mcp_spawn_registered_device_registry_refresh(state: &CloudMcpState, rea
                             }),
                         );
                     }
-                    CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+                    cloud_mcp_registry_refresh_guard_release(account_epoch);
                     return;
                 }
                 Err(error) => {
+                    let stale_account = error == CLOUD_MCP_REGISTRY_REFRESH_STALE_ACCOUNT_ERROR;
                     last_error = error;
                     log_cloud_sync_event(
                         "registered_device_registry.refresh_error",
@@ -14273,6 +14332,13 @@ fn cloud_mcp_spawn_registered_device_registry_refresh(state: &CloudMcpState, rea
                             "error": clean_terminal_telemetry_text(&last_error),
                         }),
                     );
+                    if stale_account {
+                        // The response was dropped because the account
+                        // changed mid-flight; retrying under this stale
+                        // context can only produce more stale responses.
+                        cloud_mcp_registry_refresh_guard_release(account_epoch);
+                        return;
+                    }
                 }
             }
         }
@@ -14284,7 +14350,7 @@ fn cloud_mcp_spawn_registered_device_registry_refresh(state: &CloudMcpState, rea
                 "error": clean_terminal_telemetry_text(&last_error),
             }),
         );
-        CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        cloud_mcp_registry_refresh_guard_release(account_epoch);
     });
 }
 
@@ -40456,6 +40522,14 @@ async fn cloud_mcp_apply_desktop_auth_session(
         .global_ws_registration_blocked
         .swap(false, Ordering::SeqCst);
     if account_context_changed {
+        // Fence in-flight account-scoped fetches (e.g. the registered-device
+        // registry refresh): clearing the snapshots below is not enough,
+        // because a request already awaiting its response would apply that
+        // stale payload into the NEW account's runtime afterwards. Bumping
+        // the epoch makes such responses detectably stale so they are
+        // dropped, and lets the new context's refresh bypass the old
+        // context's in-flight/backoff guard.
+        state.account_epoch.fetch_add(1, Ordering::SeqCst);
         {
             let mut snapshots = state.runtime_snapshots.lock().await;
             *snapshots = CloudMcpRuntimeSnapshots::default();
@@ -62664,6 +62738,50 @@ mod cloud_mcp_tests {
                 .is_none(),
             "a command captured for account A must abort if account B wins before the guard"
         );
+    }
+
+    #[test]
+    fn registry_refresh_guard_is_keyed_per_account_epoch() {
+        // Epoch values far above anything the app can reach in-process, so
+        // this test never collides with a concurrently running refresh loop.
+        let epoch_a = 900_000_001_u64;
+        let epoch_b = 900_000_002_u64;
+        assert!(
+            cloud_mcp_registry_refresh_guard_try_acquire(epoch_a),
+            "first refresh for an account context must acquire the guard"
+        );
+        assert!(
+            !cloud_mcp_registry_refresh_guard_try_acquire(epoch_a),
+            "a second refresh under the SAME account context must be deduped"
+        );
+        // The account-switch regression: while account A's retry loop is
+        // still in flight, account B (fresh epoch) must NOT be suppressed.
+        assert!(
+            cloud_mcp_registry_refresh_guard_try_acquire(epoch_b),
+            "a refresh under a NEW account context must proceed even while \
+             the previous context's loop is still in flight"
+        );
+        cloud_mcp_registry_refresh_guard_release(epoch_a);
+        assert!(
+            cloud_mcp_registry_refresh_guard_try_acquire(epoch_a),
+            "releasing one context's key must not disturb another's"
+        );
+        cloud_mcp_registry_refresh_guard_release(epoch_a);
+        cloud_mcp_registry_refresh_guard_release(epoch_b);
+    }
+
+    #[test]
+    fn account_epoch_bump_marks_in_flight_registry_response_stale() {
+        let state = CloudMcpState::new();
+        // A refresh captures the epoch before its request...
+        let captured = state.account_epoch.load(Ordering::SeqCst);
+        assert_eq!(captured, state.account_epoch.load(Ordering::SeqCst));
+        // ...an account switch bumps it (the same edge that clears the
+        // account-scoped snapshots)...
+        state.account_epoch.fetch_add(1, Ordering::SeqCst);
+        // ...so the late response fails revalidation and must be dropped
+        // instead of union-merged into the new account's registry.
+        assert_ne!(captured, state.account_epoch.load(Ordering::SeqCst));
     }
 
     #[test]
