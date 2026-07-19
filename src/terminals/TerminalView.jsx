@@ -12968,6 +12968,10 @@ function pruneTodoQueueRemoteCommandReceipts(receipts, nowMs = Date.now()) {
         remote_intake: Boolean(receipt?.remote_intake),
         source: String(receipt?.source || receipt?.receipt_source || ""),
         status: normalizeTodoQueueRemoteCommandReceiptStatus(receipt?.status),
+        // Requeue keeps the previous attempt's settled receipt (Plans
+        // history) but stamps it superseded: non-authoritative for
+        // settlement/dedupe in every consumer of this mirror.
+        superseded: Boolean(receipt?.status_superseded_at || receipt?.superseded),
         text: String(receipt?.text || "").slice(0, 180),
         updated_at_ms: updatedAtMs,
         workspace_id: String(receipt?.workspace_id || ""),
@@ -13077,6 +13081,11 @@ function getTodoQueueRemoteCommandReceiptKey(item, workspaceId = "") {
 
 function todoQueueRemoteCommandReceiptBlocks(receipt) {
   if (!receipt) {
+    return false;
+  }
+  // A superseded receipt is a re-queued previous attempt: it must not block
+  // the new attempt's import/dispatch as a duplicate.
+  if (receipt?.superseded || receipt?.status_superseded_at) {
     return false;
   }
   const status = normalizeTodoQueueRemoteCommandReceiptStatus(receipt?.status);
@@ -30442,6 +30451,12 @@ function TerminalView({
             item?.remote_command?.command_id || item?.id || "",
           ).trim();
           const receipt = (ledgerReceipts && ledgerReceipts[commandId]) || null;
+          // A superseded receipt is a re-queued previous attempt: mirroring
+          // its stale settled status here would settle the NEW attempt's
+          // local item without execution.
+          if (receipt?.superseded || receipt?.status_superseded_at) {
+            return item;
+          }
           const receiptStatus = receipt
             ? normalizeTodoQueueRemoteCommandReceiptStatus(receipt.status)
             : "";
@@ -30511,7 +30526,12 @@ function TerminalView({
             return;
           }
           const receipt = ledgerReceipts[commandId] || todoQueueRemoteCommandReceiptsRef.current[commandId] || null;
-          const receiptStatus = receipt
+          // Superseded receipts (re-queued previous attempts) carry no
+          // settlement authority for the item's current attempt.
+          const receiptAuthoritative = Boolean(
+            receipt && !receipt.superseded && !receipt.status_superseded_at,
+          );
+          const receiptStatus = receiptAuthoritative
             ? normalizeTodoQueueRemoteCommandReceiptStatus(receipt.status)
             : "";
           updatesByItemId.set(itemId, {

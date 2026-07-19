@@ -19323,20 +19323,49 @@ fn terminal_activity_watchdog_waiting_release_action(
     }
 }
 
+/// Non-Claude panes launch (or may launch) the agent INSIDE a prewarmed
+/// interactive wrapper shell: the invocation is typed into the shell without
+/// `exec`, so the PTY child the watchdog polls for liveness is the WRAPPER
+/// SHELL, not the agent — a crashed/exited Codex or OpenCode still reports a
+/// live child. Claude panes spawn the CLI as the PTY child itself (prewarm
+/// explicitly excludes Claude), so child liveness observes the agent
+/// directly there.
+fn terminal_agent_may_run_inside_wrapper_shell(metadata: &TerminalInstanceMetadata) -> bool {
+    !terminal_metadata_is_claude(metadata)
+}
+
 /// interrupted/error decay: settled, turn closed, no open interaction, the
 /// CLI process alive and NOT visibly stuck in startup, and 30s since the
 /// runtime ENTERED the settled state — then project back to idle via the
 /// prompt-ready recovery path. The age is measured from the runtime's own
 /// update stamp, never the hook/output quiet clock: an interrupt after a
 /// long-quiet turn must still wait the full window.
+///
+/// `live_process` is NECESSARY but not SUFFICIENT for wrapper-shell panes
+/// (`agent_in_wrapper_shell`, i.e. every non-Claude provider): there the
+/// live child is only the wrapper shell, so decaying to idle on liveness
+/// alone lets dispatch type queued prompts into a bare shell after the agent
+/// crashed. Those panes additionally require POSITIVE agent-at-prompt
+/// evidence — the composer prompt marker visible in the output tail. The
+/// marker detector recognizes the `›`/`❯`/`❱` glyphs, `>`-prefixed composer
+/// lines, and OpenCode's "ctrl+p commands" footer; a provider whose composer
+/// renders none of these never satisfies the gate and therefore never
+/// decays — fail CLOSED by construction, because a false negative merely
+/// keeps the pane in its settled state while a false positive would feed
+/// prompts to a dead agent.
 fn terminal_activity_watchdog_settled_decay_action(
     runtime: &TerminalRuntimeSnapshot,
     settled_age_ms: u64,
     live_process: bool,
     mcp_startup_visible: bool,
+    agent_in_wrapper_shell: bool,
+    prompt_marker_visible: bool,
 ) -> Option<TerminalActivityWatchdogAction> {
     if settled_age_ms < TERMINAL_SETTLED_DECAY_WATCHDOG_MS || !live_process || mcp_startup_visible
     {
+        return None;
+    }
+    if agent_in_wrapper_shell && !prompt_marker_visible {
         return None;
     }
     let canonical = terminal_projection_text(&runtime.canonical_state, "");
@@ -21478,6 +21507,8 @@ fn spawn_terminal_activity_hook_watcher(
                     now_ms.saturating_sub(runtime.updated_at_ms),
                     live_process,
                     mcp_startup_visible,
+                    terminal_agent_may_run_inside_wrapper_shell(&instance.metadata),
+                    prompt_marker_visible,
                 )
             });
             if let Some(action) = watchdog_action {
@@ -39267,21 +39298,68 @@ notifications = true
 
     /// interrupted/error are settled states: after 30s of quiet they decay
     /// to idle (the CLI sits at its prompt) — never while a turn is active,
-    /// an interaction is open, or the pane is in any busy family.
+    /// an interaction is open, or the pane is in any busy family. For
+    /// wrapper-shell panes (every non-Claude provider) liveness only proves
+    /// the wrapper shell, so decay additionally requires the composer prompt
+    /// marker as POSITIVE agent-at-prompt evidence.
     #[test]
     fn interrupted_and_error_decay_to_idle_after_thirty_seconds() {
         let mut runtime = waiting_test_runtime_thinking();
         runtime.canonical_state = "interrupted".to_string();
         runtime.turn_active = false;
         runtime.active_interaction_id = None;
+        // Direct-child pane (Claude): liveness observes the agent itself, no
+        // prompt marker required.
         assert_eq!(
             terminal_activity_watchdog_settled_decay_action(
                 &runtime,
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
                 true,
                 false,
+                false,
+                false,
             ),
             Some(TerminalActivityWatchdogAction::SettledDecayIdle)
+        );
+        // Wrapper-shell pane (Codex/OpenCode inside the prewarmed shell):
+        // a live child is only the wrapper — without the agent's composer
+        // prompt marker the agent may have crashed back to a bare shell, and
+        // decaying would let dispatch type prompts into it. Fail closed.
+        assert_eq!(
+            terminal_activity_watchdog_settled_decay_action(
+                &runtime,
+                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                true,
+                false,
+                true,
+                false,
+            ),
+            None
+        );
+        // With the marker visible the agent is provably at its prompt.
+        assert_eq!(
+            terminal_activity_watchdog_settled_decay_action(
+                &runtime,
+                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                true,
+                false,
+                true,
+                true,
+            ),
+            Some(TerminalActivityWatchdogAction::SettledDecayIdle)
+        );
+        // The marker alone is not enough either: live_process stays a
+        // necessary condition even for wrapper-shell panes.
+        assert_eq!(
+            terminal_activity_watchdog_settled_decay_action(
+                &runtime,
+                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                false,
+                false,
+                true,
+                true,
+            ),
+            None
         );
         // The age is SETTLED-ENTRY age (runtime update stamp), never the
         // hook/output quiet clock: below the window nothing decays even if
@@ -39291,6 +39369,8 @@ notifications = true
                 &runtime,
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS - 1,
                 true,
+                false,
+                false,
                 false,
             ),
             None
@@ -39303,6 +39383,8 @@ notifications = true
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
                 false,
                 false,
+                false,
+                false,
             ),
             None
         );
@@ -39312,6 +39394,8 @@ notifications = true
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
                 true,
                 true,
+                false,
+                false,
             ),
             None
         );
@@ -39321,6 +39405,8 @@ notifications = true
                 &runtime,
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
                 true,
+                false,
+                false,
                 false,
             ),
             Some(TerminalActivityWatchdogAction::SettledDecayIdle)
@@ -39333,6 +39419,8 @@ notifications = true
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
                 true,
                 false,
+                false,
+                false,
             ),
             None
         );
@@ -39343,6 +39431,8 @@ notifications = true
                 &runtime,
                 TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
                 true,
+                false,
+                false,
                 false,
             ),
             None
@@ -39355,6 +39445,8 @@ notifications = true
                     &runtime,
                     TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
                     true,
+                    false,
+                    false,
                     false,
                 ),
                 None,

@@ -79,7 +79,11 @@ export function normalizeTodoQueueTerminalReceipts(receipts, paneId, options = {
         receipt.terminal_instance_id || receipt.target_terminal_instance_id || receipt.instance_id,
       );
       const rawStatus = normalizeTodoQueueSourceValue(receipt.status).toLowerCase() || "queued";
-      const active = TODO_QUEUE_ACTIVE_RECEIPT_STATUSES.has(rawStatus);
+      // A requeue keeps the previous attempt's settled receipt in the ledger
+      // (Plans history) but stamps it superseded: it renders as history
+      // (labeled "re-queued") and must never read as the current attempt.
+      const superseded = Boolean(receipt.status_superseded_at || receipt.superseded);
+      const active = !superseded && TODO_QUEUE_ACTIVE_RECEIPT_STATUSES.has(rawStatus);
       // An active receipt is only rewritten to "interrupted" when it CARRIES
       // identity that the live terminal cannot confirm: a receipt naming a
       // session must match the live session, and a receipt naming an
@@ -101,6 +105,7 @@ export function normalizeTodoQueueTerminalReceipts(receipts, paneId, options = {
         session_id: Array.from(receiptSessions)[0] || liveSessionId,
         stale_active: staleActive,
         status: staleActive ? "interrupted" : rawStatus,
+        superseded,
         terminal_instance_id: receiptInstanceId,
         text: normalizeTodoQueueSourceValue(receipt.text),
         updated_at_ms: updatedAtMs,

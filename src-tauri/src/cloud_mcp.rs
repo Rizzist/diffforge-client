@@ -11667,12 +11667,46 @@ fn cloud_mcp_process_known_account_scope() -> Option<(String, Option<String>)> {
     ))
 }
 
+/// Distinguishable "drop, don't cache" error for a JWT mint whose account
+/// context changed while the request was in flight.
+const CLOUD_MCP_JWT_MINT_STALE_ACCOUNT_ERROR: &str =
+    "Appwrite JWT mint belongs to a previous account context.";
+
+/// Commit a freshly minted Appwrite JWT into the process auth cache ONLY if
+/// the desktop session token that minted it is still the cache's current
+/// token. A mint that raced an account switch (or a sign-out, which clears
+/// the cached token) must never write the OLD account's JWT into the cache —
+/// later refreshes would silently authenticate as the previous account.
+fn cloud_mcp_commit_minted_jwt_to_process_cache(
+    minted_with_session_token: &str,
+    jwt: &str,
+    expires_ms: u64,
+) -> bool {
+    let Ok(mut cache) = cloud_mcp_process_auth_cache().lock() else {
+        return false;
+    };
+    if cache.desktop_session_token.as_deref() != Some(minted_with_session_token) {
+        return false;
+    }
+    cache.appwrite_jwt = Some(jwt.to_string());
+    cache.appwrite_jwt_expires_ms = Some(expires_ms);
+    true
+}
+
 async fn cloud_mcp_authorization_bearer(state: &CloudMcpState) -> Result<Option<String>, String> {
     if let Some(token) = cloud_mcp_static_appwrite_jwt() {
         return Ok(Some(token));
     }
 
     let now_ms = cloud_mcp_now_ms();
+    // Account-switch fencing (same shape as the registry-refresh fence): the
+    // session token captured below belongs to the account context at THIS
+    // instant, but the mint await can outlive an A→B switch. Capture the
+    // epoch alongside the token and revalidate after the mint — a stale
+    // response must be dropped, never written into the new account's auth
+    // state or the process cache, where later refreshes would silently
+    // authenticate as account A inside account B's session.
+    let account_epoch = state.account_epoch.load(Ordering::SeqCst);
     let desktop_session_token = {
         let auth = state.auth.lock().await;
         if auth
@@ -11716,20 +11750,31 @@ async fn cloud_mcp_authorization_bearer(state: &CloudMcpState) -> Result<Option<
             json!({"expires_ms": expires_ms}),
         )
         .await;
+        if state.account_epoch.load(Ordering::SeqCst) != account_epoch {
+            log_cloud_sync_event(
+                "auth.jwt_mint_stale_account_dropped",
+                json!({"reason": "account_epoch_moved"}),
+            );
+            return Err(CLOUD_MCP_JWT_MINT_STALE_ACCOUNT_ERROR.to_string());
+        }
         {
             let mut auth = state.auth.lock().await;
+            // Identity recheck under the auth lock: the epoch only moves on
+            // ACCOUNT context changes, so a same-account re-login (new
+            // session token, same epoch) is caught here instead — the JWT
+            // minted from the replaced session is dropped and the next call
+            // re-mints with the current token.
+            if auth.desktop_session_token.as_deref() != Some(desktop_session_token.as_str()) {
+                log_cloud_sync_event(
+                    "auth.jwt_mint_stale_account_dropped",
+                    json!({"reason": "session_token_replaced"}),
+                );
+                return Err(CLOUD_MCP_JWT_MINT_STALE_ACCOUNT_ERROR.to_string());
+            }
             auth.appwrite_jwt = Some(jwt.clone());
             auth.appwrite_jwt_expires_ms = Some(expires_ms);
         }
-        cloud_mcp_update_process_auth_cache(
-            Some(desktop_session_token),
-            Some(jwt.clone()),
-            Some(expires_ms),
-            None,
-            None,
-            None,
-            None,
-        );
+        cloud_mcp_commit_minted_jwt_to_process_cache(&desktop_session_token, &jwt, expires_ms);
         return Ok(Some(jwt));
     }
 
@@ -11763,16 +11808,22 @@ fn cloud_mcp_process_authorization_bearer() -> Option<String> {
     if let Some(desktop_session_token) = desktop_session_token {
         if let Ok((jwt, expires_ms)) = cloud_mcp_fetch_appwrite_jwt_blocking(&desktop_session_token)
         {
-            cloud_mcp_update_process_auth_cache(
-                Some(desktop_session_token),
-                Some(jwt.clone()),
-                Some(expires_ms),
-                None,
-                None,
-                None,
-                None,
+            // Same await-then-write poisoning shape as the async mint path:
+            // an account switch (or sign-out) during the blocking fetch
+            // replaces/clears the cached session token, and this mint then
+            // belongs to the PREVIOUS account. The guarded commit only
+            // writes the JWT while the minting token is still current; a
+            // stale mint is dropped entirely (not returned either — it would
+            // authenticate the caller as the old account).
+            if cloud_mcp_commit_minted_jwt_to_process_cache(&desktop_session_token, &jwt, expires_ms)
+            {
+                return Some(jwt);
+            }
+            log_cloud_sync_event(
+                "auth.jwt_mint_stale_account_dropped",
+                json!({"reason": "process_cache_session_token_replaced"}),
             );
-            return Some(jwt);
+            return None;
         }
     }
 
@@ -13789,7 +13840,15 @@ async fn cloud_mcp_cache_account_device_live_state_snapshot(state: &CloudMcpStat
     let Some(snapshot) = cloud_mcp_account_device_live_state_snapshot_from_event(event) else {
         return;
     };
+    // Same check-to-commit fencing as the apply path: the account switch
+    // handler bumps the epoch BEFORE clearing the snapshot under this lock,
+    // so an event captured for the previous account context fails this
+    // recheck instead of union-merging stale devices into the new account.
+    let account_epoch = state.account_epoch.load(Ordering::SeqCst);
     let mut runtime = state.inner.lock().await;
+    if state.account_epoch.load(Ordering::SeqCst) != account_epoch {
+        return;
+    }
     runtime.account_device_live_state_snapshot = Some(cloud_mcp_merge_account_live_state_snapshot(
         runtime.account_device_live_state_snapshot.as_ref(),
         snapshot,
@@ -13815,6 +13874,7 @@ async fn cloud_mcp_apply_account_device_live_state_snapshot(
     snapshot: Value,
     trigger: &str,
     activity_source: &str,
+    expected_account_epoch: u64,
 ) {
     let bytes = cloud_mcp_sync_payload_bytes(&snapshot);
     let count = cloud_mcp_sync_payload_count(&snapshot);
@@ -13830,6 +13890,25 @@ async fn cloud_mcp_apply_account_device_live_state_snapshot(
     );
     let snapshot = {
         let mut runtime = state.inner.lock().await;
+        // Check-to-commit fencing: callers validate the epoch after their
+        // fetch, but this commit runs LATER — an account switch between that
+        // check and this merge bumps the epoch and then clears the snapshot
+        // under this same lock. Rechecking here, inside the mutation critical
+        // section, makes bump+clear vs merge+emit strictly ordered: a moved
+        // epoch means the cleared state must not be re-seeded (and the stale
+        // payload must not be emitted) — abort silently.
+        if state.account_epoch.load(Ordering::SeqCst) != expected_account_epoch {
+            drop(runtime);
+            log_cloud_sync_event(
+                "account_device_live_state.stale_epoch_dropped",
+                json!({
+                    "trigger": trigger,
+                    "source": activity_source,
+                }),
+            );
+            cloud_mcp_clear_sync_activity_key(&activity_key);
+            return;
+        }
         let snapshot = cloud_mcp_merge_account_live_state_snapshot(
             runtime.account_device_live_state_snapshot.as_ref(),
             snapshot,
@@ -14240,6 +14319,7 @@ async fn cloud_mcp_refresh_registered_device_registry(
         snapshot,
         reason,
         "agents/devices:registered_device_registry",
+        account_epoch,
     )
     .await;
     Ok(())
@@ -14360,6 +14440,10 @@ fn cloud_mcp_spawn_account_live_state_reconcile(state: &CloudMcpState, reason: &
         let retry_delays_ms = [120_u64, 500, 1_200];
         for (attempt, delay_ms) in retry_delays_ms.iter().enumerate() {
             sleep(Duration::from_millis(*delay_ms)).await;
+            // Captured before the ws request: the response belongs to the
+            // account context in force NOW; the apply recheck drops it if an
+            // account switch lands while the request is in flight.
+            let account_epoch = state.account_epoch.load(Ordering::SeqCst);
             let payload = json!({
                 "reason": reason,
                 "source": "rust-diffforge",
@@ -14380,6 +14464,7 @@ fn cloud_mcp_spawn_account_live_state_reconcile(state: &CloudMcpState, reason: &
                             snapshot,
                             reason,
                             "account_live_state:reconcile",
+                            account_epoch,
                         )
                         .await;
                         log_cloud_sync_event(
@@ -18276,6 +18361,11 @@ async fn cloud_mcp_handle_global_ws_message(
         cloud_mcp_note_sync_connection(false, "desktop_registering");
         let ready_message = message.clone();
         let state_for_initial = state.clone();
+        // The ready frame arrived on THIS connection under the CURRENT
+        // account context; captured here so the initial live-state apply can
+        // be dropped if an account switch lands before the spawned task
+        // commits it.
+        let ready_account_epoch = state.account_epoch.load(Ordering::SeqCst);
         tauri::async_runtime::spawn(async move {
             if let Some(initial_account_asset_state) = initial_account_asset_state {
                 let bytes = cloud_mcp_sync_payload_bytes(&initial_account_asset_state);
@@ -18396,6 +18486,7 @@ async fn cloud_mcp_handle_global_ws_message(
                     initial_account_live_state,
                     "global_ws_ready",
                     "global_ws_ready:account_device_live_state_snapshot",
+                    ready_account_epoch,
                 )
                 .await;
             }
@@ -62782,6 +62873,138 @@ mod cloud_mcp_tests {
         // ...so the late response fails revalidation and must be dropped
         // instead of union-merged into the new account's registry.
         assert_ne!(captured, state.account_epoch.load(Ordering::SeqCst));
+    }
+
+    /// The check-to-commit half of the epoch fence: passing the caller's
+    /// captured epoch INTO the snapshot commit and rechecking it inside the
+    /// mutation critical section means a switch that lands between the
+    /// caller's post-fetch check and the async commit still drops the stale
+    /// payload instead of re-seeding the freshly cleared snapshot.
+    #[tokio::test]
+    async fn stale_epoch_snapshot_commit_is_dropped_inside_the_critical_section() {
+        let state = CloudMcpState::new();
+        let captured_epoch = state.account_epoch.load(Ordering::SeqCst);
+        let stale_snapshot = json!({
+            "kind": "account_device_live_state",
+            "registered_devices": {"items": [{"device_id": "device-account-a"}]},
+        });
+
+        // The account switch bumps the epoch and clears the snapshot AFTER
+        // the caller's check but BEFORE the commit runs.
+        state.account_epoch.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut runtime = state.inner.lock().await;
+            runtime.account_device_live_state_snapshot = None;
+        }
+
+        cloud_mcp_apply_account_device_live_state_snapshot(
+            &state,
+            stale_snapshot.clone(),
+            "test_stale_commit",
+            "test:stale_epoch_commit",
+            captured_epoch,
+        )
+        .await;
+        assert!(
+            state
+                .inner
+                .lock()
+                .await
+                .account_device_live_state_snapshot
+                .is_none(),
+            "a commit carrying a stale epoch must abort inside the critical \
+             section instead of merging the old account's registry"
+        );
+
+        // The same payload under the CURRENT epoch commits normally.
+        let current_epoch = state.account_epoch.load(Ordering::SeqCst);
+        cloud_mcp_apply_account_device_live_state_snapshot(
+            &state,
+            stale_snapshot,
+            "test_current_commit",
+            "test:current_epoch_commit",
+            current_epoch,
+        )
+        .await;
+        let committed = state
+            .inner
+            .lock()
+            .await
+            .account_device_live_state_snapshot
+            .clone();
+        assert!(
+            committed.is_some_and(|snapshot| snapshot["registered_devices"]["items"][0]
+                ["device_id"]
+                == json!("device-account-a")),
+            "a commit carrying the current epoch must apply"
+        );
+    }
+
+    /// Finding: a late Appwrite JWT mint captured under account A must never
+    /// be committed into the process auth cache after the cache's session
+    /// token changed (account switch) or cleared (sign-out).
+    #[test]
+    fn stale_jwt_mint_never_commits_into_process_auth_cache() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let original = cloud_mcp_process_auth_cache()
+            .lock()
+            .map(|cache| {
+                (
+                    cache.desktop_session_token.clone(),
+                    cache.appwrite_jwt.clone(),
+                    cache.appwrite_jwt_expires_ms,
+                )
+            })
+            .unwrap();
+
+        if let Ok(mut cache) = cloud_mcp_process_auth_cache().lock() {
+            cache.desktop_session_token = Some("session-account-b".to_string());
+            cache.appwrite_jwt = None;
+            cache.appwrite_jwt_expires_ms = None;
+        }
+        // Account A's mint resolves after the switch to B: dropped.
+        assert!(!cloud_mcp_commit_minted_jwt_to_process_cache(
+            "session-account-a",
+            "jwt-minted-for-a",
+            9_999,
+        ));
+        {
+            let cache = cloud_mcp_process_auth_cache().lock().unwrap();
+            assert_eq!(cache.appwrite_jwt, None);
+            assert_eq!(
+                cache.desktop_session_token.as_deref(),
+                Some("session-account-b")
+            );
+        }
+        // B's own mint (token still current) commits.
+        assert!(cloud_mcp_commit_minted_jwt_to_process_cache(
+            "session-account-b",
+            "jwt-minted-for-b",
+            1_234,
+        ));
+        {
+            let cache = cloud_mcp_process_auth_cache().lock().unwrap();
+            assert_eq!(cache.appwrite_jwt.as_deref(), Some("jwt-minted-for-b"));
+            assert_eq!(cache.appwrite_jwt_expires_ms, Some(1_234));
+        }
+        // Sign-out clears the token; a straggler mint stays dropped.
+        if let Ok(mut cache) = cloud_mcp_process_auth_cache().lock() {
+            cache.desktop_session_token = None;
+        }
+        assert!(!cloud_mcp_commit_minted_jwt_to_process_cache(
+            "session-account-b",
+            "jwt-minted-for-b-late",
+            5_678,
+        ));
+
+        if let Ok(mut cache) = cloud_mcp_process_auth_cache().lock() {
+            cache.desktop_session_token = original.0;
+            cache.appwrite_jwt = original.1;
+            cache.appwrite_jwt_expires_ms = original.2;
+        }
     }
 
     #[test]

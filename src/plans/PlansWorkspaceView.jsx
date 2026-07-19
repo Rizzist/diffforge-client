@@ -1279,6 +1279,11 @@ export default function PlansWorkspaceView({
                 <TodoBadge data-kind={receiptStatusKind(openedTodo.status)}>
                   {receiptStatusLabel(openedTodo.status)}
                 </TodoBadge>
+                {openedTodo.superseded && (
+                  <TodoBadge data-kind="queued" title="This attempt was re-queued; a newer attempt owns the todo now.">
+                    Re-queued
+                  </TodoBadge>
+                )}
               </TodoCardActions>
             </TodoCardHeader>
             <TodoCardText>{openedTodo.text || "(no todo text)"}</TodoCardText>
@@ -1444,6 +1449,11 @@ export default function PlansWorkspaceView({
                     </HistoryRowTop>
                     <HistoryRowMeta>
                       <HistoryBadge data-kind={kind}>{receiptStatusLabel(item.status)}</HistoryBadge>
+                      {item.superseded && (
+                        <HistoryBadge data-kind="queued" title="This attempt was re-queued; a newer attempt owns the todo now.">
+                          Re-queued
+                        </HistoryBadge>
+                      )}
                       <span>{relativeTimeLabel(item.received_at_ms, nowMs)}</span>
                       {duration && <span>{duration.prefix} {duration.label}</span>}
                     </HistoryRowMeta>

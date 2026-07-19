@@ -170,6 +170,45 @@ test("identity-less receipt on a restarted sessionless terminal stays current", 
   assert.equal(items[0].stale_active, false);
 });
 
+test("superseded requeue receipt keeps rendering as history, never as current", () => {
+  // A requeue keeps the previous attempt's settled receipt in the ledger
+  // (Plans history) stamped superseded: it renders with its settled outcome
+  // plus the superseded flag, and must never read as the current attempt.
+  const items = normalizeTodoQueueTerminalReceipts({
+    "cmd-requeued": {
+      command_id: "cmd-requeued",
+      item_id: "todo-requeued",
+      pane_id: "workspace-terminal-ws-0-claude",
+      received_at_ms: 1000,
+      status: "completed",
+      status_superseded_at: "2026-07-19T00:00:00Z",
+      superseded_by_attempt_seq: 1,
+      text: "First attempt, since re-queued",
+    },
+    "cmd-live": {
+      command_id: "cmd-live",
+      item_id: "todo-live",
+      pane_id: "workspace-terminal-ws-0-claude",
+      received_at_ms: 2000,
+      status: "running",
+      text: "Second attempt running",
+    },
+  }, "workspace-terminal-ws-0-claude", {
+    instance_id: "instance-1",
+    session_id: "",
+  });
+
+  assert.equal(items.length, 2);
+  const superseded = items.find((item) => item.command_id === "cmd-requeued");
+  const live = items.find((item) => item.command_id === "cmd-live");
+  assert.equal(superseded.superseded, true);
+  assert.equal(superseded.status, "completed");
+  assert.equal(superseded.is_current, false);
+  assert.equal(superseded.stale_active, false);
+  assert.equal(live.superseded, false);
+  assert.equal(live.is_current, true);
+});
+
 test("remote control source is preserved through queued auto dispatch", () => {
   assert.equal(
     getTodoQueueAutoQueueSourceForSource({ source: TODO_QUEUE_SOURCE_REMOTE_CONTROL }),
