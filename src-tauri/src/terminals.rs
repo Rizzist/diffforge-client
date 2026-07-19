@@ -2780,6 +2780,14 @@ fn terminal_reduce_canonical_state(
         // turn/task evidence cannot resume or park it; only an exact answer
         // or provider resolution may move UIR back to thinking.
         "uir"
+    } else if previous_state == "waiting" && !turn_started {
+        // Passive/background evidence — SubagentStop, TaskCompleted, tool
+        // noise — IS the work the parking Stop awaits. It must not melt the
+        // WAITING latch (a flip to thinking clears waiting_origin_ms and
+        // drops the settle gate, so the true final Stop can be rejected or
+        // a stale one accepted). Only Stop-family outcomes, interrupts,
+        // errors, prompts, close, or explicit turn re-entry move waiting.
+        "waiting"
     } else if task_parked {
         "paused"
     } else if turn_started {
@@ -2817,7 +2825,11 @@ fn terminal_reduce_canonical_state(
             && terminal_canonical_transition_allowed(&previous_state, "thinking")
             && terminal_canonical_transition_allowed("thinking", "uir"));
     if !transition_allowed {
-        next_state = if turn_active {
+        next_state = if previous_state == "waiting" {
+            // A vetoed transition out of WAITING must never decay to
+            // thinking — that clears the ordering latch. Hold waiting.
+            "waiting"
+        } else if turn_active {
             "thinking"
         } else {
             previous_state.as_str()
@@ -37793,6 +37805,75 @@ notifications = true
         assert!(!terminal_waiting_origin_ordered(0, 100));
         assert!(!terminal_waiting_origin_ordered(0, 0));
         assert!(terminal_waiting_origin_ordered(1, 0));
+    }
+
+    /// Round-6 hardening: SubagentStop / TaskCompleted map to passive
+    /// thinking-family events ("provider-subagent-completed" /
+    /// "provider-task-completed") — they are the awaited background work
+    /// completing and must HOLD the waiting latch with the ordering origin
+    /// intact; the true final Stop then settles through it.
+    #[test]
+    fn waiting_latch_survives_background_completion_hooks_then_final_stop_settles() {
+        let mut waiting_runtime = waiting_test_runtime_thinking();
+        waiting_runtime.canonical_state = "waiting".to_string();
+        waiting_runtime.waiting_origin_ms = 100;
+
+        for event_type in ["provider-subagent-completed", "provider-task-completed"] {
+            let mut background_done = waiting_test_payload(event_type, false);
+            background_done.activity_status = "thinking".to_string();
+            background_done.input_ready = false;
+            background_done.hook_timestamp_ms = 300;
+            let projection = terminal_reduce_canonical_state(
+                &waiting_runtime,
+                &background_done,
+                None,
+                false,
+                false,
+            );
+            assert_eq!(
+                projection.canonical_state, "waiting",
+                "{event_type} must hold the waiting latch"
+            );
+            assert_eq!(
+                terminal_next_waiting_origin_ms(
+                    &waiting_runtime,
+                    &background_done,
+                    &projection,
+                    false,
+                ),
+                100,
+                "{event_type} must preserve the waiting origin"
+            );
+        }
+
+        // A parked todo queue must not melt waiting either: waiting→paused is
+        // not an allowed edge and the veto fallback must hold waiting, not
+        // decay to thinking.
+        let mut passive = waiting_test_payload("provider-subagent-completed", false);
+        passive.activity_status = "thinking".to_string();
+        passive.input_ready = false;
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &passive, None, true, false);
+        assert_eq!(projection.canonical_state, "waiting");
+
+        // With the latch intact, the true final Stop (new turn id, fresh
+        // origin) settles.
+        let mut final_stop = waiting_test_payload("provider-turn-completed", false);
+        final_stop.provider_turn_id = Some("turn-w9".to_string());
+        final_stop.turn_id = Some("turn-w9".to_string());
+        final_stop.hook_timestamp_ms = 400;
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &final_stop, None, false, false);
+        assert_eq!(projection.canonical_state, "idle");
+        assert!(projection.completion_accepted);
+
+        // Explicit turn re-entry still moves waiting → thinking.
+        let mut re_entry = waiting_test_payload("provider-turn-started", false);
+        re_entry.activity_status = "thinking".to_string();
+        re_entry.input_ready = false;
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &re_entry, None, false, false);
+        assert_eq!(projection.canonical_state, "thinking");
     }
 
     /// The waiting ordering identity is stamped from the PARKING event's
