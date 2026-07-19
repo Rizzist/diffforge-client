@@ -35461,7 +35461,7 @@ export default function App() {
           || readiness === "ready"
           || ["idle", "ready"].includes(visibleStatus)))
       );
-      const isWorking = canonicalState === "thinking" || (!canonicalState && !presenceSaysIdle && Boolean(
+      const isWorking = ["thinking", "waiting"].includes(canonicalState) || (!canonicalState && !presenceSaysIdle && Boolean(
         ["compacting", "compaction", "thinking", "working", "running", "busy"].includes(visibleStatus)
           || readiness === "busy"
           || (

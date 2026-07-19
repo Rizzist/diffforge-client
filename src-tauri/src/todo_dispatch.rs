@@ -1995,6 +1995,7 @@ fn todo_dispatch_activity_hook_should_wake_queue(
 ) -> bool {
     !payload.workspace_id.trim().is_empty()
         && payload.terminal_state_contract_version == 1
+        && !payload.background_work_active
         && payload.canonical_state == "idle"
         && !payload.turn_active
         && payload.completed_turn_generation == payload.turn_generation
@@ -2007,6 +2008,12 @@ fn todo_dispatch_activity_hook_settle_status(
     event_type: &str,
 ) -> Option<&'static str> {
     match event_type {
+        // WAITING settlement gate: a Stop that arrives while the harness
+        // still owns live background work must never settle COMPLETED — the
+        // canonical reducer withholds turn_settlement_accepted for it, and
+        // this guard keeps the invariant even for payloads that bypass the
+        // reducer. Errors and interrupts remain terminal and still settle.
+        "provider-turn-completed" if payload.background_work_active => None,
         "provider-turn-completed" if payload.turn_settlement_accepted => Some("completed"),
         "provider-turn-error" => Some("failed"),
         "provider-turn-interrupted" if payload.turn_settlement_accepted => Some("interrupted"),
@@ -2894,6 +2901,7 @@ fn todo_dispatch_update_terminal_runtime(payload: &TerminalActivityHookPayload) 
         pane_id.to_string(),
         json!({
             "terminal_state_contract_version": payload.terminal_state_contract_version,
+            "background_work_active": payload.background_work_active,
             "canonical_state": payload.canonical_state.clone(),
             "canonical_badge_label": payload.canonical_badge_label.clone(),
             "canonical_state_seq": payload.canonical_state_seq,

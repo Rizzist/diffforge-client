@@ -31,6 +31,9 @@ const TERMINAL_ACTIVITY_THINKING_STATES = new Set([
   "tool",
   "tool_completed",
   "tool_running",
+  // WAITING: turn parked on live background shells/subagents — the session is
+  // still working (never needs-input, never settled), so it rides with busy.
+  "waiting",
   "working",
 ]);
 
@@ -62,7 +65,6 @@ const TERMINAL_ACTIVITY_PAUSED_STATES = new Set([
   "parked",
   "paused",
   "resume_ready",
-  "waiting",
 ]);
 
 const TERMINAL_ACTIVITY_ERROR_STATES = new Set([
@@ -95,6 +97,7 @@ const TERMINAL_CANONICAL_STATES = new Set([
   "starting",
   "idle",
   "thinking",
+  "waiting",
   "paused",
   "uir",
   "interrupted",

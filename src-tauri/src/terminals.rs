@@ -12,6 +12,10 @@ const TERMINAL_STARTING_WATCHDOG_MS: u64 = 30_000;
 const TERMINAL_MCP_STARTUP_DEGRADED_MS: u64 = 30_000;
 const TERMINAL_WATCHDOG_OUTPUT_QUIET_MS: u64 = 2_500;
 const TERMINAL_HOT_STALE_WATCHDOG_MS: u64 = 10 * 60_000;
+/// A WAITING session (turn parked on live background shells/subagents) that
+/// sees no hook or output activity for this long is force-released to idle so
+/// a silently-dead background task can never hold receipts hostage forever.
+const TERMINAL_WAITING_RELEASE_WATCHDOG_MS: u64 = 30 * 60_000;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
 const TERMINAL_CONTROL_AUTOMATION_GUARD_TTL_MS: u64 = 60_000;
 const TERMINAL_CONTROL_PROMPT_ANSWER_GUARD_TTL_MS: u64 = 10_000;
@@ -1604,6 +1608,9 @@ fn terminal_runtime_apply_activity_payload(
     let completion_rejected = terminal_projection_text(&payload.event_type, "")
         == "provider_turn_completed"
         && !projection.completion_accepted;
+    let waiting_rejected = terminal_projection_text(&payload.event_type, "")
+        == "provider_turn_waiting"
+        && !projection.waiting_accepted;
     let interrupt_rejected = terminal_projection_text(&payload.event_type, "")
         == "provider_turn_interrupted"
         && !projection.interrupt_accepted;
@@ -1621,6 +1628,7 @@ fn terminal_runtime_apply_activity_payload(
             open_structured_interaction,
         );
     let terminal_event_rejected = completion_rejected
+        || waiting_rejected
         || interrupt_rejected
         || error_rejected
         || prompt_ready_recovery_rejected;
@@ -1983,6 +1991,7 @@ fn terminal_projection_state_is_busy(value: &str) -> bool {
             | "tool"
             | "tool_completed"
             | "tool_running"
+            | "waiting"
             | "working"
     )
 }
@@ -2008,7 +2017,6 @@ fn terminal_projection_state_is_paused(value: &str) -> bool {
             | "resume_ready"
             | "uir"
             | "user_input_required"
-            | "waiting"
     )
 }
 
@@ -2214,6 +2222,7 @@ struct TerminalCanonicalProjection {
     active_interaction_revision: Option<u64>,
     interaction_actionable: bool,
     completion_accepted: bool,
+    waiting_accepted: bool,
     interrupt_accepted: bool,
     error_accepted: bool,
 }
@@ -2233,6 +2242,7 @@ fn terminal_canonical_projection_from_runtime(
         active_interaction_revision: runtime.active_interaction_revision,
         interaction_actionable: runtime.interaction_actionable,
         completion_accepted: false,
+        waiting_accepted: false,
         interrupt_accepted: false,
         error_accepted: false,
     }
@@ -2243,6 +2253,7 @@ fn terminal_canonical_default_badge_label(state: &str) -> &'static str {
         "starting" => "starting",
         "idle" => "idle",
         "thinking" => "thinking",
+        "waiting" => "waiting",
         "paused" => "paused",
         "uir" => "input required",
         "interrupted" => "interrupted",
@@ -2358,7 +2369,13 @@ fn terminal_canonical_stop_correlates(
         (Some(previous), Some(candidate)) => previous.trim() == candidate.trim(),
         _ => true,
     };
-    generation_matches && session_matches && turn_matches
+    // WAITING awaits a FUTURE turn's stop: the background continuation may
+    // mint a new turn id with no intermediate event updating the runtime, so
+    // a turn-id mismatch alone must not reject the stop — generation and
+    // session matching stay required.
+    let waiting_awaits_future_turn =
+        terminal_projection_text(&previous.canonical_state, "") == "waiting";
+    generation_matches && session_matches && (turn_matches || waiting_awaits_future_turn)
 }
 
 fn terminal_canonical_error_correlates(
@@ -2502,6 +2519,15 @@ fn terminal_canonical_transition_allowed(previous: &str, next: &str) -> bool {
             | ("thinking", "idle")
             | ("uir", "idle")
             | ("paused", "idle")
+            | ("thinking", "waiting")
+            | ("uir", "waiting")
+            | ("paused", "waiting")
+            | ("waiting", "thinking")
+            | ("waiting", "idle")
+            | ("waiting", "uir")
+            | ("waiting", "interrupted")
+            | ("waiting", "error")
+            | ("waiting", "closing")
             | ("interrupted", "idle")
             | ("error", "idle")
             | ("thinking", "interrupted")
@@ -2539,6 +2565,7 @@ fn terminal_reduce_canonical_state(
         "provider_turn_started" | "message_submitted" | "pending_prompt_sent"
     );
     let completion_event = event_type == "provider_turn_completed";
+    let waiting_event = event_type == "provider_turn_waiting";
     let interrupt_event = event_type == "provider_turn_interrupted";
     let error_event =
         event_type == "provider_turn_error" || authoritative_event.provider_error.is_some();
@@ -2588,11 +2615,27 @@ fn terminal_reduce_canonical_state(
         && stop_correlates
         && !generationless_completion_blocked_by_uir
         && previous_runtime.turn_active
-        && matches!(previous_state.as_str(), "thinking" | "uir" | "paused");
+        && matches!(
+            previous_state.as_str(),
+            "thinking" | "uir" | "paused" | "waiting"
+        );
+    // A Stop that arrives while the harness still owns background work
+    // (shells/subagents) parks the session in WAITING: the turn stays OPEN —
+    // no settlement, no completed generation — until the true final Stop.
+    let waiting_accepted = waiting_event
+        && stop_correlates
+        && previous_runtime.turn_active
+        && matches!(
+            previous_state.as_str(),
+            "thinking" | "uir" | "paused" | "waiting"
+        );
     let interrupt_accepted = interrupt_event
         && stop_correlates
         && previous_runtime.turn_active
-        && matches!(previous_state.as_str(), "thinking" | "uir" | "paused");
+        && matches!(
+            previous_state.as_str(),
+            "thinking" | "uir" | "paused" | "waiting"
+        );
     if completion_accepted {
         completed_turn_generation = turn_generation;
         turn_active = false;
@@ -2617,6 +2660,13 @@ fn terminal_reduce_canonical_state(
         "interrupted"
     } else if completion_accepted && completed_turn_generation == turn_generation {
         "idle"
+    } else if waiting_accepted {
+        "waiting"
+    } else if waiting_event && previous_state == "waiting" {
+        // A repeated background Stop that failed acceptance (id drift) must
+        // hold WAITING — falling through to thinking would flap the state and
+        // adopt unverified identifiers.
+        "waiting"
     } else if prompt_ready_recovery {
         "idle"
     } else if prompt_event {
@@ -2719,9 +2769,10 @@ fn terminal_reduce_canonical_state(
     let interaction_actionable = next_state == "uir"
         && terminal_canonical_interaction_actionable(open_structured_interaction);
     let rejected_completion = completion_event && !completion_accepted;
+    let rejected_waiting = waiting_event && !waiting_accepted;
     let rejected_interrupt = interrupt_event && !interrupt_accepted;
     let rejected_error = error_event && !error_accepted;
-    let badge_label = if rejected_completion || rejected_interrupt || rejected_error {
+    let badge_label = if rejected_completion || rejected_waiting || rejected_interrupt || rejected_error {
         previous_runtime.canonical_badge_label.clone()
     } else if next_state == "thinking" {
         terminal_canonical_thinking_badge(authoritative_event).to_string()
@@ -2753,6 +2804,7 @@ fn terminal_reduce_canonical_state(
         active_interaction_revision,
         interaction_actionable,
         completion_accepted,
+        waiting_accepted,
         interrupt_accepted,
         error_accepted,
     }
@@ -2853,7 +2905,7 @@ fn terminal_project_runtime(
     };
     let status = canonical_state.clone();
     let readiness = match canonical_state.as_str() {
-        "thinking" | "starting" => "busy",
+        "thinking" | "starting" | "waiting" => "busy",
         "uir" | "paused" => "needs_input",
         "error" => "error",
         "closing" => "closing",
@@ -2862,7 +2914,7 @@ fn terminal_project_runtime(
     }
     .to_string();
     let turn_status = match canonical_state.as_str() {
-        "thinking" => "running",
+        "thinking" | "waiting" => "running",
         "uir" | "paused" => "pending",
         "error" => "failed",
         "interrupted" | "closing" | "closed" | "offline" => "interrupted",
@@ -2884,7 +2936,7 @@ fn terminal_project_runtime(
         "prompting_user"
     } else if canonical_state == "error" {
         "error"
-    } else if canonical_state == "thinking" {
+    } else if matches!(canonical_state.as_str(), "thinking" | "waiting") {
         "running"
     } else {
         "complete"
@@ -17634,6 +17686,20 @@ fn terminal_activity_hook_payload(
                         false,
                         "cli_hook_stop_background_active",
                     )
+                } else if claude_stop_has_background_work {
+                    // WAITING: the turn ended but the harness still owns live
+                    // background work (shells/subagents). Not idle — settling
+                    // now would be a false completion; not paused — no input
+                    // is required. The prompt IS available (input_ready), but
+                    // receipts settle only at the true end of the work.
+                    (
+                        "provider-turn-waiting",
+                        "waiting",
+                        "active",
+                        "background_waiting",
+                        true,
+                        "cli_hook_stop_background_waiting",
+                    )
                 } else {
                     let completion_evidence =
                         if hook_key == "sessionstart" || hook_key == "sessionstarted" {
@@ -18659,6 +18725,7 @@ enum TerminalActivityWatchdogAction {
     StartupDowngradeRunning,
     McpStartupError,
     StaleHotStop,
+    WaitingRelease,
 }
 
 fn terminal_activity_watchdog_launch_mode(runtime: &TerminalRuntimeSnapshot) -> &'static str {
@@ -18726,7 +18793,8 @@ fn terminal_activity_watchdog_runtime_is_active_tool(runtime: &TerminalRuntimeSn
 fn terminal_activity_watchdog_runtime_is_stale_hot_candidate(
     runtime: &TerminalRuntimeSnapshot,
 ) -> bool {
-    terminal_runtime_snapshot_is_busy_turn(runtime)
+    terminal_projection_text(&runtime.canonical_state, "") != "waiting"
+        && terminal_runtime_snapshot_is_busy_turn(runtime)
         && !terminal_runtime_snapshot_is_starting(runtime)
         && !terminal_activity_watchdog_runtime_is_paused_or_manual(runtime)
         && !terminal_activity_watchdog_runtime_is_active_tool(runtime)
@@ -18788,6 +18856,19 @@ fn terminal_activity_watchdog_stale_hot_action(
         && terminal_activity_watchdog_runtime_is_stale_hot_candidate(runtime)
     {
         Some(TerminalActivityWatchdogAction::StaleHotStop)
+    } else {
+        None
+    }
+}
+
+fn terminal_activity_watchdog_waiting_release_action(
+    runtime: &TerminalRuntimeSnapshot,
+    quiet_age_ms: u64,
+) -> Option<TerminalActivityWatchdogAction> {
+    if quiet_age_ms >= TERMINAL_WAITING_RELEASE_WATCHDOG_MS
+        && terminal_projection_text(&runtime.canonical_state, "") == "waiting"
+    {
+        Some(TerminalActivityWatchdogAction::WaitingRelease)
     } else {
         None
     }
@@ -20657,6 +20738,14 @@ fn spawn_terminal_activity_hook_watcher(
                     })
                 })
                 .flatten()
+            })
+            // OUTSIDE the pty-lifecycle-recovery gate: WAITING is Claude-only
+            // and that gate rejects Claude — the release must run for it.
+            .or_else(|| {
+                terminal_activity_watchdog_waiting_release_action(
+                    &runtime,
+                    now_ms.saturating_sub(last_hook_or_output_activity_ms),
+                )
             });
             if let Some(action) = watchdog_action {
                 let (hook_event_name, source, reason) = match action {
@@ -20683,6 +20772,11 @@ fn spawn_terminal_activity_hook_watcher(
                         "Stop",
                         "backend-stale-hot-watchdog",
                         "stale_hot_no_hook_or_output",
+                    ),
+                    TerminalActivityWatchdogAction::WaitingRelease => (
+                        "Stop",
+                        "backend-waiting-release-watchdog",
+                        "waiting_background_ttl_exceeded",
                     ),
                 };
                 log_terminal_status_event(
@@ -20738,6 +20832,7 @@ fn spawn_terminal_activity_hook_watcher(
                     action,
                     TerminalActivityWatchdogAction::StartupStop
                         | TerminalActivityWatchdogAction::StaleHotStop
+                        | TerminalActivityWatchdogAction::WaitingRelease
                 ) {
                     last_output_activity_ms = now_ms;
                 }
@@ -25396,7 +25491,7 @@ fn terminal_runtime_accepts_interrupt(runtime: &TerminalRuntimeSnapshot) -> bool
         && !runtime.input_ready
         && matches!(
             terminal_projection_text(&runtime.canonical_state, "").as_str(),
-            "thinking" | "uir" | "paused"
+            "thinking" | "uir" | "paused" | "waiting"
         )
 }
 
@@ -37279,7 +37374,7 @@ notifications = true
     }
 
     #[test]
-    fn claude_stop_with_background_work_settles_foreground_unless_input_blocked() {
+    fn claude_stop_with_background_work_parks_in_waiting_never_false_completion() {
         let mut claude_metadata = terminal_projection_test_metadata();
         claude_metadata.agent_id = "claude".to_string();
         claude_metadata.agent_kind = "claude".to_string();
@@ -37290,11 +37385,16 @@ notifications = true
         assert!(terminal_activity_hook_claude_stop_has_background_work(
             &background_stop
         ));
+        // Prompt available + background running is WAITING, not forced-busy…
         assert!(!terminal_activity_hook_background_stop_forces_busy(
             &claude_metadata,
             "stop",
             &background_stop,
         ));
+        // …and not a plain completion either: the payload site diverts a
+        // background-carrying Stop to the waiting tuple (covered below via
+        // the reducer); the bare lifecycle mapping stays a completion for
+        // background-free Stops.
         assert_eq!(
             terminal_activity_hook_lifecycle_kind("Stop"),
             Some((
@@ -37316,6 +37416,208 @@ notifications = true
             "stop",
             &blocked_background_stop,
         ));
+    }
+
+    fn waiting_test_runtime_thinking() -> TerminalRuntimeSnapshot {
+        TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("session-waiting".to_string()),
+            native_session_id: Some("session-waiting".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-w1".to_string()),
+            turn_id: Some("turn-w1".to_string()),
+            source: "cli-hook:provider-turn-started".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: "PreToolUse".to_string(),
+            canonical_state: "thinking".to_string(),
+            turn_active: true,
+            turn_generation: 3,
+            completed_turn_generation: 2,
+            updated_at_ms: 1,
+            ..TerminalRuntimeSnapshot::opened_idle(None)
+        }
+    }
+
+    fn waiting_test_payload(event_type: &str, background: bool) -> TerminalActivityHookPayload {
+        let activity_status = if event_type == "provider-turn-waiting" {
+            "waiting"
+        } else if event_type == "provider-turn-started" {
+            "thinking"
+        } else {
+            "idle"
+        };
+        let mut payload = terminal_activity_hook_test_payload(
+            event_type,
+            activity_status,
+            "completed",
+            event_type != "provider-turn-started",
+            Some("session-waiting"),
+        );
+        payload.background_work_active = background;
+        payload.native_session_id = Some("session-waiting".to_string());
+        payload.provider_turn_id = Some("turn-w1".to_string());
+        payload.turn_id = Some("turn-w1".to_string());
+        payload.turn_generation = 3;
+        payload.turn_generation_explicit = true;
+        payload
+    }
+
+    /// THE WAITING CONTRACT: a Stop that arrives while the harness still owns
+    /// live background shells/subagents parks the session in `waiting` — the
+    /// turn stays OPEN (no settlement, no completed generation, no false
+    /// completion) — until the true final Stop lands, which settles normally.
+    #[test]
+    fn waiting_reducer_parks_turn_open_then_final_stop_settles() {
+        let thinking = waiting_test_runtime_thinking();
+        // Stop-with-background → waiting, turn still active, NOT settled.
+        let waiting_stop = waiting_test_payload("provider-turn-waiting", true);
+        let projection =
+            terminal_reduce_canonical_state(&thinking, &waiting_stop, None, false, false);
+        assert_eq!(projection.canonical_state, "waiting");
+        assert!(projection.turn_active, "turn must stay open while waiting");
+        assert!(!projection.completion_accepted);
+        assert_eq!(
+            projection.completed_turn_generation, 2,
+            "waiting must not advance the completed generation"
+        );
+
+        // Re-entry: background work re-invokes the model — waiting → thinking.
+        let mut waiting_runtime = thinking.clone();
+        waiting_runtime.canonical_state = "waiting".to_string();
+        let re_entry = {
+            let mut payload = waiting_test_payload("provider-turn-started", false);
+            payload.activity_status = "thinking".to_string();
+            payload.input_ready = false;
+            payload
+        };
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &re_entry, None, false, false);
+        assert_eq!(projection.canonical_state, "thinking");
+        assert!(projection.turn_active);
+
+        // Final Stop without background → idle + settlement accepted, straight
+        // from waiting too (no re-entry evidence required).
+        let final_stop = waiting_test_payload("provider-turn-completed", false);
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &final_stop, None, false, false);
+        assert_eq!(projection.canonical_state, "idle");
+        assert!(projection.completion_accepted);
+        assert!(!projection.turn_active);
+        assert_eq!(projection.completed_turn_generation, 3);
+
+        // Idempotent re-waiting: another background Stop while already waiting
+        // stays waiting (no flap to thinking).
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &waiting_stop, None, false, false);
+        assert_eq!(projection.canonical_state, "waiting");
+        assert!(projection.turn_active);
+
+        // The background continuation may mint a NEW turn id with no
+        // intermediate event: the final Stop must still correlate from
+        // waiting (session match is what counts) and settle.
+        let mut new_turn_final_stop = waiting_test_payload("provider-turn-completed", false);
+        new_turn_final_stop.provider_turn_id = Some("turn-w2".to_string());
+        new_turn_final_stop.turn_id = Some("turn-w2".to_string());
+        let projection = terminal_reduce_canonical_state(
+            &waiting_runtime,
+            &new_turn_final_stop,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(
+            projection.canonical_state, "idle",
+            "a new-turn-id final Stop must settle from waiting"
+        );
+        assert!(projection.completion_accepted);
+
+        // A waiting Stop from a DIFFERENT session must hold waiting (rejected,
+        // no id adoption, no thinking flap).
+        let mut foreign_waiting_stop = waiting_test_payload("provider-turn-waiting", true);
+        foreign_waiting_stop.provider_session_id = Some("session-other".to_string());
+        foreign_waiting_stop.native_session_id = Some("session-other".to_string());
+        let projection = terminal_reduce_canonical_state(
+            &waiting_runtime,
+            &foreign_waiting_stop,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(projection.canonical_state, "waiting");
+        assert!(!projection.waiting_accepted);
+        assert!(projection.turn_active);
+    }
+
+    #[test]
+    fn waiting_accepts_interrupt_and_stale_hot_never_owns_it() {
+        // Interrupt from waiting settles (user pressed Escape while background
+        // work ran) — guard + reducer agree.
+        let mut waiting_runtime = waiting_test_runtime_thinking();
+        waiting_runtime.canonical_state = "waiting".to_string();
+        waiting_runtime.input_ready = false;
+        assert!(terminal_runtime_accepts_interrupt(&waiting_runtime));
+        let mut interrupt = waiting_test_payload("provider-turn-interrupted", false);
+        interrupt.activity_status = "interrupted".to_string();
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &interrupt, None, false, false);
+        assert_eq!(projection.canonical_state, "interrupted");
+        assert!(projection.interrupt_accepted);
+        assert!(!projection.turn_active);
+        // Stale-hot (10 min) must never own a waiting session — only the
+        // 30-min WaitingRelease may.
+        assert!(!terminal_activity_watchdog_runtime_is_stale_hot_candidate(
+            &waiting_runtime
+        ));
+    }
+
+    #[test]
+    fn waiting_projection_is_busy_running_never_needs_input_or_complete() {
+        let metadata = terminal_projection_test_metadata();
+        let mut runtime = waiting_test_runtime_thinking();
+        runtime.canonical_state = "waiting".to_string();
+        runtime.canonical_badge_label = "waiting".to_string();
+        let projected = terminal_project_runtime(&metadata, &runtime, false);
+        assert_eq!(projected.readiness, "busy");
+        assert_eq!(projected.turn_status, "running");
+        assert_eq!(projected.terminal_work_state, "running");
+        assert_eq!(projected.execution_phase, "waiting");
+        // waiting is not paused/needs-input anywhere.
+        assert!(!terminal_projection_state_is_paused("waiting"));
+        assert!(terminal_projection_state_is_busy("waiting"));
+    }
+
+    #[test]
+    fn waiting_release_watchdog_fires_only_for_stale_waiting_sessions() {
+        let mut runtime = waiting_test_runtime_thinking();
+        runtime.canonical_state = "waiting".to_string();
+        assert_eq!(
+            terminal_activity_watchdog_waiting_release_action(
+                &runtime,
+                TERMINAL_WAITING_RELEASE_WATCHDOG_MS,
+            ),
+            Some(TerminalActivityWatchdogAction::WaitingRelease)
+        );
+        assert_eq!(
+            terminal_activity_watchdog_waiting_release_action(
+                &runtime,
+                TERMINAL_WAITING_RELEASE_WATCHDOG_MS - 1,
+            ),
+            None
+        );
+        runtime.canonical_state = "thinking".to_string();
+        assert_eq!(
+            terminal_activity_watchdog_waiting_release_action(
+                &runtime,
+                TERMINAL_WAITING_RELEASE_WATCHDOG_MS,
+            ),
+            None
+        );
     }
 
     #[test]

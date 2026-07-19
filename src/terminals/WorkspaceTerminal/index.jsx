@@ -1578,7 +1578,7 @@ function terminalCanonicalActivityAcceptsInterrupt(fields = {}) {
   const inputReady = fields?.input_ready ?? fields?.inputReady;
   return turnActive === true
     && inputReady === false
-    && ["thinking", "uir", "paused"].includes(canonicalState);
+    && ["thinking", "uir", "paused", "waiting"].includes(canonicalState);
 }
 
 function formatTerminalNativeRailLabel(value) {
