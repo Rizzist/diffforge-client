@@ -179,6 +179,60 @@ test("a delayed reply cannot resolve a still-open reused request id", async () =
   }
 });
 
+test("a request id that reappears in the fresh final list defers the drain", async () => {
+  const sessionID = "session-reappearing-id";
+  const requestID = "permission-reappearing";
+  const first = { id: requestID, sessionID, title: "generation A" };
+  const reused = { id: requestID, sessionID, title: "generation C (reused id)" };
+  const listResults = [];
+  const harness = await createHarness({
+    permission: {
+      list: async () => (listResults.length ? listResults.shift() : []),
+    },
+    question: { list: async () => [] },
+  });
+
+  try {
+    await harness.fire("permission.asked", sessionID, first);
+    const observed = await harness.waitFor(
+      (events) => events.some((event) => event.hook_event_name === "PermissionRequest"),
+      "generation A should be emitted",
+    );
+    const interaction = observed.find(
+      (event) => event.hook_event_name === "PermissionRequest",
+    );
+
+    // The request id is absent from the pre-drain snapshot but PRESENT again
+    // in the fresh final list: a generation appended mid-fetch reused it.
+    // The drain must be skipped this pass — resolving captured generation A
+    // would also unlatch the reused prompt through Rust's provider_api
+    // request-identity fallback.
+    listResults.push([], [reused]);
+    await harness.fire("session.idle", sessionID);
+    await sleep(80);
+    assert.equal(
+      (await harness.events()).some(
+        (event) => event.hook_event_name === "PermissionResult"
+          && event.resolved_interaction_id === interaction.interaction_id,
+      ),
+      false,
+      "a reappearing request id must defer the drain",
+    );
+
+    // The next pass with genuine absence still drains generation A.
+    await harness.fire("session.idle", sessionID);
+    await harness.waitFor(
+      (events) => events.some(
+        (event) => event.hook_event_name === "PermissionResult"
+          && event.resolved_interaction_id === interaction.interaction_id,
+      ),
+      "a genuinely absent request id still reconciles on the next pass",
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("an idle continuation drops its Stop when a new turn starts during reconciliation", async () => {
   const sessionID = "session-idle-race";
   let permissionList = async () => [];
@@ -305,7 +359,11 @@ test("a hung provider list is evicted so the next cycle can resolve a disappeara
     assert.equal(signals[0]?.aborted, true, "timeout should abort the underlying request");
 
     await harness.fire("session.idle", sessionID);
-    assert.equal(calls, 2, "the next reconciliation should issue a fresh SDK request");
+    assert.equal(
+      calls,
+      3,
+      "the next reconciliation should issue a fresh snapshot request plus the fresh final validation",
+    );
     await harness.waitFor(
       (events) => events.some(
         (event) => event.hook_event_name === "PermissionResult"

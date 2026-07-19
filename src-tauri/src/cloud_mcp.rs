@@ -14222,18 +14222,69 @@ async fn cloud_mcp_refresh_registered_device_registry(
     Ok(())
 }
 
+/// One registry-refresh retry loop at a time; ready/hello-ack both spawn one.
+static CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 fn cloud_mcp_spawn_registered_device_registry_refresh(state: &CloudMcpState, reason: &'static str) {
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = cloud_mcp_refresh_registered_device_registry(&state, reason).await {
-            log_cloud_sync_event(
-                "registered_device_registry.refresh_error",
-                json!({
-                    "reason": reason,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
+        // Auth RACES the websocket at startup: the ready/hello-ack triggers
+        // fire before the bearer token is stored, and a single attempt left
+        // the client permanently without the registered-device registry — the
+        // Devices views then run in a degraded live-connections-only mode
+        // (registered offline devices MISSING; WEB badges dark, because the
+        // registry carries the cloud's presence fold links and device
+        // identity). Retry with backoff until the fetch lands; the web
+        // dashboard always has this registry, so device-list parity depends
+        // on it.
+        if CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
         }
+        let retry_delays_ms: [u64; 6] = [0, 1_000, 3_000, 8_000, 20_000, 45_000];
+        let mut last_error = String::new();
+        for (attempt, delay_ms) in retry_delays_ms.iter().enumerate() {
+            if *delay_ms > 0 {
+                sleep(Duration::from_millis(*delay_ms)).await;
+            }
+            match cloud_mcp_refresh_registered_device_registry(&state, reason).await {
+                Ok(()) => {
+                    if attempt > 0 {
+                        log_cloud_sync_event(
+                            "registered_device_registry.refresh_ok_after_retry",
+                            json!({
+                                "reason": reason,
+                                "attempt": attempt + 1,
+                            }),
+                        );
+                    }
+                    CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+                    return;
+                }
+                Err(error) => {
+                    last_error = error;
+                    log_cloud_sync_event(
+                        "registered_device_registry.refresh_error",
+                        json!({
+                            "reason": reason,
+                            "attempt": attempt + 1,
+                            "error": clean_terminal_telemetry_text(&last_error),
+                        }),
+                    );
+                }
+            }
+        }
+        log_cloud_sync_event(
+            "registered_device_registry.refresh_gave_up",
+            json!({
+                "reason": reason,
+                "attempts": retry_delays_ms.len(),
+                "error": clean_terminal_telemetry_text(&last_error),
+            }),
+        );
+        CLOUD_MCP_REGISTRY_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
     });
 }
 
@@ -44165,36 +44216,88 @@ fn cloud_mcp_agent_chat_status_sync_request_from_hook(
 /// sync. Every passive frame of a held-WAITING session qualifies for the
 /// relevance gate, and each spawned sync scans the transcript before its
 /// metadata dedup — without coalescing a long waiting hold turns into an
-/// unbounded rescan backlog. Key: `provider:provider_session_id`.
-static CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO: OnceLock<StdMutex<HashMap<String, String>>> =
-    OnceLock::new();
+/// unbounded rescan backlog. Key: `provider:provider_session_id`; value is
+/// the armed request entry, its unique attempt token, and whether that
+/// attempt COMPLETED successfully (`false` = still in flight). The in-flight
+/// marker coalesces concurrent frames, but only a successful completion may
+/// suppress retries — a failed sync clears its marker so the next identical
+/// waiting frame syncs again. Settlement is token-gated so a LATE settle from
+/// a superseded attempt (waiting → running → identical waiting again) can
+/// never promote or clear a newer attempt's marker (ABA).
+static CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO: OnceLock<
+    StdMutex<HashMap<String, (String, u64, bool)>>,
+> = OnceLock::new();
+static CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO_TOKEN: AtomicU64 = AtomicU64::new(0);
 const CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO_MAX: usize = 2048;
 
-/// True when this hook-driven status sync should be SKIPPED: the session's
-/// last synced status is already "waiting" and nothing else about the sync
-/// request changed. Every other status (and any changed waiting fingerprint)
-/// records itself in the memo and syncs — status TRANSITIONS always land.
-fn cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+/// Arm the per-session status-sync marker. Returns `None` when this sync
+/// should be SKIPPED (the session's last identical "waiting" request either
+/// synced successfully or is still in flight); otherwise records an in-flight
+/// marker and returns its unique attempt token. Every non-waiting status (and
+/// any changed waiting fingerprint) arms and syncs — status TRANSITIONS
+/// always land. The spawned sync MUST settle the returned token via
+/// `cloud_mcp_agent_chat_status_sync_memo_settle`.
+fn cloud_mcp_agent_chat_status_sync_try_arm(
     provider: &str,
     provider_session_id: &str,
     status: &str,
     fingerprint: &str,
-) -> bool {
+) -> Option<u64> {
     let memo =
         CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO.get_or_init(|| StdMutex::new(HashMap::new()));
     let Ok(mut map) = memo.lock() else {
-        return false;
+        // Poisoned memo: fail open (sync anyway) with a token that never
+        // matches an armed marker, so the settle is a no-op.
+        return Some(u64::MAX);
     };
     let key = format!("{provider}:{provider_session_id}");
     let entry = format!("{status}|{fingerprint}");
-    if status == "waiting" && map.get(&key).is_some_and(|existing| existing == &entry) {
-        return true;
+    if status == "waiting"
+        && map
+            .get(&key)
+            .is_some_and(|(existing, _, _)| existing == &entry)
+    {
+        return None;
     }
     if map.len() >= CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO_MAX && !map.contains_key(&key) {
         map.clear();
     }
-    map.insert(key, entry);
-    false
+    let token = CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO_TOKEN.fetch_add(1, Ordering::AcqRel) + 1;
+    map.insert(key, (entry, token, false));
+    Some(token)
+}
+
+/// Settle the in-flight marker armed by
+/// `cloud_mcp_agent_chat_status_sync_try_arm`: a successful sync promotes it
+/// to the success memo (keeps coalescing identical waiting frames); a failed
+/// sync removes it so the next identical frame RETRIES. Token-gated: a settle
+/// from a superseded attempt is a no-op even when the re-armed entry text is
+/// identical (ABA), and a marker replaced by a newer request is left alone.
+fn cloud_mcp_agent_chat_status_sync_memo_settle(
+    provider: &str,
+    provider_session_id: &str,
+    token: u64,
+    synced: bool,
+) {
+    let memo =
+        CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO.get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut map) = memo.lock() else {
+        return;
+    };
+    let key = format!("{provider}:{provider_session_id}");
+    if !map
+        .get(&key)
+        .is_some_and(|(_, armed_token, _)| *armed_token == token)
+    {
+        return;
+    }
+    if synced {
+        if let Some(state) = map.get_mut(&key) {
+            state.2 = true;
+        }
+    } else {
+        map.remove(&key);
+    }
 }
 
 fn cloud_mcp_sync_agent_chat_session_status_from_hook(
@@ -44227,27 +44330,42 @@ fn cloud_mcp_sync_agent_chat_session_status_from_hook(
         request.context.session_mode,
         request.cwd,
     );
-    if cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+    let Some(memo_token) = cloud_mcp_agent_chat_status_sync_try_arm(
         &request.provider,
         &request.provider_session_id,
         &request.context.status,
         &waiting_fingerprint,
-    ) {
+    ) else {
         return;
-    }
+    };
     if cloud_mcp_agent_chat_turn_git_should_clear(payload, state_value, turn_status) {
         cloud_mcp_agent_chat_turn_git_clear_session(
             &request.provider,
             &request.provider_session_id,
         );
     }
-    agent_chat_session_sync_spawn_with_state(
+    // The arm above only recorded an in-flight marker. The memo may record
+    // success exclusively AFTER the spawned sync completes OK — a transient
+    // build failure must clear the marker so the next identical waiting frame
+    // retries instead of being suppressed forever. The token gates the settle
+    // to THIS attempt.
+    let memo_provider = request.provider.clone();
+    let memo_session = request.provider_session_id.clone();
+    agent_chat_session_sync_spawn_with_state_observed(
         state.clone(),
         request.provider,
         request.provider_session_id,
         request.cwd,
         request.context,
         "terminal_activity_hook_status",
+        Some(Box::new(move |synced: bool| {
+            cloud_mcp_agent_chat_status_sync_memo_settle(
+                &memo_provider,
+                &memo_session,
+                memo_token,
+                synced,
+            );
+        })),
     );
 }
 
@@ -44257,48 +44375,66 @@ mod cloud_mcp_agent_chat_status_sync_memo_tests {
 
     #[test]
     fn waiting_status_sync_coalesces_per_session_until_something_changes() {
+        let arm = cloud_mcp_agent_chat_status_sync_try_arm;
         let session = format!("ses-{}", uuid::Uuid::new_v4());
         // First waiting sync for a session always lands.
-        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo",
-        ));
+        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo").is_some());
         // Every further identical passive waiting frame is coalesced.
-        assert!(cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo",
-        ));
-        assert!(cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo",
-        ));
+        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo").is_none());
+        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo").is_none());
         // A changed fingerprint (something else about the request changed)
         // syncs again — then coalesces again.
-        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo",
-        ));
-        assert!(cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo",
-        ));
+        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
+        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo").is_none());
         // A status TRANSITION always syncs, and re-arms the waiting memo.
-        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo",
-        ));
-        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo",
-        ));
-        assert!(cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo",
-        ));
+        assert!(arm("opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
+        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
+        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo").is_none());
         // Non-waiting statuses are never coalesced by this memo.
-        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo",
-        ));
-        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo",
-        ));
+        assert!(arm("opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
+        assert!(arm("opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
         // Sessions are independent.
         let other = format!("ses-{}", uuid::Uuid::new_v4());
-        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
-            "opencode", &other, "waiting", "ws-1|thread-1|pane-1|8|native|/repo",
-        ));
+        assert!(arm("opencode", &other, "waiting", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
+
+        // The memo only records SUCCESS after the spawned sync settles: an
+        // armed in-flight marker coalesces concurrent identical frames, a
+        // FAILED sync clears it so the next identical waiting frame retries,
+        // and a successful sync keeps suppressing duplicates.
+        let flaky = format!("ses-{}", uuid::Uuid::new_v4());
+        let fingerprint = "ws-1|thread-1|pane-1|9|native|/repo";
+        let first_attempt =
+            arm("opencode", &flaky, "waiting", fingerprint).expect("first waiting arm");
+        // Concurrent identical frame while the sync is still in flight.
+        assert!(arm("opencode", &flaky, "waiting", fingerprint).is_none());
+        // Transient build failure: the marker clears and the retry lands.
+        cloud_mcp_agent_chat_status_sync_memo_settle("opencode", &flaky, first_attempt, false);
+        let retry_attempt =
+            arm("opencode", &flaky, "waiting", fingerprint).expect("retry waiting arm");
+        assert_ne!(retry_attempt, first_attempt);
+        // Successful completion promotes the marker to the success memo.
+        cloud_mcp_agent_chat_status_sync_memo_settle("opencode", &flaky, retry_attempt, true);
+        assert!(arm("opencode", &flaky, "waiting", fingerprint).is_none());
+
+        // ABA guard: waiting → running → identical waiting re-arms with a NEW
+        // token; a LATE settle from the superseded first waiting attempt must
+        // neither promote nor clear the newer attempt's marker.
+        let running_attempt =
+            arm("opencode", &flaky, "running", fingerprint).expect("running arm");
+        let waiting_again =
+            arm("opencode", &flaky, "waiting", fingerprint).expect("re-armed waiting");
+        assert_ne!(waiting_again, retry_attempt);
+        // Stale failure from the first waiting attempt: no-op — the current
+        // in-flight marker keeps coalescing.
+        cloud_mcp_agent_chat_status_sync_memo_settle("opencode", &flaky, retry_attempt, false);
+        assert!(arm("opencode", &flaky, "waiting", fingerprint).is_none());
+        // Stale success from the superseded running attempt: also a no-op.
+        cloud_mcp_agent_chat_status_sync_memo_settle("opencode", &flaky, running_attempt, true);
+        assert!(arm("opencode", &flaky, "waiting", fingerprint).is_none());
+        // The CURRENT attempt's failure still clears the marker so the next
+        // identical waiting frame retries.
+        cloud_mcp_agent_chat_status_sync_memo_settle("opencode", &flaky, waiting_again, false);
+        assert!(arm("opencode", &flaky, "waiting", fingerprint).is_some());
     }
 }
 

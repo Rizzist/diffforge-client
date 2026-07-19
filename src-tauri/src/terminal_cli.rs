@@ -8314,6 +8314,21 @@ mod terminal_cli_tests {
         ));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("queued_length: queued.length"));
+        // Fresh final validation before the drain: a request id PRESENT again
+        // in the CURRENT pending list (reused by a generation appended while
+        // the snapshot fetches were in flight) defers the whole drain to the
+        // next pass — resolving the captured generation would also unlatch
+        // the reused prompt through Rust's provider_api request-identity
+        // fallback.
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("requestStillPending = await providerInteractionStillPending("));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("if (requestStillPending) continue;"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("revalidatedHead.interaction_id !== capturedGeneration.interaction_id"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains(
+            "revalidatedHead.interaction_revision !== capturedGeneration.interaction_revision"
+        ));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("interaction_id: current.interaction_id"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
@@ -10866,6 +10881,34 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
           // never covered by this absence evidence and may still be live —
           // it stays queued for the next pass / the native-resolution path,
           // which performs its own fresh final validation.
+          //
+          // Fresh final validation (mirrors the native-resolution path): the
+          // budget alone is not enough — a generation appended mid-fetch
+          // REUSES this request id, and Rust's provider_api fallback accepts
+          // a resolution by session/request identity despite generation
+          // drift, so resolving captured generation A would also unlatch the
+          // reused prompt. Re-check the CURRENT pending list; if the request
+          // id is PRESENT again, skip the drain entirely this pass — the
+          // next reconcile pass owns whatever is genuinely absent then.
+          let requestStillPending = false;
+          try {
+            requestStillPending = await providerInteractionStillPending(
+              kind,
+              generation.session_id,
+              generation.request_id,
+            );
+          } catch {
+            // An unavailable/malformed list is not proof of absence.
+            continue;
+          }
+          if (interactionReconciliationStopped) return;
+          const revalidatedHead = (interactionGenerations.get(interactionKey) || [])[0];
+          if (
+            !revalidatedHead
+            || revalidatedHead.interaction_id !== capturedGeneration.interaction_id
+            || revalidatedHead.interaction_revision !== capturedGeneration.interaction_revision
+          ) continue;
+          if (requestStillPending) continue;
           let drainBudget = Math.min(queued.length, capturedGeneration.queued_length || 0);
           while (drainBudget > 0) {
             const current = (interactionGenerations.get(interactionKey) || [])[0];

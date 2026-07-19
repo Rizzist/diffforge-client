@@ -4004,13 +4004,49 @@ fn agent_chat_session_sync_spawn_with_state(
     context: AgentChatSessionSyncContext,
     reason: &'static str,
 ) {
+    agent_chat_session_sync_spawn_with_state_observed(
+        state,
+        agent_id,
+        provider_session_id,
+        cwd,
+        context,
+        reason,
+        None,
+    );
+}
+
+/// Completion observer for a spawned session sync: invoked exactly once when
+/// the spawned task finishes, with `true` when the sync payloads were built
+/// and enqueued (or there was legitimately nothing to sync) and `false` on a
+/// build failure. Callers use it to settle optimistic dedup state (e.g. the
+/// WAITING status memo) only on real outcomes.
+type AgentChatSessionSyncSettleObserver = Box<dyn FnOnce(bool) + Send + 'static>;
+
+fn agent_chat_session_sync_spawn_with_state_observed(
+    state: CloudMcpState,
+    agent_id: String,
+    provider_session_id: String,
+    cwd: String,
+    context: AgentChatSessionSyncContext,
+    reason: &'static str,
+    on_settled: Option<AgentChatSessionSyncSettleObserver>,
+) {
     tauri::async_runtime::spawn(async move {
+        let mut on_settled = on_settled;
+        let mut settle = move |synced: bool| {
+            if let Some(observer) = on_settled.take() {
+                observer(synced);
+            }
+        };
         let _build_permit = match agent_chat_session_sync_build_semaphore()
             .acquire_owned()
             .await
         {
             Ok(permit) => permit,
-            Err(_) => return,
+            Err(_) => {
+                settle(false);
+                return;
+            }
         };
         let build_agent_id = agent_id.clone();
         let build_provider_session_id = provider_session_id.clone();
@@ -4036,7 +4072,11 @@ fn agent_chat_session_sync_spawn_with_state(
         .map_err(|error| format!("Agent chat sync build task failed: {error}"));
         let payloads = match result {
             Ok(Ok(payloads)) if !payloads.is_empty() => payloads,
-            Ok(Ok(_)) => return,
+            Ok(Ok(_)) => {
+                // Nothing to sync is a successful, settled outcome.
+                settle(true);
+                return;
+            }
             Ok(Err(error)) | Err(error) => {
                 agent_chat_session_sync_mark_build_failed(
                     &agent_id,
@@ -4053,6 +4093,7 @@ fn agent_chat_session_sync_spawn_with_state(
                         "error": clean_terminal_telemetry_text(&error),
                     }),
                 );
+                settle(false);
                 return;
             }
         };
@@ -4076,6 +4117,7 @@ fn agent_chat_session_sync_spawn_with_state(
             )
             .await;
         }
+        settle(true);
     });
 }
 

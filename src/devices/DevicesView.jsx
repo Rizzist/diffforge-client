@@ -43,10 +43,31 @@ function deviceNameOf(device) {
   ).trim();
 }
 
+// Web-dashboard parity: a device is ONLINE when ANY surface is live
+// (`connected = native || web` on the dashboard cards). Rows from
+// buildAccountLiveDeviceRows carry native_connected/web_connected/liveState;
+// legacy rows may only carry connected/online.
 function deviceOnlineOf(device) {
   return Boolean(
-    device?.connected ?? device?.native_connected ?? device?.online,
+    device?.connected
+      ?? (device?.native_connected
+        || device?.web_connected
+        || device?.liveState === "live"
+        || device?.online),
   );
+}
+
+// Account push needs the NATIVE app reachable on the target — a lit WEB
+// surface alone cannot receive credentials.
+function deviceNativeOnlineOf(device) {
+  return Boolean(device?.native_connected ?? device?.connected ?? device?.online);
+}
+
+function deviceSurfaceBadgesOf(device) {
+  return [
+    { active: Boolean(device?.native_connected ?? device?.connected ?? device?.online), id: "native", label: "NATIVE" },
+    { active: Boolean(device?.web_connected), id: "web", label: "WEB" },
+  ];
 }
 
 function devicePlatformOf(device) {
@@ -471,6 +492,17 @@ export default function DevicesView({ active = true, deviceRows = [], local_devi
                 </DeviceName>
                 <DeviceSub>{devicePlatformOf(thisDevice) || "Local machine"}</DeviceSub>
               </DeviceMeta>
+              <SurfaceBadgeRow aria-hidden="true">
+                {deviceSurfaceBadgesOf(thisDevice).map((surface) => (
+                  <SurfaceBadge
+                    data-active={surface.active ? "true" : undefined}
+                    data-surface={surface.id}
+                    key={surface.id}
+                  >
+                    {surface.label}
+                  </SurfaceBadge>
+                ))}
+              </SurfaceBadgeRow>
             </DeviceCardHead>
           </DeviceCard>
         ) : null}
@@ -486,6 +518,7 @@ export default function DevicesView({ active = true, deviceRows = [], local_devi
           remoteDevices.map((device) => {
             const deviceId = deviceIdOf(device);
             const online = deviceOnlineOf(device);
+            const nativeOnline = deviceNativeOnlineOf(device);
             const push = pushByDevice[deviceId];
             const isOpen = openDeviceId === deviceId;
             return (
@@ -504,7 +537,18 @@ export default function DevicesView({ active = true, deviceRows = [], local_devi
                       {online ? "Connected" : "Offline"}
                     </DeviceSub>
                   </DeviceMeta>
-                  {online ? (
+                  <SurfaceBadgeRow aria-hidden="true">
+                    {deviceSurfaceBadgesOf(device).map((surface) => (
+                      <SurfaceBadge
+                        data-active={surface.active ? "true" : undefined}
+                        data-surface={surface.id}
+                        key={surface.id}
+                      >
+                        {surface.label}
+                      </SurfaceBadge>
+                    ))}
+                  </SurfaceBadgeRow>
+                  {nativeOnline ? (
                     <PushOpenButton
                       data-open={isOpen ? "true" : undefined}
                       onClick={() => setOpenDeviceId(isOpen ? "" : deviceId)}
@@ -514,10 +558,12 @@ export default function DevicesView({ active = true, deviceRows = [], local_devi
                       {isOpen ? "Close" : "Push account"}
                     </PushOpenButton>
                   ) : (
-                    <OfflineNote>Connect it to push an account</OfflineNote>
+                    <OfflineNote>
+                      {online ? "Open the app on it to push an account" : "Connect it to push an account"}
+                    </OfflineNote>
                   )}
                 </DeviceCardHead>
-                {isOpen && online ? (
+                {isOpen && nativeOnline ? (
                   <DevicePushPanel
                     accounts={accounts}
                     device={device}
@@ -719,6 +765,40 @@ const OfflineNote = styled.span`
   color: rgba(148, 163, 184, 0.62);
   font-size: 11px;
   font-style: italic;
+`;
+
+const SurfaceBadgeRow = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+`;
+
+const SurfaceBadge = styled.span`
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  color: rgba(148, 163, 184, 0.55);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+
+  &[data-active="true"] {
+    border-color: rgba(74, 222, 128, 0.45);
+    color: rgba(74, 222, 128, 0.95);
+    background: rgba(74, 222, 128, 0.1);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(100, 116, 139, 0.26);
+    color: rgba(100, 116, 139, 0.6);
+
+    &[data-active="true"] {
+      border-color: rgba(22, 163, 74, 0.4);
+      color: rgb(22, 163, 74);
+      background: rgba(22, 163, 74, 0.08);
+    }
+  }
 `;
 
 const PushOpenButton = styled.button`

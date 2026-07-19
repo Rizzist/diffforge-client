@@ -16,6 +16,10 @@ const TERMINAL_HOT_STALE_WATCHDOG_MS: u64 = 10 * 60_000;
 /// sees no hook or output activity for this long is force-released to idle so
 /// a silently-dead background task can never hold receipts hostage forever.
 const TERMINAL_WAITING_RELEASE_WATCHDOG_MS: u64 = 30 * 60_000;
+/// Interrupted/error are SETTLED states — the CLI is back at its prompt.
+/// After this much quiet they decay to idle so the pane doesn't wear a stale
+/// attention badge forever.
+const TERMINAL_SETTLED_DECAY_WATCHDOG_MS: u64 = 30_000;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
 const TERMINAL_CONTROL_AUTOMATION_GUARD_TTL_MS: u64 = 60_000;
 const TERMINAL_CONTROL_PROMPT_ANSWER_GUARD_TTL_MS: u64 = 10_000;
@@ -19170,6 +19174,7 @@ enum TerminalActivityWatchdogAction {
     McpStartupError,
     StaleHotStop,
     WaitingRelease,
+    SettledDecayIdle,
 }
 
 fn terminal_activity_watchdog_launch_mode(runtime: &TerminalRuntimeSnapshot) -> &'static str {
@@ -19316,6 +19321,22 @@ fn terminal_activity_watchdog_waiting_release_action(
     } else {
         None
     }
+}
+
+/// interrupted/error decay: settled, turn closed, no open interaction, and
+/// 30s of quiet — project back to idle via the prompt-ready recovery path.
+fn terminal_activity_watchdog_settled_decay_action(
+    runtime: &TerminalRuntimeSnapshot,
+    quiet_age_ms: u64,
+) -> Option<TerminalActivityWatchdogAction> {
+    if quiet_age_ms < TERMINAL_SETTLED_DECAY_WATCHDOG_MS {
+        return None;
+    }
+    let canonical = terminal_projection_text(&runtime.canonical_state, "");
+    (matches!(canonical.as_str(), "interrupted" | "error")
+        && !runtime.turn_active
+        && runtime.active_interaction_id.is_none())
+    .then_some(TerminalActivityWatchdogAction::SettledDecayIdle)
 }
 
 fn terminal_activity_watchdog_headless_total_bytes(
@@ -20198,10 +20219,34 @@ fn terminal_structured_interaction_open_is_older(
     incoming_revision < current.revision
 }
 
+/// A resolution that fails the structured-interaction gate may still continue
+/// into projection (so the caller can overlay and emit the still-open
+/// interaction). Its session identity failed that same gate — strip it so
+/// `terminal_runtime_apply_activity_payload` cannot adopt a stale provider
+/// session into the runtime. A poisoned runtime session lets a later
+/// stale-session Stop/StopFailure pass session correlation and settle the
+/// still-open NEW prompt.
+fn terminal_activity_payload_strip_rejected_resolution_session(
+    payload: &mut TerminalActivityHookPayload,
+) {
+    payload.provider_session_id = None;
+    payload.native_session_id = None;
+}
+
 fn terminal_activity_payload_overlay_open_interaction(
     payload: &mut TerminalActivityHookPayload,
     interaction: &TerminalStructuredInteraction,
 ) {
+    // The frame now describes the OPEN interaction, so that interaction's
+    // provider session must survive the overlay: a stale resolution's session
+    // identity is stripped by the reconcile gate before this overlay, and
+    // without the refill the runtime would keep only its previous binding by
+    // fallback instead of the authoritative one recorded at open.
+    if terminal_activity_payload_session_id(payload).is_empty()
+        && !interaction.provider_session_id.trim().is_empty()
+    {
+        payload.provider_session_id = Some(interaction.provider_session_id.clone());
+    }
     payload.status = "active".to_string();
     payload.activity_status = "awaiting_input".to_string();
     payload.command_phase = "awaiting_input".to_string();
@@ -20509,6 +20554,12 @@ fn terminal_structured_interaction_reconcile(
             // the caller will overlay and emit that authoritative interaction.
             // With no surviving interaction, the stale resolution has no
             // canonical effect and is rejected outright.
+            if same_terminal_open {
+                // The event only continues so the open interaction can be
+                // overlaid and emitted — its own (rejected, possibly
+                // old-session) identity must not be adopted by the runtime.
+                terminal_activity_payload_strip_rejected_resolution_session(payload);
+            }
             return !same_terminal_open;
         }
         let resolved_codex_hook_trust = provider_resolved_interaction
@@ -21409,6 +21460,14 @@ fn spawn_terminal_activity_hook_watcher(
                     &runtime,
                     now_ms.saturating_sub(last_hook_or_output_activity_ms),
                 )
+            })
+            // Also outside the gate: interrupted/error decay applies to every
+            // provider.
+            .or_else(|| {
+                terminal_activity_watchdog_settled_decay_action(
+                    &runtime,
+                    now_ms.saturating_sub(last_hook_or_output_activity_ms),
+                )
             });
             if let Some(action) = watchdog_action {
                 let (hook_event_name, source, reason) = match action {
@@ -21441,6 +21500,15 @@ fn spawn_terminal_activity_hook_watcher(
                         "backend-waiting-release-watchdog",
                         "waiting_background_ttl_exceeded",
                     ),
+                    TerminalActivityWatchdogAction::SettledDecayIdle => (
+                        if terminal_projection_text(&runtime.canonical_state, "") == "error" {
+                            "PromptReadyAfterStartupError"
+                        } else {
+                            "PromptReadyAfterInterrupt"
+                        },
+                        "backend-settled-decay-watchdog",
+                        "interrupted_error_settled_ttl",
+                    ),
                 };
                 log_terminal_status_event(
                     "backend.terminal_activity_watchdog.transition",
@@ -21469,6 +21537,14 @@ fn spawn_terminal_activity_hook_watcher(
                     source,
                     reason,
                 );
+                if matches!(action, TerminalActivityWatchdogAction::SettledDecayIdle) {
+                    // The prompt-ready recovery correlator requires an
+                    // EXPLICIT matching generation; the runtime's own value
+                    // is exactly the settled turn being decayed.
+                    if let Some(object) = event.as_object_mut() {
+                        object.insert("turn_generation".to_string(), json!(runtime.turn_generation));
+                    }
+                }
                 if matches!(action, TerminalActivityWatchdogAction::McpStartupError) {
                     if let Some(object) = event.as_object_mut() {
                         object.insert("error_code".to_string(), json!("mcp_startup_timeout"));
@@ -37954,6 +38030,173 @@ notifications = true
     }
 
     #[test]
+    fn rejected_stale_session_resolution_keeps_runtime_session_binding() {
+        let root = env::temp_dir().join(format!(
+            "terminal-stale-session-resolution-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let size = PtySize {
+            rows: 12,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let warm = create_warm_shell_pty_in_directory(size, &root).unwrap();
+        let metadata = TerminalInstanceMetadata {
+            pane_id: "pane-stale-session".to_string(),
+            agent_id: "opencode".to_string(),
+            agent_kind: "opencode".to_string(),
+            ..TerminalInstanceMetadata::default()
+        };
+        let (instance, reader) = TerminalInstance::from_warm_shell(
+            72,
+            warm,
+            root.clone(),
+            true,
+            None,
+            TerminalSessionMode::General,
+            metadata,
+            TerminalLaunchRuntimeMetadata::default(),
+            None,
+            false,
+        );
+
+        // Open interaction B belongs to the CURRENT provider session and the
+        // runtime latched it.
+        let interaction = TerminalStructuredInteraction {
+            interaction_id: "uir:opencode:req-current".to_string(),
+            revision: 5,
+            pane_id: "pane-stale-session".to_string(),
+            instance_id: 72,
+            provider: "opencode".to_string(),
+            provider_session_id: "ses_current".to_string(),
+            provider_request_id: "req-current".to_string(),
+            prompt_id: "req-current".to_string(),
+            hook_event_name: "PermissionRequest".to_string(),
+            response_mode: "provider_api".to_string(),
+            awaiting_provider_confirmation: false,
+            claimed_option_id: None,
+            options: Vec::new(),
+            permission_suggestions: None,
+            prompt_questions: None,
+            prompt_schema: None,
+            provider_payload: None,
+            prompt_metadata: TerminalStructuredInteractionPromptMetadata::default(),
+        };
+        *instance.runtime.lock().unwrap() = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "awaiting_input".to_string(),
+            command_phase: "awaiting_input".to_string(),
+            input_ready: false,
+            provider_session_id: Some("ses_current".to_string()),
+            native_session_id: Some("ses_current".to_string()),
+            provider_turn_id: Some("turn-3".to_string()),
+            turn_id: Some("turn-3".to_string()),
+            source: "test".to_string(),
+            event_type: "provider-permission-requested".to_string(),
+            hook_event_name: "PermissionRequest".to_string(),
+            updated_at_ms: 1,
+            canonical_state: "uir".to_string(),
+            canonical_badge_label: "input required".to_string(),
+            canonical_state_seq: 8,
+            turn_generation: 3,
+            turn_active: true,
+            active_interaction_id: Some(interaction.interaction_id.clone()),
+            active_interaction_revision: Some(interaction.revision),
+            interaction_actionable: true,
+            ..TerminalRuntimeSnapshot::opened_idle(None)
+        };
+
+        // A PermissionResult from an OLD provider session was rejected by the
+        // structured-interaction gate and continues into projection only so
+        // the open interaction can be overlaid and emitted. The gate strips
+        // its stale session identity; the overlay restores the OPEN
+        // interaction's session.
+        let mut stale_resolution = terminal_activity_hook_test_payload(
+            "provider_user_prompt_completed",
+            "thinking",
+            "running",
+            false,
+            Some("ses_old"),
+        );
+        stale_resolution.hook_event_name = "PermissionResult".to_string();
+        stale_resolution.turn_generation = 3;
+        terminal_activity_payload_strip_rejected_resolution_session(&mut stale_resolution);
+        assert!(stale_resolution.provider_session_id.is_none());
+        assert!(stale_resolution.native_session_id.is_none());
+        terminal_activity_payload_overlay_open_interaction(&mut stale_resolution, &interaction);
+        assert_eq!(
+            stale_resolution.provider_session_id.as_deref(),
+            Some("ses_current"),
+            "the overlay must carry the OPEN interaction's session",
+        );
+
+        let (after_resolution, _) = terminal_runtime_apply_activity_payload(
+            &instance,
+            &stale_resolution,
+            Some(&interaction),
+            false,
+            true,
+        );
+        assert_eq!(
+            after_resolution.provider_session_id.as_deref(),
+            Some("ses_current"),
+            "a rejected stale-session resolution must not poison the runtime session binding",
+        );
+        assert_eq!(after_resolution.canonical_state, "uir");
+        assert!(after_resolution.turn_active);
+
+        // A later stop from the OLD session must fail session correlation:
+        // it must NOT settle the still-open NEW prompt.
+        let mut stale_stop = terminal_activity_hook_test_payload(
+            "provider-turn-completed",
+            "idle",
+            "completed",
+            true,
+            Some("ses_old"),
+        );
+        stale_stop.turn_generation = 3;
+        stale_stop.turn_generation_explicit = true;
+        stale_stop.provider_turn_id = Some("turn-3".to_string());
+        stale_stop.turn_id = Some("turn-3".to_string());
+        let (after_stale_stop, stale_stop_projection) = terminal_runtime_apply_activity_payload(
+            &instance,
+            &stale_stop,
+            Some(&interaction),
+            false,
+            false,
+        );
+        assert!(!stale_stop_projection.completion_accepted);
+        assert_eq!(after_stale_stop.canonical_state, "uir");
+        assert!(after_stale_stop.turn_active);
+        assert_eq!(
+            after_stale_stop.provider_session_id.as_deref(),
+            Some("ses_current"),
+        );
+
+        // Sanity: the SAME stop from the CURRENT session still settles, so
+        // the stale-session rejection above is doing the discriminating.
+        let mut current_stop = stale_stop.clone();
+        current_stop.provider_session_id = Some("ses_current".to_string());
+        current_stop.native_session_id = Some("ses_current".to_string());
+        let (after_current_stop, current_stop_projection) =
+            terminal_runtime_apply_activity_payload(&instance, &current_stop, None, false, false);
+        assert!(current_stop_projection.completion_accepted);
+        assert_eq!(after_current_stop.canonical_state, "idle");
+
+        drop(reader);
+        cleanup_terminal_instance_async(
+            instance,
+            true,
+            "terminal_stale_session_resolution_test",
+            true,
+            None,
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn terminal_prompt_ready_recovery_uses_provider_structured_lifecycle_for_claude() {
         let mut runtime = TerminalRuntimeSnapshot {
             status: "active".to_string(),
@@ -39009,6 +39252,89 @@ notifications = true
         // waiting is not paused/needs-input anywhere.
         assert!(!terminal_projection_state_is_paused("waiting"));
         assert!(terminal_projection_state_is_busy("waiting"));
+    }
+
+    /// interrupted/error are settled states: after 30s of quiet they decay
+    /// to idle (the CLI sits at its prompt) — never while a turn is active,
+    /// an interaction is open, or the pane is in any busy family.
+    #[test]
+    fn interrupted_and_error_decay_to_idle_after_thirty_seconds() {
+        let mut runtime = waiting_test_runtime_thinking();
+        runtime.canonical_state = "interrupted".to_string();
+        runtime.turn_active = false;
+        runtime.active_interaction_id = None;
+        assert_eq!(
+            terminal_activity_watchdog_settled_decay_action(
+                &runtime,
+                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+            ),
+            Some(TerminalActivityWatchdogAction::SettledDecayIdle)
+        );
+        assert_eq!(
+            terminal_activity_watchdog_settled_decay_action(
+                &runtime,
+                TERMINAL_SETTLED_DECAY_WATCHDOG_MS - 1,
+            ),
+            None
+        );
+        runtime.canonical_state = "error".to_string();
+        assert_eq!(
+            terminal_activity_watchdog_settled_decay_action(
+                &runtime,
+                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+            ),
+            Some(TerminalActivityWatchdogAction::SettledDecayIdle)
+        );
+        // Guards: active turn, open interaction, busy/waiting states hold.
+        runtime.turn_active = true;
+        assert_eq!(
+            terminal_activity_watchdog_settled_decay_action(
+                &runtime,
+                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+            ),
+            None
+        );
+        runtime.turn_active = false;
+        runtime.active_interaction_id = Some("uir:open".to_string());
+        assert_eq!(
+            terminal_activity_watchdog_settled_decay_action(
+                &runtime,
+                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+            ),
+            None
+        );
+        runtime.active_interaction_id = None;
+        for state in ["thinking", "waiting", "idle", "uir", "paused"] {
+            runtime.canonical_state = state.to_string();
+            assert_eq!(
+                terminal_activity_watchdog_settled_decay_action(
+                    &runtime,
+                    TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
+                ),
+                None,
+                "{state}"
+            );
+        }
+
+        // The decay event (terminal-input-ready with the runtime's explicit
+        // generation and identity) is ACCEPTED by the reducer from both
+        // settled states and lands on idle.
+        for settled in ["interrupted", "error"] {
+            let mut settled_runtime = waiting_test_runtime_thinking();
+            settled_runtime.canonical_state = settled.to_string();
+            settled_runtime.turn_active = false;
+            settled_runtime.active_interaction_id = None;
+            let mut decay = waiting_test_payload("terminal-input-ready", false);
+            decay.hook_event_name = "PromptReadyAfterInterrupt".to_string();
+            decay.activity_status = "idle".to_string();
+            decay.command_phase = "ready".to_string();
+            decay.input_ready = true;
+            decay.turn_generation = settled_runtime.turn_generation;
+            decay.turn_generation_explicit = true;
+            let projection =
+                terminal_reduce_canonical_state(&settled_runtime, &decay, None, false, false);
+            assert_eq!(projection.canonical_state, "idle", "{settled}");
+        }
     }
 
     #[test]

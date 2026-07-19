@@ -902,6 +902,19 @@ fn todo_dispatch_maybe_notify_drained(
     todo_dispatch_native_notify(app, &title, &body);
 }
 
+/// Outcome of one receipt upsert. Settlement callers that bridge receipts
+/// into the queue store must observe a precedence rejection: when the
+/// incoming status loses to an already-settled receipt, rewriting the queue
+/// row with the LOSING status would fork queue history from receipt history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TodoDispatchReceiptWrite {
+    Applied,
+    /// The incoming status lost settlement precedence; carries the WINNING
+    /// (already settled, non-interrupted) status so callers can keep the
+    /// queue row coherent with the receipt that won.
+    RejectedSettledWins(String),
+}
+
 /// Upsert one receipt and run drain detection. `app` is optional so storage
 /// can be exercised without an active Tauri context (tests, early startup).
 pub(crate) fn todo_dispatch_record_receipt_internal(
@@ -910,6 +923,18 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
     receipt: Value,
     reason: &str,
 ) -> Result<Value, String> {
+    todo_dispatch_record_receipt_with_outcome(app, workspace_id, receipt, reason)
+        .map(|(receipts, _)| receipts)
+}
+
+/// Same as `todo_dispatch_record_receipt_internal`, but also reports whether
+/// the write was applied or rejected by settlement precedence.
+pub(crate) fn todo_dispatch_record_receipt_with_outcome(
+    app: Option<&AppHandle>,
+    workspace_id: &str,
+    receipt: Value,
+    reason: &str,
+) -> Result<(Value, TodoDispatchReceiptWrite), String> {
     let workspace_id = workspace_id.trim();
     if workspace_id.is_empty() {
         return Err("workspace_id is required.".to_string());
@@ -964,7 +989,10 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
                 "workspace_id": workspace_id,
             }),
         );
-        return Ok(current);
+        return Ok((
+            current,
+            TodoDispatchReceiptWrite::RejectedSettledWins(existing_status),
+        ));
     }
 
     let mut merged = existing.as_object().cloned().unwrap_or_default();
@@ -1044,7 +1072,7 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
             todo_dispatch_maybe_notify_drained(app, workspace_id, &workspace_name, &last_text);
         }
     }
-    Ok(next)
+    Ok((next, TodoDispatchReceiptWrite::Applied))
 }
 
 /// Record remote command intake at the websocket loop, before the webview ever
@@ -2332,13 +2360,23 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
             );
         }
     }
-    let _ = todo_dispatch_record_receipt_internal(
+    let receipt_write = todo_dispatch_record_receipt_with_outcome(
         Some(app),
         &workspace_id,
         update,
         "activity_hook_settled",
-    );
-    todo_dispatch_queue_mark_settled(Some(app), &workspace_id, &command_id, settle_status);
+    )
+    .map(|(_, outcome)| outcome)
+    .unwrap_or(TodoDispatchReceiptWrite::Applied);
+    // Settlement coherence: when receipt precedence rejects this settlement
+    // (an earlier completed/final receipt wins over a late interruption), the
+    // queue/history row must be rewritten with the WINNING status — never the
+    // rejected one.
+    let queue_settle_status = match &receipt_write {
+        TodoDispatchReceiptWrite::RejectedSettledWins(winning) => winning.as_str(),
+        TodoDispatchReceiptWrite::Applied => settle_status,
+    };
+    todo_dispatch_queue_mark_settled(Some(app), &workspace_id, &command_id, queue_settle_status);
     log_terminal_status_event(
         "backend.todo_dispatch.hook_settled",
         json!({
@@ -2346,6 +2384,7 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
             "event_type": event_type,
             "match_source": match_source,
             "pane_id": payload.pane_id,
+            "queue_status": queue_settle_status,
             "status": settle_status,
             "workspace_id": workspace_id,
         }),
@@ -7925,6 +7964,40 @@ fn todo_dispatch_queue_mark_settled(
         return;
     };
     let _store_guard = todo_dispatch_queue_store_guard();
+    // Settlement precedence, revalidated INSIDE the store guard: an incoming
+    // "interrupted" must never overwrite a command whose receipt has already
+    // settled with a final non-interrupted status. Callers pre-check this,
+    // but a racing completion can settle the receipt between their check and
+    // this write — the receipt store is the settlement authority, so the
+    // winning status is substituted here, at the queue mutation itself.
+    let precedence_status: String;
+    let status = if status == "interrupted" {
+        let receipt_status = todo_dispatch_normalize_status(
+            todo_dispatch_load(workspace_id)
+                .get(command_id)
+                .and_then(|receipt| receipt.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        if receipt_status != "interrupted" && todo_dispatch_status_is_settled(&receipt_status) {
+            log_terminal_status_event(
+                "backend.todo_dispatch.queue_settle_precedence_substituted",
+                json!({
+                    "command_id": command_id,
+                    "receipt_status": receipt_status,
+                    "rejected_status": "interrupted",
+                    "workspace_id": workspace_id,
+                }),
+            );
+            precedence_status = receipt_status;
+            precedence_status.as_str()
+        } else {
+            status
+        }
+    } else {
+        status
+    };
+    let normalized_target = todo_store_normalize_lifecycle_status(status);
     let snapshot = todo_dispatch_queue_read(&path);
     let Some(items) = snapshot.get("items").and_then(Value::as_array).cloned() else {
         return;
@@ -7937,6 +8010,16 @@ fn todo_dispatch_queue_mark_settled(
         .into_iter()
         .map(|mut item| {
             if todo_dispatch_queue_item_command_id(&item) != command_id {
+                return item;
+            }
+            // Idempotence: a row already carrying this exact status must not
+            // be re-marked — re-marking resets settle timestamps and
+            // double-fires corrections, cloud sync, and the prune journal for
+            // routine duplicate settlements (e.g. repeated late interrupts
+            // losing precedence to the same completed receipt).
+            if !normalized_target.is_empty()
+                && todo_store_item_explicit_status(&item) == normalized_target
+            {
                 return item;
             }
             changed = true;
@@ -8033,6 +8116,7 @@ pub(crate) fn todo_dispatch_mark_active_for_pane_interrupted(
         reason
     };
     let mut settled = HashSet::<String>::new();
+    let mut rejected_winning = HashMap::<String, String>::new();
 
     let receipts = todo_dispatch_load(workspace_id);
     if let Some(entries) = receipts.as_object() {
@@ -8053,23 +8137,50 @@ pub(crate) fn todo_dispatch_mark_active_for_pane_interrupted(
                 object.insert("updated_at".to_string(), json!(now_iso.clone()));
                 object.insert("updated_at_ms".to_string(), json!(todo_dispatch_now_ms()));
             }
-            let _ = todo_dispatch_record_receipt_internal(
-                app,
-                workspace_id,
-                receipt,
-                "terminal_interrupt_settled",
-            );
+            if let Ok((_, TodoDispatchReceiptWrite::RejectedSettledWins(winning))) =
+                todo_dispatch_record_receipt_with_outcome(
+                    app,
+                    workspace_id,
+                    receipt,
+                    "terminal_interrupt_settled",
+                )
+            {
+                rejected_winning.insert(command_id.clone(), winning);
+            }
             if !command_id.trim().is_empty() {
                 settled.insert(command_id);
             }
         }
     }
 
+    // Settlement coherence: a command whose receipt already settled with a
+    // FINAL non-interrupted status (either just now — the precedence guard
+    // rejected our interrupt above — or through a racing completion path
+    // whose own queue rewrite has not landed yet) must not have its
+    // queue/history row rewritten to "interrupted". Settle the row with the
+    // WINNING receipt status instead so receipt and queue histories agree.
+    let receipts_after_interrupts = todo_dispatch_load(workspace_id);
     for command_id in todo_dispatch_active_queue_item_ids_for_pane(workspace_id, pane_id) {
         if command_id.trim().is_empty() {
             continue;
         }
-        todo_dispatch_queue_mark_settled(app, workspace_id, &command_id, "interrupted");
+        let winning_status = rejected_winning.get(&command_id).cloned().or_else(|| {
+            let receipt_status = todo_dispatch_normalize_status(
+                receipts_after_interrupts
+                    .get(command_id.as_str())
+                    .and_then(|receipt| receipt.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+            (receipt_status != "interrupted" && todo_dispatch_status_is_settled(&receipt_status))
+                .then_some(receipt_status)
+        });
+        todo_dispatch_queue_mark_settled(
+            app,
+            workspace_id,
+            &command_id,
+            winning_status.as_deref().unwrap_or("interrupted"),
+        );
         settled.insert(command_id);
     }
 
@@ -9322,30 +9433,26 @@ mod todo_store_tests {
     fn todo_dispatch_pane_interruption_settles_active_receipt_and_queue_item() {
         let workspace_id = format!("test-pane-interrupt-{}", uuid::Uuid::new_v4());
         let receipt_path = todo_dispatch_store_path(&workspace_id);
-        let queue_path = todo_dispatch_data_path("queues", &workspace_id);
-        todo_dispatch_queue_write(
-            &workspace_id,
-            &[
-                json!({
-                    "id": "todo-pane-a",
-                    "remote_command": { "command_id": "command-pane-a" },
-                    "status": "running",
-                    "target_terminal_id": "pane-a",
-                    "text": "old running todo",
-                    "todo_status": "running",
-                    "workspace_id": workspace_id,
-                }),
-                json!({
-                    "id": "todo-pane-b",
-                    "remote_command": { "command_id": "command-pane-b" },
-                    "status": "running",
-                    "target_terminal_id": "pane-b",
-                    "text": "other pane",
-                    "todo_status": "running",
-                    "workspace_id": workspace_id,
-                }),
-            ],
-        );
+        let queue_seed = [
+            json!({
+                "id": "todo-pane-a",
+                "remote_command": { "command_id": "command-pane-a" },
+                "status": "running",
+                "target_terminal_id": "pane-a",
+                "text": "old running todo",
+                "todo_status": "running",
+                "workspace_id": workspace_id,
+            }),
+            json!({
+                "id": "todo-pane-b",
+                "remote_command": { "command_id": "command-pane-b" },
+                "status": "running",
+                "target_terminal_id": "pane-b",
+                "text": "other pane",
+                "todo_status": "running",
+                "workspace_id": workspace_id,
+            }),
+        ];
         todo_dispatch_record_receipt_internal(
             None,
             &workspace_id,
@@ -9361,12 +9468,46 @@ mod todo_store_tests {
         )
         .unwrap();
 
-        let settled = todo_dispatch_mark_active_for_pane_interrupted(
-            None,
-            &workspace_id,
-            "pane-a",
-            "terminal_restart",
-        );
+        // The queue store re-resolves its data root from the environment on
+        // every call, and concurrently running cloud_mcp tests scope that env
+        // to their own temp roots (`ScopedCloudMcpEnv`). A mid-test flip can
+        // transiently redirect one lookup, so retry the queue leg — genuine
+        // settlement breakage still fails every attempt.
+        let mut settled = 0usize;
+        let mut queue_path = None;
+        let mut pane_a_status = String::new();
+        let mut pane_b_status = String::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            todo_dispatch_queue_write(&workspace_id, &queue_seed);
+            settled = todo_dispatch_mark_active_for_pane_interrupted(
+                None,
+                &workspace_id,
+                "pane-a",
+                "terminal_restart",
+            );
+            queue_path = todo_dispatch_data_path("queues", &workspace_id);
+            let queue_items = queue_path
+                .as_ref()
+                .map(|path| todo_dispatch_queue_read(path))
+                .and_then(|snapshot| snapshot.get("items").and_then(Value::as_array).cloned())
+                .unwrap_or_default();
+            pane_a_status = queue_items
+                .iter()
+                .find(|item| todo_dispatch_queue_item_command_id(item) == "command-pane-a")
+                .map(todo_store_item_status)
+                .unwrap_or_default();
+            pane_b_status = queue_items
+                .iter()
+                .find(|item| todo_dispatch_queue_item_command_id(item) == "command-pane-b")
+                .map(todo_store_item_status)
+                .unwrap_or_default();
+            if pane_a_status == "interrupted" {
+                break;
+            }
+        }
 
         assert_eq!(settled, 1);
         let receipts = todo_dispatch_load(&workspace_id);
@@ -9378,21 +9519,8 @@ mod todo_store_tests {
             receipts["command-pane-a"]["status_reason"].as_str(),
             Some("terminal_restart")
         );
-        let queue_items = queue_path
-            .as_ref()
-            .map(|path| todo_dispatch_queue_read(path))
-            .and_then(|snapshot| snapshot.get("items").and_then(Value::as_array).cloned())
-            .unwrap_or_default();
-        let pane_a = queue_items
-            .iter()
-            .find(|item| todo_dispatch_queue_item_command_id(item) == "command-pane-a")
-            .expect("pane-a item");
-        let pane_b = queue_items
-            .iter()
-            .find(|item| todo_dispatch_queue_item_command_id(item) == "command-pane-b")
-            .expect("pane-b item");
-        assert_eq!(todo_store_item_status(pane_a), "interrupted");
-        assert_eq!(todo_store_item_status(pane_b), "running");
+        assert_eq!(pane_a_status, "interrupted");
+        assert_eq!(pane_b_status, "running");
 
         if let Some(path) = receipt_path {
             let _ = fs::remove_file(path);
@@ -9447,6 +9575,77 @@ mod todo_store_tests {
             receipts["command-race"]["status"].as_str(),
             Some("completed"),
             "completed receipt must win over a late interruption"
+        );
+        // The precedence rejection is observable to settlement callers, and
+        // it carries the WINNING status for coherent queue settlement.
+        let (_, outcome) = todo_dispatch_record_receipt_with_outcome(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-race",
+                "item_id": "todo-race",
+                "pane_id": "pane-a",
+                "status": "interrupted",
+                "status_reason": "terminal_closed",
+            }),
+            "test_late_interrupt_outcome",
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            TodoDispatchReceiptWrite::RejectedSettledWins("completed".to_string()),
+        );
+
+        // The queue/history row must stay coherent with the winning receipt:
+        // a late pane interruption that loses receipt precedence must not
+        // rewrite the still-active queue row to "interrupted". (Bounded retry:
+        // concurrent cloud_mcp tests transiently rescope the todo-dispatch
+        // data root env; broken coherence still fails every attempt.)
+        let queue_seed = [json!({
+            "id": "todo-race",
+            "remote_command": { "command_id": "command-race" },
+            "status": "running",
+            "target_terminal_id": "pane-a",
+            "text": "finished work",
+            "todo_status": "running",
+            "workspace_id": workspace_id,
+        })];
+        let mut queue_path = None;
+        let mut race_item_status = String::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            todo_dispatch_queue_write(&workspace_id, &queue_seed);
+            todo_dispatch_mark_active_for_pane_interrupted(
+                None,
+                &workspace_id,
+                "pane-a",
+                "terminal_closed",
+            );
+            queue_path = todo_dispatch_data_path("queues", &workspace_id);
+            let queue_items = queue_path
+                .as_ref()
+                .map(|path| todo_dispatch_queue_read(path))
+                .and_then(|snapshot| snapshot.get("items").and_then(Value::as_array).cloned())
+                .unwrap_or_default();
+            race_item_status = queue_items
+                .iter()
+                .find(|item| todo_dispatch_queue_item_command_id(item) == "command-race")
+                .map(todo_store_item_status)
+                .unwrap_or_default();
+            if !race_item_status.is_empty() && race_item_status != "running" {
+                break;
+            }
+        }
+        assert_eq!(
+            race_item_status, "completed",
+            "queue history must keep the winning completed status"
+        );
+        let receipts = todo_dispatch_load(&workspace_id);
+        assert_eq!(
+            receipts["command-race"]["status"].as_str(),
+            Some("completed"),
         );
 
         // Opposite arrival order still ends deterministically at completed.
@@ -9512,6 +9711,9 @@ mod todo_store_tests {
         );
 
         if let Some(path) = receipt_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(path) = queue_path {
             let _ = fs::remove_file(path);
         }
         if let Ok(mut cache) = TODO_DISPATCH_RECEIPTS_CACHE
@@ -15360,15 +15562,30 @@ async fn todo_dispatch_receipt_record(
             .and_then(Value::as_str)
             .map(todo_dispatch_normalize_status)
             .unwrap_or_else(|| "queued".to_string());
-        let receipts = todo_dispatch_record_receipt_internal(
+        let (receipts, receipt_write) = todo_dispatch_record_receipt_with_outcome(
             Some(&app),
             &workspace_id,
             receipt,
             reason.as_deref().unwrap_or("frontend_record"),
         )?;
         if let Some(command_id) = command_id.as_deref() {
-            if todo_dispatch_status_is_settled(&status) {
-                todo_dispatch_queue_mark_settled(Some(&app), &workspace_id, command_id, &status);
+            match &receipt_write {
+                // Settlement coherence: when receipt precedence rejects this
+                // settlement, keep the queue/history row on the WINNING
+                // receipt status instead of rewriting it with the loser.
+                TodoDispatchReceiptWrite::RejectedSettledWins(winning) => {
+                    todo_dispatch_queue_mark_settled(Some(&app), &workspace_id, command_id, winning);
+                }
+                TodoDispatchReceiptWrite::Applied => {
+                    if todo_dispatch_status_is_settled(&status) {
+                        todo_dispatch_queue_mark_settled(
+                            Some(&app),
+                            &workspace_id,
+                            command_id,
+                            &status,
+                        );
+                    }
+                }
             }
         }
         Ok(todo_dispatch_receipts_payload(
