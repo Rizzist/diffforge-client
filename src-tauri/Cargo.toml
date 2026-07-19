@@ -1,6 +1,6 @@
 [package]
 name = "rust-diffforge"
-version = "0.9.20"
+version = "0.9.21"
 description = "Diff Forge AI desktop app"
 authors = ["Diff Forge AI"]
 edition = "2021"
