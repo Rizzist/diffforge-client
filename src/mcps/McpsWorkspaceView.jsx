@@ -1153,6 +1153,34 @@ export default function McpsWorkspaceView({
     [beginAction, commandBase, finishAction, replaceRegistry, workspaceId, workspaceName],
   );
 
+  // Coordination Kernel todo/asset tool switch. The kernel stays enabled
+  // either way; this only controls whether the todo-status and asset-transfer
+  // tools are offered to coding agents (they stay listed in this tab).
+  const toggleKernelTodoAssetTools = useCallback(
+    async (server, nextEnabled) => {
+      if (!workspaceId || !server) return;
+      beginAction(nextEnabled ? "enabling_mcp" : "disabling_mcp", { name: server.name });
+      setError("");
+      try {
+        const response = await invoke("coordination_update_workspace_mcp_server", {
+          ...commandBase,
+          workspace_id: workspaceId,
+          server_id: server.id,
+          input: {
+            workspace_name: workspaceName,
+            kernel_todo_asset_tools_enabled: nextEnabled,
+          },
+        });
+        replaceRegistry(response);
+      } catch (caught) {
+        setError(errorMessage(caught));
+      } finally {
+        finishAction();
+      }
+    },
+    [beginAction, commandBase, finishAction, replaceRegistry, workspaceId, workspaceName],
+  );
+
   const indexMarketplace = useCallback(
     async (marketplace) => {
       if (!workspaceId || !marketplace?.id) return null;
@@ -2331,6 +2359,9 @@ export default function McpsWorkspaceView({
     );
     const selectedTools = asArray(selectedServer.tools_json);
     const selectedIsSecrets = isSecretsServer(selectedServer);
+    const selectedIsKernel = selectedServer.server_key === "coordination-kernel";
+    const kernelHeldTools = asArray(selectedServer.held_agent_tools_json).map(toolDisplayName);
+    const kernelTodoAssetToolsEnabled = Boolean(selectedServer.kernel_todo_asset_tools_enabled);
     const savedConfigValues = configValuesFromServer(selectedServer);
     const configKeys = new Set([
       ...Object.keys(savedConfigValues),
@@ -2643,14 +2674,56 @@ export default function McpsWorkspaceView({
               {selectedServer.built_in ? "Agent-exposed tools" : "Tools"}
             </span>
             <McpStatusBadge data-state="planned">
-              {selectedTools.length}
+              {selectedIsKernel && !kernelTodoAssetToolsEnabled
+                ? `${selectedTools.length - kernelHeldTools.length} of ${selectedTools.length}`
+                : selectedTools.length}
             </McpStatusBadge>
           </McpAccessTopline>
+          {selectedIsKernel && (
+            <KernelToolSwitchRow>
+              <KernelToolSwitchCopy>
+                <strong>Todo &amp; asset tools</strong>
+                <span>
+                  {kernelTodoAssetToolsEnabled
+                    ? "Todo-status and asset-transfer tools are offered to coding agents."
+                    : "Held back from coding agents; still visible below. Flip on to expose them."}
+                </span>
+              </KernelToolSwitchCopy>
+              <McpSwitchButton
+                aria-pressed={kernelTodoAssetToolsEnabled ? "true" : "false"}
+                disabled={actionState !== "idle"}
+                onClick={() =>
+                  toggleKernelTodoAssetTools(selectedServer, !kernelTodoAssetToolsEnabled)
+                }
+                type="button"
+              >
+                <span aria-hidden="true" />
+                {buttonContent(
+                  actionState === "enabling_mcp" || actionState === "disabling_mcp",
+                  kernelTodoAssetToolsEnabled ? "Enabled" : "Disabled",
+                  kernelTodoAssetToolsEnabled ? "Disabling" : "Enabling",
+                )}
+              </McpSwitchButton>
+            </KernelToolSwitchRow>
+          )}
           {selectedTools.length ? (
             <McpToolList>
-              {selectedTools.map((tool) => (
-                <McpToolChip key={toolDisplayName(tool)}>{toolDisplayName(tool)}</McpToolChip>
-              ))}
+              {selectedTools.map((tool) => {
+                const held =
+                  selectedIsKernel
+                  && !kernelTodoAssetToolsEnabled
+                  && kernelHeldTools.includes(toolDisplayName(tool));
+                return held ? (
+                  <HeldToolChip
+                    key={toolDisplayName(tool)}
+                    title="Held back from coding agents until the todo & asset tools switch is enabled."
+                  >
+                    {toolDisplayName(tool)}
+                  </HeldToolChip>
+                ) : (
+                  <McpToolChip key={toolDisplayName(tool)}>{toolDisplayName(tool)}</McpToolChip>
+                );
+              })}
             </McpToolList>
           ) : (
             <McpEmptyAccess>
@@ -3259,6 +3332,42 @@ const McpSecretActions = styled(McpInlineActions)`
   @container (max-width: 680px) {
     justify-content: flex-start;
   }
+`;
+
+const KernelToolSwitchRow = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 9px 11px;
+  border: 1px solid var(--forge-border);
+  border-radius: 9px;
+  background: var(--forge-surface-control, rgba(21, 27, 35, 0.55));
+`;
+
+const KernelToolSwitchCopy = styled.span`
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 260px;
+
+  strong {
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    color: var(--forge-text);
+  }
+
+  span {
+    font-size: 10px;
+    color: var(--forge-text-muted);
+  }
+`;
+
+const HeldToolChip = styled(McpToolChip)`
+  opacity: 0.45;
+  border-style: dashed;
 `;
 
 const SecretsToolbar = styled.div`

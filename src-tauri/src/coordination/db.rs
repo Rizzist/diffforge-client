@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 use super::schema::{
     AGENT_SESSION_MODE_MIGRATION_NAME, AGENT_SESSION_MODE_MIGRATION_VERSION,
+    AGENT_TODO_ASSET_TOOLS_MIGRATION_NAME, AGENT_TODO_ASSET_TOOLS_MIGRATION_VERSION,
     APPROVAL_SQL_ORCHESTRATION_MIGRATION_NAME, APPROVAL_SQL_ORCHESTRATION_MIGRATION_VERSION,
     CRASH_TODO_RESUME_MIGRATION_NAME, CRASH_TODO_RESUME_MIGRATION_VERSION, CREATE_SCHEMA_SQL,
     DEPENDENCY_GRAPH_MIGRATION_NAME, DEPENDENCY_GRAPH_MIGRATION_VERSION,
@@ -702,8 +703,43 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_workspace_mcp_seed_state_migration(connection)?);
     diagnostics.push(apply_workspace_mcp_secrets_state_migration(connection)?);
     diagnostics.push(apply_workspace_mcp_ssh_targets_migration(connection)?);
+    diagnostics.push(apply_agent_todo_asset_tools_migration(connection)?);
 
     Ok(diagnostics)
+}
+
+fn apply_agent_todo_asset_tools_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, AGENT_TODO_ASSET_TOOLS_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            AGENT_TODO_ASSET_TOOLS_MIGRATION_VERSION,
+            AGENT_TODO_ASSET_TOOLS_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    // Default 0: kernel todo/asset tools are held back from coding agents
+    // until the user enables them in the Coordination Kernel MCP panel.
+    let added = ensure_column(
+        connection,
+        "repo_policies",
+        "agent_todo_asset_tools_enabled",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    let mut migration = record_migration_if_missing(
+        connection,
+        AGENT_TODO_ASSET_TOOLS_MIGRATION_VERSION,
+        AGENT_TODO_ASSET_TOOLS_MIGRATION_NAME,
+    )?;
+    migration.details.splice(
+        0..0,
+        [format!(
+            "repo_policies.agent_todo_asset_tools_enabled column_added={added}"
+        )],
+    );
+    Ok(migration)
 }
 
 fn apply_workspace_mcp_ssh_targets_migration(

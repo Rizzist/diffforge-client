@@ -178,7 +178,12 @@ export default function WebPanelHost() {
     }
   }, [emitNavigate, history, historyIndex]);
 
-  const nativeAgentPromptOverlayActive = Boolean(agentPromptOpen && hasTauriRuntime());
+  // The in-page overlay is the single status surface: keep it mounted while
+  // prompts are queued/running even after the composer closes, so activity
+  // never rides in the window's top rail.
+  const nativeAgentPromptOverlayActive = Boolean(
+    (agentPromptOpen || agentPromptActivityItems.length > 0) && hasTauriRuntime(),
+  );
 
   const { evaluate, reload } = useNativeWebview({
     viewportRef,
@@ -404,6 +409,7 @@ export default function WebPanelHost() {
   const webAgentPromptOverlay = useWebAgentPromptOverlay({
     autoDismissCompleted: windowFocused,
     activityItems: agentPromptActivityItems,
+    composer_open: agentPromptOpen,
     context_refs: webElementPicker.context_refs,
     default_selected_target_ids: defaultAgentPromptTargetIds,
     enabled: nativeAgentPromptOverlayActive,
@@ -678,15 +684,6 @@ export default function WebPanelHost() {
               <OpenInNew aria-hidden="true" />
             </HostIconButton>
           </HostRailControls>
-          {hasAgentPromptActivity ? (
-            <HostActivityRow data-host-rail-section="activity">
-              <PanelAgentPromptActivity
-                autoDismissCompleted={windowFocused}
-                items={agentPromptActivityItems}
-                onDismissCompletedItem={dismissPanelAgentPromptActivityItem}
-              />
-            </HostActivityRow>
-          ) : null}
         </HostTopRail>
       </HostChrome>
 
@@ -697,6 +694,15 @@ export default function WebPanelHost() {
           <Language aria-hidden="true" />
           <span>{currentHost}</span>
         </HostBackdrop>
+        {hasAgentPromptActivity && !webAgentPromptOverlay.active ? (
+          <HostActivityOverlay>
+            <PanelAgentPromptActivity
+              autoDismissCompleted={windowFocused}
+              items={agentPromptActivityItems}
+              onDismissCompletedItem={dismissPanelAgentPromptActivityItem}
+            />
+          </HostActivityOverlay>
+        ) : null}
         {agentPromptOpen && !webAgentPromptOverlay.active ? (
           <PanelAgentPromptComposer
             autoFocus
@@ -883,12 +889,21 @@ const HostNav = styled.form`
   background: transparent;
 `;
 
-const HostActivityRow = styled.div`
+// Fallback status surface when the injected in-page overlay is unavailable
+// (non-native runtime): float the activity stack over the viewport so status
+// never rides in the window's top rail.
+const HostActivityOverlay = styled.div`
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
   display: flex;
-  grid-column: 1 / -1;
-  grid-row: 3;
-  min-width: 0;
   justify-content: flex-end;
+  pointer-events: none;
+
+  > * {
+    pointer-events: auto;
+  }
 `;
 
 const HostAddressInput = styled.input`

@@ -151,8 +151,13 @@ export default function WebPane({
     && !webviewObscured
     && (!fullscreenActive || isFullscreen),
   );
+  const hasPanelAgentPromptActivity = Array.isArray(panelAgentPromptActivityItems)
+    && panelAgentPromptActivityItems.length > 0;
+  // The in-page overlay is the single status surface: it stays mounted while
+  // prompts are queued/running even after the composer closes or the tab is
+  // revisited, so activity never falls back to the toolbar.
   const nativeAgentPromptOverlayActive = Boolean(
-    agentPromptOpen
+    (agentPromptOpen || hasPanelAgentPromptActivity)
     && agentPromptControlVisible
     && visible
     && !poppedOut
@@ -246,6 +251,7 @@ export default function WebPane({
   const webAgentPromptOverlay = useWebAgentPromptOverlay({
     autoDismissCompleted: Boolean(isFocused),
     activityItems: panelAgentPromptActivityItems,
+    composer_open: agentPromptOpen && agentPromptControlVisible,
     context_refs: webElementPicker.context_refs,
     default_selected_target_ids: defaultPanelAgentPromptTargetIds,
     enabled: nativeAgentPromptOverlayActive,
@@ -336,8 +342,6 @@ export default function WebPane({
   const popOutControlVisible = showPopOutControl && typeof onPopOut === "function";
   const minimizeControlVisible = showMinimizeControl && typeof onMinimize === "function";
   const fullscreenControlVisible = showFullscreenControl && typeof onToggleFullscreen === "function";
-  const hasPanelAgentPromptActivity = Array.isArray(panelAgentPromptActivityItems)
-    && panelAgentPromptActivityItems.length > 0;
   const toolbarControlsVisible = agentPromptControlVisible
     || splitControlsVisible
     || popOutControlVisible
@@ -506,15 +510,6 @@ export default function WebPane({
             ) : null}
           </WebPaneRailControls>
         ) : null}
-        {hasPanelAgentPromptActivity ? (
-          <WebPaneActivityRow data-web-pane-rail-section="activity">
-            <PanelAgentPromptActivity
-              autoDismissCompleted={Boolean(isFocused)}
-              items={panelAgentPromptActivityItems}
-              onDismissCompletedItem={dismissPanelAgentPromptActivityItem}
-            />
-          </WebPaneActivityRow>
-        ) : null}
       </WebPaneRail>
 
       {addressError ? <WebPaneInlineError role="alert">{addressError}</WebPaneInlineError> : null}
@@ -524,6 +519,15 @@ export default function WebPane({
           <Language aria-hidden="true" />
           <span>{currentHost}</span>
         </WebPaneBackdrop>
+        {hasPanelAgentPromptActivity && !webAgentPromptOverlay.active ? (
+          <WebPaneActivityOverlay>
+            <PanelAgentPromptActivity
+              autoDismissCompleted={Boolean(isFocused)}
+              items={panelAgentPromptActivityItems}
+              onDismissCompletedItem={dismissPanelAgentPromptActivityItem}
+            />
+          </WebPaneActivityOverlay>
+        ) : null}
         {poppedOut ? (
           <WebPaneBreakoutOverlay>
             <strong>Opened in window</strong>
@@ -720,12 +724,21 @@ const WebPaneNavControls = styled.span`
   gap: 2px;
 `;
 
-const WebPaneActivityRow = styled.div`
+// Fallback status surface when the injected in-page overlay is unavailable
+// (non-native runtime): float the activity stack over the viewport so status
+// never rides in the toolbar rail.
+const WebPaneActivityOverlay = styled.div`
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
   display: flex;
-  grid-column: 1 / -1;
-  grid-row: 3;
-  min-width: 0;
   justify-content: flex-end;
+  pointer-events: none;
+
+  > * {
+    pointer-events: auto;
+  }
 `;
 
 const WebPaneAddressInput = styled.input`

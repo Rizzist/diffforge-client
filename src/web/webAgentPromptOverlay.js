@@ -87,6 +87,7 @@ function normalizeOverlayActivityItems(items) {
 function buildOverlayConfig({
   autoDismissCompleted = false,
   activityItems = [],
+  composer_open: composerOpen = true,
   context_refs: contextRefs = [],
   default_selected_target_ids: defaultSelectedTargetIds = [],
   targets = [],
@@ -94,6 +95,7 @@ function buildOverlayConfig({
   return {
     autoDismissCompleted: Boolean(autoDismissCompleted),
     activityItems: normalizeOverlayActivityItems(activityItems),
+    composer_open: composerOpen !== false,
     context_refs: cleanArray(contextRefs).filter((context) => context && typeof context === "object"),
     default_selected_target_ids: normalizeOverlayTargetIds(defaultSelectedTargetIds),
     targets: normalizeOverlayTargets(targets),
@@ -784,6 +786,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
           }
         </style>
         \${activity}
+        \${state.config.composerOpen ? \`
         <div class="shell" role="group" aria-label="Send prompt to terminal agents">
           <textarea aria-label="Prompt" data-role="prompt" placeholder="\${targets.length ? "Prompt selected agents" : "Open a coding-agent terminal first"}" rows="1" \${disabled ? "disabled" : ""}></textarea>
           <div class="context-row">
@@ -807,6 +810,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
           </div>
           <div class="error" role="alert">\${html(state.error)}</div>
         </div>
+        \` : ""}
       \`;
 
       const shell = root.querySelector(".shell");
@@ -917,6 +921,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
           config: {
             activityItems: [],
             autoDismissCompleted: false,
+            composerOpen: false,
             contextRefs: [],
             defaultSelectedTargetIds: [],
             targets: [],
@@ -1001,10 +1006,18 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
     state.config = {
       activityItems: normalizeActivityItems(CONFIG.activityItems),
       autoDismissCompleted: Boolean(CONFIG.autoDismissCompleted),
+      composerOpen: CONFIG.composer_open !== false,
       contextRefs: array(CONFIG.context_refs),
       defaultSelectedTargetIds: array(CONFIG.default_selected_target_ids).map(text).filter(Boolean),
       targets: normalizeTargets(CONFIG.targets)
     };
+    if (!state.config.composerOpen) {
+      // Activity-only mode: forget composer UI state so reopening the
+      // composer autofocuses cleanly.
+      state.didAutofocus = false;
+      state.menuOpen = false;
+      state.error = "";
+    }
     state.selectedIds = normalizeSelectedIds(state.config.targets, state.selectedIds, state.config.defaultSelectedTargetIds);
     render(state);
     return { ok: true };
@@ -1018,6 +1031,7 @@ function normalizeOverlayEvents(value) {
 export function useWebAgentPromptOverlay({
   autoDismissCompleted = false,
   activityItems = [],
+  composer_open: composerOpen = true,
   context_refs: contextRefs = [],
   default_selected_target_ids: defaultSelectedTargetIds = [],
   enabled = false,
@@ -1034,6 +1048,7 @@ export function useWebAgentPromptOverlay({
   const activityItemsRef = useRef(activityItems);
   const clearContextRef = useRef(onClearContext);
   const closeRef = useRef(onClose);
+  const composerOpenRef = useRef(composerOpen);
   const contextRefsRef = useRef(contextRefs);
   const defaultSelectedTargetIdsRef = useRef(defaultSelectedTargetIds);
   const dismissCompletedItemRef = useRef(onDismissCompletedItem);
@@ -1047,6 +1062,7 @@ export function useWebAgentPromptOverlay({
   activityItemsRef.current = activityItems;
   clearContextRef.current = onClearContext;
   closeRef.current = onClose;
+  composerOpenRef.current = composerOpen;
   contextRefsRef.current = contextRefs;
   defaultSelectedTargetIdsRef.current = defaultSelectedTargetIds;
   dismissCompletedItemRef.current = onDismissCompletedItem;
@@ -1061,10 +1077,11 @@ export function useWebAgentPromptOverlay({
   const config = useMemo(() => buildOverlayConfig({
     autoDismissCompleted,
     activityItems,
+    composer_open: composerOpen,
     context_refs: contextRefs,
     default_selected_target_ids: defaultSelectedTargetIds,
     targets,
-  }), [activityItems, autoDismissCompleted, contextRefs, defaultSelectedTargetIds, targets]);
+  }), [activityItems, autoDismissCompleted, composerOpen, contextRefs, defaultSelectedTargetIds, targets]);
   const configRef = useRef(config);
   configRef.current = config;
   const configSignature = useMemo(() => JSON.stringify(config), [config]);
@@ -1130,6 +1147,7 @@ export function useWebAgentPromptOverlay({
             await runOverlayAction("show", buildOverlayConfig({
               autoDismissCompleted: configRef.current.autoDismissCompleted,
               activityItems: activityItemsRef.current,
+              composer_open: composerOpenRef.current,
               context_refs: contextRefsRef.current,
               default_selected_target_ids: defaultSelectedTargetIdsRef.current,
               targets: targetsRef.current,
@@ -1186,6 +1204,7 @@ export function useWebAgentPromptOverlay({
         void runOverlayAction("show", buildOverlayConfig({
           autoDismissCompleted: configRef.current.autoDismissCompleted,
           activityItems: activityItemsRef.current,
+          composer_open: composerOpenRef.current,
           context_refs: contextRefsRef.current,
           default_selected_target_ids: defaultSelectedTargetIdsRef.current,
           targets: targetsRef.current,

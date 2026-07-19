@@ -1912,6 +1912,22 @@ const TerminalPcbPanelBody = styled.div`
   overflow: hidden;
 `;
 
+// Prompt activity floats over the panel content (matching the web panel's
+// in-page overlay) instead of riding in the header button rail.
+const TerminalPanelActivityOverlay = styled.div`
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
+  display: flex;
+  justify-content: flex-end;
+  pointer-events: none;
+
+  > * {
+    pointer-events: auto;
+  }
+`;
+
 const TerminalPcbBreakoutOverlay = styled.div`
   position: absolute;
   inset: 0;
@@ -19655,7 +19671,6 @@ function WorkspacePcbGridPane({
           </TerminalPcbPanelTitle>
         </TerminalPcbPanelIdentity>
         <TerminalPaneInlineRailControls data-rail-row="inline">
-          <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
           <TerminalRestartButton
             aria-label="Prompt terminal agents"
             aria-pressed={agentPromptOpen ? "true" : "false"}
@@ -19775,6 +19790,11 @@ function WorkspacePcbGridPane({
         </TerminalPaneInlineRailControls>
       </TerminalPcbPanelHeader>
       <TerminalPcbPanelBody>
+        {panelAgentPromptActivityItems.length ? (
+          <TerminalPanelActivityOverlay>
+            <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
+          </TerminalPanelActivityOverlay>
+        ) : null}
         <PaneErrorBoundary label={`PCB pane ${paneId}`} resetKey={`pcb-${paneId}-${repoPath}-${resumeNonce}`}>
           <PcbWorkspacePane
             key={`pcb-${paneId}-${repoPath}-${resumeNonce}`}
@@ -35794,11 +35814,6 @@ function TerminalView({
                   </TerminalDocumentPanelTitle>
                 </TerminalDocumentPanelIdentity>
                 <TerminalPaneInlineRailControls data-rail-row="inline">
-                  <PanelAgentPromptActivity
-                    items={panelAgentPromptActivityItems.filter((item) => (
-                      String(item.panel_pane_id || "").trim() === TERMINAL_DOCUMENT_PANEL_ID
-                    ))}
-                  />
                   <TerminalRestartButton
                     aria-label="Prompt terminal agents"
                     aria-pressed={documentPanelAgentPromptOpen ? "true" : "false"}
@@ -35847,6 +35862,17 @@ function TerminalView({
                 </TerminalPaneInlineRailControls>
               </TerminalDocumentPanelHeader>
               <TerminalDocumentPanelBody>
+                {panelAgentPromptActivityItems.some((item) => (
+                  String(item.panel_pane_id || "").trim() === TERMINAL_DOCUMENT_PANEL_ID
+                )) ? (
+                  <TerminalPanelActivityOverlay>
+                    <PanelAgentPromptActivity
+                      items={panelAgentPromptActivityItems.filter((item) => (
+                        String(item.panel_pane_id || "").trim() === TERMINAL_DOCUMENT_PANEL_ID
+                      ))}
+                    />
+                  </TerminalPanelActivityOverlay>
+                ) : null}
                 <ToolsWorkspaceView
                   agentPromptWorkspaceId={terminalWorkspace?.id || ""}
                   default_working_directory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}

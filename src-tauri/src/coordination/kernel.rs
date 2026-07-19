@@ -399,6 +399,20 @@ fn repo_policy_requires_agent_worktree(policy: &Value) -> bool {
     repo_policy_agent_session_mode(policy) == AGENT_SESSION_MODE_WORKTREE_COORDINATION
 }
 
+/// Whether the kernel's todo/asset MCP tools are exposed to coding agents.
+/// Default false: the tools stay listed in the MCPs tab but are held back
+/// from the agent harness until the user flips the Coordination Kernel switch.
+pub(crate) fn repo_policy_todo_asset_tools_enabled(policy: &Value) -> bool {
+    policy["agent_todo_asset_tools_enabled"]
+        .as_bool()
+        .unwrap_or_else(|| {
+            policy["agent_todo_asset_tools_enabled"]
+                .as_i64()
+                .unwrap_or(0)
+                != 0
+        })
+}
+
 fn write_enforcement_safety_rank(mode: &str) -> Option<u8> {
     match mode {
         "worktree_required" => Some(3),
@@ -754,7 +768,7 @@ fn workspace_mcp_visibility(
         .collect::<Vec<_>>()
 }
 
-fn coordination_workspace_mcp_server(status: &Value) -> Value {
+fn coordination_workspace_mcp_server(status: &Value, todo_asset_tools_enabled: bool) -> Value {
     let health = &status["health"];
     let client_mount_summary = &health["agent_client_mount_summary"];
     let status_text = health["status"].as_str().unwrap_or("warning");
@@ -765,6 +779,11 @@ fn coordination_workspace_mcp_server(status: &Value) -> Value {
         "description": "Built-in task coordination, leases, checkpoints, and patch submission.",
         "built_in": true,
         "toggleable": false,
+        // The todo/asset tool slice is user-switchable: listed in tools_json
+        // either way (visible in the MCPs tab), but only offered to the agent
+        // harness when enabled.
+        "kernel_todo_asset_tools_enabled": todo_asset_tools_enabled,
+        "held_agent_tools_json": crate::coordination::mcp::KERNEL_TODO_ASSET_TOOL_NAMES,
         "source_kind": "built_in",
         "source_label": "Diff Forge",
         "package_ref": "internal",
@@ -8750,7 +8769,14 @@ impl CoordinationKernel {
         let secret_rows = self.workspace_mcp_secret_public_rows(workspace_id)?;
         let ssh_target_rows = self.workspace_mcp_ssh_target_public_rows(workspace_id)?;
 
-        let mut servers = vec![coordination_workspace_mcp_server(&coordination_status)];
+        let todo_asset_tools_enabled = self
+            .repo_policy()
+            .map(|policy| repo_policy_todo_asset_tools_enabled(&policy))
+            .unwrap_or(false);
+        let mut servers = vec![coordination_workspace_mcp_server(
+            &coordination_status,
+            todo_asset_tools_enabled,
+        )];
         servers.push(workspace_mcp_secrets_server(
             &secret_rows,
             &ssh_target_rows,
@@ -10642,7 +10668,32 @@ impl CoordinationKernel {
         let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
         let server_id = required_trimmed(server_id, "server_id")?;
         if server_id == "coordination-kernel" {
-            return Err("The Coordination Kernel MCP is built in and always enabled.".to_string());
+            // The kernel itself cannot be disabled, but its todo/asset tool
+            // slice has a user switch. Persisted in repo policy so the agent
+            // MCP surface (which reads repo policy per call) picks it up.
+            let enabled = input["kernel_todo_asset_tools_enabled"]
+                .as_bool()
+                .or_else(|| {
+                    input["kernel_todo_asset_tools_enabled"]
+                        .as_i64()
+                        .map(|value| value != 0)
+                })
+                .ok_or_else(|| {
+                    "The Coordination Kernel MCP is built in and always enabled; only the todo/asset tools switch can change.".to_string()
+                })?;
+            self.update_repo_policy(&json!({ "agent_todo_asset_tools_enabled": enabled }))?;
+            self.emit_event(
+                "workspace_mcp_server_updated",
+                "kernel",
+                REPO_ID,
+                EventRefs::default(),
+                json!({
+                    "workspace_id": workspace_id,
+                    "server_id": "coordination-kernel",
+                    "kernel_todo_asset_tools_enabled": enabled,
+                }),
+            )?;
+            return self.workspace_mcp_registry(workspace_id, input["workspace_name"].as_str());
         }
         if server_id == "secrets" {
             let enabled = input["workspace_enabled"]
@@ -23129,6 +23180,7 @@ impl CoordinationKernel {
             "sql_engine",
             "agent_worktree_required",
             "agent_session_mode",
+            "agent_todo_asset_tools_enabled",
             "patch_lease_validation_required",
             "merge_gate_required",
             "unleased_write_policy",

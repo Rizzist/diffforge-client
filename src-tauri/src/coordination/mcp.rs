@@ -44,6 +44,25 @@ pub const TOOL_NAMES: &[&str] = &[
     "submit_patch_status",
     "pcb_drc",
 ];
+/// Todo-status and asset-transfer tools held behind the per-workspace
+/// "todo/asset tools" switch (repo policy `agent_todo_asset_tools_enabled`,
+/// default off). They stay listed in the MCPs tab registry either way, but are
+/// only offered to the coding-agent harness once the user enables the switch
+/// in the Coordination Kernel panel.
+pub const KERNEL_TODO_ASSET_TOOL_NAMES: &[&str] = &[
+    "list_todo_targets",
+    "get_todo_status",
+    "wait_for_todos",
+    "list_todo_history",
+    "list_assets",
+    "get_asset_root",
+    "upload_asset",
+    "upload_asset_status",
+    "download_asset",
+    "download_asset_status",
+    "delete_local_asset",
+    "delete_cloud_asset",
+];
 const TERMINAL_SESSION_TOOL_NAMES: &[&str] = &[
     "start_task",
     "acquire_lease",
@@ -4867,7 +4886,37 @@ fn coordination_context_repo_session_mode(context: &McpContext) -> Option<&'stat
     Some(super::kernel::repo_policy_agent_session_mode(&policy))
 }
 
+/// Reads the workspace's repo policy switch for the kernel todo/asset tool
+/// slice. Any unresolved context (no repo, unopenable kernel) means the switch
+/// reads as off — the tools default to held-back.
+fn coordination_context_todo_asset_tools_enabled(context: &McpContext) -> bool {
+    let Some(repo_path) = context
+        .repo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let db_path = context
+        .db_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let Ok(kernel) = CoordinationKernel::open(PathBuf::from(repo_path), db_path) else {
+        return false;
+    };
+    kernel
+        .repo_policy()
+        .map(|policy| super::kernel::repo_policy_todo_asset_tools_enabled(&policy))
+        .unwrap_or(false)
+}
+
 fn coordination_tools_for_context(context: &McpContext) -> Vec<&'static str> {
+    let todo_asset_enabled = coordination_context_todo_asset_tools_enabled(context);
+    let todo_asset_visible =
+        |tool: &&str| todo_asset_enabled || !KERNEL_TODO_ASSET_TOOL_NAMES.contains(tool);
     // Unsafe direct workspaces expose only the tiny lifecycle slice needed for
     // Loopspace runtime hydration/progress. Normal Full-mode work is still not
     // coordinated, patchable, leasable, pausable, or resumable.
@@ -4883,15 +4932,21 @@ fn coordination_tools_for_context(context: &McpContext) -> Vec<&'static str> {
                     || (has_terminal_session
                         && DIRECT_UNMANAGED_LOOPSPACE_TOOL_NAMES.contains(tool))
             })
+            .filter(todo_asset_visible)
             .collect();
     }
     if coordination_context_has_terminal_session(context) {
-        return TOOL_NAMES.to_vec();
+        return TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(todo_asset_visible)
+            .collect();
     }
     TOOL_NAMES
         .iter()
         .copied()
         .filter(|tool| !TERMINAL_SESSION_TOOL_NAMES.contains(tool))
+        .filter(todo_asset_visible)
         .collect()
 }
 
@@ -8500,6 +8555,11 @@ edge trig.out -> dispatch.in
         kernel
             .update_repo_policy(&json!({"agent_session_mode": "direct_unmanaged"}))
             .unwrap();
+        // This test exercises the direct-unmanaged lifecycle slice; flip the
+        // todo/asset switch on so those assertions stay focused on lifecycle.
+        kernel
+            .update_repo_policy(&json!({"agent_todo_asset_tools_enabled": true}))
+            .unwrap();
 
         let session_context = McpContext {
             repo_path: Some(repo.display().to_string()),
@@ -8563,6 +8623,93 @@ edge trig.out -> dispatch.in
             .unwrap();
         let restored = coordination_tools_for_context(&session_context);
         assert!(restored.contains(&"start_task"));
+    }
+
+    #[test]
+    fn todo_asset_tools_are_held_back_until_policy_switch_enables_them() {
+        let repo = std::env::temp_dir().join(format!(
+            "diffforge-mcp-todo-asset-switch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let session_context = McpContext {
+            repo_path: Some(repo.display().to_string()),
+            db_path: Some(kernel.paths.db_path.display().to_string()),
+            session_id: Some("session-todo-asset".to_string()),
+            ..McpContext::default()
+        };
+
+        // Default: every todo/asset tool is hidden from the agent surface,
+        // while lifecycle tools stay available.
+        let held = coordination_tools_for_context(&session_context);
+        for tool in KERNEL_TODO_ASSET_TOOL_NAMES {
+            assert!(
+                !held.contains(tool),
+                "{tool} must be held back while the switch is off"
+            );
+        }
+        assert!(held.contains(&"start_task"));
+        assert!(held.contains(&"pcb_drc"));
+
+        // Dispatch is denied with unknown_tool, exactly like a retired tool.
+        let denied = dispatch_tool(&session_context, "list_todo_targets", json!({}));
+        assert_eq!(denied["ok"].as_bool(), Some(false));
+        assert_eq!(denied["error"]["code"].as_str(), Some("unknown_tool"));
+
+        // Flipping the repo-policy switch restores the full slice.
+        kernel
+            .update_repo_policy(&json!({"agent_todo_asset_tools_enabled": true}))
+            .unwrap();
+        let enabled = coordination_tools_for_context(&session_context);
+        for tool in KERNEL_TODO_ASSET_TOOL_NAMES {
+            assert!(
+                enabled.contains(tool),
+                "{tool} must return once the switch is on"
+            );
+        }
+
+        // And the kernel registry entry reports the switch + held tool list
+        // while keeping every tool visible in tools_json for the MCPs tab.
+        let registry = kernel
+            .update_workspace_mcp_server(
+                "workspace-todo-asset",
+                "coordination-kernel",
+                &json!({ "kernel_todo_asset_tools_enabled": false }),
+            )
+            .unwrap();
+        let servers = registry["servers"].as_array().unwrap();
+        let kernel_server = servers
+            .iter()
+            .find(|server| server["server_key"].as_str() == Some("coordination-kernel"))
+            .unwrap();
+        assert_eq!(
+            kernel_server["kernel_todo_asset_tools_enabled"].as_bool(),
+            Some(false)
+        );
+        let tools_json = kernel_server["tools_json"].as_array().unwrap();
+        for tool in KERNEL_TODO_ASSET_TOOL_NAMES {
+            assert!(
+                tools_json.iter().any(|value| value.as_str() == Some(tool)),
+                "{tool} must stay visible in the MCPs tab registry"
+            );
+        }
+        let held_json = kernel_server["held_agent_tools_json"].as_array().unwrap();
+        assert_eq!(held_json.len(), KERNEL_TODO_ASSET_TOOL_NAMES.len());
+        assert!(coordination_tools_for_context(&session_context)
+            .iter()
+            .all(|tool| !KERNEL_TODO_ASSET_TOOL_NAMES.contains(tool)));
+
+        // Plain enable/disable of the kernel server itself stays rejected.
+        let rejected = kernel.update_workspace_mcp_server(
+            "workspace-todo-asset",
+            "coordination-kernel",
+            &json!({ "workspace_enabled": false }),
+        );
+        assert!(rejected.is_err());
     }
 
     #[test]

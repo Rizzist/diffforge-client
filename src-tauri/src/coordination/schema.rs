@@ -68,6 +68,12 @@ pub const WORKSPACE_MCP_SECRETS_STATE_MIGRATION_NAME: &str =
 pub const WORKSPACE_MCP_SSH_TARGETS_MIGRATION_VERSION: i64 = 25;
 pub const WORKSPACE_MCP_SSH_TARGETS_MIGRATION_NAME: &str =
     "coordination_kernel_workspace_mcp_ssh_targets";
+// Repo-policy switch for exposing the kernel's todo/asset MCP tools to coding
+// agents. Default 0 (held back): the tools stay visible in the MCPs tab but are
+// not offered to the agent harness until the user flips the switch.
+pub const AGENT_TODO_ASSET_TOOLS_MIGRATION_VERSION: i64 = 26;
+pub const AGENT_TODO_ASSET_TOOLS_MIGRATION_NAME: &str =
+    "coordination_kernel_agent_todo_asset_tools_policy";
 
 // Stores whether the built-in Secrets MCP is exposed to coding agents for a
 // workspace. No row means disabled: the vault and its data stay available in

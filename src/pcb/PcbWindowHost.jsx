@@ -443,7 +443,6 @@ export default function PcbWindowHost() {
             </PanelCloseButton>
           </TerminalRailControls>
           <TerminalRailControls data-rail-row="secondary">
-            <PanelAgentPromptActivity items={agentPromptActivityItems} />
             <PanelIconButton
               aria-label="Prompt terminal agents"
               aria-pressed={agentPromptOpen ? "true" : "false"}
@@ -481,6 +480,11 @@ export default function PcbWindowHost() {
           </TerminalRailControls>
         </PanelChrome>
         <PanelBody>
+          {agentPromptActivityItems.length ? (
+            <PanelActivityOverlay>
+              <PanelAgentPromptActivity items={agentPromptActivityItems} />
+            </PanelActivityOverlay>
+          ) : null}
           <PcbWorkspacePane
             controlCommand={panelCommand}
             is_active
@@ -572,4 +576,20 @@ const PanelBody = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+`;
+
+// Prompt activity floats over the board content (matching the web panel's
+// in-page overlay) instead of riding in the window's button rail.
+const PanelActivityOverlay = styled.div`
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
+  display: flex;
+  justify-content: flex-end;
+  pointer-events: none;
+
+  > * {
+    pointer-events: auto;
+  }
 `;
