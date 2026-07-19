@@ -20,6 +20,10 @@ const TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID_NORMALIZED: &str = "diffforge_app_c
 const TODO_DISPATCH_APP_CONTROL_PANE_ID: &str = "forge-app-control-agent-terminal";
 
 static TODO_DISPATCH_RECEIPTS_CACHE: OnceLock<StdMutex<HashMap<String, Value>>> = OnceLock::new();
+/// Serializes receipt upserts (load → merge → save). Without it two settlers
+/// racing the same command (in-flight completion vs close-path interruption)
+/// could interleave load/save and let scheduling pick the surviving status.
+static TODO_DISPATCH_RECEIPT_UPSERT_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TODO_DISPATCH_DRAIN_NOTIFIED_AT: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
 #[derive(Default)]
 struct TodoDispatchAttentionNotificationState {
@@ -919,9 +923,49 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
         .to_string();
 
     let now_ms = todo_dispatch_now_ms();
+    // Hold the upsert guard across load → merge → save so two settlers of the
+    // same command cannot interleave (receipt settlement is deterministic).
+    let upsert_guard = TODO_DISPATCH_RECEIPT_UPSERT_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock();
     let current = todo_dispatch_load(workspace_id);
     let before_active = todo_dispatch_active_count(&current);
     let existing = current.get(&command_id).cloned().unwrap_or(Value::Null);
+
+    // Settlement precedence: a completed/final receipt wins over interrupted
+    // when both settle the same command. The close/restart interruption path
+    // races normal in-flight completion — an interruption that arrives AFTER
+    // the command already settled (completed/failed/cancelled/timed_out) must
+    // not rewrite history to "interrupted"; the reverse order already ends at
+    // the final status because the later completion overwrites.
+    let existing_status = todo_dispatch_normalize_status(
+        existing
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let incoming_status_raw = receipt
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let incoming_status = todo_dispatch_normalize_status(incoming_status_raw);
+    if !incoming_status_raw.trim().is_empty()
+        && incoming_status == "interrupted"
+        && existing_status != "interrupted"
+        && todo_dispatch_status_is_settled(&existing_status)
+    {
+        drop(upsert_guard);
+        log_terminal_status_event(
+            "backend.todo_dispatch.receipt_interrupt_after_settled_skip",
+            json!({
+                "command_id": command_id,
+                "existing_status": existing_status,
+                "reason": reason,
+                "workspace_id": workspace_id,
+            }),
+        );
+        return Ok(current);
+    }
 
     let mut merged = existing.as_object().cloned().unwrap_or_default();
     if let Some(incoming) = receipt.as_object() {
@@ -982,6 +1026,7 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
     let next = todo_dispatch_prune(&next, now_ms);
     let after_active = todo_dispatch_active_count(&next);
     todo_dispatch_save(workspace_id, &next);
+    drop(upsert_guard);
     if before_active != after_active || todo_dispatch_status_is_active(&status) {
         todo_store_orphan_sweep_trigger("todo_dispatch_receipt_status_changed");
     }
@@ -9353,6 +9398,120 @@ mod todo_store_tests {
             let _ = fs::remove_file(path);
         }
         if let Some(path) = queue_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Ok(mut cache) = TODO_DISPATCH_RECEIPTS_CACHE
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            cache.remove(&todo_dispatch_safe_workspace_id(&workspace_id));
+        }
+    }
+
+    #[test]
+    fn completed_receipt_beats_late_interrupted_on_same_command() {
+        let workspace_id = format!("test-receipt-precedence-{}", uuid::Uuid::new_v4());
+        let receipt_path = todo_dispatch_store_path(&workspace_id);
+
+        // Normal in-flight completion settles first...
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-race",
+                "item_id": "todo-race",
+                "pane_id": "pane-a",
+                "status": "completed",
+                "text": "finished work",
+            }),
+            "test_completed_receipt",
+        )
+        .unwrap();
+        // ...then the close/restart interruption path races in late: it must
+        // NOT rewrite the settled command to interrupted.
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-race",
+                "item_id": "todo-race",
+                "pane_id": "pane-a",
+                "status": "interrupted",
+                "status_reason": "terminal_closed",
+            }),
+            "test_late_interrupt",
+        )
+        .unwrap();
+        let receipts = todo_dispatch_load(&workspace_id);
+        assert_eq!(
+            receipts["command-race"]["status"].as_str(),
+            Some("completed"),
+            "completed receipt must win over a late interruption"
+        );
+
+        // Opposite arrival order still ends deterministically at completed.
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-race-2",
+                "item_id": "todo-race-2",
+                "pane_id": "pane-a",
+                "status": "interrupted",
+            }),
+            "test_early_interrupt",
+        )
+        .unwrap();
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-race-2",
+                "item_id": "todo-race-2",
+                "pane_id": "pane-a",
+                "status": "completed",
+            }),
+            "test_completion_after_interrupt",
+        )
+        .unwrap();
+        let receipts = todo_dispatch_load(&workspace_id);
+        assert_eq!(
+            receipts["command-race-2"]["status"].as_str(),
+            Some("completed"),
+        );
+
+        // An interruption of a still-active command keeps settling normally.
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-race-3",
+                "item_id": "todo-race-3",
+                "pane_id": "pane-a",
+                "status": "running",
+            }),
+            "test_running_receipt",
+        )
+        .unwrap();
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-race-3",
+                "item_id": "todo-race-3",
+                "pane_id": "pane-a",
+                "status": "interrupted",
+            }),
+            "test_interrupt_running",
+        )
+        .unwrap();
+        let receipts = todo_dispatch_load(&workspace_id);
+        assert_eq!(
+            receipts["command-race-3"]["status"].as_str(),
+            Some("interrupted"),
+        );
+
+        if let Some(path) = receipt_path {
             let _ = fs::remove_file(path);
         }
         if let Ok(mut cache) = TODO_DISPATCH_RECEIPTS_CACHE

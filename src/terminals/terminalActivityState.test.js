@@ -294,6 +294,46 @@ test("app-wide lifecycle side effects reject an unaccepted old-generation comple
   );
 });
 
+test("held-waiting stop never counts as an accepted completion", () => {
+  // WAITING regression: a rejected Stop held while the harness still owns
+  // background work is a completion-SHAPED frame the reducer refused to
+  // settle (turn stays open). Completing todos / deleting in-flight prompts
+  // on it is the exact false-completion class WAITING exists to prevent.
+  const heldStop = {
+    event_type: "provider-turn-completed",
+    turn_settlement_accepted: false,
+    ...canonicalCohort({
+      canonical_state: "waiting",
+      canonical_badge_label: "waiting",
+      turn_active: true,
+    }),
+  };
+  assert.equal(terminalLifecycleSettlementAccepted(heldStop), false);
+  assert.equal(terminalLifecycleSettlementSideEffectsAllowed(heldStop), false);
+  // Even without the explicit boolean, the waiting canonical state (turn
+  // still open) refuses completion settlement.
+  const heldStopLegacy = {
+    event_type: "provider-turn-completed",
+    ...canonicalCohort({
+      canonical_state: "waiting",
+      canonical_badge_label: "waiting",
+      turn_active: true,
+    }),
+  };
+  assert.equal(terminalLifecycleSettlementAccepted(heldStopLegacy), false);
+  // The true final Stop settles normally.
+  assert.equal(terminalLifecycleSettlementAccepted({
+    event_type: "provider-turn-completed",
+    turn_settlement_accepted: true,
+    ...canonicalCohort(),
+  }), true);
+  // Errors are terminal and keep settling regardless of the gate.
+  assert.equal(terminalLifecycleSettlementAccepted({
+    event_type: "provider-turn-error",
+    turn_settlement_accepted: false,
+  }), true);
+});
+
 test("retired instance tombstone rejects rollback while a newer epoch resets sequences", () => {
   const current = canonicalCohort({ instance_id: 8 });
   const retired = canonicalCohort({

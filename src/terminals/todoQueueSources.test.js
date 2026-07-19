@@ -100,6 +100,76 @@ test("running todo receipt is current only for matching live provider session", 
   assert.equal(items[0].stale_active, false);
 });
 
+test("identity-less direct-prompt receipt stays bound to the pane as current", () => {
+  // Direct typed prompts record neither session nor instance identity: the
+  // backend capture receipt only carries command/item/pane/status/text. It
+  // must NOT be rewritten to interrupted while the turn runs.
+  const items = normalizeTodoQueueTerminalReceipts({
+    "cmd-direct": {
+      command_id: "cmd-direct",
+      item_id: "todo-direct",
+      pane_id: "workspace-terminal-ws-0-claude",
+      received_at_ms: 1000,
+      status: "running",
+      text: "Typed straight into the terminal",
+    },
+  }, "workspace-terminal-ws-0-claude", {
+    instance_id: "instance-1",
+    session_id: "live-provider-session",
+  });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].is_current, true);
+  assert.equal(items[0].status, "running");
+  assert.equal(items[0].original_status, "");
+  assert.equal(items[0].stale_active, false);
+});
+
+test("receipt carrying a mismatching session is interrupted even without instance identity", () => {
+  const items = normalizeTodoQueueTerminalReceipts({
+    "cmd-stale": {
+      command_id: "cmd-stale",
+      item_id: "todo-stale",
+      pane_id: "workspace-terminal-ws-0-claude",
+      provider_session_id: "other-provider-session",
+      received_at_ms: 1000,
+      status: "running",
+      text: "Belongs to another session",
+    },
+  }, "workspace-terminal-ws-0-claude", {
+    instance_id: "instance-1",
+    session_id: "live-provider-session",
+  });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].is_current, false);
+  assert.equal(items[0].status, "interrupted");
+  assert.equal(items[0].stale_active, true);
+});
+
+test("identity-less receipt on a restarted sessionless terminal stays current", () => {
+  // The receipt itself names no session or instance, so a restarted live
+  // terminal (no session yet, fresh instance) is not evidence of staleness.
+  const items = normalizeTodoQueueTerminalReceipts({
+    "cmd-direct": {
+      command_id: "cmd-direct",
+      item_id: "todo-direct",
+      pane_id: "workspace-terminal-ws-0-claude",
+      received_at_ms: 1000,
+      status: "running",
+      text: "Typed straight into the terminal",
+    },
+  }, "workspace-terminal-ws-0-claude", {
+    instance_id: "new-instance",
+    session_id: "",
+  });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].is_current, true);
+  assert.equal(items[0].status, "running");
+  assert.equal(items[0].stale_active, false);
+});
+
 test("remote control source is preserved through queued auto dispatch", () => {
   assert.equal(
     getTodoQueueAutoQueueSourceForSource({ source: TODO_QUEUE_SOURCE_REMOTE_CONTROL }),

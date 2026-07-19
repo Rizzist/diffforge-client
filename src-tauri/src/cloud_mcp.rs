@@ -44161,6 +44161,42 @@ fn cloud_mcp_agent_chat_status_sync_request_from_hook(
     })
 }
 
+/// Per-session last-synced status memo for the hook-driven agent_chat status
+/// sync. Every passive frame of a held-WAITING session qualifies for the
+/// relevance gate, and each spawned sync scans the transcript before its
+/// metadata dedup — without coalescing a long waiting hold turns into an
+/// unbounded rescan backlog. Key: `provider:provider_session_id`.
+static CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO: OnceLock<StdMutex<HashMap<String, String>>> =
+    OnceLock::new();
+const CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO_MAX: usize = 2048;
+
+/// True when this hook-driven status sync should be SKIPPED: the session's
+/// last synced status is already "waiting" and nothing else about the sync
+/// request changed. Every other status (and any changed waiting fingerprint)
+/// records itself in the memo and syncs — status TRANSITIONS always land.
+fn cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+    provider: &str,
+    provider_session_id: &str,
+    status: &str,
+    fingerprint: &str,
+) -> bool {
+    let memo =
+        CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO.get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut map) = memo.lock() else {
+        return false;
+    };
+    let key = format!("{provider}:{provider_session_id}");
+    let entry = format!("{status}|{fingerprint}");
+    if status == "waiting" && map.get(&key).is_some_and(|existing| existing == &entry) {
+        return true;
+    }
+    if map.len() >= CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO_MAX && !map.contains_key(&key) {
+        map.clear();
+    }
+    map.insert(key, entry);
+    false
+}
+
 fn cloud_mcp_sync_agent_chat_session_status_from_hook(
     state: &CloudMcpState,
     payload: &TerminalActivityHookPayload,
@@ -44178,6 +44214,27 @@ fn cloud_mcp_sync_agent_chat_session_status_from_hook(
     ) else {
         return;
     };
+    let waiting_fingerprint = format!(
+        "{}|{}|{}|{}|{}|{}",
+        request.context.workspace_id,
+        request.context.thread_id,
+        request.context.pane_id,
+        request
+            .context
+            .terminal_instance_id
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        request.context.session_mode,
+        request.cwd,
+    );
+    if cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+        &request.provider,
+        &request.provider_session_id,
+        &request.context.status,
+        &waiting_fingerprint,
+    ) {
+        return;
+    }
     if cloud_mcp_agent_chat_turn_git_should_clear(payload, state_value, turn_status) {
         cloud_mcp_agent_chat_turn_git_clear_session(
             &request.provider,
@@ -44192,6 +44249,57 @@ fn cloud_mcp_sync_agent_chat_session_status_from_hook(
         request.context,
         "terminal_activity_hook_status",
     );
+}
+
+#[cfg(test)]
+mod cloud_mcp_agent_chat_status_sync_memo_tests {
+    use super::*;
+
+    #[test]
+    fn waiting_status_sync_coalesces_per_session_until_something_changes() {
+        let session = format!("ses-{}", uuid::Uuid::new_v4());
+        // First waiting sync for a session always lands.
+        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo",
+        ));
+        // Every further identical passive waiting frame is coalesced.
+        assert!(cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo",
+        ));
+        assert!(cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo",
+        ));
+        // A changed fingerprint (something else about the request changed)
+        // syncs again — then coalesces again.
+        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo",
+        ));
+        assert!(cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo",
+        ));
+        // A status TRANSITION always syncs, and re-arms the waiting memo.
+        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo",
+        ));
+        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo",
+        ));
+        assert!(cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo",
+        ));
+        // Non-waiting statuses are never coalesced by this memo.
+        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo",
+        ));
+        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo",
+        ));
+        // Sessions are independent.
+        let other = format!("ses-{}", uuid::Uuid::new_v4());
+        assert!(!cloud_mcp_agent_chat_status_sync_is_duplicate_waiting(
+            "opencode", &other, "waiting", "ws-1|thread-1|pane-1|8|native|/repo",
+        ));
+    }
 }
 
 fn cloud_mcp_agent_chat_turn_git_should_clear(

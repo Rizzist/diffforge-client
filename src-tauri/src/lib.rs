@@ -695,6 +695,13 @@ struct TerminalStructuredInteraction {
     pane_id: String,
     instance_id: u64,
     provider: String,
+    /// Provider session id stamped when the interaction OPENS (empty when the
+    /// opening event carried none). Request/tool ids are only unique WITHIN a
+    /// provider session (OpenCode namespaces them by session), so resolution
+    /// matchers require session equality whenever both sides carry one — a
+    /// delayed event from session A must not unlatch session B after an
+    /// in-PTY relaunch reuses an id.
+    provider_session_id: String,
     provider_request_id: String,
     prompt_id: String,
     hook_event_name: String,

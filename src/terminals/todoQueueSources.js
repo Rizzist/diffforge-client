@@ -80,9 +80,17 @@ export function normalizeTodoQueueTerminalReceipts(receipts, paneId, options = {
       );
       const rawStatus = normalizeTodoQueueSourceValue(receipt.status).toLowerCase() || "queued";
       const active = TODO_QUEUE_ACTIVE_RECEIPT_STATUSES.has(rawStatus);
+      // An active receipt is only rewritten to "interrupted" when it CARRIES
+      // identity that the live terminal cannot confirm: a receipt naming a
+      // session must match the live session, and a receipt naming an
+      // instance must match the live instance. Identity-less receipts (e.g.
+      // direct typed prompts captured by the backend, which record neither a
+      // session nor an instance) stay bound to the pane so the current todo
+      // keeps showing while the turn runs.
       const sessionMatches = Boolean(liveSessionId && receiptSessions.has(liveSessionId));
+      const sessionKnownStale = Boolean(receiptSessions.size > 0 && !sessionMatches);
       const instanceKnownStale = Boolean(liveInstanceId && receiptInstanceId && receiptInstanceId !== liveInstanceId);
-      const isCurrent = Boolean(active && sessionMatches && !instanceKnownStale);
+      const isCurrent = Boolean(active && !sessionKnownStale && !instanceKnownStale);
       const staleActive = Boolean(active && !isCurrent);
       return {
         command_id: commandId,

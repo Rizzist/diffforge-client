@@ -8305,9 +8305,15 @@ mod terminal_cli_tests {
         // Drain-all reconciliation: when a provider request disappears from
         // the pending list, EVERY queued generation of that interaction key
         // must resolve (oldest-first, newest-last) — a head-only resolution
-        // strands the Rust-side latch on the newest generation.
+        // strands the Rust-side latch on the newest generation. The drain is
+        // BOUNDED to the pre-await snapshot length: a generation appended
+        // while the provider list fetch was in flight (request-id reuse) was
+        // never covered by the absence evidence and must stay queued.
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains(
+            "let drainBudget = Math.min(queued.length, capturedGeneration.queued_length || 0)"
+        ));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
-            .contains("let drainBudget = queued.length"));
+            .contains("queued_length: queued.length"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("interaction_id: current.interaction_id"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
@@ -10818,6 +10824,7 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
             .set(interactionKey, {
               interaction_id: generation.interaction_id,
               interaction_revision: generation.interaction_revision,
+              queued_length: queued.length,
             });
         }
       }
@@ -10853,7 +10860,13 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
           // lands last — Rust latches the newest generation, and a head-only
           // resolution (process killed/replaced before the next pass) would
           // strand that latch in UIR forever.
-          let drainBudget = queued.length;
+          //
+          // Bounded to the PRE-await snapshot: a generation appended while
+          // the provider list fetch was in flight (request-id reuse) was
+          // never covered by this absence evidence and may still be live —
+          // it stays queued for the next pass / the native-resolution path,
+          // which performs its own fresh final validation.
+          let drainBudget = Math.min(queued.length, capturedGeneration.queued_length || 0);
           while (drainBudget > 0) {
             const current = (interactionGenerations.get(interactionKey) || [])[0];
             if (!current || current.interaction_kind !== kind) break;

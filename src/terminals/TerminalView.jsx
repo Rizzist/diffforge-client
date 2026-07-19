@@ -197,6 +197,7 @@ import {
   terminalActivityStatusIsPaused,
   terminalActivityStatusIsSendable,
   terminalAgentUsesActivityHooks,
+  terminalLifecycleSettlementAccepted,
 } from "./terminalActivityState.js";
 import {
   TODO_QUEUE_DEFAULT_DOT_COLOR,
@@ -24241,7 +24242,13 @@ function TerminalView({
       const payload = hookEvent?.payload || {};
       const eventType = todoQueueLifecycleEventType(payload.event_type || payload.type);
       const promptSubmitHook = todoQueueLifecycleEventIsProviderHookPromptSubmit(eventType, payload);
-      const completionHook = todoQueueLifecycleEventIsProviderHookCompletion(eventType);
+      // Settlement gate: a completion-shaped frame the canonical reducer did
+      // NOT accept (turn_settlement_accepted withheld — e.g. a stale Stop
+      // held in WAITING while the harness still owns background work) must
+      // never settle todos or delete the in-flight prompt. Errors always
+      // settle; frames without settlement fields keep legacy behavior.
+      const completionHook = todoQueueLifecycleEventIsProviderHookCompletion(eventType)
+        && terminalLifecycleSettlementAccepted(payload);
       const lifecycleEventType = eventType || (promptSubmitHook ? "provider-turn-started" : "");
       if (!lifecycleEventType && !completionHook) {
         return;
@@ -24323,7 +24330,7 @@ function TerminalView({
         ).trim()
         || String(payload.user_message || payload.message || "").trim(),
       );
-      if (eventType === "provider-turn-completed" && turnPromptEvidence) {
+      if (completionHook && eventType === "provider-turn-completed" && turnPromptEvidence) {
         triggerTodoCompletionFlash(payloadPaneId || getTerminalPaneId(terminalIndex));
         if (!todoQueueTerminalInFlightPromptsRef.current.get(terminalIndex)) {
           window.dispatchEvent(new CustomEvent(TODO_COMPLETED_NOTIFICATION_EVENT, {

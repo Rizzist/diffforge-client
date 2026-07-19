@@ -2729,6 +2729,7 @@ fn terminal_reduce_canonical_state(
                 authoritative_event.event_interaction_id.as_deref(),
                 authoritative_event.event_interaction_revision,
                 terminal_activity_payload_resolution_request_id(authoritative_event).as_deref(),
+                &terminal_activity_payload_session_id(authoritative_event),
             )
         });
     // Tool-execution evidence: a permission prompt bound to a specific tool
@@ -3050,7 +3051,22 @@ fn terminal_apply_canonical_projection_to_payload(
         // completion tuple — emitting input_ready=true would disable Escape
         // in the UI and project remote awaiting_input while the harness
         // still owns background work. The turn is open: no readiness or
-        // completion stamps may ride along.
+        // completion stamps may ride along. The event TYPE is part of the
+        // completion tuple as well: leaving "provider-turn-completed" (or
+        // "provider-turn-interrupted") on a held frame let webview consumers
+        // settle todos / delete in-flight prompts on it — no consumer may
+        // ever see a completion-shaped held event, so those frames are
+        // rewritten to the waiting lifecycle shape. Passive frames (tool
+        // activity and other non-settlement hooks) keep their own event
+        // identity; rejected errors keep the caller's dedicated stale-error
+        // rewrite.
+        if matches!(
+            terminal_projection_text(&payload.event_type, "").as_str(),
+            "provider_turn_completed" | "provider_turn_interrupted"
+        ) {
+            payload.event_type = "provider-turn-waiting".to_string();
+            payload.hook_event_name = "Stop".to_string();
+        }
         payload.status = "active".to_string();
         payload.activity_status = "waiting".to_string();
         payload.command_phase = "background_waiting".to_string();
@@ -5870,6 +5886,12 @@ struct TerminalLiveSessionSummary {
     active_interaction_id: Option<String>,
     active_interaction_revision: Option<u64>,
     interaction_actionable: bool,
+    /// WAITING cue fields: the summary is consumed by AppShell and the cloud
+    /// snapshot normalizer, which copy both through verbatim. Omitting them
+    /// here let routine lifecycle refreshes erase the advertised waiting
+    /// counts/active cue end-to-end.
+    background_work_active: bool,
+    background_task_counts: Option<TerminalBackgroundTaskCounts>,
     status: String,
     activity_status: String,
     command_phase: String,
@@ -16322,12 +16344,20 @@ fn terminal_activity_hook_claude_stop_has_background_work(event: &Value) -> bool
 fn terminal_activity_hook_background_task_counts(
     event: &Value,
 ) -> Option<TerminalBackgroundTaskCounts> {
+    // Only actual ARRAYS are evidence. The CLI hook normalizer inserts
+    // `"background_tasks": null` / `"session_crons": null` on EVERY hook it
+    // forwards, so a present-but-null field is indistinguishable from an
+    // absent one — treating it as evidence returned Some(zero) on every
+    // passive frame and overwrote the latched nonzero counts. An EMPTY array
+    // remains legitimate zero-evidence.
     let tasks = event
         .get("background_tasks")
-        .or_else(|| event.get("backgroundTasks"));
+        .or_else(|| event.get("backgroundTasks"))
+        .filter(|value| value.is_array());
     let crons = event
         .get("session_crons")
-        .or_else(|| event.get("sessionCrons"));
+        .or_else(|| event.get("sessionCrons"))
+        .filter(|value| value.is_array());
     if tasks.is_none() && crons.is_none() {
         return None;
     }
@@ -20036,11 +20066,28 @@ fn terminal_activity_hook_buffer_final_stop_candidate(
     );
 }
 
+/// Session-scoped identity gate for resolution matching: request/tool ids
+/// are only unique WITHIN a provider session (OpenCode namespaces them by
+/// session), so when BOTH the latched interaction and the resolving evidence
+/// carry a session id they must agree. Either side missing a session keeps
+/// the pre-session behavior (no gate).
+fn terminal_structured_interaction_session_gate_allows(
+    interaction: &TerminalStructuredInteraction,
+    resolved_session_id: &str,
+) -> bool {
+    let interaction_session = interaction.provider_session_id.trim();
+    let resolved_session = resolved_session_id.trim();
+    interaction_session.is_empty()
+        || resolved_session.is_empty()
+        || interaction_session == resolved_session
+}
+
 fn terminal_structured_interaction_matches_resolution(
     interaction: &TerminalStructuredInteraction,
     resolved_interaction_id: Option<&str>,
     resolved_interaction_revision: Option<u64>,
     resolved_request_id: Option<&str>,
+    resolved_session_id: &str,
 ) -> bool {
     let exact = resolved_interaction_id == Some(interaction.interaction_id.as_str())
         && resolved_interaction_revision == Some(interaction.revision)
@@ -20060,9 +20107,12 @@ fn terminal_structured_interaction_matches_resolution(
     // interactions (Claude/Codex) keep strict exact-match: their transport is
     // synchronous and request ids can be reused across generations. An
     // UNcorrelated resolution (no resolved interaction id) must keep using the
-    // answer-confirmation path, never this fallback.
+    // answer-confirmation path, never this fallback. Request identity is only
+    // durable WITHIN a session, so the fallback additionally requires session
+    // equality when both sides carry a session id.
     interaction.response_mode == "provider_api"
         && resolved_interaction_id.is_some()
+        && terminal_structured_interaction_session_gate_allows(interaction, resolved_session_id)
         && resolved_request_id.is_some_and(|request_id| {
             !request_id.trim().is_empty()
                 && (interaction.provider_request_id == request_id
@@ -20100,6 +20150,14 @@ fn terminal_structured_interaction_tool_evidence_resolves(
     else {
         return false;
     };
+    // Tool ids are session-scoped: evidence from another provider session
+    // (id reuse after an in-PTY relaunch) proves nothing about this prompt.
+    if !terminal_structured_interaction_session_gate_allows(
+        interaction,
+        &terminal_activity_payload_session_id(payload),
+    ) {
+        return false;
+    }
     let bound_to_tool = interaction.provider_request_id == tool_use_id
         || interaction.prompt_id == tool_use_id
         || interaction.prompt_metadata.permission_request_id.as_deref() == Some(tool_use_id);
@@ -20279,6 +20337,10 @@ fn terminal_structured_interaction_reconcile(
                 pane_id: payload.pane_id.clone(),
                 instance_id: payload.instance_id,
                 provider: payload.provider.clone(),
+                // Stamped at OPEN: the provider session that owns this
+                // prompt's request/tool ids. Resolution matchers require
+                // session equality whenever both sides carry one.
+                provider_session_id: terminal_activity_payload_session_id(payload),
                 provider_request_id,
                 prompt_id: payload.prompt_id.clone().unwrap_or_default(),
                 hook_event_name: payload.hook_event_name.clone(),
@@ -20384,6 +20446,7 @@ fn terminal_structured_interaction_reconcile(
                             payload.event_interaction_id.as_deref(),
                             payload.event_interaction_revision,
                             resolved_request_id.as_deref(),
+                            &terminal_activity_payload_session_id(payload),
                         )
                 };
                 // Tool-execution evidence proves a TUI-answered prompt even
@@ -30786,6 +30849,11 @@ async fn terminal_live_sessions(
             active_interaction_id: runtime.active_interaction_id.clone(),
             active_interaction_revision: runtime.active_interaction_revision,
             interaction_actionable: runtime.interaction_actionable,
+            // WAITING is the state in which the harness still owns live
+            // background work; the latched counts ride along so refreshes
+            // never erase the cue.
+            background_work_active: runtime.canonical_state == "waiting",
+            background_task_counts: runtime.background_task_counts,
             status: runtime.status,
             activity_status: runtime.activity_status,
             command_phase: runtime.command_phase,
@@ -31360,6 +31428,7 @@ mod terminal_tests {
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "codex".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "request-1".to_string(),
             prompt_id: "request-1".to_string(),
             hook_event_name: if method == "mcpServer/elicitation/request" {
@@ -32860,6 +32929,7 @@ mod terminal_tests {
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "codex".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "codex-hook-trust-catalog-deadbeef".to_string(),
             prompt_id: "codex-hook-trust-catalog-deadbeef".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
@@ -32889,6 +32959,7 @@ mod terminal_tests {
 
         let generic = TerminalStructuredInteraction {
             provider: "other".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "request-1".to_string(),
             options: vec![TerminalActivityHookPromptOption {
                 id: "allow_once".to_string(),
@@ -32969,6 +33040,7 @@ mod terminal_tests {
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "codex".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "request-free-text".to_string(),
             prompt_id: "prompt-free-text".to_string(),
             hook_event_name: "UserInputRequired".to_string(),
@@ -33078,6 +33150,7 @@ mod terminal_tests {
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "codex".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "codex-hook-trust-catalog-deadbeef".to_string(),
             prompt_id: "codex-hook-trust-catalog-deadbeef".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
@@ -36265,6 +36338,7 @@ notifications = true
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "opencode".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "req-1".to_string(),
             prompt_id: "req-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
@@ -36459,6 +36533,7 @@ notifications = true
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "claude".to_string(),
+            provider_session_id: "session-1".to_string(),
             provider_request_id: tool_use_id.to_string(),
             prompt_id: tool_use_id.to_string(),
             hook_event_name: "PermissionRequest".to_string(),
@@ -36523,6 +36598,25 @@ notifications = true
         assert!(!terminal_structured_interaction_tool_evidence_resolves(
             &interaction,
             &prompting,
+        ));
+
+        // Session-bound evidence: the same tool id observed under ANOTHER
+        // provider session (id reuse after an in-PTY relaunch) proves
+        // nothing about this prompt.
+        let mut other_session = tool_done.clone();
+        other_session.provider_session_id = Some("session-2".to_string());
+        other_session.native_session_id = Some("session-2".to_string());
+        assert!(!terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &other_session,
+        ));
+        // Absent session on the evidence side keeps the pre-session behavior.
+        let mut sessionless_evidence = tool_done.clone();
+        sessionless_evidence.provider_session_id = None;
+        sessionless_evidence.native_session_id = None;
+        assert!(terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &sessionless_evidence,
         ));
 
         // PreToolUse: the same-id event that TRIGGERED the prompt can arrive
@@ -38825,6 +38919,23 @@ notifications = true
         assert_eq!(emitted.command_phase, "background_waiting");
         assert!(emitted.completed_at.is_none());
         assert!(!emitted.turn_settlement_accepted);
+        assert_eq!(
+            emitted.event_type, "provider-turn-waiting",
+            "a held Stop must never leave completion-shaped on the wire"
+        );
+        assert_eq!(emitted.hook_event_name, "Stop");
+
+        // A passive tool frame held in waiting keeps its own event identity.
+        let mut tool_frame = waiting_test_payload("provider-tool-completed", false);
+        tool_frame.hook_event_name = "PostToolUse".to_string();
+        tool_frame.input_ready = false;
+        let tool_projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &tool_frame, None, false, false);
+        if tool_projection.canonical_state == "waiting" {
+            let mut emitted_tool = tool_frame.clone();
+            terminal_apply_canonical_projection_to_payload(&mut emitted_tool, &tool_projection);
+            assert_eq!(emitted_tool.event_type, "provider-tool-completed");
+        }
 
         // Accepted parks stay busy on the wire as well.
         let thinking = waiting_test_runtime_thinking();
@@ -38834,6 +38945,7 @@ notifications = true
         terminal_apply_canonical_projection_to_payload(&mut emitted, &projection);
         assert_eq!(emitted.canonical_state, "waiting");
         assert!(!emitted.input_ready);
+        assert_eq!(emitted.event_type, "provider-turn-waiting");
     }
 
     /// The waiting ordering identity is stamped from the PARKING event's
@@ -39298,6 +39410,7 @@ notifications = true
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "codex".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "codex-question-1".to_string(),
             prompt_id: "codex-question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
@@ -39397,6 +39510,7 @@ notifications = true
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "claude".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "permission-denied-1".to_string(),
             prompt_id: "permission-denied-1".to_string(),
             hook_event_name: "PermissionDenied".to_string(),
@@ -39432,6 +39546,7 @@ notifications = true
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "claude".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "permission-1".to_string(),
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
@@ -39476,6 +39591,7 @@ notifications = true
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "claude".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "question-1".to_string(),
             prompt_id: "question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
@@ -39519,6 +39635,7 @@ notifications = true
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "claude".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "question-1".to_string(),
             prompt_id: "question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
@@ -39561,6 +39678,7 @@ notifications = true
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "opencode".to_string(),
+            provider_session_id: "session-a".to_string(),
             provider_request_id: "permission-1".to_string(),
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
@@ -39579,6 +39697,7 @@ notifications = true
             Some("uir:permission-1"),
             Some(8),
             Some("permission-1"),
+            "session-a",
         ));
         // Provider-API interactions accept an explicitly correlated
         // resolution whose provider request id matches, even when the
@@ -39588,12 +39707,51 @@ notifications = true
             Some("uir:permission-1"),
             Some(7),
             Some("permission-1"),
+            "session-a",
         ));
         assert!(terminal_structured_interaction_matches_resolution(
             &interaction,
             Some("uir:permission-old"),
             Some(8),
             Some("permission-1"),
+            "session-a",
+        ));
+        // Session-bound fallback: a resolution from ANOTHER provider session
+        // never resolves this prompt via request identity (OpenCode
+        // namespaces request ids by session; reuse after an in-PTY relaunch
+        // must not unlatch a different session's prompt).
+        assert!(!terminal_structured_interaction_matches_resolution(
+            &interaction,
+            Some("uir:permission-1"),
+            Some(7),
+            Some("permission-1"),
+            "session-b",
+        ));
+        // Absent session on either side keeps the pre-session behavior.
+        assert!(terminal_structured_interaction_matches_resolution(
+            &interaction,
+            Some("uir:permission-1"),
+            Some(7),
+            Some("permission-1"),
+            "",
+        ));
+        let mut sessionless = interaction.clone();
+        sessionless.provider_session_id = String::new();
+        assert!(terminal_structured_interaction_matches_resolution(
+            &sessionless,
+            Some("uir:permission-1"),
+            Some(7),
+            Some("permission-1"),
+            "session-b",
+        ));
+        // Exact id+revision identity stays authoritative regardless of the
+        // carried session (globally unique, no reuse possible).
+        assert!(terminal_structured_interaction_matches_resolution(
+            &interaction,
+            Some("uir:permission-1"),
+            Some(8),
+            Some("permission-1"),
+            "session-b",
         ));
         // No request identity: drifted generations stay rejected.
         assert!(!terminal_structured_interaction_matches_resolution(
@@ -39601,6 +39759,7 @@ notifications = true
             Some("uir:permission-1"),
             Some(7),
             None,
+            "session-a",
         ));
         // Wrong request identity never matches.
         assert!(!terminal_structured_interaction_matches_resolution(
@@ -39608,6 +39767,7 @@ notifications = true
             Some("uir:permission-1"),
             Some(7),
             Some("permission-other"),
+            "session-a",
         ));
         // Uncorrelated resolutions (no resolved interaction id) must keep
         // using the answer-confirmation path, not the request-id fallback.
@@ -39616,6 +39776,7 @@ notifications = true
             None,
             None,
             Some("permission-1"),
+            "session-a",
         ));
         // Blocking-hook (Claude/Codex) interactions stay strict exact-match.
         let mut blocking = interaction.clone();
@@ -39626,12 +39787,14 @@ notifications = true
             Some("uir:permission-1"),
             Some(7),
             Some("permission-1"),
+            "session-a",
         ));
         assert!(terminal_structured_interaction_matches_resolution(
             &blocking,
             Some("uir:permission-1"),
             Some(8),
             Some("permission-1"),
+            "session-a",
         ));
     }
 
@@ -39643,6 +39806,7 @@ notifications = true
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "claude".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "plan-1".to_string(),
             prompt_id: "plan-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
@@ -39724,6 +39888,7 @@ notifications = true
             pane_id: "pane-1".to_string(),
             instance_id: 1,
             provider: "opencode".to_string(),
+            provider_session_id: String::new(),
             provider_request_id: "permission-1".to_string(),
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
@@ -39916,6 +40081,31 @@ notifications = true
                 &json!({"background_tasks": [], "session_crons": []})
             ),
             Some(TerminalBackgroundTaskCounts::default())
+        );
+        // Present-but-NULL fields are NO evidence: the CLI hook normalizer
+        // stamps both keys as null on every forwarded hook, and passive
+        // frames must never zero the latched counts.
+        assert_eq!(
+            terminal_activity_hook_background_task_counts(
+                &json!({"background_tasks": null, "session_crons": null})
+            ),
+            None
+        );
+        // Non-array garbage is not evidence either.
+        assert_eq!(
+            terminal_activity_hook_background_task_counts(
+                &json!({"background_tasks": "busy", "session_crons": {"c1": true}})
+            ),
+            None
+        );
+        // A null field next to a real array: the array alone is authoritative.
+        assert_eq!(
+            terminal_activity_hook_background_task_counts(&json!({
+                "background_tasks": null,
+                "session_crons": [{ "id": "c1", "state": "queued" }],
+            }))
+            .map(|counts| counts.monitors),
+            Some(1)
         );
     }
 

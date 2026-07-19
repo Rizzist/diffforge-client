@@ -4086,7 +4086,15 @@ fn tokenomics_provider_account(provider: &str, agent_kind: &str) -> TokenomicsPr
             .and_then(tokenomics_read_json_file), None),
         "claude" => (tokenomics_claude_auth_value(), None),
         "opencode" => {
-            let active_root = agent_accounts_active_profile_dir("opencode").map(PathBuf::from);
+            // LAUNCH authority, not the raw registry selector: the Default
+            // selector resolves to None while the launched process can be
+            // bound to a CAPTURED effective profile. Session ingestion
+            // (`opencode_data_home`) already resolves via the launch
+            // authority; using the raw selector here parked the identity
+            // sidecar at `<profile>/opencode` instead of the canonical
+            // `<profile>` root and minted a second random first-seen
+            // identity — splitting usage across phantom accounts.
+            let active_root = agent_accounts_profile_home_for_launch("opencode");
             let found = opencode_data_home().into_iter().find_map(|home| {
                 let auth = tokenomics_read_json_file(home.join("auth.json"))?;
                 let identity_home = active_root
