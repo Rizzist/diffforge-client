@@ -67595,6 +67595,7 @@ mod cloud_mcp_tests {
             session_state: "session_attached".to_string(),
             input_ready: false,
             background_work_active: false,
+            background_task_counts: None,
             input_ready_at: None,
             prompt_ready_at: None,
             completed_at: None,

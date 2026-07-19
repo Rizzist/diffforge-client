@@ -1140,6 +1140,10 @@ struct TerminalRuntimeSnapshot {
     /// time moves on unrelated writes (provider-session recording) and lives
     /// on a different clock than hook fire time.
     waiting_origin_ms: u64,
+    /// Last-known live background work counts (from Claude Stop evidence);
+    /// latched so passive frames while WAITING keep the visual cue. None =
+    /// no evidence yet.
+    background_task_counts: Option<TerminalBackgroundTaskCounts>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1223,6 +1227,7 @@ impl TerminalRuntimeSnapshot {
             hook_event_name: "TerminalOpen".to_string(),
             updated_at_ms: now_ms,
             waiting_origin_ms: 0,
+            background_task_counts: None,
         }
     }
 
@@ -2359,6 +2364,27 @@ struct TerminalActivityHookPromptOption {
     danger: Option<bool>,
 }
 
+/// Counts of live harness-owned background work, classified from the Claude
+/// Code Stop hook's `background_tasks` / `session_crons` evidence. Drives the
+/// WAITING visual cue (client + dashboard): the user sees WHAT the session is
+/// waiting on.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+struct TerminalBackgroundTaskCounts {
+    shells: u32,
+    subagents: u32,
+    monitors: u32,
+    other: u32,
+}
+
+impl TerminalBackgroundTaskCounts {
+    fn total(&self) -> u32 {
+        self.shells
+            .saturating_add(self.subagents)
+            .saturating_add(self.monitors)
+            .saturating_add(self.other)
+    }
+}
+
 #[derive(Serialize, Clone)]
 struct TerminalActivityHookPayload {
     pane_id: String,
@@ -2407,6 +2433,8 @@ struct TerminalActivityHookPayload {
     session_state: String,
     input_ready: bool,
     background_work_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    background_task_counts: Option<TerminalBackgroundTaskCounts>,
     input_ready_at: Option<String>,
     prompt_ready_at: Option<String>,
     completed_at: Option<String>,

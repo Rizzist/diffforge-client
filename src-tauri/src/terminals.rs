@@ -1814,6 +1814,19 @@ fn terminal_runtime_apply_activity_payload(
             &projection,
             terminal_event_rejected,
         ),
+        background_task_counts: if terminal_event_rejected {
+            previous.background_task_counts
+        } else if payload.background_task_counts.is_some() {
+            payload.background_task_counts
+        } else if matches!(
+            projection.canonical_state.as_str(),
+            "idle" | "interrupted" | "error" | "closing"
+        ) {
+            // Settled/terminal states owe no background cue.
+            None
+        } else {
+            previous.background_task_counts
+        },
     };
     *runtime = snapshot.clone();
     (snapshot, projection)
@@ -2950,6 +2963,20 @@ fn terminal_apply_canonical_projection_to_payload(
         payload.input_ready_at.get_or_insert_with(|| now.clone());
         payload.prompt_ready_at.get_or_insert_with(|| now.clone());
         payload.completed_at.get_or_insert(now);
+    } else if projection.canonical_state == "waiting" {
+        // WAITING is busy on the WIRE too, not just in the stored runtime:
+        // a held (rejected) same-turn stale Stop still carries its original
+        // completion tuple — emitting input_ready=true would disable Escape
+        // in the UI and project remote awaiting_input while the harness
+        // still owns background work. The turn is open: no readiness or
+        // completion stamps may ride along.
+        payload.status = "active".to_string();
+        payload.activity_status = "waiting".to_string();
+        payload.command_phase = "background_waiting".to_string();
+        payload.input_ready = false;
+        payload.input_ready_at = None;
+        payload.prompt_ready_at = None;
+        payload.completed_at = None;
     }
 }
 
@@ -2971,6 +2998,11 @@ fn terminal_apply_projected_runtime_to_payload(
     payload.terminal_work_state = projected.terminal_work_state;
     payload.turn_status = projected.turn_status;
     payload.session_state = projected.session_state;
+    if payload.background_task_counts.is_none() {
+        // Passive frames while WAITING carry no task evidence of their own —
+        // backfill the latched counts so every emitted frame keeps the cue.
+        payload.background_task_counts = runtime.background_task_counts;
+    }
 }
 
 fn terminal_projection_display_name(metadata: &TerminalInstanceMetadata) -> String {
@@ -15384,6 +15416,7 @@ fn emit_terminal_prompt_submitted_activity_started(
         hook_event_name: "BackendPromptSubmit".to_string(),
         updated_at_ms: now_ms,
         waiting_origin_ms: 0,
+        background_task_counts: previous_runtime.background_task_counts,
     };
     let projected_runtime = terminal_project_runtime(&metadata, &synthetic_runtime, false);
     let mut payload = TerminalActivityHookPayload {
@@ -15432,6 +15465,7 @@ fn emit_terminal_prompt_submitted_activity_started(
         session_state: projected_runtime.session_state,
         input_ready: false,
         background_work_active: false,
+        background_task_counts: None,
         input_ready_at: None,
         prompt_ready_at: Some(event_time),
         completed_at: None,
@@ -16088,6 +16122,68 @@ fn terminal_activity_hook_background_field_is_active(event: &Value, keys: &[&str
 
 fn terminal_activity_hook_claude_stop_has_background_work(event: &Value) -> bool {
     terminal_activity_hook_background_field_is_active(event, &["background_tasks", "session_crons"])
+}
+
+/// Classify LIVE background work from the hook event into user-facing counts
+/// (shells / subagents / monitors / other). Field names are defensive: the
+/// Stop payload's task entries carry at least {id, status}; richer builds add
+/// a type/kind. Absent evidence (no arrays at all) returns None so stale
+/// zeroes never overwrite a latched count.
+fn terminal_activity_hook_background_task_counts(
+    event: &Value,
+) -> Option<TerminalBackgroundTaskCounts> {
+    let tasks = event
+        .get("background_tasks")
+        .or_else(|| event.get("backgroundTasks"));
+    let crons = event
+        .get("session_crons")
+        .or_else(|| event.get("sessionCrons"));
+    if tasks.is_none() && crons.is_none() {
+        return None;
+    }
+    let mut counts = TerminalBackgroundTaskCounts::default();
+    if let Some(Value::Array(items)) = tasks {
+        for item in items {
+            if !terminal_activity_hook_background_value_is_active(item) {
+                continue;
+            }
+            let kind = [
+                "type",
+                "kind",
+                "task_type",
+                "taskType",
+                "task_kind",
+                "taskKind",
+                "tool",
+                "tool_name",
+                "toolName",
+                "source",
+            ]
+            .iter()
+            .filter_map(|key| item.get(*key))
+            .filter_map(Value::as_str)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .find(|value| !value.is_empty())
+            .unwrap_or_default();
+            if kind.contains("shell") || kind.contains("bash") || kind.contains("command") {
+                counts.shells = counts.shells.saturating_add(1);
+            } else if kind.contains("monitor") || kind.contains("watch") {
+                counts.monitors = counts.monitors.saturating_add(1);
+            } else if kind.contains("agent") || kind.contains("task") {
+                counts.subagents = counts.subagents.saturating_add(1);
+            } else {
+                counts.other = counts.other.saturating_add(1);
+            }
+        }
+    }
+    if let Some(Value::Array(items)) = crons {
+        for item in items {
+            if terminal_activity_hook_background_value_is_active(item) {
+                counts.monitors = counts.monitors.saturating_add(1);
+            }
+        }
+    }
+    Some(counts)
 }
 
 fn terminal_activity_hook_background_stop_forces_busy(
@@ -18331,6 +18427,7 @@ fn terminal_activity_hook_payload(
             hook_event_name: hook_event_name.clone(),
             updated_at_ms: now_ms,
             waiting_origin_ms: current_runtime.waiting_origin_ms,
+            background_task_counts: current_runtime.background_task_counts,
         },
         terminal_is_prompting_user,
     );
@@ -18385,6 +18482,7 @@ fn terminal_activity_hook_payload(
         session_state: projected_runtime.session_state,
         input_ready,
         background_work_active,
+        background_task_counts: terminal_activity_hook_background_task_counts(event),
         input_ready_at,
         prompt_ready_at,
         completed_at,
@@ -35474,6 +35572,7 @@ notifications = true
             session_state: "session_attached".to_string(),
             input_ready,
             background_work_active: false,
+            background_task_counts: None,
             input_ready_at: input_ready.then(|| "2026-07-02T00:00:00Z".to_string()),
             prompt_ready_at: None,
             completed_at: input_ready.then(|| "2026-07-02T00:00:00Z".to_string()),
@@ -37876,6 +37975,47 @@ notifications = true
         assert_eq!(projection.canonical_state, "thinking");
     }
 
+    /// Round-7 hardening: WAITING must be busy on the WIRE too — a held
+    /// stale Stop's emitted payload carried its original completion tuple
+    /// (input_ready=true), disabling Escape in the UI and projecting remote
+    /// awaiting_input while background work still ran.
+    #[test]
+    fn waiting_wire_payload_never_carries_input_ready() {
+        let mut waiting_runtime = waiting_test_runtime_thinking();
+        waiting_runtime.canonical_state = "waiting".to_string();
+        waiting_runtime.waiting_origin_ms = 100;
+
+        // Same-turn stale Stop: rejected (held waiting), but the raw payload
+        // is a completion tuple that starts input-ready.
+        let mut stale_stop = waiting_test_payload("provider-turn-completed", false);
+        stale_stop.hook_timestamp_ms = 50;
+        assert!(stale_stop.input_ready, "completion tuple starts ready");
+        let projection =
+            terminal_reduce_canonical_state(&waiting_runtime, &stale_stop, None, false, false);
+        assert_eq!(projection.canonical_state, "waiting");
+        assert!(!projection.completion_accepted);
+        let mut emitted = stale_stop.clone();
+        terminal_apply_canonical_projection_to_payload(&mut emitted, &projection);
+        assert_eq!(emitted.canonical_state, "waiting");
+        assert!(
+            !emitted.input_ready,
+            "wire waiting must never be input-ready"
+        );
+        assert_eq!(emitted.activity_status, "waiting");
+        assert_eq!(emitted.command_phase, "background_waiting");
+        assert!(emitted.completed_at.is_none());
+        assert!(!emitted.turn_settlement_accepted);
+
+        // Accepted parks stay busy on the wire as well.
+        let thinking = waiting_test_runtime_thinking();
+        let park = waiting_test_payload("provider-turn-waiting", true);
+        let projection = terminal_reduce_canonical_state(&thinking, &park, None, false, false);
+        let mut emitted = park.clone();
+        terminal_apply_canonical_projection_to_payload(&mut emitted, &projection);
+        assert_eq!(emitted.canonical_state, "waiting");
+        assert!(!emitted.input_ready);
+    }
+
     /// The waiting ordering identity is stamped from the PARKING event's
     /// ORIGIN (hook fire time), survives rejected events and continued
     /// waiting, never rewinds on a stale re-park, and clears on exit.
@@ -38877,6 +39017,45 @@ notifications = true
                 "session_crons": [],
             })
         ));
+    }
+
+    #[test]
+    fn background_task_counts_classify_shells_subagents_monitors() {
+        // No evidence at all → None (absent arrays must not zero a latch).
+        assert_eq!(
+            terminal_activity_hook_background_task_counts(&json!({"stop_hook_active": true})),
+            None
+        );
+        // Typed entries classify; completed entries don't count; unknown
+        // types land in `other`; active session crons count as monitors.
+        let counts = terminal_activity_hook_background_task_counts(&json!({
+            "background_tasks": [
+                { "id": "t1", "status": "running", "type": "local_shell" },
+                { "id": "t2", "status": "running", "type": "bash" },
+                { "id": "t3", "status": "running", "type": "subagent" },
+                { "id": "t4", "status": "running", "kind": "task" },
+                { "id": "t5", "status": "running", "type": "monitor" },
+                { "id": "t6", "status": "completed", "type": "subagent" },
+                { "id": "t7", "status": "running" },
+            ],
+            "session_crons": [
+                { "id": "c1", "state": "queued" },
+                { "id": "c2", "state": "done" },
+            ],
+        }))
+        .expect("evidence present");
+        assert_eq!(counts.shells, 2);
+        assert_eq!(counts.subagents, 2);
+        assert_eq!(counts.monitors, 2, "monitor task + active cron");
+        assert_eq!(counts.other, 1);
+        assert_eq!(counts.total(), 7);
+        // Empty arrays are evidence of ZERO work (settles the cue).
+        assert_eq!(
+            terminal_activity_hook_background_task_counts(
+                &json!({"background_tasks": [], "session_crons": []})
+            ),
+            Some(TerminalBackgroundTaskCounts::default())
+        );
     }
 
     #[test]

@@ -12907,6 +12907,7 @@ mod todo_dispatch_backend_tests {
             hook_event_name: "test".to_string(),
             updated_at_ms: 1,
             waiting_origin_ms: 0,
+            background_task_counts: None,
         }
     }
 
@@ -13067,6 +13068,7 @@ mod todo_dispatch_backend_tests {
             session_state: "session_attached".to_string(),
             input_ready,
             background_work_active: false,
+            background_task_counts: None,
             input_ready_at: input_ready.then(|| "2026-06-19T00:00:00Z".to_string()),
             prompt_ready_at: None,
             completed_at: None,
