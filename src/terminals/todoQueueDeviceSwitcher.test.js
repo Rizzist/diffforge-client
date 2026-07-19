@@ -1583,3 +1583,122 @@ test("authoritative todo_store_snapshot absence removes hard-deleted webview row
     "command-hard-deleted",
   );
 });
+
+test("presence v2 prod shape: claimed_target_device_id never lights a badge", () => {
+  // The cloud's v2 summary keeps the browser's declared operating target as a
+  // routing-only claim under claimed_target_device_id; the badge-lighting
+  // target_device_id carries the SERVER-VALIDATED resolution (an unlinked
+  // browser targets its own standalone identity). A claim about a native
+  // device must never light that device's WEB badge.
+  const rows = buildAccountLiveDeviceRows({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        client_connection: {
+          active_desktop_device_ids: ["desktop-local"],
+          active_web_device_ids: ["web-macos-chrome"],
+          active_web_devices: [
+            {
+              active_count: 1,
+              claimed_target_device_id: "desktop-local",
+              device_id: "web-macos-chrome",
+              target_device_id: "web-macos-chrome",
+              web_device_id: "web-macos-chrome",
+            },
+          ],
+          active_web_target_device_ids: ["web-macos-chrome"],
+          web_connected: true,
+        },
+        registered_devices: {
+          items: [
+            {
+              device_id: "desktop-local",
+              device_name: "Syed's MacBook Air",
+              form_factor: "pc",
+              native_connected: true,
+              platform: "macos",
+              registered: true,
+              status: "connected",
+              web_connected: false,
+            },
+          ],
+        },
+      },
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "This device",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+  });
+  const mac = rows.find((row) => row.device_id === "desktop-local");
+  assert.equal(mac?.native_connected, true);
+  assert.equal(
+    mac?.web_connected,
+    false,
+    "a routing claim must not light the native device's WEB badge",
+  );
+});
+
+test("presence v2 prod shape: linked browser lights the device WEB badge; disconnect darkens both", () => {
+  // Linked shape: the server-validated target IS the native device — WEB lights.
+  const registered_devices = {
+    items: [
+      {
+        device_id: "desktop-local",
+        device_name: "Syed's MacBook Air",
+        form_factor: "pc",
+        native_connected: false,
+        platform: "macos",
+        registered: true,
+        status: "connected",
+        web_connected: false,
+      },
+    ],
+  };
+  const linkedRows = buildAccountLiveDeviceRows({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        client_connection: {
+          active_desktop_device_ids: ["desktop-local"],
+          active_web_device_ids: ["web-macos-chrome"],
+          active_web_devices: [
+            {
+              active_count: 1,
+              device_id: "web-macos-chrome",
+              target_device_id: "desktop-local",
+              web_device_id: "web-macos-chrome",
+            },
+          ],
+          active_web_target_device_ids: ["desktop-local"],
+          web_connected: true,
+        },
+        registered_devices,
+      },
+    },
+  });
+  const linkedMac = linkedRows.find((row) => row.device_id === "desktop-local");
+  assert.equal(linkedMac?.native_connected, true);
+  assert.equal(linkedMac?.web_connected, true);
+
+  // Disconnect shape: v2 empties every compat field and the per-item stamps
+  // are false — both badges MUST go dark (no latch from earlier frames).
+  const darkRows = buildAccountLiveDeviceRows({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        client_connection: {
+          active_desktop_device_ids: [],
+          active_web_device_ids: [],
+          active_web_devices: [],
+          active_web_target_device_ids: [],
+          connected: false,
+          web_connected: false,
+        },
+        registered_devices,
+      },
+    },
+  });
+  const darkMac = darkRows.find((row) => row.device_id === "desktop-local");
+  assert.equal(darkMac?.native_connected, false);
+  assert.equal(darkMac?.web_connected, false);
+});
