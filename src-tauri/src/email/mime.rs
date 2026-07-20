@@ -167,9 +167,32 @@ fn contains_addr_spec_token(haystack: &str, needle: &str) -> bool {
         return false;
     }
 
-    let local_part_continues =
-        |ch: char| ch.is_alphanumeric() || matches!(ch, '.' | '_' | '%' | '+' | '-');
-    let domain_continues = |ch: char| ch.is_alphanumeric() || matches!(ch, '-' | '.');
+    let local_part_continues = |ch: char| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '!' | '#'
+                    | '$'
+                    | '%'
+                    | '&'
+                    | '\''
+                    | '*'
+                    | '+'
+                    | '-'
+                    | '.'
+                    | '/'
+                    | '='
+                    | '?'
+                    | '^'
+                    | '_'
+                    | '`'
+                    | '{'
+                    | '|'
+                    | '}'
+                    | '~'
+            )
+    };
+    let domain_continues = |ch: char| ch.is_alphanumeric() || ch == '-';
     let mut search_start = 0;
     while let Some(relative_start) = haystack[search_start..].find(needle) {
         let start = search_start + relative_start;
@@ -179,11 +202,12 @@ fn contains_addr_spec_token(haystack: &str, needle: &str) -> bool {
             .next_back()
             .map(|ch| !local_part_continues(ch))
             .unwrap_or(true);
-        let after_is_boundary = haystack[end..]
-            .chars()
-            .next()
-            .map(|ch| !domain_continues(ch))
-            .unwrap_or(true);
+        let mut after = haystack[end..].chars();
+        let after_is_boundary = match after.next() {
+            Some('.') => !after.next().map(|ch| ch.is_alphanumeric()).unwrap_or(false),
+            Some(ch) => !domain_continues(ch),
+            None => true,
+        };
         if before_is_boundary && after_is_boundary {
             return true;
         }
@@ -312,6 +336,7 @@ fn normalize_addr_spec(raw: &str) -> Option<String> {
     let (local, domain) = addr.rsplit_once('@')?;
     let local = local.trim();
     let domain = domain.trim();
+    let domain = domain.strip_suffix('.').unwrap_or(domain);
     if domain.is_empty() {
         return None;
     }
@@ -1036,11 +1061,19 @@ mod tests {
 
     #[test]
     fn raw_bcc_guard_requires_addr_spec_token_boundaries() {
+        assert_eq!(
+            normalize_addr_spec("archive@acme.example."),
+            Some("archive@acme.example".to_string()),
+            "structured normalization must canonicalize a root-FQDN trailing dot"
+        );
+
         // A bcc addr-spec embedded in a longer local part or followed by a
         // longer domain is a distinct visible address, not a disclosure.
         for (visible, bcc) in [
             ("devops@example.com", "ops@example.com"),
+            ("dev!ops@example.com", "ops@example.com"),
             ("a@b.com.attacker.example", "a@b.com"),
+            ("user@acme.example.org", "user@acme.example"),
         ] {
             let mime =
                 format!("From: sender@acme.example\r\nTo: {visible}\r\n\r\nhello\r\n").into_bytes();
@@ -1056,6 +1089,19 @@ mod tests {
                 "distinct visible address {visible:?} must not match bcc {bcc:?}: {result:?}"
             );
         }
+
+        // A root-FQDN trailing dot terminates the same domain rather than
+        // extending it with another label, including before CFWS.
+        for header in [
+            "To: <archive@acme.example.>",
+            "Subject: archive@acme.example.",
+            "Subject: archive@acme.example.(comment)",
+        ] {
+            assert_bcc_leak_rejected(header, "archive@acme.example");
+        }
+
+        // A complete, delimited token still discloses the bcc recipient.
+        assert_bcc_leak_rejected("To: ops@example.com", "ops@example.com");
 
         // The same bcc address as a genuinely delimited To token still
         // rejects before the visible-recipient mismatch can mask the leak.
