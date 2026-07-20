@@ -989,7 +989,7 @@ fn workspace_root_is_user_collection_or_profile(root: &Path, home: Option<&Path>
 
     #[cfg(not(windows))]
     {
-        if root_key == "/users" || root_key == "/home" {
+        if root_key == "/users" || root_key == "/home" || root_key == "/root" {
             return true;
         }
 
@@ -997,12 +997,33 @@ fn workspace_root_is_user_collection_or_profile(root: &Path, home: Option<&Path>
             .split('/')
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>();
-        if parts.len() == 2 && matches!(parts[0], "users" | "home") {
+        if parts.len() == 2 && parts[0] == "users" {
+            return true;
+        }
+        // A direct child of /home is only a profile root if it actually looks
+        // like a login home; operators on headless boxes also park plain
+        // project folders there.
+        if parts.len() == 2 && parts[0] == "home" && workspace_root_looks_like_login_home(root) {
             return true;
         }
     }
 
     false
+}
+
+#[cfg(not(windows))]
+fn workspace_root_looks_like_login_home(root: &Path) -> bool {
+    [
+        ".bashrc",
+        ".bash_profile",
+        ".bash_history",
+        ".profile",
+        ".zshrc",
+        ".zsh_history",
+        ".ssh",
+    ]
+    .iter()
+    .any(|marker| root.join(marker).exists())
 }
 
 fn workspace_root_is_common_user_folder(root: &Path, home: Option<&Path>) -> bool {
@@ -1180,7 +1201,6 @@ fn workspace_root_is_known_system_or_app_directory(root: &Path) -> Option<&'stat
             "/lib",
             "/lib64",
             "/proc",
-            "/root",
             "/run",
             "/sbin",
             "/sys",
@@ -2887,6 +2907,40 @@ mod workspace_files_tests {
         assert!(error.contains("too broad"));
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn root_home_is_rejected_while_its_project_subfolders_are_allowed() {
+        let error = workspace_root_rejection_reason_for_home(Path::new("/root"), None).unwrap();
+        assert!(error.contains("user account"));
+
+        assert!(
+            workspace_root_rejection_reason_for_home(Path::new("/root/appledir"), None).is_none()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn home_child_without_login_markers_is_allowed() {
+        assert!(workspace_root_rejection_reason_for_home(
+            Path::new("/home/diffforge-policy-appledir"),
+            None
+        )
+        .is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn login_home_markers_are_detected() {
+        let dir = test_workspace_root("diffforge-policy-login-home");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!workspace_root_looks_like_login_home(&dir));
+
+        fs::write(dir.join(".bashrc"), "# rc\n").unwrap();
+        assert!(workspace_root_looks_like_login_home(&dir));
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
