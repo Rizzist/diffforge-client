@@ -60,39 +60,113 @@ fn extract_addresses_from_text(value: &str) -> Vec<String> {
     out
 }
 
-/// Lowercased addr-specs from a STRUCTURALLY parsed header value (review
-/// R3-5): mail-parser's RFC 5322 parser handles group syntax
-/// (`hidden:archive@x;`), comments, and quoted local parts — the shapes a
-/// comma/whitespace splitter can be evaded through.
-fn addresses_of(value: &mail_parser::HeaderValue<'_>) -> Vec<String> {
+/// Normalize a raw addr-spec for comparison (review R4-3): strip the RFC
+/// 5322 obsolete route form (`<@relay,@relay2:user@dom>` ⇒ `user@dom`),
+/// unquote quoted local parts (`"archive"@dom` ≡ `archive@dom`), and
+/// lowercase. None = the entry carries no comparable addr-spec.
+fn normalize_addr_spec(raw: &str) -> Option<String> {
+    let mut addr = raw.trim();
+    if addr.is_empty() {
+        return None;
+    }
+    // Obsolete route prefix (`@relay,@relay2:user@dom`).
+    if addr.starts_with('@') {
+        addr = addr.split_once(':').map(|(_, rest)| rest)?.trim();
+    }
+    let (local, domain) = addr.rsplit_once('@')?;
+    let local = local.trim();
+    let domain = domain.trim();
+    if domain.is_empty() {
+        return None;
+    }
+    let local = if local.len() >= 2 && local.starts_with('"') && local.ends_with('"') {
+        let inner = &local[1..local.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut escaped = false;
+        for ch in inner.chars() {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    } else {
+        local.to_string()
+    };
+    if local.is_empty() {
+        return None;
+    }
+    Some(format!("{local}@{domain}").to_ascii_lowercase())
+}
+
+/// Normalized addr-specs from a STRUCTURALLY parsed header value (reviews
+/// R3-5/R4-3): mail-parser's RFC 5322 parser handles group syntax
+/// (`hidden:archive@x;`), comments, and quoted locals; every yielded entry
+/// is then normalized to a comparable addr-spec. FAIL CLOSED: an entry the
+/// parser yields WITHOUT a comparable addr-spec (encoded-word-only, empty,
+/// route-only) in a transmitted address header is an error, never a skip —
+/// an unmatchable entry could be exactly the smuggled bcc address.
+fn addresses_of(value: &mail_parser::HeaderValue<'_>) -> Result<Vec<String>, String> {
     use mail_parser::{Address, HeaderValue};
     let mut out = Vec::new();
+    let mut push = |raw: &str| -> Result<(), String> {
+        match normalize_addr_spec(raw) {
+            Some(address) => {
+                out.push(address);
+                Ok(())
+            }
+            None => Err(format!(
+                "address header entry has no comparable addr-spec: {raw:?}"
+            )),
+        }
+    };
     match value {
         HeaderValue::Address(Address::List(list)) => {
             for addr in list {
-                if let Some(address) = addr.address.as_deref() {
-                    out.push(address.to_ascii_lowercase());
+                match addr.address.as_deref() {
+                    Some(address) => push(address)?,
+                    None => {
+                        return Err(
+                            "address header entry without an addr-spec fails closed".to_string()
+                        )
+                    }
                 }
             }
         }
         HeaderValue::Address(Address::Group(groups)) => {
             for group in groups {
                 for addr in &group.addresses {
-                    if let Some(address) = addr.address.as_deref() {
-                        out.push(address.to_ascii_lowercase());
+                    match addr.address.as_deref() {
+                        Some(address) => push(address)?,
+                        None => {
+                            return Err(
+                                "address header entry without an addr-spec fails closed"
+                                    .to_string(),
+                            )
+                        }
                     }
                 }
             }
         }
-        HeaderValue::Text(text) => out.extend(extract_addresses_from_text(text)),
+        HeaderValue::Text(text) => {
+            for token in extract_addresses_from_text(text) {
+                push(&token)?;
+            }
+        }
         HeaderValue::TextList(items) => {
             for item in items {
-                out.extend(extract_addresses_from_text(item));
+                for token in extract_addresses_from_text(item) {
+                    push(&token)?;
+                }
             }
         }
         _ => {}
     }
-    out
+    Ok(out)
 }
 
 /// Verify downloaded MIME bytes against the prepare grant. Every failure is
@@ -126,13 +200,16 @@ pub fn verify_mime(
         .parse(bytes)
         .ok_or_else(|| "frozen MIME failed RFC 5322 parsing".to_string())?;
     use mail_parser::HeaderName;
-    let header_value = |wanted: &[HeaderName<'static>]| -> Vec<String> {
-        parsed
+    let header_value = |wanted: &[HeaderName<'static>]| -> Result<Vec<String>, String> {
+        let mut out = Vec::new();
+        for header in parsed
             .headers()
             .iter()
             .filter(|header| wanted.iter().any(|name| name == &header.name))
-            .flat_map(|header| addresses_of(header.value()))
-            .collect()
+        {
+            out.extend(addresses_of(header.value())?);
+        }
+        Ok(out)
     };
 
     // Bcc must never appear as a header in the frozen MIME (§3b) — and the
@@ -145,8 +222,9 @@ pub fn verify_mime(
         return Err("frozen MIME must not carry a Bcc or Resent-Bcc header".to_string());
     }
 
-    let from_addresses = header_value(&[HeaderName::From]);
-    let identity_lower = identity_address.to_ascii_lowercase();
+    let from_addresses = header_value(&[HeaderName::From])?;
+    let identity_lower =
+        normalize_addr_spec(identity_address).unwrap_or_else(|| identity_address.to_ascii_lowercase());
     // From is bound to EXACTLY the granted identity (review R2-7): a second
     // mailbox riding the From list is both an impersonation surface and a
     // bcc-disclosure channel.
@@ -160,21 +238,26 @@ pub fn verify_mime(
         ));
     }
 
-    let header_recipients: BTreeSet<String> = header_value(&[HeaderName::To])
+    let header_recipients: BTreeSet<String> = header_value(&[HeaderName::To])?
         .into_iter()
-        .chain(header_value(&[HeaderName::Cc]))
+        .chain(header_value(&[HeaderName::Cc])?)
         .collect();
+    // Envelope addresses ride the SAME normalization so the comparison is
+    // symmetric (quoted locals, case).
+    let normalize_envelope = |address: &str| {
+        normalize_addr_spec(address).unwrap_or_else(|| address.to_ascii_lowercase())
+    };
     let envelope_visible: BTreeSet<String> = envelope
         .recipients
         .iter()
         .filter(|recipient| recipient.role != "bcc")
-        .map(|recipient| recipient.address.to_ascii_lowercase())
+        .map(|recipient| normalize_envelope(&recipient.address))
         .collect();
     let envelope_bcc: BTreeSet<String> = envelope
         .recipients
         .iter()
         .filter(|recipient| recipient.role == "bcc")
-        .map(|recipient| recipient.address.to_ascii_lowercase())
+        .map(|recipient| normalize_envelope(&recipient.address))
         .collect();
 
     // Bcc envelope addresses must not leak into ANY transmitted
@@ -196,7 +279,7 @@ pub fn verify_mime(
         HeaderName::ResentCc,
         HeaderName::ResentFrom,
         HeaderName::ResentSender,
-    ])
+    ])?
     .into_iter()
     .collect();
     if let Some(leaked) = envelope_bcc
@@ -432,6 +515,39 @@ mod tests {
             comment_leak,
             &sha256_hex(comment_leak),
             comment_leak.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // Quoted-local-part obfuscation must not evade the scan (R4-3):
+        // `"archive"@dom` normalizes to archive@dom for comparison.
+        let quoted_leak = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nReply-To: \"archive\"@acme.example\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            quoted_leak,
+            &sha256_hex(quoted_leak),
+            quoted_leak.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // RFC 5322 obsolete-route form must not evade it either:
+        // `<@relay.example:archive@acme.example>` strips to the addr-spec.
+        let route_leak = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nReply-To: <@relay.example:archive@acme.example>\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            route_leak,
+            &sha256_hex(route_leak),
+            route_leak.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // An address-header entry with NO comparable addr-spec fails closed
+        // — an unmatchable entry could be exactly the smuggled address.
+        let unmatchable = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nReply-To: ghost-without-domain\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            unmatchable,
+            &sha256_hex(unmatchable),
+            unmatchable.len() as u64,
             "ops@acme.example",
             &bcc_envelope,
         )

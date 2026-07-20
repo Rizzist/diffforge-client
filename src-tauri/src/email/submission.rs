@@ -691,7 +691,7 @@ fn run_native_transaction(
             .connection()
             .query_row(
                 "SELECT egress_ip, port25_open FROM email_egress_ip_observations
-                 ORDER BY observed_at_ms DESC LIMIT 1",
+                 ORDER BY observed_at_ms DESC, observation_id DESC LIMIT 1",
                 [],
                 |row| {
                     Ok((
@@ -804,10 +804,27 @@ fn run_native_transaction(
             }
             let mut guard = journal_cell.borrow_mut();
             let journal: &mut EmailJournal = &mut *guard;
-            let _ = journal.extend_lease(&send_job_id, generation, grant.lease_epoch, renewed_expiry);
-            journal
-                .mark_data_started(&send_job_id, generation)
-                .map_err(|error| format!("data_started journal failed: {error}"))?;
+            // A lease-bookkeeping failure aborts BEFORE DATA (review R4-2):
+            // never discard it and cross the boundary on stale lease state.
+            if let Err(error) =
+                journal.extend_lease(&send_job_id, generation, grant.lease_epoch, renewed_expiry)
+            {
+                let reason = format!("renew_failed:extend:{error}");
+                *hook_abort.borrow_mut() = Some(reason.clone());
+                return Err(reason);
+            }
+            // The SQL cancel/supersede fence (review R4-2): a cancel landing
+            // during the renewal window zero-rows this update — route the
+            // sentinel to the §6b.1 cancel/supersede flows, never to DATA.
+            if let Err(error) = journal.mark_data_started(&send_job_id, generation) {
+                let reason = match error.as_str() {
+                    "data_started_fenced:cancel_requested" => "cancel_requested".to_string(),
+                    "data_started_fenced:superseded" => "superseded".to_string(),
+                    other => format!("data_started journal failed: {other}"),
+                };
+                *hook_abort.borrow_mut() = Some(reason.clone());
+                return Err(reason);
+            }
             email_killpoint("post_data_started_journal");
             if first_crossing {
                 if let Ok(Some(job)) = journal.load_job(&send_job_id, generation) {
@@ -1348,12 +1365,10 @@ fn run_provider_transaction(
                 SendPhase::MailFromSent.as_str(),
             ) {
                 Ok(RenewOutcome::Extended { expires_at_ms }) => {
-                    let _ = journal.extend_lease(
-                        &send_job_id,
-                        generation,
-                        grant.lease_epoch,
-                        expires_at_ms,
-                    );
+                    // Lease-bookkeeping failure aborts before DATA (R4-2).
+                    journal
+                        .extend_lease(&send_job_id, generation, grant.lease_epoch, expires_at_ms)
+                        .map_err(|error| format!("renew_failed:extend:{error}"))?;
                 }
                 Ok(RenewOutcome::Refused { slug, .. }) => {
                     return Err(format!("lease_{slug}"));
@@ -1364,9 +1379,16 @@ fn run_provider_transaction(
                     return Err(format!("renew_failed:{error}"));
                 }
             }
+            // The SQL cancel/supersede fence (review R4-2): a cancel landing
+            // during the renewal window zero-rows the update — the sentinel
+            // routes into the existing cancel/supersede failure flows.
             journal
                 .mark_data_started(&send_job_id, generation)
-                .map_err(|error| format!("data_started journal failed: {error}"))?;
+                .map_err(|error| match error.as_str() {
+                    "data_started_fenced:cancel_requested" => "cancel_requested".to_string(),
+                    "data_started_fenced:superseded" => "superseded".to_string(),
+                    other => format!("data_started journal failed: {other}"),
+                })?;
             email_killpoint("post_data_started_journal");
             if let Ok(Some(job)) = journal.load_job(&send_job_id, generation) {
                 let _ = emit_phase_event(

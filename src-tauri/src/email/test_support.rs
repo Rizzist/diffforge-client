@@ -528,6 +528,11 @@ pub struct FakeCloudTransport {
     pub emitted_events: Mutex<Vec<Value>>,
     pub prepare_calls: Mutex<u32>,
     pub renew_calls: Mutex<u32>,
+    /// Side-effect hook invoked on every lease_renew with the 1-based call
+    /// index — crash-window tests inject state changes (e.g. a cancel
+    /// landing DURING the renewal round-trip).
+    #[allow(clippy::type_complexity)]
+    pub on_renew: Mutex<Option<Box<dyn Fn(u32) + Send + Sync>>>,
 }
 
 impl FakeCloudTransport {
@@ -593,7 +598,14 @@ impl EmailCloudTransport for FakeCloudTransport {
         _fence_token: &str,
         _phase: &str,
     ) -> Result<RenewOutcome, String> {
-        *self.renew_calls.lock().unwrap() += 1;
+        let call_index = {
+            let mut count = self.renew_calls.lock().unwrap();
+            *count += 1;
+            *count
+        };
+        if let Some(hook) = self.on_renew.lock().unwrap().as_ref() {
+            hook(call_index);
+        }
         self.renew_outcomes
             .lock()
             .unwrap()

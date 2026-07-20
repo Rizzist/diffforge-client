@@ -1105,8 +1105,12 @@ impl EmailJournal {
     /// The DATA-boundary write (§6b.2 / §10.1): `data_started` committed with
     /// `synchronous=FULL` BEFORE the DATA command goes on the wire. The
     /// update is MONOTONIC — a job already at or past `data_completed` is
-    /// never regressed back to `data_started` (a duplicate worker attempting
-    /// it gets an error and must stop).
+    /// never regressed back to `data_started` — and the cancel/supersede
+    /// fence lives INSIDE the SQL (review R4-2): the database is the
+    /// arbiter, so a cancel or supersede landing during the pre-DATA
+    /// renewal window makes this a zero-row update and the caller aborts
+    /// before DATA. Fence errors carry the machine-readable sentinels
+    /// `data_started_fenced:cancel_requested` / `:superseded`.
     pub fn mark_data_started(&mut self, send_job_id: &str, generation: u32) -> Result<(), String> {
         self.with_full_synchronous(|connection| {
             let txn = connection
@@ -1118,7 +1122,8 @@ impl EmailJournal {
                      SET data_started = 1, phase = 'data_started', phase_rank = ?3,
                          updated_at_ms = ?4
                      WHERE send_job_id = ?1 AND generation = ?2 AND terminal_outcome IS NULL
-                       AND phase_rank < ?5",
+                       AND phase_rank < ?5
+                       AND cancel_requested = 0 AND superseded = 0",
                     params![
                         send_job_id,
                         generation,
@@ -1129,9 +1134,49 @@ impl EmailJournal {
                 )
                 .map_err(|error| format!("email data_started update failed: {error}"))?;
             if updated == 0 {
-                return Err(
-                    "email data_started on unknown, terminal, or already-completed job".to_string(),
-                );
+                // Diagnose the fence INSIDE the same transaction so the
+                // caller can route cancel/supersede to their §6b.1 flows.
+                let fence: Option<(bool, bool, bool, i64)> = txn
+                    .query_row(
+                        "SELECT cancel_requested, superseded, data_started, phase_rank
+                         FROM email_send_jobs
+                         WHERE send_job_id = ?1 AND generation = ?2
+                           AND terminal_outcome IS NULL",
+                        params![send_job_id, generation],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)? != 0,
+                                row.get::<_, i64>(1)? != 0,
+                                row.get::<_, i64>(2)? != 0,
+                                row.get::<_, i64>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|error| format!("email data_started fence check failed: {error}"))?;
+                return match fence {
+                    // The boundary is ALREADY durably crossed: re-marking is
+                    // an idempotent no-op, and per §6b.3 a cancel/supersede
+                    // arriving after data_started does not retract the wire
+                    // — the transaction finishes and reports.
+                    Some((_, _, true, rank)) if rank < i64::from(SendPhase::DataCompleted.rank()) => {
+                        txn.commit().map_err(|error| {
+                            format!("email data_started commit failed: {error}")
+                        })?;
+                        Ok(())
+                    }
+                    // Cancel/supersede fence BEFORE the first data_started.
+                    Some((true, _, false, _)) => {
+                        Err("data_started_fenced:cancel_requested".to_string())
+                    }
+                    Some((_, true, false, _)) => {
+                        Err("data_started_fenced:superseded".to_string())
+                    }
+                    _ => Err(
+                        "email data_started on unknown, terminal, or already-completed job"
+                            .to_string(),
+                    ),
+                };
             }
             txn.commit()
                 .map_err(|error| format!("email data_started commit failed: {error}"))
@@ -1695,11 +1740,13 @@ impl EmailJournal {
             let status_event_id = uuid::Uuid::now_v7().to_string();
             let recipients = self.load_recipients(&job.send_job_id, job.generation)?;
             // The FULL-durable recipient rows decide the job outcome BEFORE
-            // any blanket classification (review R3-2): a crash after the
-            // final recipient's durable 2xx (job phase still `data_started`)
-            // recovers as `submitted`, and a settled mix with no pending
-            // rows recovers `partially_submitted` — delivery_unknown is
-            // reserved for genuinely unknowable (pending) recipients.
+            // any blanket classification (reviews R3-2/R4-1), mirroring the
+            // live aggregator: all-submitted ⇒ submitted (even at phase
+            // data_started), settled-mix ⇒ partially_submitted, all-bounced
+            // ⇒ provider_rejected (a crash after the final durable bounce
+            // must not fake delivery_unknown and unlock retry_unknown) —
+            // delivery_unknown is reserved for genuinely unknowable
+            // (pending) recipients.
             let any_pending = recipients
                 .iter()
                 .any(|recipient| recipient.status == "pending");
@@ -1710,10 +1757,16 @@ impl EmailJournal {
                 && recipients
                     .iter()
                     .all(|recipient| recipient.status == "submitted");
+            let all_bounced = !recipients.is_empty()
+                && recipients
+                    .iter()
+                    .all(|recipient| recipient.status == "bounced");
             let (outcome, error_class) = if persisted_success || all_submitted {
                 ("submitted", "none")
             } else if !recipients.is_empty() && !any_pending && any_submitted {
                 ("partially_submitted", "none")
+            } else if all_bounced {
+                ("provider_rejected", "policy")
             } else {
                 ("delivery_unknown", "delivery_unknown")
             };

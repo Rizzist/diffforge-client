@@ -3015,25 +3015,35 @@ fn settlement_ack_for_unknown_event_is_an_error() {
 }
 
 #[test]
-fn outbox_email_arm_propagates_before_ack_deletion() {
-    // Review R3-8 routing: the cloud_mcp outbox arm must propagate email ack
-    // failures with `?` BEFORE the acked-update/delete statements run —
-    // source-ordering guard in the repo's established wiring-test style.
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cloud_mcp.rs"),
-    )
-    .expect("cloud_mcp.rs readable");
-    let start = source
-        .find("fn cloud_mcp_outbox_mark_acked")
-        .expect("mark_acked present");
-    let body = &source[start..start + 8_000];
-    let email_arm = body
-        .find("email_record_send_event_cloud_ack(&payload, response)?")
-        .expect("email arm must propagate with ?");
-    let acked_update = body.find("SET status='acked'").expect("acked update present");
+fn outbox_mark_acked_propagates_email_ack_failure() {
+    // Review R4-6: REAL execution through cloud_mcp_outbox_mark_acked with
+    // an injected failing email ack — the outbox payload names an event no
+    // journal holds, so the journal write is a zero-row error. The fn must
+    // return Err from the email arm, which runs BEFORE the outbox conn is
+    // even opened — the durable row is never acked/deleted.
+    let ghost = format!("evt-ghost-{}", uuid::Uuid::now_v7());
+    let row = crate::CloudMcpOutboxRow {
+        outbox_id: format!("test-{}", uuid::Uuid::now_v7()),
+        idempotency_key: format!("email-send-event:job-ghost:1:{ghost}"),
+        event_kind: contract::EMAIL_SEND_EVENT_KIND.to_string(),
+        payload_json: json!({
+            "status_event_id": ghost,
+            "send_job_id": "job-ghost",
+            "generation": 1,
+        })
+        .to_string(),
+        attempt_count: 0,
+    };
+    let ack = json!({
+        "contract": contract::EMAIL_CONTRACT,
+        "schema_version": 1,
+        "status_event_id": ghost,
+        "applied": true,
+    });
+    let result = crate::cloud_mcp_outbox_mark_acked(&row, &ack);
     assert!(
-        email_arm < acked_update,
-        "email ack failures must propagate BEFORE the outbox row is acked/deleted"
+        result.is_err(),
+        "a failing email ack must propagate out of mark_acked so the outbox row survives"
     );
 }
 
@@ -3066,4 +3076,180 @@ fn collect_observations_runs_local_checks_without_network() {
     assert!(observations.clock_skew_ms.is_none());
     assert!(observations.spf_authorizes_egress.is_none());
     assert!(observations.port25_open.is_none());
+}
+
+// =====================================================================
+// Round-4 regressions: all-bounced recovery (R4-1), the in-SQL
+// cancel/supersede DATA fence (R4-2), addr-spec normalization + fail-closed
+// unmatchable entries (R4-3), and the uniform generation >= 1 rule (R4-4).
+// =====================================================================
+
+#[test]
+fn recovery_all_bounced_recovers_provider_rejected() {
+    // Review R4-1: a crash after the final durable bounce must recover
+    // provider_rejected (matching the live aggregator) — never
+    // delivery_unknown, which would wrongly unlock retry_unknown.
+    let dir = temp_dir("recovery-all-bounced");
+    let mut journal = open_journal(&dir);
+    journal
+        .record_send_command("job-ab", 1, "cmd-ab", "bind-1", "hash-ab", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    let recipient = |suffix: &str| RecipientRow {
+        recipient_ref: format!("r{suffix}"),
+        role: "to".to_string(),
+        address: format!("user{suffix}@partner.example"),
+        domain: "partner.example".to_string(),
+        status: "pending".to_string(),
+        smtp_code: None,
+        enhanced_code: None,
+        response_class: None,
+        response_sanitized: None,
+        retry_at_ms: None,
+    };
+    journal
+        .seed_recipients("job-ab", 1, &[recipient("1"), recipient("2")])
+        .unwrap();
+    journal.mark_data_started("job-ab", 1).unwrap();
+    for suffix in ["1", "2"] {
+        journal
+            .record_recipient_outcome_full(
+                "job-ab",
+                1,
+                &format!("r{suffix}"),
+                "bounced",
+                Some(550),
+                Some("rejected_permanent"),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    let settled = journal.recover_after_restart("device-test").unwrap();
+    let entry = settled
+        .iter()
+        .find(|(job, _, _)| job == "job-ab")
+        .expect("recovered");
+    assert_eq!(entry.2, "provider_rejected");
+    let (event, _) = journal.load_settled_event("job-ab", 1).unwrap().unwrap();
+    assert_eq!(event.payload["error_class"], "policy");
+    let per_recipient = event.payload["per_recipient"].as_array().unwrap();
+    assert!(per_recipient
+        .iter()
+        .all(|entry| entry["delivery_state"] == "bounced"));
+}
+
+#[test]
+fn data_started_sql_fence_blocks_cancel_and_supersede() {
+    // Review R4-2: the cancel/supersede fence lives INSIDE the
+    // mark_data_started UPDATE — the database is the arbiter.
+    let dir = temp_dir("data-fence");
+    let mut journal = open_journal(&dir);
+    journal
+        .record_send_command("job-fc", 1, "cmd-fc", "bind-1", "hash-fc", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    journal.request_cancel("job-fc", 1).unwrap().unwrap();
+    let error = journal.mark_data_started("job-fc", 1).unwrap_err();
+    assert_eq!(error, "data_started_fenced:cancel_requested");
+    let job = journal.load_job("job-fc", 1).unwrap().unwrap();
+    assert!(!job.data_started, "the fence kept the boundary uncrossed");
+
+    // Supersede fence: a higher generation arrives, generation 1 must never
+    // cross DATA afterwards.
+    journal
+        .record_send_command("job-fs", 1, "cmd-fs1", "bind-1", "hash-fs1", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    journal
+        .record_send_command("job-fs", 2, "cmd-fs2", "bind-1", "hash-fs2", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    let error = journal.mark_data_started("job-fs", 1).unwrap_err();
+    assert_eq!(error, "data_started_fenced:superseded");
+
+    // Once the boundary IS crossed, a late cancel does not retract it:
+    // re-marking stays an idempotent success (§6b.3).
+    journal
+        .record_send_command("job-late", 1, "cmd-late", "bind-1", "hash-late", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    journal.mark_data_started("job-late", 1).unwrap();
+    journal
+        .connection()
+        .execute(
+            "UPDATE email_send_jobs SET cancel_requested = 1
+             WHERE send_job_id = 'job-late' AND generation = 1",
+            [],
+        )
+        .unwrap();
+    journal.mark_data_started("job-late", 1).unwrap();
+    let job = journal.load_job("job-late", 1).unwrap().unwrap();
+    assert!(job.data_started);
+}
+
+#[test]
+fn cancel_during_renewal_window_never_reaches_data() {
+    // Review R4-2 e2e: the cancel lands WHILE the pre-DATA lease renewal is
+    // in flight (after the hook's own cancel check already passed). The SQL
+    // fence must zero-row mark_data_started and the run settles cancelled —
+    // zero DATA on the wire.
+    let sink = SmtpSink::start(SinkMode::Plain, SinkBehavior::default());
+    let dir = temp_dir("cancel-renewal-window");
+    let journal_path = dir.join("journal.sqlite");
+    let mut journal = EmailJournal::open_at(&journal_path).unwrap();
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink.port);
+
+    let transport = FakeCloudTransport::new();
+    scripted_prepare(&transport, "provider");
+    // Renew call #2 is the provider pre-DATA renewal: inject the cancel
+    // through a second connection to the SAME journal, mid-round-trip.
+    let race_path = journal_path.clone();
+    let race_job = send_job_id.clone();
+    *transport.on_renew.lock().unwrap() = Some(Box::new(move |call_index| {
+        if call_index == 2 {
+            let mut racer = EmailJournal::open_at(&race_path).unwrap();
+            racer.request_cancel(&race_job, 1).unwrap().unwrap();
+        }
+    }));
+
+    let result = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation)
+        .unwrap();
+    assert_eq!(result, SubmissionResult::Terminal("cancelled".to_string()));
+    let state = sink.state();
+    assert_eq!(state.messages.len(), 0, "zero DATA on the wire");
+    assert!(
+        !state
+            .transcript
+            .iter()
+            .any(|line| line.trim().eq_ignore_ascii_case("DATA")),
+        "the DATA command itself was never sent"
+    );
+    let job = journal.load_job(&send_job_id, generation).unwrap().unwrap();
+    assert!(!job.data_started);
+    assert_eq!(job.terminal_outcome.as_deref(), Some("cancelled"));
+}
+
+#[test]
+fn generation_rule_is_uniform_across_paths() {
+    // Review R4-4: one shared parser — zero and overflow rejected everywhere.
+    assert!(super::remote::checked_generation(0).is_err());
+    assert_eq!(super::remote::checked_generation(1).unwrap(), 1);
+    assert!(super::remote::checked_generation(u64::from(u32::MAX) + 1).is_err());
+    // generation_retired with generation 0 fails closed.
+    let event = json!({
+        "contract": contract::EMAIL_CONTRACT,
+        "schema_version": 1,
+        "kind": "email_generation_retired",
+        "send_job_id": "job-1",
+        "generation": 0,
+        "retired_at_ms": 1,
+    });
+    assert!(super::remote::parse_generation_retired(&event).is_err());
 }

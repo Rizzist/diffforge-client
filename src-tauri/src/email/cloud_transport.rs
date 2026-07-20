@@ -349,9 +349,8 @@ impl EmailCloudTransport for WsCloudTransport {
         let generation = payload
             .get("generation")
             .and_then(Value::as_u64)
-            .and_then(|raw| u32::try_from(raw).ok())
-            .filter(|generation| *generation >= 1)
-            .ok_or_else(|| "send event payload missing or out-of-range generation".to_string())?;
+            .ok_or_else(|| "send event payload missing generation".to_string())
+            .and_then(super::remote::checked_generation)?;
         let status_event_id = payload
             .get("status_event_id")
             .and_then(Value::as_str)

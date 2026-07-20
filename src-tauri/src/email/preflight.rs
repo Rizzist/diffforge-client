@@ -288,7 +288,7 @@ pub fn collect_observations(
         .connection()
         .prepare(
             "SELECT egress_ip, port25_open FROM email_egress_ip_observations
-             ORDER BY observed_at_ms DESC LIMIT 10",
+             ORDER BY observed_at_ms DESC, observation_id DESC LIMIT 10",
         )
         .ok()
         .and_then(|mut statement| {

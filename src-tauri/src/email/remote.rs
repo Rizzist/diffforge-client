@@ -204,6 +204,17 @@ pub fn email_intake_ack_payload(
     )
 }
 
+/// Uniform checked send-generation parse (§1: bounded u32, starts at 1) —
+/// the ONE conversion every generation-bearing path uses (reviews
+/// R2-10/R3-11/R4-4): missing, zero, or out-of-range values are errors,
+/// never defaults or aliases.
+pub(crate) fn checked_generation(raw: u64) -> Result<u32, String> {
+    u32::try_from(raw)
+        .ok()
+        .filter(|generation| *generation >= 1)
+        .ok_or_else(|| format!("generation out of range (must be 1..=u32::MAX): {raw}"))
+}
+
 /// True when the event's kind names `email_generation_retired` — the strict
 /// parse below decides whether it is well-formed.
 pub fn is_generation_retired_event(event: &Value) -> bool {
@@ -246,8 +257,7 @@ pub fn parse_generation_retired(event: &Value) -> Result<(String, u32), String> 
         Some(value @ Value::String(_)) => contract::u64_from_wire(value)?,
         _ => return Err("generation_retired missing generation".to_string()),
     };
-    let generation = u32::try_from(raw)
-        .map_err(|_| format!("generation_retired generation out of range: {raw}"))?;
+    let generation = checked_generation(raw)?;
     Ok((send_job_id, generation))
 }
 
@@ -1051,13 +1061,13 @@ pub async fn email_account_sync_resume_hook(state: &crate::CloudMcpState) {
                         else {
                             continue;
                         };
-                        // Checked u32 conversion (§1: generation is a bounded
-                        // u32) — an out-of-range value is dropped, never
+                        // Uniform checked conversion (reviews R2-10/R4-4):
+                        // zero/out-of-range values are dropped, never
                         // aliased onto another generation.
                         let Some(generation) = entry
                             .get("generation")
                             .and_then(Value::as_u64)
-                            .and_then(|raw| u32::try_from(raw).ok())
+                            .and_then(|raw| checked_generation(raw).ok())
                         else {
                             continue;
                         };
