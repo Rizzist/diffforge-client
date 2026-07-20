@@ -18,56 +18,81 @@ use std::thread::JoinHandle;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 
-/// Self-signed cert for CN/SAN `localhost` + `127.0.0.1`, valid to 2046.
-/// Test trust anchor ONLY — never shipped into any production trust store.
+/// Trust anchor for sink TLS tests: a dedicated test CA (CA:TRUE), valid
+/// to 2046. Clients add it as an extra root — full validation including
+/// hostname checking still runs. Test-only; never shipped anywhere.
 pub const SINK_TLS_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIDJTCCAg2gAwIBAgIUSnit9R/6VlXQTrMu/2t6p1wLCgEwDQYJKoZIhvcNAQEL
-BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcyMDA2NDUzNFoXDTQ2MDcx
-NTA2NDUzNFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEA7CD/IzZxnJOP6KdvWU5edL1p2bBGR4Pu6a4cuWVylIxH
-S+bZ5caSwmOzTMJecZ41x+wLPayRnGL05/XezLJAQGwdBJMYM7rROvZlcupT8pah
-/VsUZX2kKL13/tcDflqO33ZNTkbEI7uC+NnL2kscWPaQ7lwEAiCrQVlWaxHe7NvE
-ZRCSnXgzJVknhRGXrTwpgXRktH7oToRkhv8Xxym9susy/vEnLrwaLEHRv4Kr95k4
-itZhtOc+gc3Mn4GQVIUghrI58NqNfNCGzkpHJmXgEd9RvA5rltW0XWkypCmUYJSa
-f6wCAh49nZ8KKfjhtrSadKozsuzu+v7c4HdM/lmJ/wIDAQABo28wbTAdBgNVHQ4E
-FgQUVwvaTs6B2h7NRgZk+nD6eGxq6QIwHwYDVR0jBBgwFoAUVwvaTs6B2h7NRgZk
-+nD6eGxq6QIwDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SH
-BH8AAAEwDQYJKoZIhvcNAQELBQADggEBACNotl+QchNcc/gMs/UWD5Gwoq5syitu
-IO8qp+5Gfh8Jp4jXQP+F48IuWOdCq2nKK13wBHQIZlTk1cpnAha+coy8xhWcIDSW
-LYsbGx1+uIWhCsP4zGqqylImmajHZsJPFPBck2YhfDE/noSC+YmXKDtlFiKwxxxh
-gLrJU+wv4Tf46nH3KXFKzRoyFWnIkWZpuiKI42WIvQjGwLVfZJXZ9zRFSS4rEtyg
-5A+X/B4/3V8mYDCvt819FyhQ9d72lxMwreXb0OHAnaP9VG9QZFxzgdBtETY3iKjT
-Cch+G3csJSSYQWe1j3cU0gYcNHqCV96fZ/d5bjia5zVPWOl+fcHve2Y=
+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
+-----END CERTIFICATE-----
+";
+
+/// The leaf certificate the sink serves: CN/SAN `localhost` + 127.0.0.1,
+/// CA:FALSE, serverAuth EKU, signed by the test CA above.
+const SINK_TLS_LEAF_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIDUTCCAjmgAwIBAgIUL5/LX0u2OtAkL3Nh1r7qcxglFV0wDQYJKoZIhvcNAQEL
+BQAwIjEgMB4GA1UEAwwXRGlmZkZvcmdlIEVtYWlsIFRlc3QgQ0EwHhcNMjYwNzIw
+MTQ0OTIxWhcNNDYwNzE1MTQ0OTIxWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEi
+MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCMLq1qybvUIjzAKZkfmdweMjFN
+AEJyN4kh3VeAfBY1yOkysEagD+YyIM7FdeAr9mshYZqmNbslaCVw8+4XP08G9ltH
+0zPng78hxKHdiIxEbWsTuzNA5Psc8HADyw3s8PXny4aBQwYbncjPv8eswnmdtiAA
+mBY++cSulgt5skydXbIktxjXjivh4W0cbELuaFDuWBY0r7nhxulObqARC9gUiDlI
+3/0jirYki4Fygm+09nDzy9usxKMv+wJl8B7WfBA9YbHhBuCsDibVagX+LSCWDnBE
+oTk3uIMmCOB1Extw0k62B50j1rJsBjn80XsldA/tbWee5XEfCpldiPblRX4HAgMB
+AAGjgYwwgYkwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAkGA1UdEwQCMAAw
+CwYDVR0PBAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBQZG+PQ
+lDUiz1uFzjZjBkubFAILWDAfBgNVHSMEGDAWgBQI3lCe90rGykem6Syoke8rKbUe
+8jANBgkqhkiG9w0BAQsFAAOCAQEAKFXzzlWfXS4sTL8qumGu363J18iCKooNAnr9
++MUcGkk5+e14eepV5bVbrOnlRyyy4p40jBYSLmry7t7Btuz25UJIUL35X4nSDJBi
+BC81zR9BMviyuKzlL9SEgF27RlNbrZW0jgjlRN1yj7vCQ5JnBjA68OVOWcyd2uOL
+uycdpubcDjvTGXeomypYNB5Ni1nHy47pw7bcFItD/QYvV5yCC4NOF4PUZKgplbyK
+VXDj0TnyMDIGvIeoNAIya9jnGIhXzUe9JBEAZPm6PDJRFhvxeArc7r32UD+MYEQZ
+SysB6vdeSktF1SAiO19KZgrz13cBm9dD3nhpuGnEf4t8ymOi2g==
 -----END CERTIFICATE-----
 ";
 
 const SINK_TLS_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDsIP8jNnGck4/o
-p29ZTl50vWnZsEZHg+7prhy5ZXKUjEdL5tnlxpLCY7NMwl5xnjXH7As9rJGcYvTn
-9d7MskBAbB0EkxgzutE69mVy6lPylqH9WxRlfaQovXf+1wN+Wo7fdk1ORsQju4L4
-2cvaSxxY9pDuXAQCIKtBWVZrEd7s28RlEJKdeDMlWSeFEZetPCmBdGS0fuhOhGSG
-/xfHKb2y6zL+8ScuvBosQdG/gqv3mTiK1mG05z6BzcyfgZBUhSCGsjnw2o180IbO
-SkcmZeAR31G8DmuW1bRdaTKkKZRglJp/rAICHj2dnwop+OG2tJp0qjOy7O76/tzg
-d0z+WYn/AgMBAAECggEAFbxRKrFKR/rKq8SDMBn8q+D7q2QvM/S7EJuhspcvXZPZ
-bu0zGumVJ3unTOY0wgn+3VunCpL7XFqSPKqZ9bG6zwikqyp3IdvigqZHtF+e6/Jd
-uu/1XVpGutFQsw6hGF0cUF7tbXUqJ4032HxZPXYzMnqP4MEWRV6IenLPd6T6JkdE
-m1cUio+w5uIj8F1mWixsn1SABbk6VGJhJCsVtEPwJ9Qk9/Nj1jDu240XGZNAhsE0
-NKWTWCjxZfHkrS2YGbnhQz0v6u5VUO+Um5mtghypGkP2E5IT1WSe3IHvZs7MS+aB
-mXDyOnLgGOeoP37DIdMowPWVg7gBXK9EWz+gr1mh8QKBgQD9UwlZDvKp4V0pXuIa
-m5pXGmfqQfXlHDcWGRdcrqR15mB7zi33L88QC5e0r1kEdKtnoh8wzfGTt3pAw0oM
-DsbuwMg09yq2hC9khGwfGVIAuMq3yrxJKanrYlvVVyt7ZV9KsMie6E2HETz58QS+
-zzcpII2eM8IVbsO125cYlIOtFQKBgQDun3ceVAkUxQBCDZKWdqcM1Sn8Ag5XzSI2
-Pv12mp16rNDJEORo0hwKwfqLOeBLAGFQOOZhO8MaRgOK/ozJTTZjAe1ku7+dhB6m
-TFEjZF/sEVGxsrxj6bboFJ8JIi5B8cghyCkGG4z9rgfhlEnxXwEx5XtWNl5Dose2
-LMtUSJSnwwKBgQDfZhIRUuhXPiJNMJrPAjgq5mOLp920zZwaxcffeTgZrS+bHulU
-WvoM2VxRAG3NSyI5gzRkcsm/DggnAtHTLljrBmHIq8wkJxAwYcOD7W1uq4hCaux+
-zNpHdXcs/fGfoXdWw+44jP6JxX7zoEQiDVVE1KtvP4/CHOtE/kEScS5qPQKBgEHM
-GNV1CJgAhkSwZ2Yzy3Y/ZPdHPds6Bh/9GHjWw2urMVrv3HuGzBKvUD2JtO4Zabvs
-JKJVD0Q0YA+4huuO7ds5EdN/7aMqZiUm0Ay5RbXbRLKB/W5zaGrwHLYxBZ5LZArk
-nWNAv4zHqwaplAYJU1QF2g94qF9wCC+UhHB2Hv9vAoGAaZeU1BPerJDagjK6oSav
-VmRMVp6OtYTBXIuY94AAy582wEci37/mvm6lAz6xDyRXOx1VZk3WsWklPXT/G48M
-dBy4MZTunYI/xZP4rTWG+TAqksEVhwd4NWFNxc1kjgKgkfpn1zHKREj0y761m09S
-WUwsg49vvPpVHgnulDe00lI=
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCMLq1qybvUIjzA
+KZkfmdweMjFNAEJyN4kh3VeAfBY1yOkysEagD+YyIM7FdeAr9mshYZqmNbslaCVw
+8+4XP08G9ltH0zPng78hxKHdiIxEbWsTuzNA5Psc8HADyw3s8PXny4aBQwYbncjP
+v8eswnmdtiAAmBY++cSulgt5skydXbIktxjXjivh4W0cbELuaFDuWBY0r7nhxulO
+bqARC9gUiDlI3/0jirYki4Fygm+09nDzy9usxKMv+wJl8B7WfBA9YbHhBuCsDibV
+agX+LSCWDnBEoTk3uIMmCOB1Extw0k62B50j1rJsBjn80XsldA/tbWee5XEfCpld
+iPblRX4HAgMBAAECggEABCqXp+QIC5ra5baMIQbQe9Xvu4NQS5cVTHwzehOgu1zV
+0CuyEFbN94ZxxCen5Svv7NrlnvQGNGs/KvdtB6QvjpxALpx7NJx9+px0AngTpy2o
+sDpGSzL4YwNNvlHI1QEnuzRu3ST8p6cjDUhSFciP7HKPH/AP6ojqN2rT5ibjpQz/
+wfavF4QjJUUtcb8Ot+44t4sYXL7XekXhaCMWU+7hhEe9Y0msPbo9LJMNqfUMZR/1
+9m9rtsKSks3k5t/rjqLUVgoecOFqabkaqKZyHdVIx6VaGPU9gcSMsep0fpx47WBl
+QwrQwsvLYrZOHJK2ZAMKgB7IJZT3GEHxQNJZg8XgKQKBgQDCMxF9QydVlT/gL1DB
+zdgBSW+gQkKruJ4jh7xqLesHPqvUX4PrHSHjxlpFKYUJergOy+ueP8y82P1nX67V
+AWjgmR35jwEKJ1Fch3Bdo0fg+viv02f3DaI30gBBEUKJIjl5GLeS7JdP6nUK8oTc
+4UjcLfBi4fFXcvaIPT/r8JyMPwKBgQC4yviNsA8hpEXlH9w/kWysueVAziWd4lwu
+XmMHmZaxAjTB6ksn/JOuI+Vewv4vdwa2TiijIJIsperfM0VItTJWlWARNazSlE83
+d0utcbB8tQZSHIoimUSP1CgGF5zZeSjAfBK19KwHsD4qkNbMNvgead6ibQfQLLKi
+KoXv+ZS8OQKBgGVhTZ8MAKvQB5Gcgdc7A6ngUXLjRHTrIzs/MCBqKkkU8ZUj6/VA
+tyF2ukdi3n3NX+rxj+aEPfjUeq2NqPKwErU1mg1fF1baocHhPsrTY8HSoyL/BUZX
+CrmDWvic7xQyFrjeK297LZ7dsg5t/uhkf6naHaUxeNGDRapn90fPy5n3AoGBAKfL
+vjhCFutQVBtCe+bI8SpCPnZC+gtMQLHmCPwcraWbQDaYvZfYlGy6sYsDenW1GcYu
+YF4HtFOQcR4tWwszZTsTtkDKQVyRSQEvdOtQYZZLdirXOWNDUutbFOC7TjR2/NcT
+kpXgTtlIYpqaHEEg5NoQ/hT09fREsgvomugV88WZAoGAdZoHl5bxjbY7MX68zkRL
+t2+Oe0RsjEgIN+KOgS7Z91jk9h4Pg9BZiSM+vgLqCKH8tDKxGsKoUBPxdxaDwv28
+fgLL+SsTEaFH6KYEpiBko3HBZsbuolILYhkMe5nlz0X1ddnHkCWfCz/05Yw4f95p
+AW7yH4V3ox4H8MDtdSoyUQg=
 -----END PRIVATE KEY-----
 ";
 
@@ -230,11 +255,12 @@ impl Drop for SmtpSink {
 }
 
 fn sink_tls_config() -> rustls::ServerConfig {
-    let cert = rustls::pki_types::CertificateDer::from(pem_body(SINK_TLS_CERT_PEM));
+    let leaf = rustls::pki_types::CertificateDer::from(pem_body(SINK_TLS_LEAF_CERT_PEM));
+    let ca = rustls::pki_types::CertificateDer::from(pem_body(SINK_TLS_CERT_PEM));
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(pem_body(SINK_TLS_KEY_PEM).into());
     rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
+        .with_single_cert(vec![leaf, ca], key)
         .expect("sink TLS config")
 }
 

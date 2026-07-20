@@ -154,12 +154,114 @@ mod tests {
         assert!(text.contains("a=rsa-sha256"));
     }
 
-    // Round-trip: sign, then verify with mail-auth's verifier against a
-    // domain-key TXT record seeded from the generated public key. mail-auth's
-    // resolver has a test-mode mock, so we verify the signature object's
-    // shape and re-derive the body hash instead of a full DNS verify (which
-    // the mock stubs to NXDOMAIN). The parse-back proves the header is
-    // well-formed and self-consistent.
+    // Full round-trip: sign, then verify with mail-auth's DKIM verifier
+    // against the generated public key seeded into the resolver cache — no
+    // DNS is touched (the cache is checked before any lookup).
+    #[test]
+    fn dkim_sign_then_mail_auth_verifier_passes() {
+        use std::borrow::Borrow;
+        use std::collections::HashMap;
+        use std::hash::Hash;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        use mail_auth::common::parse::TxtRecordParser;
+        use mail_auth::common::verify::DomainKey;
+        use mail_auth::hickory_resolver::config::{ResolverConfig, ResolverOpts};
+        use mail_auth::{
+            AuthenticatedMessage, DkimResult, MessageAuthenticator, Parameters, ResolverCache,
+            Txt, MX,
+        };
+
+        struct SeededCache<K, V>(Mutex<HashMap<K, V>>);
+        impl<K: Eq + Hash, V: Clone> ResolverCache<K, V> for SeededCache<K, V> {
+            fn get<Q>(&self, name: &Q) -> Option<V>
+            where
+                K: Borrow<Q>,
+                Q: Hash + Eq + ?Sized,
+            {
+                self.0.lock().unwrap().get(name).cloned()
+            }
+            fn remove<Q>(&self, name: &Q) -> Option<V>
+            where
+                K: Borrow<Q>,
+                Q: Hash + Eq + ?Sized,
+            {
+                self.0.lock().unwrap().remove(name)
+            }
+            fn insert(&self, key: K, value: V, _valid_until: Instant) {
+                self.0.lock().unwrap().insert(key, value);
+            }
+        }
+
+        let key = generate_rsa_dkim_key().unwrap();
+        let message = b"From: Acme Ops <ops@acme.example>\r\nTo: billing@partner.example\r\nSubject: round trip\r\nDate: Mon, 20 Jul 2026 00:00:00 +0000\r\nMessage-ID: <rt@acme.example>\r\n\r\nround trip body\r\n";
+        let signed = sign_message(&key.private_key_pem, "acme.example", "dfmail1", message).unwrap();
+
+        let authenticated = AuthenticatedMessage::parse(&signed).expect("message parses");
+        let domain_key =
+            DomainKey::parse(key.dns_txt_value.as_bytes()).expect("domain key parses");
+        let txt_cache: SeededCache<String, Txt> = SeededCache(Mutex::new(HashMap::new()));
+        let record = Txt::DomainKey(Arc::new(domain_key));
+        // txt_lookup keys are lowercased FQDNs with a trailing dot; seed both
+        // forms so the cache hit is unambiguous.
+        txt_cache.insert(
+            "dfmail1._domainkey.acme.example.".to_string(),
+            record.clone(),
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+        txt_cache.insert(
+            "dfmail1._domainkey.acme.example".to_string(),
+            record,
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+
+        let authenticator =
+            MessageAuthenticator::new(ResolverConfig::cloudflare(), ResolverOpts::default())
+                .expect("authenticator builds");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outputs = runtime.block_on(authenticator.verify_dkim(Parameters {
+            params: &authenticated,
+            cache_txt: Some(&txt_cache),
+            cache_mx: None::<&SeededCache<String, Arc<Vec<MX>>>>,
+            cache_ptr: None::<&SeededCache<IpAddr, Arc<Vec<String>>>>,
+            cache_ipv4: None::<&SeededCache<String, Arc<Vec<Ipv4Addr>>>>,
+            cache_ipv6: None::<&SeededCache<String, Arc<Vec<Ipv6Addr>>>>,
+        }));
+        assert!(!outputs.is_empty(), "one DKIM signature evaluated");
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output.result(), DkimResult::Pass)),
+            "mail-auth verifier must pass the round trip: {:?}",
+            outputs.iter().map(|output| output.result()).collect::<Vec<_>>()
+        );
+
+        // Negative control: a tampered body must not verify.
+        let mut tampered = signed.clone();
+        let body_at = tampered.len() - 6;
+        tampered[body_at] ^= 0x01;
+        let tampered_message = AuthenticatedMessage::parse(&tampered).expect("tampered parses");
+        let outputs = runtime.block_on(authenticator.verify_dkim(Parameters {
+            params: &tampered_message,
+            cache_txt: Some(&txt_cache),
+            cache_mx: None::<&SeededCache<String, Arc<Vec<MX>>>>,
+            cache_ptr: None::<&SeededCache<IpAddr, Arc<Vec<String>>>>,
+            cache_ipv4: None::<&SeededCache<String, Arc<Vec<Ipv4Addr>>>>,
+            cache_ipv6: None::<&SeededCache<String, Arc<Vec<Ipv6Addr>>>>,
+        }));
+        assert!(
+            !outputs
+                .iter()
+                .any(|output| matches!(output.result(), DkimResult::Pass)),
+            "tampered body must fail verification"
+        );
+    }
+
     #[test]
     fn signed_header_parses_back_to_a_signature() {
         use mail_auth::dkim::Signature;

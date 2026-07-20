@@ -6,7 +6,6 @@
 use serde_json::{json, Value};
 
 use super::contract::EMAIL_CAPABILITY_VERSION;
-use super::credentials::CredentialStack;
 
 /// Runtime classification reported to the cloud (§8 `runtime` enum).
 pub fn runtime_kind() -> &'static str {
@@ -22,9 +21,11 @@ pub fn runtime_kind() -> &'static str {
 /// The `email_capability` object folded into
 /// `cloud_mcp_desktop_device_profile` (§28273 region). Content-free about
 /// individual profiles; the full capability list rides
-/// `email_sender_capabilities_sync`.
+/// `email_sender_capabilities_sync`. Uses the CACHED credential-store
+/// health — the device profile is on hot ack/presence paths and must never
+/// block on a Keychain probe.
 pub fn email_capability_block() -> Value {
-    let credential_store = CredentialStack::new().health().as_str();
+    let credential_store = super::credentials::cached_store_health().as_str();
     json!({
         "capability_version": EMAIL_CAPABILITY_VERSION,
         "modes": ["provider", "native"],

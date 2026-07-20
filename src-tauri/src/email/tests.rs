@@ -64,7 +64,7 @@ fn seed_send_job(
     journal
         .connection()
         .execute(
-            "INSERT INTO email_sender_profiles
+            "INSERT OR REPLACE INTO email_sender_profiles
              (profile_ref, mode, smtp_host, smtp_port, smtp_security, username,
               secret_locator, has_credentials, created_at_ms, updated_at_ms)
              VALUES ('profile-test', 'provider', 'localhost', ?1, 'starttls',

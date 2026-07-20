@@ -646,32 +646,26 @@ pub fn email_startup_journal_recovery() {
 pub async fn email_account_sync_resume_hook(state: &crate::CloudMcpState) {
     use super::cloud_transport::EmailCloudTransport;
 
-    // (a) Pending events → outbox.
-    let pending = tauri::async_runtime::spawn_blocking(|| {
-        let journal = EmailJournal::open_default()?;
-        journal.pending_events()
-    })
-    .await
-    .unwrap_or_else(|error| Err(format!("pending events join failed: {error}")));
-    if let Ok(pending) = pending {
-        if !pending.is_empty() {
-            let transport = super::cloud_transport::WsCloudTransport {
-                state: state.clone(),
-            };
-            let handed: Vec<String> = pending
-                .iter()
-                .filter(|event| transport.emit_send_event(&event.payload).is_ok())
-                .map(|event| event.status_event_id.clone())
-                .collect();
-            let _ = tauri::async_runtime::spawn_blocking(move || {
-                let mut journal = EmailJournal::open_default()?;
-                for status_event_id in handed {
-                    journal.mark_event_handed_off(&status_event_id)?;
+    // (a) Pending events → outbox. The whole walk runs on a blocking thread:
+    // WsCloudTransport::emit_send_event parks on the runtime internally and
+    // must never be called from an async worker thread.
+    {
+        let emit_state = state.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let mut journal = EmailJournal::open_default()?;
+            let pending = journal.pending_events()?;
+            if pending.is_empty() {
+                return Ok::<(), String>(());
+            }
+            let transport = super::cloud_transport::WsCloudTransport { state: emit_state };
+            for event in pending {
+                if transport.emit_send_event(&event.payload).is_ok() {
+                    journal.mark_event_handed_off(&event.status_event_id)?;
                 }
-                Ok::<(), String>(())
-            })
-            .await;
-        }
+            }
+            Ok(())
+        })
+        .await;
     }
 
     // (b) Capabilities sync → bindings cache.

@@ -81,6 +81,13 @@ impl CredentialStore for OsKeyringStore {
     }
 
     fn health(&self) -> CredentialStoreHealth {
+        // Never touch the real OS keychain from unit tests: macOS Security
+        // framework calls can block indefinitely in headless test contexts
+        // (and would prompt in signed ones). Tests exercise credential flows
+        // through MemoryCredentialStore / the vault.
+        if cfg!(test) {
+            return CredentialStoreHealth::Unavailable;
+        }
         let probe_name = "diffforge-health-probe";
         let Ok(entry) = Self::entry(probe_name) else {
             return CredentialStoreHealth::Unavailable;
@@ -369,6 +376,40 @@ impl SecretResolver for CredentialStack {
     fn resolve_locator(&self, locator: &str) -> Result<Option<SecretString>, String> {
         self.resolve(locator)
     }
+}
+
+/// Non-blocking cached credential-store health for hot paths (the device
+/// profile is rebuilt on every presence/ack payload — it must NEVER wait on
+/// a Keychain round-trip). Returns the last probed value immediately and
+/// refreshes on a detached thread when stale (60s TTL). Reports
+/// `unavailable` until the first probe lands; the authoritative value rides
+/// `email_sender_capabilities_sync`, which probes synchronously off the hot
+/// path.
+pub fn cached_store_health() -> CredentialStoreHealth {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    const TTL: Duration = Duration::from_secs(60);
+    static STATE: Mutex<Option<(Instant, CredentialStoreHealth)>> = Mutex::new(None);
+    static PROBING: AtomicBool = AtomicBool::new(false);
+
+    let cached = STATE
+        .lock()
+        .ok()
+        .and_then(|guard| *guard);
+    let (stale, value) = match cached {
+        Some((at, value)) => (at.elapsed() > TTL, value),
+        None => (true, CredentialStoreHealth::Unavailable),
+    };
+    if stale && !PROBING.swap(true, Ordering::SeqCst) {
+        std::thread::spawn(move || {
+            let health = CredentialStack::new().health();
+            if let Ok(mut guard) = STATE.lock() {
+                *guard = Some((Instant::now(), health));
+            }
+            PROBING.store(false, Ordering::SeqCst);
+        });
+    }
+    value
 }
 
 impl SecretResolver for MemoryCredentialStore {
