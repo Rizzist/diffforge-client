@@ -950,6 +950,23 @@ fn todo_store_set_item_attempt_seq(item: &mut Value, attempt_seq: u64) {
     }
 }
 
+/// Strip a queue row's swarm RUN binding. Every settled→queued requeue flip
+/// that bumps `attempt_seq` must call this: cancel-then-queue used to
+/// preserve `swarm_run_id`, so when the OLD run eventually settled, the
+/// run-id ROW FALLBACK in `todo_dispatch_mark_active_for_swarm_completed`
+/// matched the preserved run id, read the row's NEW attempt, and settled the
+/// fresh attempt as completed without it ever executing. A queued row
+/// carries NO run linkage — the next dispatch mints its own run id and
+/// stamps a fresh binding. Target fields (`target_swarm_id`, ...) survive:
+/// they say where to dispatch next, not which run owns the row.
+fn todo_store_clear_item_swarm_run_binding(item: &mut Value) {
+    if let Some(object) = item.as_object_mut() {
+        // Every run-id spelling todo_dispatch_value_matches_swarm_run reads.
+        object.remove("swarm_run_id");
+        object.remove("run_id");
+    }
+}
+
 /// The current attempt of the queue row holding `command_id`, for stamping
 /// freshly created receipts with the attempt they were written against.
 fn todo_dispatch_queue_item_attempt_seq_for_command(
@@ -6816,6 +6833,11 @@ async fn todo_store_set_status(
                         if let Some(next_attempt_seq) = next_attempt_seq {
                             todo_store_set_item_attempt_seq(item, next_attempt_seq);
                         }
+                        // The requeued attempt owns no swarm run yet — the
+                        // preserved binding is what let an OLD run's
+                        // completion settle the fresh attempt via the run-id
+                        // row fallback.
+                        todo_store_clear_item_swarm_run_binding(item);
                     }
                     apply_targets(item);
                     matched_item = Some(item.clone());
@@ -6865,6 +6887,9 @@ async fn todo_store_set_status(
                     if let Some(next_attempt_seq) = next_attempt_seq {
                         todo_store_set_item_attempt_seq(&mut item, next_attempt_seq);
                     }
+                    // Mirror rows can carry the old run's binding too; a
+                    // requeued attempt owns no swarm run yet.
+                    todo_store_clear_item_swarm_run_binding(&mut item);
                 }
                 apply_targets(&mut item);
                 item
@@ -6954,6 +6979,9 @@ fn todo_store_queue_all_apply_core(
                 stored_item,
                 todo_dispatch_queue_item_attempt_seq(stored_item).saturating_add(1),
             );
+            // And drop the old swarm run binding: the run-id row fallback
+            // must never match the fresh attempt against the old run.
+            todo_store_clear_item_swarm_run_binding(stored_item);
             todo_store_apply_target_fields(stored_item, true, None, None, None, None);
             updated = Some(stored_item.clone());
             break;
@@ -8812,12 +8840,19 @@ fn todo_dispatch_active_queue_item_ids_for_swarm(
         .collect()
 }
 
+/// `dispatch_attempt_seq` is the queue-row attempt this run was DISPATCHED
+/// at, carried by the swarm run registration (`None` for runs that predate
+/// the stamp or were submitted outside the todo queue). When present, the
+/// run-id row fallback below only settles rows still on that attempt — a
+/// row that kept the run id but moved to a newer attempt is not this run's
+/// work product and must stay queued.
 pub(crate) fn todo_dispatch_mark_active_for_swarm_completed(
     app: Option<&AppHandle>,
     workspace_id: &str,
     swarm_id: &str,
     run_id: &str,
     run_status: &str,
+    dispatch_attempt_seq: Option<u64>,
 ) -> usize {
     let workspace_id = workspace_id.trim();
     let swarm_id = swarm_id.trim();
@@ -8906,6 +8941,28 @@ pub(crate) fn todo_dispatch_mark_active_for_swarm_completed(
     {
         if settled.contains(&command_id) {
             continue;
+        }
+        // Belt over the requeue run-binding clear: the row fallback reads
+        // the row's CURRENT attempt, so with a known dispatch attempt it
+        // must only settle rows still ON that attempt. A row that kept the
+        // run id but moved to a newer attempt (requeued before the binding
+        // clear existed, or an echo that resurrected the binding) was never
+        // executed by this run.
+        if let Some(dispatch_attempt_seq) = dispatch_attempt_seq {
+            if attempt_seq != dispatch_attempt_seq {
+                log_terminal_status_event(
+                    "backend.todo_dispatch.swarm_run_row_fallback_attempt_fenced",
+                    json!({
+                        "command_id": command_id,
+                        "dispatch_attempt_seq": dispatch_attempt_seq,
+                        "row_attempt_seq": attempt_seq,
+                        "run_id": run_id,
+                        "swarm_id": swarm_id,
+                        "workspace_id": workspace_id,
+                    }),
+                );
+                continue;
+            }
         }
         todo_dispatch_queue_mark_settled(
             app,
@@ -10652,12 +10709,15 @@ mod todo_store_tests {
 
         // The new run completes: the row must settle COMPLETED at attempt 1
         // (receipt path fenced off, row fallback settles).
+        // Legacy runs carry no registration attempt stamp (`None`): the row
+        // fallback must keep its recovery guarantee for them.
         let settled_count = todo_dispatch_mark_active_for_swarm_completed(
             None,
             &workspace_id,
             "swarm-1",
             "run-new",
             "completed",
+            None,
         );
         assert!(
             settled_count >= 1,
@@ -10788,6 +10848,7 @@ mod todo_store_tests {
             "swarm-1",
             "run-new",
             "completed",
+            Some(1),
         );
         assert!(settled_count >= 1);
         let queue_path = todo_dispatch_data_path("queues", &workspace_id);
@@ -10799,6 +10860,213 @@ mod todo_store_tests {
             .into_iter()
             .find(|item| todo_dispatch_queue_item_command_id(item) == "command-swarm")
             .expect("the requeued swarm row must survive settlement");
+        assert_eq!(todo_store_item_status(&row), "completed");
+        assert_eq!(todo_dispatch_queue_item_attempt_seq(&row), 1);
+
+        if let Some(path) = receipt_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(path) = queue_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Ok(mut cache) = TODO_DISPATCH_RECEIPTS_CACHE
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            cache.remove(&todo_dispatch_safe_workspace_id(&workspace_id));
+        }
+    }
+
+    /// Round 7: a cancel-then-requeue must CLEAR the row's swarm run
+    /// binding, so the OLD run's completion can never settle the requeued
+    /// attempt through the run-id row fallback — the requeued work would be
+    /// falsely completed without ever executing. Sequence: dispatch at
+    /// attempt 0 → cancel → requeue (attempt 1, run binding cleared) → old
+    /// run completes → row STAYS queued at attempt 1 → fresh dispatch at
+    /// attempt 1 completes normally.
+    #[test]
+    fn requeue_clears_swarm_run_binding_so_old_run_cannot_settle_fresh_attempt() {
+        let workspace_id = format!("test-swarm-requeue-binding-{}", uuid::Uuid::new_v4());
+        let receipt_path = todo_dispatch_store_path(&workspace_id);
+
+        // Attempt 0 dispatched into the swarm under run-old.
+        let dispatched_row = json!({
+            "id": "todo-swarm",
+            "remote_command": { "command_id": "command-swarm" },
+            "status": "running",
+            "target_kind": "swarm",
+            "target_swarm_id": "swarm-1",
+            "swarm_run_id": "run-old",
+            "text": "do the swarm thing",
+            "todo_status": "running",
+            "workspace_id": workspace_id,
+        });
+        todo_dispatch_queue_write(&workspace_id, &[dispatched_row.clone()]);
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-swarm",
+                "item_id": "todo-swarm",
+                "status": "running",
+                "status_reason": "todo_queue_swarm_run_started",
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-old",
+                "attempt_seq": 0,
+                "text": "do the swarm thing",
+                "workspace_id": workspace_id,
+            }),
+            "backend_swarm_dispatch",
+        )
+        .unwrap();
+
+        // Cancel the running attempt (cancel settlement writes a settled
+        // receipt over the running dispatch entry)...
+        let mut cancelled_row = dispatched_row.clone();
+        todo_store_set_item_status(&mut cancelled_row, "cancelled", "test_cancel");
+        todo_dispatch_queue_write(&workspace_id, &[cancelled_row.clone()]);
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-swarm",
+                "item_id": "todo-swarm",
+                "status": "cancelled",
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-old",
+                "attempt_seq": 0,
+                "text": "do the swarm thing",
+                "workspace_id": workspace_id,
+            }),
+            "test_cancelled",
+        )
+        .unwrap();
+        // ...then requeue through the production queue-all core: attempt 0→1
+        // and the run binding must be CLEARED.
+        todo_dispatch_clear_settled_receipts_for_requeue(
+            None,
+            &workspace_id,
+            &["todo-swarm".to_string(), "command-swarm".to_string()],
+            "todo_queue_manual_queue",
+            Some(1),
+        );
+        let (requeued_items, corrections) = todo_store_queue_all_apply_core(
+            vec![cancelled_row],
+            vec![dispatched_row.clone()],
+            &workspace_id,
+            "todo_queue_manual_queue",
+        );
+        assert_eq!(corrections.len(), 1, "queue-all must requeue the row");
+        let requeued_row = corrections[0].clone();
+        assert_eq!(todo_store_item_status(&requeued_row), "queued");
+        assert_eq!(todo_dispatch_queue_item_attempt_seq(&requeued_row), 1);
+        assert!(
+            requeued_row.get("swarm_run_id").is_none(),
+            "the requeue flip must CLEAR the old swarm run binding — the \
+             preserved run id is what let the old run settle the fresh attempt"
+        );
+        todo_dispatch_queue_write(&workspace_id, &requeued_items);
+
+        // The OLD run completes AFTER the requeue: nothing may settle. The
+        // superseded receipt is fenced, and the row fallback no longer
+        // matches run-old (binding cleared) — belt: even a row that somehow
+        // kept the binding would be refused by the dispatch-attempt fence
+        // (run-old was dispatched at attempt 0, the row is at attempt 1).
+        todo_dispatch_mark_active_for_swarm_completed(
+            None,
+            &workspace_id,
+            "swarm-1",
+            "run-old",
+            "completed",
+            Some(0),
+        );
+        let queue_path = todo_dispatch_data_path("queues", &workspace_id);
+        let read_row = || {
+            queue_path
+                .as_ref()
+                .map(|path| todo_dispatch_queue_read(path))
+                .and_then(|snapshot| snapshot.get("items").and_then(Value::as_array).cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .find(|item| todo_dispatch_queue_item_command_id(item) == "command-swarm")
+        };
+        let row = read_row().expect("the requeued row must survive the old run's completion");
+        assert_eq!(
+            todo_store_item_status(&row),
+            "queued",
+            "the OLD run's completion must not settle the requeued attempt \
+             it never executed"
+        );
+        assert_eq!(todo_dispatch_queue_item_attempt_seq(&row), 1);
+
+        // Belt in isolation: even if a stale echo resurrected the old run
+        // binding on the requeued row, the dispatch-attempt fence must
+        // refuse the row fallback (run-old dispatched at attempt 0, row at
+        // attempt 1).
+        let mut resurrected = row.clone();
+        if let Some(object) = resurrected.as_object_mut() {
+            object.insert("swarm_run_id".to_string(), json!("run-old"));
+        }
+        todo_dispatch_queue_write(&workspace_id, &[resurrected]);
+        todo_dispatch_mark_active_for_swarm_completed(
+            None,
+            &workspace_id,
+            "swarm-1",
+            "run-old",
+            "completed",
+            Some(0),
+        );
+        let row = read_row().expect("row survives the attempt-fenced fallback");
+        assert_eq!(
+            todo_store_item_status(&row),
+            "queued",
+            "the run-id row fallback must only settle the attempt the run \
+             was dispatched at"
+        );
+
+        // Fresh dispatch at attempt 1 under run-new completes normally.
+        let mut fresh_row = row.clone();
+        if let Some(object) = fresh_row.as_object_mut() {
+            object.remove("swarm_run_id");
+        }
+        todo_store_set_item_status(&mut fresh_row, "running", "todo_queue_swarm_run_started");
+        if let Some(object) = fresh_row.as_object_mut() {
+            object.insert("swarm_run_id".to_string(), json!("run-new"));
+        }
+        todo_dispatch_queue_write(&workspace_id, &[fresh_row]);
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-swarm",
+                "item_id": "todo-swarm",
+                "status": "running",
+                "status_reason": "todo_queue_swarm_run_started",
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-new",
+                "attempt_seq": 1,
+                "text": "do the swarm thing",
+                "workspace_id": workspace_id,
+            }),
+            "backend_swarm_dispatch",
+        )
+        .unwrap();
+        let settled_count = todo_dispatch_mark_active_for_swarm_completed(
+            None,
+            &workspace_id,
+            "swarm-1",
+            "run-new",
+            "completed",
+            Some(1),
+        );
+        assert!(
+            settled_count >= 1,
+            "the fresh run's completion must settle the fresh attempt"
+        );
+        let row = read_row().expect("row survives fresh settlement");
         assert_eq!(todo_store_item_status(&row), "completed");
         assert_eq!(todo_dispatch_queue_item_attempt_seq(&row), 1);
 
@@ -15677,6 +15945,12 @@ async fn todo_dispatch_backend_submit_swarm(
         &swarm_id,
         &prompt,
         "implement",
+        // Stamp the queue-row attempt this dispatch acts on into the run
+        // registration: settlement fences the run-id row fallback to this
+        // exact attempt, so a cancel-then-requeue (which bumps the attempt
+        // and clears the row's run binding) can never be settled by THIS
+        // run's completion.
+        Some(todo_dispatch_queue_item_attempt_seq(item)),
     )
     .await
     {

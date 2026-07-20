@@ -96,6 +96,13 @@ struct RunSummary {
     started_at: u64,
     settled_at: u64,
     result_summary: String,
+    /// The todo queue-row attempt this run was DISPATCHED at, stamped by the
+    /// todo backend at submit time. Settlement hands it to the todo store so
+    /// the run-id row fallback can refuse rows requeued past this attempt.
+    /// `None` for runs submitted outside the todo queue (direct submits) and
+    /// for runs that predate the stamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_attempt_seq: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -183,6 +190,7 @@ fn swarm_persisted_key(key: String, to_runtime: bool) -> String {
             "championMemberId" => "champion_member_id",
             "championRuns" => "champion_runs",
             "contextPack" => "context_pack",
+            "dispatchAttemptSeq" => "dispatch_attempt_seq",
             "exitCode" => "exit_code",
             "fuseChars" => "fuse_chars",
             "inputReady" => "input_ready",
@@ -211,6 +219,7 @@ fn swarm_persisted_key(key: String, to_runtime: bool) -> String {
             "champion_member_id" => "championMemberId",
             "champion_runs" => "championRuns",
             "context_pack" => "contextPack",
+            "dispatch_attempt_seq" => "dispatchAttemptSeq",
             "exit_code" => "exitCode",
             "fuse_chars" => "fuseChars",
             "input_ready" => "inputReady",
@@ -911,6 +920,7 @@ fn swarm_run_summary_from_events(events: &[SwarmRunEvent]) -> Option<RunSummary>
         started_at: first.at,
         settled_at: 0,
         result_summary: String::new(),
+        dispatch_attempt_seq: None,
     };
     for event in events {
         match event.kind.as_str() {
@@ -927,6 +937,11 @@ fn swarm_run_summary_from_events(events: &[SwarmRunEvent]) -> Option<RunSummary>
                         .and_then(Value::as_str)
                         .unwrap_or("plan")
                         .to_string();
+                    // Restores the todo dispatch-attempt stamp across a
+                    // restart, so settlement keeps its attempt fence even
+                    // for runs reconstructed from the ledger.
+                    summary.dispatch_attempt_seq =
+                        data.get("dispatch_attempt_seq").and_then(Value::as_u64);
                 }
             }
             "run_result" => {
@@ -2182,13 +2197,14 @@ async fn swarm_mark_run_settled(
     text: &str,
 ) -> Result<bool, String> {
     let entry = swarm_entry(state, workspace_id, swarm_id).await;
-    let should_emit = {
+    let (should_emit, dispatch_attempt_seq) = {
         let mut data = entry.lock().await;
         if data.active_run_id != run_id {
-            false
+            (false, None)
         } else {
             data.active_run_id.clear();
             data.active_run_cancel = None;
+            let mut dispatch_attempt_seq = None;
             if let Some(summary) = data
                 .runs
                 .iter_mut()
@@ -2199,8 +2215,12 @@ async fn swarm_mark_run_settled(
                 if summary.result_summary.is_empty() {
                     summary.result_summary = swarm_summary_text(text);
                 }
+                // The todo queue-row attempt this run was dispatched at:
+                // handed to todo settlement so the run-id row fallback only
+                // settles rows still on that attempt.
+                dispatch_attempt_seq = summary.dispatch_attempt_seq;
             }
-            true
+            (true, dispatch_attempt_seq)
         }
     };
     if should_emit {
@@ -2223,6 +2243,7 @@ async fn swarm_mark_run_settled(
             swarm_id,
             run_id,
             status,
+            dispatch_attempt_seq,
         );
     }
     Ok(should_emit)
@@ -2767,7 +2788,23 @@ async fn swarm_run_conductor(
     mode: String,
     ready_members: Vec<SwarmMemberRef>,
     cancel: Arc<AtomicBool>,
+    dispatch_attempt_seq: Option<u64>,
 ) {
+    let mut run_started_data = json!({
+        "prompt": prompt,
+        "mode": mode,
+        "members": ready_members.len(),
+    });
+    // Persisted into the ledger so restart reconstruction keeps the todo
+    // dispatch-attempt fence (see swarm_run_summary_from_events).
+    if let (Some(object), Some(dispatch_attempt_seq)) =
+        (run_started_data.as_object_mut(), dispatch_attempt_seq)
+    {
+        object.insert(
+            "dispatch_attempt_seq".to_string(),
+            json!(dispatch_attempt_seq),
+        );
+    }
     let _ = swarm_append_run_event(
         &app,
         &state,
@@ -2777,11 +2814,7 @@ async fn swarm_run_conductor(
         "run_started",
         None,
         Some("Swarm run started.".to_string()),
-        Some(json!({
-            "prompt": prompt,
-            "mode": mode,
-            "members": ready_members.len(),
-        })),
+        Some(run_started_data),
     )
     .await;
 
@@ -3519,6 +3552,10 @@ pub(crate) async fn swarm_can_submit_task_internal(
     Ok(())
 }
 
+/// `dispatch_attempt_seq`: when the todo backend dispatches a queue row into
+/// the swarm, the row's CURRENT attempt is stamped into the run registration
+/// so settlement can fence the run-id row fallback to that exact attempt.
+/// Direct (non-todo) submits pass `None`.
 pub(crate) async fn swarm_submit_task_internal(
     app: &AppHandle,
     state: &SwarmRuntimeState,
@@ -3527,6 +3564,7 @@ pub(crate) async fn swarm_submit_task_internal(
     swarm_id: &str,
     prompt: &str,
     mode: &str,
+    dispatch_attempt_seq: Option<u64>,
 ) -> Result<String, String> {
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() {
@@ -3567,6 +3605,7 @@ pub(crate) async fn swarm_submit_task_internal(
                 started_at: swarm_now_ms(),
                 settled_at: 0,
                 result_summary: String::new(),
+                dispatch_attempt_seq,
             },
         );
         (run_id, ready_members, cancel)
@@ -3591,6 +3630,7 @@ pub(crate) async fn swarm_submit_task_internal(
             task_mode,
             ready_members,
             cancel,
+            dispatch_attempt_seq,
         )
         .await;
     });
@@ -3616,6 +3656,8 @@ async fn swarm_submit_task(
         &swarm_id,
         &prompt,
         mode.as_deref().unwrap_or("plan"),
+        // Direct submit: no todo queue row, so no dispatch attempt to stamp.
+        None,
     )
     .await?;
     Ok(SwarmSubmitTaskResult { run_id })
@@ -4003,7 +4045,11 @@ mod swarm_runtime_tests {
                 kind: "run_started".to_string(),
                 member_id: None,
                 text: None,
-                data: Some(json!({ "prompt": "do work", "mode": "implement" })),
+                data: Some(json!({
+                    "prompt": "do work",
+                    "mode": "implement",
+                    "dispatch_attempt_seq": 2,
+                })),
             },
             SwarmRunEvent {
                 seq: 2,
@@ -4030,5 +4076,11 @@ mod swarm_runtime_tests {
         assert_eq!(summary.status, "done");
         assert_eq!(summary.result_summary, "finished");
         assert_eq!(summary.settled_at, 30);
+        assert_eq!(
+            summary.dispatch_attempt_seq,
+            Some(2),
+            "ledger reconstruction must restore the todo dispatch-attempt \
+             stamp so settlement keeps its attempt fence across restarts"
+        );
     }
 }

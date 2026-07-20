@@ -13206,23 +13206,37 @@ async fn cloud_mcp_open_global_ws(
                 }
                 match incoming {
                     Ok(Message::Text(text)) => {
-                        cloud_mcp_handle_global_ws_message(
+                        if cloud_mcp_handle_global_ws_message(
                             state,
                             text.as_str(),
                             &termio_binary,
                             socket_account_epoch,
                         )
                         .await
+                            == CloudMcpWsFrameDisposition::StaleAccountEpoch
+                        {
+                            break Err(
+                                "Cloud MCP account context changed; dropped a stale-account frame and closed the websocket."
+                                    .to_string(),
+                            );
+                        }
                     }
                     Ok(Message::Binary(bytes)) => {
                         if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                            cloud_mcp_handle_global_ws_message(
+                            if cloud_mcp_handle_global_ws_message(
                                 state,
                                 &text,
                                 &termio_binary,
                                 socket_account_epoch,
                             )
-                            .await;
+                            .await
+                                == CloudMcpWsFrameDisposition::StaleAccountEpoch
+                            {
+                                break Err(
+                                    "Cloud MCP account context changed; dropped a stale-account frame and closed the websocket."
+                                        .to_string(),
+                                );
+                            }
                         } else {
                             cloud_mcp_store_ws_inbound(
                                 "binary",
@@ -13268,15 +13282,19 @@ async fn cloud_mcp_open_global_ws(
                         && runtime.global_ws_connection_id.is_some()
                         && runtime.global_ws_message_token.is_some();
                 }
-                // A socket still handshaking under an account context that no
-                // longer exists must die here: the ready gate above refused to
-                // stamp it connected, so close the transport and let the
-                // reconnect loop open a fresh socket under the CURRENT epoch.
-                if !ready_seen
-                    && state.account_epoch.load(Ordering::SeqCst) != socket_account_epoch
-                {
+                // A socket whose account context no longer exists must die
+                // here REGARDLESS of handshake progress (deliberately no
+                // `!ready_seen` guard): ready frames are refused by the
+                // ready gate, Text/Binary frames are dropped by the epoch
+                // fence at the top of the frame handler — but protocol
+                // Ping/Pong and undecodable Binary frames reach neither, so
+                // this transport-level check is what guarantees a stale
+                // socket cannot idle along after an account switch. Breaking
+                // here runs the normal post-loop cleanup, and the reconnect
+                // loop opens a fresh socket under the CURRENT epoch.
+                if state.account_epoch.load(Ordering::SeqCst) != socket_account_epoch {
                     break Err(
-                        "Cloud MCP account context changed during websocket handshake; closing stale socket."
+                        "Cloud MCP account context changed; closing stale-account websocket."
                             .to_string(),
                     );
                 }
@@ -18292,7 +18310,57 @@ async fn cloud_mcp_handle_list_agent_models_request(state: CloudMcpState, reques
     }
 }
 
+/// Disposition of one inbound global-ws frame, reported back to the
+/// transport loop so it can close the socket when the frame proves the
+/// socket belongs to a dead account context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloudMcpWsFrameDisposition {
+    /// The frame was processed (or deliberately ignored) under the current
+    /// account context.
+    Handled,
+    /// The frame arrived on a socket born under a PREVIOUS account epoch.
+    /// It was dropped before touching any state; the transport must close.
+    StaleAccountEpoch,
+}
+
 async fn cloud_mcp_handle_global_ws_message(
+    state: &CloudMcpState,
+    text: &str,
+    termio_binary: &Arc<AtomicBool>,
+    socket_account_epoch: u64,
+) -> CloudMcpWsFrameDisposition {
+    // Account-epoch fence for EVERY inbound frame, not just the ready frame:
+    // an ALREADY-READY socket born under account A keeps draining queued
+    // frames (todo deltas, remote-command intake, ...) after an A→B switch
+    // bumps the epoch, because the transport's biased select prioritizes
+    // inbound frames over the shutdown path and its post-frame stale check
+    // only ran while the handshake was incomplete. Drop the frame BEFORE any
+    // parsing or state application and tell the transport loop to close.
+    let current_account_epoch = state.account_epoch.load(Ordering::SeqCst);
+    if socket_account_epoch != current_account_epoch {
+        log_cloud_sync_event(
+            "ws.frame_dropped_stale_account_epoch",
+            json!({
+                "socket_account_epoch": socket_account_epoch,
+                "current_account_epoch": current_account_epoch,
+            }),
+        );
+        return CloudMcpWsFrameDisposition::StaleAccountEpoch;
+    }
+    cloud_mcp_handle_current_epoch_global_ws_message(
+        state,
+        text,
+        termio_binary,
+        socket_account_epoch,
+    )
+    .await;
+    CloudMcpWsFrameDisposition::Handled
+}
+
+/// The pre-fence body of the frame handler. Only reachable when the socket's
+/// birth epoch equals the current account epoch (checked by the caller
+/// above); the ready gate below re-checks as defense in depth.
+async fn cloud_mcp_handle_current_epoch_global_ws_message(
     state: &CloudMcpState,
     text: &str,
     termio_binary: &Arc<AtomicBool>,
@@ -66662,13 +66730,18 @@ mod cloud_mcp_tests {
         // ...then an A→B account switch bumps the epoch mid-handshake...
         state.account_epoch.fetch_add(1, Ordering::SeqCst);
         // ...so the late ready frame must be refused.
-        cloud_mcp_handle_global_ws_message(
+        let disposition = cloud_mcp_handle_global_ws_message(
             &state,
             &ready_frame,
             &termio_binary,
             socket_account_epoch,
         )
         .await;
+        assert_eq!(
+            disposition,
+            CloudMcpWsFrameDisposition::StaleAccountEpoch,
+            "a stale-epoch frame must tell the transport loop to close the socket"
+        );
         {
             let runtime = state.inner.lock().await;
             assert!(
@@ -66689,14 +66762,75 @@ mod cloud_mcp_tests {
 
         // The same frame under the CURRENT epoch is accepted normally.
         let current_epoch = state.account_epoch.load(Ordering::SeqCst);
-        cloud_mcp_handle_global_ws_message(&state, &ready_frame, &termio_binary, current_epoch)
-            .await;
-        let runtime = state.inner.lock().await;
-        assert!(runtime.global_ws_connected);
+        let disposition =
+            cloud_mcp_handle_global_ws_message(&state, &ready_frame, &termio_binary, current_epoch)
+                .await;
+        assert_eq!(disposition, CloudMcpWsFrameDisposition::Handled);
+        {
+            let runtime = state.inner.lock().await;
+            assert!(runtime.global_ws_connected);
+            assert_eq!(
+                runtime.global_ws_connection_id.as_deref(),
+                Some("connection-account-a")
+            );
+        }
+
+        // Post-ready stale-frame leg: the socket is READY under epoch N;
+        // an A→B switch bumps the epoch to N+1; a queued account-A todo
+        // delta drains out of the socket AFTER the switch. The frame must
+        // be dropped without touching state (no todo apply, no broadcast,
+        // no remote-command intake resumption) and the transport must be
+        // told to close — the old `!ready_seen` guard skipped this check
+        // exactly when it mattered most.
+        let ready_epoch = current_epoch;
+        state.account_epoch.fetch_add(1, Ordering::SeqCst);
+        let mut ws_events = state.global_ws_events.subscribe();
+        // `ack_only` keeps the CURRENT-epoch control delivery below from
+        // writing into the real todo mirror; the stale leg never gets that
+        // far — the fence drops the frame before it is even parsed.
+        let todo_delta_frame = json!({
+            "kind": "todo.live_state",
+            "event_kind": "todo.live_state",
+            "contract": "diffforge.todo.live_state.v1",
+            "payload": {
+                "ack_only": true,
+                "ops": [{
+                    "op": "upsert",
+                    "todo_id": "todo-account-a",
+                    "text": "account A leftover",
+                    "status": "queued",
+                    "seq": 7,
+                }],
+            },
+        })
+        .to_string();
+        let disposition = cloud_mcp_handle_global_ws_message(
+            &state,
+            &todo_delta_frame,
+            &termio_binary,
+            ready_epoch,
+        )
+        .await;
         assert_eq!(
-            runtime.global_ws_connection_id.as_deref(),
-            Some("connection-account-a")
+            disposition,
+            CloudMcpWsFrameDisposition::StaleAccountEpoch,
+            "an already-ready socket must drop post-switch frames and close"
         );
+        assert!(
+            ws_events.try_recv().is_err(),
+            "a stale-epoch todo delta must not be applied or broadcast into \
+             the new account's runtime"
+        );
+        // Same delta under the CURRENT epoch is dispatched normally (the
+        // fence keys on the socket's birth epoch, not the frame contents).
+        let disposition = cloud_mcp_handle_global_ws_message(
+            &state,
+            &todo_delta_frame,
+            &termio_binary,
+            state.account_epoch.load(Ordering::SeqCst),
+        )
+        .await;
+        assert_eq!(disposition, CloudMcpWsFrameDisposition::Handled);
     }
 
     fn workspace_consistency_catalog_path(data_root: &Path) -> PathBuf {
