@@ -3397,6 +3397,16 @@ fn log_terminal_diagnostic_event(app: &AppHandle, phase: &str, fields: Value) {
 }
 
 fn log_terminal_status_event(phase: &str, fields: Value) {
+    if daemon_mode_active() && phase.starts_with("backend.app_update.") {
+        // Release builds disable the JSONL diagnostic sinks, so headless BYOC
+        // daemons would otherwise have zero OTA visibility. systemd captures
+        // stderr into journald; keep it to one terse sanitized line per event.
+        eprintln!(
+            "diffforge-ota {} {}",
+            clean_terminal_telemetry_text(phase),
+            app_update_scrub_external_text(&fields.to_string())
+        );
+    }
     if !terminal_status_logging_enabled() {
         forward_terminal_status_to_energy_if_needed(phase, "backend", fields);
         return;
@@ -5597,6 +5607,10 @@ mod workspace_activation_tests {
 
 async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: String) {
     let _ = cloud_mcp_signal_desktop_closing(&app_for_shutdown, "app_shutdown").await;
+    // Close OTA admission and resolve every command generation while the
+    // Cloud transport is still available. Staged artifacts intentionally
+    // remain staged for the next launch.
+    app_update_shutdown().await;
 
     // In-flight todos cannot survive the process: label them interrupted
     // (resume-pending) now so they are never orphaned as "running".
