@@ -31,6 +31,96 @@ pub struct VerifiedMime {
     pub header_recipients: Vec<String>,
 }
 
+/// Q-encoding (RFC 2047) payload decoder: `_` = space, `=XX` = hex byte.
+fn decode_rfc2047_q(payload: &str) -> Vec<u8> {
+    let hex = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+    let bytes = payload.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'_' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'=' if index + 2 < bytes.len() => {
+                if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                    out.push((high << 4) | low);
+                    index += 3;
+                } else {
+                    out.push(b'=');
+                    index += 1;
+                }
+            }
+            other => {
+                out.push(other);
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Decode RFC 2047 encoded words (`=?charset?B|Q?payload?=`) anywhere in a
+/// header value, converting the declared charset to UTF-8. Undecodable
+/// words stay literal — the guard then still sees their raw bytes.
+fn decode_rfc2047(input: &str) -> String {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("=?") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let decoded = after.split_once('?').and_then(|(charset, tail)| {
+            let (encoding, tail) = tail.split_once('?')?;
+            let end = tail.find("?=")?;
+            let payload = &tail[..end];
+            let bytes = match encoding {
+                "b" | "B" => BASE64.decode(payload.as_bytes()).ok()?,
+                "q" | "Q" => decode_rfc2047_q(payload),
+                _ => return None,
+            };
+            let text = mail_parser::decoders::charsets::map::charset_decoder(charset.as_bytes())
+                .map(|decoder| decoder(&bytes))
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+            Some((text, &tail[end + 2..]))
+        });
+        match decoded {
+            Some((text, remainder)) => {
+                out.push_str(&text);
+                rest = remainder;
+            }
+            None => {
+                out.push_str("=?");
+                rest = &rest[start + 2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The ORIGINAL header value bytes (never the parser's reconstruction):
+/// unfolded, RFC 2047-decoded, lowercased — the haystack for the raw
+/// bcc-containment guard (review R6). The parser may drop or mangle
+/// malformed content, but a leaked address's bytes are physically HERE.
+fn raw_header_value_decoded(bytes: &[u8], header: &mail_parser::Header<'_>) -> String {
+    let start = (header.offset_start as usize).min(bytes.len());
+    let end = (header.offset_end as usize).min(bytes.len());
+    let raw = String::from_utf8_lossy(&bytes[start..end.max(start)]);
+    let unfolded: String = raw
+        .chars()
+        .filter(|ch| *ch != '\r' && *ch != '\n')
+        .collect();
+    decode_rfc2047(&unfolded).to_lowercase()
+}
+
 /// Split a TEXT-form address list on TOP-LEVEL commas only — commas inside
 /// quoted strings (`"a,b"@dom`) and inside angle brackets (obsolete routes
 /// `<@a,@b:user@dom>`) never split.
@@ -64,7 +154,15 @@ fn split_address_list(value: &str) -> Vec<String> {
                 current.push(ch);
             }
             ',' if !in_quotes && angle_depth == 0 => {
-                out.push(std::mem::take(&mut current));
+                // A bracket-stripped obsolete route (`@a,@b:user@dom`) keeps
+                // its commas until the route's ':' arrives (review R6-3) —
+                // never split a route prefix into phantom addresses.
+                let head = current.trim_start();
+                if head.starts_with('@') && !head.contains(':') {
+                    current.push(ch);
+                } else {
+                    out.push(std::mem::take(&mut current));
+                }
             }
             _ => current.push(ch),
         }
@@ -114,7 +212,7 @@ fn extract_addresses_from_text(value: &str) -> Result<Vec<String>, String> {
             None => {
                 return Err(format!(
                     "text address header entry has no comparable addr-spec: {token:?}"
-                ))
+                ));
             }
         }
     }
@@ -173,11 +271,56 @@ fn normalize_addr_spec(raw: &str) -> Option<String> {
     }
     if domain
         .chars()
-        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '<' | '>'))
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '<' | '>' | '(' | ')' | ',' | ';' | ':'))
     {
         return None;
     }
-    Some(format!("{local}@{domain}").to_ascii_lowercase())
+    Some(format!("{local}@{domain}").to_lowercase())
+}
+
+/// mail-parser 0.11 treats a quoted local part in a bare addr-spec as a
+/// display name plus an address missing its local part (`"local"@dom` becomes
+/// name `local`, address `@dom`). Recover only candidates whose ORIGINAL raw
+/// syntax has the closing quote immediately followed by `@`; a display name
+/// followed by a malformed `<@dom>` therefore cannot be mistaken for one.
+fn quoted_local_addr_specs(raw_value: &str) -> Vec<String> {
+    let bytes = raw_value.as_bytes();
+    let mut addresses = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        let mut escaped = false;
+        while index < bytes.len() {
+            match bytes[index] {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => break,
+                _ => {}
+            }
+            index += 1;
+        }
+        if index >= bytes.len() || index + 1 >= bytes.len() || bytes[index + 1] != b'@' {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 2;
+        while end < bytes.len()
+            && !bytes[end].is_ascii_whitespace()
+            && !matches!(bytes[end], b'<' | b'>' | b'(' | b')' | b',' | b';')
+        {
+            end += 1;
+        }
+        if let Some(address) = normalize_addr_spec(&raw_value[start..end]) {
+            addresses.push(address);
+        }
+        index = end;
+    }
+    addresses
 }
 
 /// Normalized addr-specs from a STRUCTURALLY parsed header value (reviews
@@ -187,11 +330,25 @@ fn normalize_addr_spec(raw: &str) -> Option<String> {
 /// parser yields WITHOUT a comparable addr-spec (encoded-word-only, empty,
 /// route-only) in a transmitted address header is an error, never a skip —
 /// an unmatchable entry could be exactly the smuggled bcc address.
-fn addresses_of(value: &mail_parser::HeaderValue<'_>) -> Result<Vec<String>, String> {
+fn addresses_of(
+    value: &mail_parser::HeaderValue<'_>,
+    raw_value: &str,
+) -> Result<Vec<String>, String> {
     use mail_parser::{Address, HeaderValue};
     let mut out = Vec::new();
+    let mut quoted_candidates = quoted_local_addr_specs(raw_value);
     let mut push = |raw: &str| -> Result<(), String> {
-        match normalize_addr_spec(raw) {
+        let normalized = normalize_addr_spec(raw).or_else(|| {
+            let suffix = raw.to_lowercase();
+            if !suffix.starts_with('@') {
+                return None;
+            }
+            let index = quoted_candidates
+                .iter()
+                .position(|candidate| candidate.ends_with(&suffix))?;
+            Some(quoted_candidates.remove(index))
+        });
+        match normalized {
             Some(address) => {
                 out.push(address);
                 Ok(())
@@ -209,7 +366,7 @@ fn addresses_of(value: &mail_parser::HeaderValue<'_>) -> Result<Vec<String>, Str
                     None => {
                         return Err(
                             "address header entry without an addr-spec fails closed".to_string()
-                        )
+                        );
                     }
                 }
             }
@@ -220,10 +377,8 @@ fn addresses_of(value: &mail_parser::HeaderValue<'_>) -> Result<Vec<String>, Str
                     match addr.address.as_deref() {
                         Some(address) => push(address)?,
                         None => {
-                            return Err(
-                                "address header entry without an addr-spec fails closed"
-                                    .to_string(),
-                            )
+                            return Err("address header entry without an addr-spec fails closed"
+                                .to_string());
                         }
                     }
                 }
@@ -244,9 +399,7 @@ fn addresses_of(value: &mail_parser::HeaderValue<'_>) -> Result<Vec<String>, Str
         // parser confusion — fail closed, never a silent skip (review R5:
         // exhaustive enumeration, no catch-all Ok).
         HeaderValue::DateTime(_) | HeaderValue::ContentType(_) | HeaderValue::Received(_) => {
-            return Err(
-                "address header carries a non-address value; fails closed".to_string(),
-            );
+            return Err("address header carries a non-address value; fails closed".to_string());
         }
     }
     Ok(out)
@@ -290,7 +443,8 @@ pub fn verify_mime(
             .iter()
             .filter(|header| wanted.iter().any(|name| name == &header.name))
         {
-            out.extend(addresses_of(header.value())?);
+            let raw = raw_header_value_decoded(bytes, header);
+            out.extend(addresses_of(header.value(), &raw)?);
         }
         Ok(out)
     };
@@ -307,7 +461,7 @@ pub fn verify_mime(
 
     let from_addresses = header_value(&[HeaderName::From])?;
     let identity_lower =
-        normalize_addr_spec(identity_address).unwrap_or_else(|| identity_address.to_ascii_lowercase());
+        normalize_addr_spec(identity_address).unwrap_or_else(|| identity_address.to_lowercase());
     // From is bound to EXACTLY the granted identity (review R2-7): a second
     // mailbox riding the From list is both an impersonation surface and a
     // bcc-disclosure channel.
@@ -327,9 +481,8 @@ pub fn verify_mime(
         .collect();
     // Envelope addresses ride the SAME normalization so the comparison is
     // symmetric (quoted locals, case).
-    let normalize_envelope = |address: &str| {
-        normalize_addr_spec(address).unwrap_or_else(|| address.to_ascii_lowercase())
-    };
+    let normalize_envelope =
+        |address: &str| normalize_addr_spec(address).unwrap_or_else(|| address.to_lowercase());
     let envelope_visible: BTreeSet<String> = envelope
         .recipients
         .iter()
@@ -344,33 +497,88 @@ pub fn verify_mime(
         .collect();
 
     // Bcc envelope addresses must not leak into ANY transmitted
-    // mailbox-bearing header (reviews R2-7/R3-5): To/Cc, Reply-To,
+    // mailbox-bearing header (reviews R2-7/R3-5/R6) — To/Cc, Reply-To,
     // From/Sender, Return-Path, and every resent variant all disclose the
-    // address to visible recipients. The scan is structural — RFC 5322
-    // parsed, so groups/comments/quoting cannot evade it. The granted
-    // identity itself is exempt: a self-bcc (archive copy) discloses
-    // nothing, since the sender's own address is already visible by
-    // construction.
-    let transmitted_addresses: BTreeSet<String> = header_value(&[
-        HeaderName::To,
-        HeaderName::Cc,
-        HeaderName::ReplyTo,
-        HeaderName::From,
-        HeaderName::Sender,
-        HeaderName::ReturnPath,
-        HeaderName::ResentTo,
-        HeaderName::ResentCc,
-        HeaderName::ResentFrom,
-        HeaderName::ResentSender,
-    ])?
-    .into_iter()
-    .collect();
-    if let Some(leaked) = envelope_bcc
+    // address to visible recipients. TWO independent belts:
+    //
+    //   1. STRUCTURED: mail-parser's RFC 5322 output, normalized to
+    //      comparable addr-specs (groups/comments/quoting/routes) — the
+    //      allow-precision check.
+    //   2. RAW CONTAINMENT: the ORIGINAL decoded header bytes (unfolded +
+    //      RFC 2047-decoded, lowercased, plus a whitespace-stripped
+    //      variant). If a bcc addr-spec's bytes appear ANYWHERE in a
+    //      transmitted address header, the message rejects — regardless of
+    //      how the parser mangled, dropped, or comment-wrapped them. A
+    //      leaked address is physically present in the bytes; no parse
+    //      corner changes that.
+    //
+    // FAIL CLOSED: a header whose RAW value is non-empty but yields no
+    // confidently-parsed addr-spec rejects — except the two legitimate
+    // no-address forms: a truly empty value and the RFC 5321 null
+    // reverse-path `<>`. The granted identity is exempt from the leak set:
+    // a self-bcc (archive copy) discloses nothing.
+    let is_transmitted_address_header = |name: &HeaderName<'_>| {
+        matches!(
+            name,
+            HeaderName::To
+                | HeaderName::Cc
+                | HeaderName::ReplyTo
+                | HeaderName::From
+                | HeaderName::Sender
+                | HeaderName::ReturnPath
+                | HeaderName::ResentTo
+                | HeaderName::ResentCc
+                | HeaderName::ResentFrom
+                | HeaderName::ResentSender
+        )
+    };
+    let strip_ws =
+        |value: &str| -> String { value.chars().filter(|ch| !ch.is_whitespace()).collect() };
+    let bcc_needles: Vec<(String, String)> = envelope_bcc
         .iter()
         .filter(|address| *address != &identity_lower)
-        .find(|address| transmitted_addresses.contains(*address))
-    {
-        return Err(format!("bcc recipient leaked into MIME headers: {leaked}"));
+        .map(|address| (address.clone(), strip_ws(address)))
+        .collect();
+    for header in parsed.headers() {
+        if !is_transmitted_address_header(&header.name) {
+            continue;
+        }
+        let raw = raw_header_value_decoded(bytes, header);
+        let raw_stripped = strip_ws(&raw);
+        // Belt 2: raw containment — parser-independent.
+        for (needle, needle_stripped) in &bcc_needles {
+            if raw.contains(needle.as_str()) || raw_stripped.contains(needle_stripped.as_str()) {
+                return Err(format!("bcc recipient leaked into MIME headers: {needle}"));
+            }
+        }
+        // The one non-empty address field body that legitimately carries no
+        // addr-spec is the RFC 5321 null reverse-path. It is legal only in
+        // Return-Path, never in To/From/etc.
+        let raw_trim = raw.trim();
+        let is_null_reverse_path =
+            matches!(header.name, HeaderName::ReturnPath) && raw_trim == "<>";
+
+        // Belt 1: structured extraction (Err = per-entry fail-closed).
+        let extracted = if is_null_reverse_path {
+            Vec::new()
+        } else {
+            addresses_of(header.value(), &raw)?
+        };
+        for address in &extracted {
+            if bcc_needles.iter().any(|(needle, _)| needle == address) {
+                return Err(format!("bcc recipient leaked into MIME headers: {address}"));
+            }
+        }
+        // Dropped-content fail-closed: raw bytes present but the parser
+        // yielded nothing comparable (e.g. an unclosed angle-addr the
+        // parser turned into Empty) — reject unless it is a legitimate
+        // no-address form.
+        if extracted.is_empty() && !raw_trim.is_empty() && !is_null_reverse_path {
+            return Err(format!(
+                "address header value not confidently parseable: {:?}",
+                header.name.as_str()
+            ));
+        }
     }
     // Visible headers must match the envelope's to/cc set exactly.
     if header_recipients != envelope_visible {
@@ -409,6 +617,29 @@ mod tests {
     }
 
     const BODY: &[u8] = b"From: Acme Ops <ops@acme.example>\r\nTo: billing@partner.example\r\nSubject: invoice\r\n\r\nhello\r\n";
+
+    fn message_with_address_header(header: &str) -> Vec<u8> {
+        format!(
+            "From: ops@acme.example\r\nTo: billing@partner.example\r\n{header}\r\n\r\nhello\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn assert_bcc_leak_rejected(header: &str, bcc_address: &str) {
+        let mime = message_with_address_header(header);
+        let error = verify_mime(
+            &mime,
+            &sha256_hex(&mime),
+            mime.len() as u64,
+            "ops@acme.example",
+            &envelope(&[("to", "billing@partner.example"), ("bcc", bcc_address)]),
+        )
+        .expect_err("a transmitted address header must not disclose an envelope-bcc address");
+        assert!(
+            error.contains("bcc recipient leaked into MIME headers"),
+            "expected the bcc-leak guard to reject {header:?}, got: {error}"
+        );
+    }
 
     #[test]
     fn accepts_matching_mime() {
@@ -673,6 +904,115 @@ mod tests {
             &self_bcc_envelope,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn systemic_bcc_guard_rejects_structured_and_raw_obfuscations() {
+        // Structured normalization remains the precision belt for valid but
+        // non-literal forms whose bytes do not contain the canonical needle.
+        for header in [
+            "Reply-To: \"archive\"@acme.example",
+            "Reply-To: <\"archive\"@acme.example>",
+            "Reply-To: hidden:archive@acme.example;",
+            "Reply-To: Archive (comment) <archive@acme.example>",
+            "Reply-To: <@relay.example:archive@acme.example>",
+            "Reply-To: innocent@example.net, archive@acme.example",
+            "Reply-To: =?UTF-8?B?YXJjaGl2ZUBhY21lLmV4YW1wbGU=?=",
+        ] {
+            assert_bcc_leak_rejected(header, "archive@acme.example");
+        }
+
+        // R6-1: mail-parser drops the unclosed value entirely and keeps only
+        // the angle address in the mixed form. The original-byte guard sees
+        // the canonical bcc addr-spec before either parser loss.
+        assert_bcc_leak_rejected("Return-Path: <archive@acme.example", "archive@acme.example");
+        assert_bcc_leak_rejected("Return-Path: archive@x <innocent@y>", "archive@x");
+
+        // R6-2: the parser may retain CFWS as if it were part of the domain;
+        // canonical containment in the original field body still rejects.
+        assert_bcc_leak_rejected(
+            "Return-Path: <archive@acme.example(comment)>",
+            "archive@acme.example",
+        );
+
+        // Folding cannot split a canonical needle past the whitespace-free
+        // raw guard.
+        assert_bcc_leak_rejected(
+            "Reply-To: archive@\r\n acme.example",
+            "archive@acme.example",
+        );
+    }
+
+    #[test]
+    fn legitimate_address_headers_and_null_reverse_path_are_accepted() {
+        for header in [
+            "Return-Path: <sender@example.net>",
+            "Return-Path: <>",
+            "Return-Path: <@relay1.example,@relay2.example:sender@example.net>",
+            "Reply-To: \"support\"@example.net",
+            "Reply-To:",
+        ] {
+            let mime = message_with_address_header(header);
+            assert!(
+                verify_mime(
+                    &mime,
+                    &sha256_hex(&mime),
+                    mime.len() as u64,
+                    "ops@acme.example",
+                    &envelope(&[
+                        ("to", "billing@partner.example"),
+                        ("bcc", "archive@acme.example"),
+                    ]),
+                )
+                .is_ok(),
+                "legitimate header should pass: {header:?}"
+            );
+        }
+
+        let multi_recipient = b"From: ops@acme.example\r\nTo: billing@partner.example, legal@example.net\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            multi_recipient,
+            &sha256_hex(multi_recipient),
+            multi_recipient.len() as u64,
+            "ops@acme.example",
+            &envelope(&[
+                ("to", "billing@partner.example"),
+                ("to", "legal@example.net"),
+                ("bcc", "archive@acme.example"),
+            ]),
+        )
+        .is_ok());
+
+        // RFC 2047 in a display name is benign when its decoded text does
+        // not disclose the bcc addr-spec.
+        let encoded_display_name = b"From: =?UTF-8?Q?Acme_Operations?= <ops@acme.example>\r\nTo: billing@partner.example\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            encoded_display_name,
+            &sha256_hex(encoded_display_name),
+            encoded_display_name.len() as u64,
+            "ops@acme.example",
+            &envelope(&[
+                ("to", "billing@partner.example"),
+                ("bcc", "archive@acme.example"),
+            ]),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn null_path_is_rejected_outside_return_path() {
+        let mime = message_with_address_header("Reply-To: <>");
+        assert!(verify_mime(
+            &mime,
+            &sha256_hex(&mime),
+            mime.len() as u64,
+            "ops@acme.example",
+            &envelope(&[
+                ("to", "billing@partner.example"),
+                ("bcc", "archive@acme.example"),
+            ]),
+        )
+        .is_err());
     }
 
     #[test]
