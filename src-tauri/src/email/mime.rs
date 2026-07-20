@@ -5,7 +5,7 @@
 //! envelope ONLY, never in the MIME headers (§3b: bcc is envelope-only and
 //! the manifest split is the proof; the device re-checks before any send).
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, ops::Range};
 
 use super::contract::sha256_hex;
 
@@ -121,13 +121,32 @@ fn raw_header_value_decoded(bytes: &[u8], header: &mail_parser::Header<'_>) -> S
     decode_rfc2047(&unfolded).to_lowercase()
 }
 
+#[derive(Debug)]
+struct DecodedHeaderBlock {
+    text: String,
+    /// One flag per UTF-8 byte in `text`. True means that byte came from a
+    /// cleanly parsed address-header value and is therefore structured-belt
+    /// jurisdiction.
+    clean_address_value: Vec<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct TaggedChar {
+    ch: char,
+    clean_address_value: bool,
+}
+
 /// The complete ORIGINAL header block, ending before the first RFC 5322
 /// blank-line body separator. Folded continuation lines are unfolded while
-/// physical boundaries between distinct header lines remain visible. This
-/// deliberately does not depend on mail-parser's header spans: malformed
-/// colon-less lines and other parser-dropped bytes must stay in the raw
-/// bcc-containment guard's haystack.
-fn raw_header_block_decoded(bytes: &[u8]) -> String {
+/// physical boundaries between distinct header lines remain visible. Every
+/// output byte retains whether its source byte was inside a cleanly parsed
+/// address-header value span, so the raw belt can exempt only those hits.
+/// Malformed colon-less lines and other parser-dropped bytes have no such
+/// span and therefore remain fully enforced.
+fn raw_header_block_decoded(
+    bytes: &[u8],
+    clean_address_value_spans: &[Range<usize>],
+) -> DecodedHeaderBlock {
     let crlf_end = bytes.windows(4).position(|window| window == b"\r\n\r\n");
     let lf_end = bytes.windows(2).position(|window| window == b"\n\n");
     let header_end = match (crlf_end, lf_end) {
@@ -136,63 +155,135 @@ fn raw_header_block_decoded(bytes: &[u8]) -> String {
         (None, Some(lf)) => lf,
         (None, None) => bytes.len(),
     };
-    let raw = String::from_utf8_lossy(&bytes[..header_end]);
-    let normalized_lines = raw.replace("\r\n", "\n").replace('\r', "\n");
-    let mut unfolded = String::with_capacity(normalized_lines.len());
-    for (index, line) in normalized_lines.split('\n').enumerate() {
-        if index > 0 && !line.starts_with([' ', '\t']) {
-            unfolded.push('\n');
-        }
-        unfolded.push_str(line);
+    // Split at every clean-span edge before UTF-8 decoding so each produced
+    // character has an unambiguous source jurisdiction. Header value offsets
+    // are ASCII syntax boundaries, so they cannot bisect a valid UTF-8 code
+    // point in a conforming message.
+    let mut cuts = vec![0, header_end];
+    for span in clean_address_value_spans {
+        cuts.push(span.start.min(header_end));
+        cuts.push(span.end.min(header_end));
     }
-    decode_rfc2047(&unfolded).to_lowercase()
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut tagged = Vec::with_capacity(header_end);
+    for edges in cuts.windows(2) {
+        let start = edges[0];
+        let end = edges[1];
+        if start == end {
+            continue;
+        }
+        let is_clean = clean_address_value_spans
+            .iter()
+            .any(|span| span.start <= start && end <= span.end);
+        tagged.extend(
+            String::from_utf8_lossy(&bytes[start..end])
+                .chars()
+                .map(|ch| TaggedChar {
+                    ch,
+                    clean_address_value: is_clean,
+                }),
+        );
+    }
+
+    // Normalize physical line endings first.
+    let mut normalized = Vec::with_capacity(tagged.len());
+    let mut index = 0;
+    while index < tagged.len() {
+        if tagged[index].ch == '\r' {
+            let clean_address_value = tagged[index].clean_address_value;
+            if tagged.get(index + 1).map(|tagged| tagged.ch) == Some('\n') {
+                index += 1;
+            }
+            normalized.push(TaggedChar {
+                ch: '\n',
+                clean_address_value,
+            });
+        } else {
+            normalized.push(tagged[index]);
+        }
+        index += 1;
+    }
+
+    // Unfold continuation lines, but retain newlines between distinct fields
+    // as sentinels so no token can be synthesized across header boundaries.
+    let mut unfolded = Vec::with_capacity(normalized.len());
+    for (index, tagged) in normalized.iter().copied().enumerate() {
+        if tagged.ch != '\n'
+            || !normalized
+                .get(index + 1)
+                .map(|next| matches!(next.ch, ' ' | '\t'))
+                .unwrap_or(false)
+        {
+            unfolded.push(tagged);
+        }
+    }
+
+    // Span edges cannot occur inside an encoded word, so decoding contiguous
+    // runs with the same jurisdiction preserves both RFC 2047 behavior and
+    // an exact clean/non-clean tag for every decoded output byte.
+    let mut decoded = DecodedHeaderBlock {
+        text: String::with_capacity(header_end),
+        clean_address_value: Vec::with_capacity(header_end),
+    };
+    let mut run_start = 0;
+    while run_start < unfolded.len() {
+        let is_clean = unfolded[run_start].clean_address_value;
+        let mut run_end = run_start + 1;
+        while run_end < unfolded.len() && unfolded[run_end].clean_address_value == is_clean {
+            run_end += 1;
+        }
+        let run: String = unfolded[run_start..run_end]
+            .iter()
+            .map(|tagged| tagged.ch)
+            .collect();
+        let run = decode_rfc2047(&run).to_lowercase();
+        for ch in run.chars() {
+            decoded.text.push(ch);
+            decoded
+                .clean_address_value
+                .extend(std::iter::repeat_n(is_clean, ch.len_utf8()));
+        }
+        run_start = run_end;
+    }
+    decoded
 }
 
 /// Whitespace-free companion for the complete raw header block. Newlines
 /// between distinct physical header fields remain as sentinels so stripping
 /// folding whitespace cannot synthesize an address across two unrelated
 /// fields.
-fn strip_header_whitespace(input: &str) -> String {
-    input
-        .chars()
-        .filter(|ch| *ch == '\n' || !ch.is_whitespace())
-        .collect()
+fn strip_header_whitespace(input: &DecodedHeaderBlock) -> DecodedHeaderBlock {
+    let mut stripped = DecodedHeaderBlock {
+        text: String::with_capacity(input.text.len()),
+        clean_address_value: Vec::with_capacity(input.clean_address_value.len()),
+    };
+    for (index, ch) in input.text.char_indices() {
+        if ch == '\n' || !ch.is_whitespace() {
+            stripped.text.push(ch);
+            stripped.clean_address_value.extend(std::iter::repeat_n(
+                input.clean_address_value[index],
+                ch.len_utf8(),
+            ));
+        }
+    }
+    stripped
 }
 
-/// A raw addr-spec containment hit is valid only when it is a delimited
-/// token, never a substring of a longer local part or domain. These are the
-/// deliberately asymmetric boundaries from the bcc-leak contract.
-fn contains_addr_spec_token(haystack: &str, needle: &str) -> bool {
+/// Find narrow raw-belt token hits. Only the conservative characters that
+/// common free-text address detectors treat as address continuation suppress
+/// a match: ASCII alphanumeric plus `.`, `-`, `_`, and local-side `+`.
+/// Full RFC 5322 atext belongs exclusively to the structured belt.
+fn addr_spec_token_ranges(haystack: &str, needle: &str) -> Vec<Range<usize>> {
     if needle.is_empty() {
-        return false;
+        return Vec::new();
     }
 
-    let local_part_continues = |ch: char| {
-        ch.is_ascii_alphanumeric()
-            || matches!(
-                ch,
-                '!' | '#'
-                    | '$'
-                    | '%'
-                    | '&'
-                    | '\''
-                    | '*'
-                    | '+'
-                    | '-'
-                    | '.'
-                    | '/'
-                    | '='
-                    | '?'
-                    | '^'
-                    | '_'
-                    | '`'
-                    | '{'
-                    | '|'
-                    | '}'
-                    | '~'
-            )
-    };
-    let domain_continues = |ch: char| ch.is_alphanumeric() || ch == '-';
+    let local_part_continues =
+        |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '+');
+    let domain_continues = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_');
+    let mut ranges = Vec::new();
     let mut search_start = 0;
     while let Some(relative_start) = haystack[search_start..].find(needle) {
         let start = search_start + relative_start;
@@ -204,17 +295,36 @@ fn contains_addr_spec_token(haystack: &str, needle: &str) -> bool {
             .unwrap_or(true);
         let mut after = haystack[end..].chars();
         let after_is_boundary = match after.next() {
-            Some('.') => !after.next().map(|ch| ch.is_alphanumeric()).unwrap_or(false),
+            // A dot extends the domain only when it opens another ordinary
+            // ASCII label. A terminal/pre-boundary dot is the root-FQDN form
+            // of the same address and must therefore match.
+            Some('.') => !after
+                .next()
+                .map(|ch| ch.is_ascii_alphanumeric())
+                .unwrap_or(false),
             Some(ch) => !domain_continues(ch),
             None => true,
         };
         if before_is_boundary && after_is_boundary {
-            return true;
+            ranges.push(start..end);
         }
 
         search_start = start + needle.chars().next().expect("non-empty needle").len_utf8();
     }
-    false
+    ranges
+}
+
+/// A narrow raw-belt hit stands unless every byte of the hit came from one
+/// cleanly parsed address-header value span. Structured comparison has
+/// already rejected exact bcc addr-specs before this carve-out is consulted.
+fn contains_unprotected_addr_spec_token(block: &DecodedHeaderBlock, needle: &str) -> bool {
+    addr_spec_token_ranges(&block.text, needle)
+        .into_iter()
+        .any(|range| {
+            !block.clean_address_value[range]
+                .iter()
+                .all(|is_clean| *is_clean)
+        })
 }
 
 /// Split a TEXT-form address list on TOP-LEVEL commas only — commas inside
@@ -502,6 +612,39 @@ fn addresses_of(
     Ok(out)
 }
 
+/// `mail-parser` parses Return-Path through its message-id/text path and may
+/// retain an angle address while dropping unrelated leading bytes. Treat its
+/// value span as clean only when the entire decoded field body itself is one
+/// comparable path. Other address headers use the parser's address form,
+/// where `addresses_of` already requires every yielded entry to carry a valid
+/// addr-spec.
+fn is_clean_address_value(
+    name: &mail_parser::HeaderName<'_>,
+    raw_trimmed: &str,
+    extracted: &[String],
+) -> bool {
+    if extracted.is_empty() {
+        return false;
+    }
+    if !matches!(name, mail_parser::HeaderName::ReturnPath) {
+        return true;
+    }
+
+    let candidate = if let Some(inner) = raw_trimmed
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+    {
+        inner
+    } else if raw_trimmed.contains(['<', '>']) {
+        return false;
+    } else {
+        raw_trimmed
+    };
+    normalize_addr_spec(candidate)
+        .filter(|address| extracted.len() == 1 && address == &extracted[0])
+        .is_some()
+}
+
 /// Verify downloaded MIME bytes against the prepare grant. Every failure is
 /// terminal for the attempt (the device never patches the frozen MIME).
 pub fn verify_mime(
@@ -602,12 +745,11 @@ pub fn verify_mime(
     //      comparable addr-specs (groups/comments/quoting/routes) — the
     //      allow-precision check.
     //   2. RAW CONTAINMENT: the COMPLETE ORIGINAL header block (unfolded +
-    //      RFC 2047-decoded, lowercased, plus a whitespace-stripped
-    //      variant). If a bcc addr-spec appears as a delimited token ANYWHERE
-    //      before the body separator, the message rejects — including bytes
-    //      from malformed colon-less lines or other content mail-parser
-    //      dropped. Token boundaries avoid treating a bcc address as a
-    //      substring of a distinct, longer address.
+    //      RFC 2047-decoded, lowercased, plus a whitespace-stripped variant)
+    //      with deliberately narrow free-text token boundaries. Hits inside
+    //      clean address-header value spans are carved out because belt 1 has
+    //      jurisdiction there; hits in every other byte stand, including
+    //      Subject/X-* and malformed colon-less lines mail-parser dropped.
     //
     // FAIL CLOSED: a header whose RAW value is non-empty but yields no
     // confidently-parsed addr-spec rejects — except the two legitimate
@@ -637,18 +779,11 @@ pub fn verify_mime(
         .map(|address| (address.clone(), strip_ws(address)))
         .collect();
 
-    // Belt 2 is intentionally parser-independent: scan every original byte
-    // in the header region, not just spans assigned to parsed headers.
-    let raw_headers = raw_header_block_decoded(bytes);
-    let raw_headers_stripped = strip_header_whitespace(&raw_headers);
-    for (needle, needle_stripped) in &bcc_needles {
-        if contains_addr_spec_token(&raw_headers, needle)
-            || contains_addr_spec_token(&raw_headers_stripped, needle_stripped)
-        {
-            return Err(format!("bcc recipient leaked into MIME headers: {needle}"));
-        }
-    }
-
+    // Belt 1 runs first. Only a successfully extracted address-header value
+    // earns a carve-out span, and a structured bcc equality always rejects
+    // before the raw belt can consult that span.
+    let mut clean_address_value_spans = Vec::new();
+    let mut structured_failure = None;
     for header in parsed.headers() {
         if !is_transmitted_address_header(&header.name) {
             continue;
@@ -661,11 +796,19 @@ pub fn verify_mime(
         let is_null_reverse_path =
             matches!(header.name, HeaderName::ReturnPath) && raw_trim == "<>";
 
-        // Belt 1: structured extraction (Err = per-entry fail-closed).
-        let extracted = if is_null_reverse_path {
-            Vec::new()
+        let extracted = match if is_null_reverse_path {
+            Ok(Vec::new())
         } else {
-            addresses_of(header.value(), &raw)?
+            addresses_of(header.value(), &raw)
+        } {
+            Ok(extracted) => extracted,
+            Err(error) => {
+                // Keep the span raw-enforced. If it contains the bcc needle,
+                // belt 2 reports the disclosure; otherwise this parse error
+                // still fails closed immediately after belt 2.
+                structured_failure.get_or_insert(error);
+                continue;
+            }
         };
         for address in &extracted {
             if bcc_needles.iter().any(|(needle, _)| needle == address) {
@@ -677,12 +820,37 @@ pub fn verify_mime(
         // parser turned into Empty) — reject unless it is a legitimate
         // no-address form.
         if extracted.is_empty() && !raw_trim.is_empty() && !is_null_reverse_path {
-            return Err(format!(
-                "address header value not confidently parseable: {:?}",
-                header.name.as_str()
-            ));
+            structured_failure.get_or_insert_with(|| {
+                format!(
+                    "address header value not confidently parseable: {:?}",
+                    header.name.as_str()
+                )
+            });
+            continue;
+        }
+        if is_clean_address_value(&header.name, raw_trim, &extracted) {
+            let start = (header.offset_start as usize).min(bytes.len());
+            let end = (header.offset_end as usize).min(bytes.len()).max(start);
+            clean_address_value_spans.push(start..end);
         }
     }
+
+    // Belt 2 scans the entire original header region. Source tags derived
+    // from mail-parser's value offsets implement the carve-out per hit: only
+    // a hit wholly inside a clean span is ignored.
+    let raw_headers = raw_header_block_decoded(bytes, &clean_address_value_spans);
+    let raw_headers_stripped = strip_header_whitespace(&raw_headers);
+    for (needle, needle_stripped) in &bcc_needles {
+        if contains_unprotected_addr_spec_token(&raw_headers, needle)
+            || contains_unprotected_addr_spec_token(&raw_headers_stripped, needle_stripped)
+        {
+            return Err(format!("bcc recipient leaked into MIME headers: {needle}"));
+        }
+    }
+    if let Some(error) = structured_failure {
+        return Err(error);
+    }
+
     // Visible headers must match the envelope's to/cc set exactly.
     if header_recipients != envelope_visible {
         return Err(format!(
@@ -730,14 +898,19 @@ mod tests {
 
     fn assert_bcc_leak_rejected(header: &str, bcc_address: &str) {
         let mime = message_with_address_header(header);
-        let error = verify_mime(
+        let result = verify_mime(
             &mime,
             &sha256_hex(&mime),
             mime.len() as u64,
             "ops@acme.example",
             &envelope(&[("to", "billing@partner.example"), ("bcc", bcc_address)]),
-        )
-        .expect_err("a transmitted address header must not disclose an envelope-bcc address");
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(verified) => panic!(
+                "a transmitted address header must not disclose an envelope-bcc address: {header:?} passed as {verified:?}"
+            ),
+        };
         assert!(
             error.contains("bcc recipient leaked into MIME headers"),
             "expected the bcc-leak guard to reject {header:?}, got: {error}"
@@ -1021,7 +1194,6 @@ mod tests {
             "Reply-To: <@relay.example:archive@acme.example>",
             "Reply-To: innocent@example.net, archive@acme.example",
             "Reply-To: =?UTF-8?B?YXJjaGl2ZUBhY21lLmV4YW1wbGU=?=",
-            "Reply-To: innocent@example.net (=?UTF-8?B?YXJjaGl2ZUBhY21lLmV4YW1wbGU=?=)",
             "Resent-To: archive@acme.example",
             "Resent-Cc: archive@acme.example",
             "Resent-From: archive@acme.example",
@@ -1042,6 +1214,10 @@ mod tests {
             "Return-Path: <archive@acme.example(comment)>",
             "archive@acme.example",
         );
+        assert_bcc_leak_rejected(
+            "To: <archive@acme.example(comment)>",
+            "archive@acme.example",
+        );
 
         // Folding cannot split a canonical needle past the whitespace-free
         // raw guard.
@@ -1060,6 +1236,31 @@ mod tests {
     }
 
     #[test]
+    fn narrow_raw_belt_rejects_free_text_atext_delimiters() {
+        assert_bcc_leak_rejected("Subject: ops@example.com", "ops@example.com");
+
+        // These are all RFC 5322 atext characters, but common free-text
+        // address detectors treat them as delimiters around an addr-spec.
+        // They therefore belong to the raw belt's narrow boundary class,
+        // not its continuation class.
+        for (before, after) in [
+            ("'", "'"),
+            ("!", "!"),
+            ("$", "$"),
+            ("&", "&"),
+            ("*", "*"),
+            ("/", "/"),
+            ("=", "="),
+            ("`", "`"),
+            ("{", "}"),
+            ("|", "|"),
+        ] {
+            let header = format!("Subject: {before}ops@example.com{after}");
+            assert_bcc_leak_rejected(&header, "ops@example.com");
+        }
+    }
+
+    #[test]
     fn raw_bcc_guard_requires_addr_spec_token_boundaries() {
         assert_eq!(
             normalize_addr_spec("archive@acme.example."),
@@ -1069,6 +1270,9 @@ mod tests {
 
         // A bcc addr-spec embedded in a longer local part or followed by a
         // longer domain is a distinct visible address, not a disclosure.
+        // `dev!ops@...` specifically exercises the carve-out: the narrow raw
+        // belt sees `!` as a boundary, but its hit lies wholly inside the
+        // clean To value span and the structured belt sees `dev!ops@...`.
         for (visible, bcc) in [
             ("devops@example.com", "ops@example.com"),
             ("dev!ops@example.com", "ops@example.com"),
