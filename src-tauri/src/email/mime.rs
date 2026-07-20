@@ -121,6 +121,78 @@ fn raw_header_value_decoded(bytes: &[u8], header: &mail_parser::Header<'_>) -> S
     decode_rfc2047(&unfolded).to_lowercase()
 }
 
+/// The complete ORIGINAL header block, ending before the first RFC 5322
+/// blank-line body separator. Folded continuation lines are unfolded while
+/// physical boundaries between distinct header lines remain visible. This
+/// deliberately does not depend on mail-parser's header spans: malformed
+/// colon-less lines and other parser-dropped bytes must stay in the raw
+/// bcc-containment guard's haystack.
+fn raw_header_block_decoded(bytes: &[u8]) -> String {
+    let crlf_end = bytes.windows(4).position(|window| window == b"\r\n\r\n");
+    let lf_end = bytes.windows(2).position(|window| window == b"\n\n");
+    let header_end = match (crlf_end, lf_end) {
+        (Some(crlf), Some(lf)) => crlf.min(lf),
+        (Some(crlf), None) => crlf,
+        (None, Some(lf)) => lf,
+        (None, None) => bytes.len(),
+    };
+    let raw = String::from_utf8_lossy(&bytes[..header_end]);
+    let normalized_lines = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let mut unfolded = String::with_capacity(normalized_lines.len());
+    for (index, line) in normalized_lines.split('\n').enumerate() {
+        if index > 0 && !line.starts_with([' ', '\t']) {
+            unfolded.push('\n');
+        }
+        unfolded.push_str(line);
+    }
+    decode_rfc2047(&unfolded).to_lowercase()
+}
+
+/// Whitespace-free companion for the complete raw header block. Newlines
+/// between distinct physical header fields remain as sentinels so stripping
+/// folding whitespace cannot synthesize an address across two unrelated
+/// fields.
+fn strip_header_whitespace(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| *ch == '\n' || !ch.is_whitespace())
+        .collect()
+}
+
+/// A raw addr-spec containment hit is valid only when it is a delimited
+/// token, never a substring of a longer local part or domain. These are the
+/// deliberately asymmetric boundaries from the bcc-leak contract.
+fn contains_addr_spec_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+
+    let local_part_continues =
+        |ch: char| ch.is_alphanumeric() || matches!(ch, '.' | '_' | '%' | '+' | '-');
+    let domain_continues = |ch: char| ch.is_alphanumeric() || matches!(ch, '-' | '.');
+    let mut search_start = 0;
+    while let Some(relative_start) = haystack[search_start..].find(needle) {
+        let start = search_start + relative_start;
+        let end = start + needle.len();
+        let before_is_boundary = haystack[..start]
+            .chars()
+            .next_back()
+            .map(|ch| !local_part_continues(ch))
+            .unwrap_or(true);
+        let after_is_boundary = haystack[end..]
+            .chars()
+            .next()
+            .map(|ch| !domain_continues(ch))
+            .unwrap_or(true);
+        if before_is_boundary && after_is_boundary {
+            return true;
+        }
+
+        search_start = start + needle.chars().next().expect("non-empty needle").len_utf8();
+    }
+    false
+}
+
 /// Split a TEXT-form address list on TOP-LEVEL commas only — commas inside
 /// quoted strings (`"a,b"@dom`) and inside angle brackets (obsolete routes
 /// `<@a,@b:user@dom>`) never split.
@@ -504,13 +576,13 @@ pub fn verify_mime(
     //   1. STRUCTURED: mail-parser's RFC 5322 output, normalized to
     //      comparable addr-specs (groups/comments/quoting/routes) — the
     //      allow-precision check.
-    //   2. RAW CONTAINMENT: the ORIGINAL decoded header bytes (unfolded +
+    //   2. RAW CONTAINMENT: the COMPLETE ORIGINAL header block (unfolded +
     //      RFC 2047-decoded, lowercased, plus a whitespace-stripped
-    //      variant). If a bcc addr-spec's bytes appear ANYWHERE in a
-    //      transmitted address header, the message rejects — regardless of
-    //      how the parser mangled, dropped, or comment-wrapped them. A
-    //      leaked address is physically present in the bytes; no parse
-    //      corner changes that.
+    //      variant). If a bcc addr-spec appears as a delimited token ANYWHERE
+    //      before the body separator, the message rejects — including bytes
+    //      from malformed colon-less lines or other content mail-parser
+    //      dropped. Token boundaries avoid treating a bcc address as a
+    //      substring of a distinct, longer address.
     //
     // FAIL CLOSED: a header whose RAW value is non-empty but yields no
     // confidently-parsed addr-spec rejects — except the two legitimate
@@ -539,18 +611,24 @@ pub fn verify_mime(
         .filter(|address| *address != &identity_lower)
         .map(|address| (address.clone(), strip_ws(address)))
         .collect();
+
+    // Belt 2 is intentionally parser-independent: scan every original byte
+    // in the header region, not just spans assigned to parsed headers.
+    let raw_headers = raw_header_block_decoded(bytes);
+    let raw_headers_stripped = strip_header_whitespace(&raw_headers);
+    for (needle, needle_stripped) in &bcc_needles {
+        if contains_addr_spec_token(&raw_headers, needle)
+            || contains_addr_spec_token(&raw_headers_stripped, needle_stripped)
+        {
+            return Err(format!("bcc recipient leaked into MIME headers: {needle}"));
+        }
+    }
+
     for header in parsed.headers() {
         if !is_transmitted_address_header(&header.name) {
             continue;
         }
         let raw = raw_header_value_decoded(bytes, header);
-        let raw_stripped = strip_ws(&raw);
-        // Belt 2: raw containment — parser-independent.
-        for (needle, needle_stripped) in &bcc_needles {
-            if raw.contains(needle.as_str()) || raw_stripped.contains(needle_stripped.as_str()) {
-                return Err(format!("bcc recipient leaked into MIME headers: {needle}"));
-            }
-        }
         // The one non-empty address field body that legitimately carries no
         // addr-spec is the RFC 5321 null reverse-path. It is legal only in
         // Return-Path, never in To/From/etc.
@@ -918,6 +996,11 @@ mod tests {
             "Reply-To: <@relay.example:archive@acme.example>",
             "Reply-To: innocent@example.net, archive@acme.example",
             "Reply-To: =?UTF-8?B?YXJjaGl2ZUBhY21lLmV4YW1wbGU=?=",
+            "Reply-To: innocent@example.net (=?UTF-8?B?YXJjaGl2ZUBhY21lLmV4YW1wbGU=?=)",
+            "Resent-To: archive@acme.example",
+            "Resent-Cc: archive@acme.example",
+            "Resent-From: archive@acme.example",
+            "Resent-Sender: archive@acme.example",
         ] {
             assert_bcc_leak_rejected(header, "archive@acme.example");
         }
@@ -940,6 +1023,54 @@ mod tests {
         assert_bcc_leak_rejected(
             "Reply-To: archive@\r\n acme.example",
             "archive@acme.example",
+        );
+    }
+
+    #[test]
+    fn whole_raw_header_block_rejects_colonless_bcc_leaks() {
+        // mail-parser drops malformed pre-separator lines that have no colon,
+        // so these bytes are outside every parsed Header value span.
+        assert_bcc_leak_rejected("Bcc archive@acme.example", "archive@acme.example");
+        assert_bcc_leak_rejected("Reply-To archive@acme.example", "archive@acme.example");
+    }
+
+    #[test]
+    fn raw_bcc_guard_requires_addr_spec_token_boundaries() {
+        // A bcc addr-spec embedded in a longer local part or followed by a
+        // longer domain is a distinct visible address, not a disclosure.
+        for (visible, bcc) in [
+            ("devops@example.com", "ops@example.com"),
+            ("a@b.com.attacker.example", "a@b.com"),
+        ] {
+            let mime =
+                format!("From: sender@acme.example\r\nTo: {visible}\r\n\r\nhello\r\n").into_bytes();
+            let result = verify_mime(
+                &mime,
+                &sha256_hex(&mime),
+                mime.len() as u64,
+                "sender@acme.example",
+                &envelope(&[("to", visible), ("bcc", bcc)]),
+            );
+            assert!(
+                result.is_ok(),
+                "distinct visible address {visible:?} must not match bcc {bcc:?}: {result:?}"
+            );
+        }
+
+        // The same bcc address as a genuinely delimited To token still
+        // rejects before the visible-recipient mismatch can mask the leak.
+        let leaked = b"From: sender@acme.example\r\nTo: devops@example.com, ops@example.com\r\n\r\nhello\r\n";
+        let error = verify_mime(
+            leaked,
+            &sha256_hex(leaked),
+            leaked.len() as u64,
+            "sender@acme.example",
+            &envelope(&[("to", "devops@example.com"), ("bcc", "ops@example.com")]),
+        )
+        .expect_err("a delimited bcc addr-spec in To must be rejected");
+        assert!(
+            error.contains("bcc recipient leaked into MIME headers"),
+            "expected the token-bounded raw guard to reject the leak, got: {error}"
         );
     }
 
