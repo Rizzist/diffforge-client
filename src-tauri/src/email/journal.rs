@@ -550,7 +550,7 @@ impl EmailJournal {
                 }
             }
 
-            let first_status_event_id = uuid::Uuid::new_v4().to_string();
+            let first_status_event_id = uuid::Uuid::now_v7().to_string();
             // Receipt + job + the phase-received event in ONE transaction
             // (§10.1 law; the event row makes the ack's
             // first_status_event_id durable — an ack must never reference an
@@ -856,6 +856,97 @@ impl EmailJournal {
         }
         txn.commit()
             .map_err(|error| format!("email recipients txn commit failed: {error}"))
+    }
+
+    /// Seed the envelope recipients WITHOUT clobbering rows that already
+    /// carry an outcome (review R2-4): a re-execution of the same generation
+    /// must preserve terminal per-recipient rows (a permanent bounce is
+    /// never retried), so seeding is INSERT-only.
+    pub fn seed_recipients(
+        &mut self,
+        send_job_id: &str,
+        generation: u32,
+        recipients: &[RecipientRow],
+    ) -> Result<(), String> {
+        let now = now_ms();
+        let txn = self
+            .connection
+            .transaction()
+            .map_err(|error| format!("email recipients txn begin failed: {error}"))?;
+        for recipient in recipients {
+            txn.execute(
+                "INSERT OR IGNORE INTO email_send_recipients
+                 (send_job_id, generation, recipient_ref, role, address, domain, status,
+                  smtp_code, enhanced_code, response_class, response_sanitized, retry_at_ms,
+                  updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    send_job_id,
+                    generation,
+                    recipient.recipient_ref,
+                    recipient.role,
+                    recipient.address,
+                    recipient.domain,
+                    recipient.status,
+                    recipient.smtp_code.map(i64::from),
+                    recipient.enhanced_code,
+                    recipient.response_class,
+                    recipient.response_sanitized,
+                    recipient.retry_at_ms,
+                    now
+                ],
+            )
+            .map_err(|error| format!("email recipients seed failed: {error}"))?;
+        }
+        txn.commit()
+            .map_err(|error| format!("email recipients txn commit failed: {error}"))
+    }
+
+    /// FULL-durability per-recipient outcome write (review R2-3): a native
+    /// recipient's DATA-boundary outcome (its 2xx above all) must survive a
+    /// crash the instant the wire fact exists — independently of the
+    /// job-level `data_completed` aggregate, which lands only after ALL
+    /// recipients finish. Recovery then reports the KNOWN outcome instead of
+    /// blanket delivery_unknown.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_recipient_outcome_full(
+        &mut self,
+        send_job_id: &str,
+        generation: u32,
+        recipient_ref: &str,
+        status: &str,
+        smtp_code: Option<u16>,
+        response_class: Option<&str>,
+        response_sanitized: Option<&str>,
+        retry_at_ms: Option<i64>,
+    ) -> Result<(), String> {
+        self.with_full_synchronous(|connection| {
+            let updated = connection
+                .execute(
+                    "UPDATE email_send_recipients
+                     SET status = ?4, smtp_code = ?5, response_class = ?6,
+                         response_sanitized = ?7, retry_at_ms = ?8, updated_at_ms = ?9
+                     WHERE send_job_id = ?1 AND generation = ?2 AND recipient_ref = ?3",
+                    params![
+                        send_job_id,
+                        generation,
+                        recipient_ref,
+                        status,
+                        smtp_code.map(i64::from),
+                        response_class,
+                        response_sanitized,
+                        retry_at_ms,
+                        now_ms()
+                    ],
+                )
+                .map_err(|error| format!("email recipient outcome write failed: {error}"))?;
+            if updated == 0 {
+                return Err(format!(
+                    "email recipient outcome write matched no row: {recipient_ref}"
+                ));
+            }
+            Ok(())
+        })
     }
 
     pub fn update_recipient_status(
@@ -1591,48 +1682,32 @@ impl EmailJournal {
                     )
                     .map_err(|error| format!("email recovery recipient force failed: {error}"))?;
             }
-            let (outcome, error_class, delivery_state, response_class) = if persisted_success {
-                ("submitted", "none", "submitted", "accepted")
+            let (outcome, error_class) = if persisted_success {
+                ("submitted", "none")
             } else {
-                (
-                    "delivery_unknown",
-                    "delivery_unknown",
-                    "delivery_unknown",
-                    "connection_failed",
-                )
+                ("delivery_unknown", "delivery_unknown")
             };
-            let status_event_id = uuid::Uuid::new_v4().to_string();
+            let status_event_id = uuid::Uuid::now_v7().to_string();
             let recipients = self.load_recipients(&job.send_job_id, job.generation)?;
+            // Per-recipient KNOWN outcomes survive recovery (review R2-3): a
+            // recipient whose FULL-durability row already carries an outcome
+            // (submitted/bounced/deferred/…) reports THAT outcome; only
+            // still-pending recipients become delivery_unknown.
             let per_recipient: Vec<Value> = recipients
                 .iter()
                 .map(|recipient| {
-                    let mut entry = json!({
-                        "recipient_ref": recipient.recipient_ref,
-                        "role": recipient.role,
-                        "address": recipient.address,
-                        "delivery_state": if persisted_success {
-                            recipient.status.clone()
-                        } else {
-                            delivery_state.to_string()
-                        },
-                        "updated_at_ms": now_ms(),
-                    });
-                    if persisted_success {
-                        if let (Some(code), Some(class)) =
-                            (recipient.smtp_code, recipient.response_class.as_deref())
-                        {
-                            entry["response"] = json!({
-                                "smtp_code": code,
-                                "response_class": class,
-                            });
-                            if let Some(enhanced) = recipient.enhanced_code.as_deref() {
-                                entry["response"]["enhanced_code"] = json!(enhanced);
-                            }
-                        }
+                    if recipient.status != "pending" {
+                        super::submission::recipient_state_value(recipient)
                     } else {
-                        entry["response"] = json!({"response_class": response_class});
+                        json!({
+                            "recipient_ref": recipient.recipient_ref,
+                            "role": recipient.role,
+                            "address": recipient.address,
+                            "delivery_state": "delivery_unknown",
+                            "response": {"response_class": "connection_failed"},
+                            "updated_at_ms": now_ms(),
+                        })
                     }
-                    entry
                 })
                 .collect();
             let mut payload = json!({

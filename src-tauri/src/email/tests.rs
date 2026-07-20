@@ -21,7 +21,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "diffforge-email-{tag}-{}-{}",
         std::process::id(),
-        uuid::Uuid::new_v4()
+        uuid::Uuid::now_v7()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -33,6 +33,17 @@ fn open_journal(dir: &std::path::Path) -> EmailJournal {
 
 const TEST_MIME: &[u8] = b"From: Acme Ops <ops@acme.example>\r\nTo: billing@partner.example\r\nSubject: invoice\r\nDate: Mon, 20 Jul 2026 00:00:00 +0000\r\nMessage-ID: <t1@acme.example>\r\n\r\nhello\r\n";
 
+/// Two-recipient variant for the native multi-recipient matrix (R2-3/R2-4).
+const TEST_MIME_TWO_RCPT: &[u8] = b"From: Acme Ops <ops@acme.example>\r\nTo: billing@partner.example, legal@partner.example\r\nSubject: invoice\r\nDate: Mon, 20 Jul 2026 00:00:00 +0000\r\nMessage-ID: <t2@acme.example>\r\n\r\nhello\r\n";
+
+fn now_plus_two_minutes() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+        + 120_000
+}
+
 /// Journal a wake command + seed profile/binding/credentials so run_send_job
 /// can go end-to-end against a sink.
 fn seed_send_job(
@@ -40,7 +51,7 @@ fn seed_send_job(
     memory: &MemoryCredentialStore,
     sink_port: u16,
 ) -> (String, u32) {
-    let send_job_id = format!("job-{}", uuid::Uuid::new_v4());
+    let send_job_id = format!("job-{}", uuid::Uuid::now_v7());
     let command = contract::parse_email_command(
         contract::EMAIL_COMMAND_SEND,
         &json!({
@@ -2029,6 +2040,18 @@ fn seed_native_dkim_key(
     key.pubkey_fingerprint_sha256
 }
 
+/// Seed the FULL fail-closed evidence set a native run requires (review
+/// R2-2): a fresh egress observation with positive port-25 evidence.
+fn seed_native_evidence(journal: &EmailJournal) {
+    crate::email::preflight::record_egress_observation(
+        journal,
+        "198.51.100.7",
+        Some(true),
+        "test",
+    )
+    .unwrap();
+}
+
 #[test]
 fn native_leased_job_executes_end_to_end() {
     use crate::email::mx::{FakeMxResolver, MxResolution, MxTarget};
@@ -2039,6 +2062,7 @@ fn native_leased_job_executes_end_to_end() {
     let memory = MemoryCredentialStore::new();
     let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink.port);
     let fingerprint = seed_native_dkim_key(&journal, &memory, "acme.example");
+    seed_native_evidence(&journal);
 
     let transport = FakeCloudTransport::new();
     transport.put_mime("mime://job", TEST_MIME.to_vec());
@@ -2178,4 +2202,516 @@ fn vendored_corpus_matches_pinned_lock() {
     .expect("email-v1.lock present");
     let pinned = lock.split_whitespace().next().unwrap_or("");
     assert_eq!(computed, pinned, "vendored corpus drifted from its lock");
+}
+
+// =====================================================================
+// Round-2 regressions: settlement acks keep the durable retry alive on
+// failure (R2-1), fresh fail-closed native fact rechecks (R2-2),
+// per-recipient DATA durability + terminal aggregation (R2-3), permanent
+// bounces never retried on the same generation (R2-4), durable
+// qualification history (R2-6), and UUIDv7 contract ids (R2-9).
+// =====================================================================
+
+#[test]
+fn settlement_ack_failures_never_ack_the_journal_event() {
+    use super::remote::email_apply_send_event_cloud_ack;
+    let dir = temp_dir("ack-r2");
+    let mut journal = open_journal(&dir);
+    journal
+        .record_send_command("job-ak", 1, "cmd-ak", "bind-1", "hash-ak", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    let event = PendingEventRow {
+        status_event_id: "evt-ak".to_string(),
+        send_job_id: "job-ak".to_string(),
+        generation: 1,
+        payload: json!({"phase": "settled", "status_event_id": "evt-ak"}),
+    };
+    journal
+        .journal_terminal("job-ak", 1, "submitted", &event)
+        .unwrap();
+    let outbox_payload = json!({"status_event_id": "evt-ak"});
+    let still_unacked = |journal: &EmailJournal| {
+        journal
+            .pending_events()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.status_event_id == "evt-ak")
+    };
+
+    // Malformed (a generic ok:true shape) — Err, event stays unacked.
+    assert!(
+        email_apply_send_event_cloud_ack(&mut journal, &outbox_payload, &json!({"ok": true}))
+            .is_err()
+    );
+    assert!(still_unacked(&journal));
+    // Mismatched status_event_id — Err, event stays unacked.
+    let mismatched = json!({
+        "contract": contract::EMAIL_CONTRACT,
+        "schema_version": 1,
+        "status_event_id": "evt-OTHER",
+        "applied": true,
+    });
+    assert!(email_apply_send_event_cloud_ack(&mut journal, &outbox_payload, &mismatched).is_err());
+    assert!(still_unacked(&journal));
+    // Payload without a status_event_id — Err.
+    assert!(
+        email_apply_send_event_cloud_ack(&mut journal, &json!({}), &json!({"applied": true}))
+            .is_err()
+    );
+    // A valid ack persists and drains the pending queue for the event.
+    let valid = json!({
+        "contract": contract::EMAIL_CONTRACT,
+        "schema_version": 1,
+        "status_event_id": "evt-ak",
+        "applied": true,
+    });
+    assert!(email_apply_send_event_cloud_ack(&mut journal, &outbox_payload, &valid).is_ok());
+    assert!(!still_unacked(&journal));
+
+    // Journal-write failure surfaces as Err (the outbox row must survive).
+    let dir = temp_dir("ack-r2-persist");
+    let mut broken = open_journal(&dir);
+    broken
+        .connection()
+        .execute_batch("DROP TABLE email_send_events")
+        .unwrap();
+    assert!(email_apply_send_event_cloud_ack(&mut broken, &outbox_payload, &valid).is_err());
+}
+
+#[test]
+fn native_missing_port25_evidence_aborts_before_wire() {
+    use crate::email::mx::{FakeMxResolver, MxResolution, MxTarget};
+
+    // Review R2-2: NO egress observation exists — the pre-DATA fact recheck
+    // fails CLOSED (port25 evidence missing) before anything reaches the
+    // wire; nothing defaults to true.
+    let sink = SmtpSink::start(SinkMode::Plain, SinkBehavior::default());
+    let dir = temp_dir("native-no-evidence");
+    let mut journal = open_journal(&dir);
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink.port);
+    let fingerprint = seed_native_dkim_key(&journal, &memory, "acme.example");
+
+    let transport = FakeCloudTransport::new();
+    transport.put_mime("mime://job", TEST_MIME.to_vec());
+    let mut grant = leased_grant_for(
+        "mime://job",
+        TEST_MIME,
+        "bounce@acme.example",
+        "ops@acme.example",
+        &[("to", "billing@partner.example")],
+        "native",
+    );
+    if let PrepareOutcome::Leased(inner) = &mut grant {
+        inner.native.as_mut().unwrap().dkim_pubkey_fingerprint = fingerprint;
+    }
+    transport.script_prepare(Ok(grant));
+    let mx = FakeMxResolver::new();
+    mx.set(
+        "partner.example",
+        MxResolution::Targets(vec![MxTarget {
+            host: "localhost".to_string(),
+            priority: 10,
+        }]),
+    );
+    let mut submission_deps = deps(&transport, &memory);
+    submission_deps.native_mx = Some(&mx);
+    submission_deps.native_port_override = Some(sink.port);
+
+    let result = run_send_job(&submission_deps, &mut journal, &send_job_id, generation).unwrap();
+    assert_eq!(
+        result,
+        SubmissionResult::Abandoned("native_preflight_recheck:port25".to_string())
+    );
+    assert_eq!(sink.state().messages.len(), 0, "nothing on the wire");
+    let job = journal.load_job(&send_job_id, generation).unwrap().unwrap();
+    assert!(!job.data_started);
+    assert!(job.terminal_outcome.is_none(), "non-terminal for requalification");
+}
+
+#[test]
+fn native_rotated_secret_behind_locator_never_signs() {
+    use crate::email::mx::{FakeMxResolver, MxResolution, MxTarget};
+
+    // Review R2-2: the journal row's fingerprint claim matches the grant,
+    // but the SECRET behind the locator was rotated to a different key. The
+    // derived fingerprint comparison must refuse to sign.
+    let sink = SmtpSink::start(SinkMode::Plain, SinkBehavior::default());
+    let dir = temp_dir("native-rotated-key");
+    let mut journal = open_journal(&dir);
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink.port);
+    let fingerprint = seed_native_dkim_key(&journal, &memory, "acme.example");
+    seed_native_evidence(&journal);
+    // Rotate the stored secret out from under the journal row (same
+    // locator, different key material).
+    let other_key = crate::email::dkim::generate_rsa_dkim_key().unwrap();
+    memory.set("dkim-test", &other_key.private_key_pem).unwrap();
+
+    let transport = FakeCloudTransport::new();
+    transport.put_mime("mime://job", TEST_MIME.to_vec());
+    let mut grant = leased_grant_for(
+        "mime://job",
+        TEST_MIME,
+        "bounce@acme.example",
+        "ops@acme.example",
+        &[("to", "billing@partner.example")],
+        "native",
+    );
+    if let PrepareOutcome::Leased(inner) = &mut grant {
+        inner.native.as_mut().unwrap().dkim_pubkey_fingerprint = fingerprint;
+    }
+    transport.script_prepare(Ok(grant));
+    let mx = FakeMxResolver::new();
+    mx.set(
+        "partner.example",
+        MxResolution::Targets(vec![MxTarget {
+            host: "localhost".to_string(),
+            priority: 10,
+        }]),
+    );
+    let mut submission_deps = deps(&transport, &memory);
+    submission_deps.native_mx = Some(&mx);
+    submission_deps.native_port_override = Some(sink.port);
+
+    let result = run_send_job(&submission_deps, &mut journal, &send_job_id, generation).unwrap();
+    assert_eq!(
+        result,
+        SubmissionResult::Abandoned("dkim_key_unavailable".to_string())
+    );
+    assert_eq!(sink.state().messages.len(), 0, "wrong key must never sign");
+}
+
+#[test]
+fn native_partial_crash_recovery_keeps_known_recipient_outcomes() {
+    // Review R2-3: recipient 1's FULL-durability `submitted` row survives a
+    // crash; recovery reports it as submitted — only the unknowable
+    // recipient becomes delivery_unknown.
+    let dir = temp_dir("native-partial-recovery");
+    let mut journal = open_journal(&dir);
+    journal
+        .record_send_command("job-pr", 1, "cmd-pr", "bind-1", "hash-pr", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    let recipient = |suffix: &str| RecipientRow {
+        recipient_ref: format!("r{suffix}"),
+        role: "to".to_string(),
+        address: format!("user{suffix}@partner.example"),
+        domain: "partner.example".to_string(),
+        status: "pending".to_string(),
+        smtp_code: None,
+        enhanced_code: None,
+        response_class: None,
+        response_sanitized: None,
+        retry_at_ms: None,
+    };
+    journal
+        .seed_recipients("job-pr", 1, &[recipient("1"), recipient("2")])
+        .unwrap();
+    journal.mark_data_started("job-pr", 1).unwrap();
+    // Recipient 1's 2xx lands FULL-atomically; then the process "dies".
+    journal
+        .record_recipient_outcome_full(
+            "job-pr",
+            1,
+            "r1",
+            "submitted",
+            Some(250),
+            Some("accepted"),
+            None,
+            None,
+        )
+        .unwrap();
+
+    let settled = journal.recover_after_restart("device-test").unwrap();
+    assert!(settled
+        .iter()
+        .any(|(job, _, outcome)| job == "job-pr" && outcome == "delivery_unknown"));
+    let (event, _) = journal
+        .load_settled_event("job-pr", 1)
+        .unwrap()
+        .expect("settled event journaled");
+    let per_recipient = event.payload["per_recipient"].as_array().unwrap();
+    let by_ref = |wanted: &str| {
+        per_recipient
+            .iter()
+            .find(|entry| entry["recipient_ref"] == wanted)
+            .unwrap()
+    };
+    assert_eq!(by_ref("r1")["delivery_state"], "submitted");
+    assert_eq!(by_ref("r1")["response"]["smtp_code"], 250);
+    assert_eq!(by_ref("r2")["delivery_state"], "delivery_unknown");
+}
+
+#[test]
+fn native_fence_after_first_recipient_terminalizes_partially_submitted() {
+    use super::cloud_transport::RenewOutcome;
+    use crate::email::mx::{FakeMxResolver, MxResolution, MxTarget};
+
+    // Review R2-3: a fence abort AFTER recipient 1 crossed DATA must
+    // terminalize the pair NOW (partially_submitted), never return a
+    // nonterminal Abandoned that strands a data_started job.
+    let sink = SmtpSink::start(SinkMode::Plain, SinkBehavior::default());
+    let dir = temp_dir("native-fence-partial");
+    let mut journal = open_journal(&dir);
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink.port);
+    let fingerprint = seed_native_dkim_key(&journal, &memory, "acme.example");
+    seed_native_evidence(&journal);
+
+    let transport = FakeCloudTransport::new();
+    transport.put_mime("mime://job2", TEST_MIME_TWO_RCPT.to_vec());
+    let mut grant = leased_grant_for(
+        "mime://job2",
+        TEST_MIME_TWO_RCPT,
+        "bounce@acme.example",
+        "ops@acme.example",
+        &[
+            ("to", "billing@partner.example"),
+            ("to", "legal@partner.example"),
+        ],
+        "native",
+    );
+    if let PrepareOutcome::Leased(inner) = &mut grant {
+        inner.native.as_mut().unwrap().dkim_pubkey_fingerprint = fingerprint;
+    }
+    transport.script_prepare(Ok(grant));
+    // Renewals: pre-SMTP ok, recipient-1 pre-DATA ok, recipient-2 fenced.
+    transport.script_renew(Ok(RenewOutcome::Extended {
+        expires_at_ms: now_plus_two_minutes(),
+    }));
+    transport.script_renew(Ok(RenewOutcome::Extended {
+        expires_at_ms: now_plus_two_minutes(),
+    }));
+    transport.script_renew(Ok(RenewOutcome::Refused {
+        slug: "fenced".to_string(),
+        current_lease_epoch: Some(2),
+    }));
+    let mx = FakeMxResolver::new();
+    mx.set(
+        "partner.example",
+        MxResolution::Targets(vec![MxTarget {
+            host: "localhost".to_string(),
+            priority: 10,
+        }]),
+    );
+    let mut submission_deps = deps(&transport, &memory);
+    submission_deps.native_mx = Some(&mx);
+    submission_deps.native_port_override = Some(sink.port);
+
+    let result = run_send_job(&submission_deps, &mut journal, &send_job_id, generation).unwrap();
+    assert_eq!(
+        result,
+        SubmissionResult::Terminal("partially_submitted".to_string())
+    );
+    // Exactly one message crossed the wire (recipient 1).
+    assert_eq!(sink.state().messages.len(), 1);
+    let rows = journal.load_recipients(&send_job_id, generation).unwrap();
+    let status_of = |wanted: &str| {
+        rows.iter()
+            .find(|row| row.recipient_ref == wanted)
+            .unwrap()
+            .status
+            .clone()
+    };
+    assert_eq!(status_of("r1"), "submitted");
+    assert_ne!(status_of("r2"), "submitted");
+    assert!(journal.tombstone(&send_job_id, generation).unwrap().is_some());
+    // The settled event reports both recipients' true states.
+    let settled = transport
+        .events()
+        .into_iter()
+        .find(|event| event["phase"] == "settled")
+        .unwrap();
+    assert_eq!(settled["per_recipient"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn native_permanent_bounce_never_retried_on_same_generation() {
+    use crate::email::mx::{FakeMxResolver, MxResolution, MxTarget};
+
+    // Review R2-4: run 1 — r1 bounces permanently (550), r2 greylisted
+    // (450). Run 2 — r1 is SKIPPED (never re-RCPTed), r2 delivers; the
+    // aggregate includes r1's preserved bounce → partially_submitted.
+    let mut rcpt_responses = std::collections::BTreeMap::new();
+    rcpt_responses.insert(
+        "billing@partner.example".to_string(),
+        "550 5.1.1 user unknown".to_string(),
+    );
+    rcpt_responses.insert(
+        "legal@partner.example".to_string(),
+        "450 4.7.1 greylisted".to_string(),
+    );
+    let sink_one = SmtpSink::start(
+        SinkMode::Plain,
+        SinkBehavior {
+            rcpt_responses,
+            ..SinkBehavior::default()
+        },
+    );
+    let dir = temp_dir("native-bounce-preserved");
+    let mut journal = open_journal(&dir);
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink_one.port);
+    let fingerprint = seed_native_dkim_key(&journal, &memory, "acme.example");
+    seed_native_evidence(&journal);
+
+    let scripted_native_grant = |transport: &FakeCloudTransport| {
+        transport.put_mime("mime://job2", TEST_MIME_TWO_RCPT.to_vec());
+        let mut grant = leased_grant_for(
+            "mime://job2",
+            TEST_MIME_TWO_RCPT,
+            "bounce@acme.example",
+            "ops@acme.example",
+            &[
+                ("to", "billing@partner.example"),
+                ("to", "legal@partner.example"),
+            ],
+            "native",
+        );
+        if let PrepareOutcome::Leased(inner) = &mut grant {
+            inner.native.as_mut().unwrap().dkim_pubkey_fingerprint = fingerprint.clone();
+        }
+        transport.script_prepare(Ok(grant));
+    };
+    let mx = FakeMxResolver::new();
+    mx.set(
+        "partner.example",
+        MxResolution::Targets(vec![MxTarget {
+            host: "localhost".to_string(),
+            priority: 10,
+        }]),
+    );
+
+    // ---- run 1: bounce + deferral → nonterminal native_deferred ----
+    let transport = FakeCloudTransport::new();
+    scripted_native_grant(&transport);
+    let mut deps_one = deps(&transport, &memory);
+    deps_one.native_mx = Some(&mx);
+    deps_one.native_port_override = Some(sink_one.port);
+    let result = run_send_job(&deps_one, &mut journal, &send_job_id, generation).unwrap();
+    assert_eq!(
+        result,
+        SubmissionResult::Abandoned("native_deferred".to_string())
+    );
+    let rows = journal.load_recipients(&send_job_id, generation).unwrap();
+    let status_of = |rows: &[RecipientRow], wanted: &str| {
+        rows.iter()
+            .find(|row| row.recipient_ref == wanted)
+            .unwrap()
+            .status
+            .clone()
+    };
+    assert_eq!(status_of(&rows, "r1"), "bounced");
+    assert_eq!(status_of(&rows, "r2"), "deferred");
+
+    // ---- run 2 (re-offer): r1 must NOT be retried; r2 delivers ----
+    let sink_two = SmtpSink::start(SinkMode::Plain, SinkBehavior::default());
+    let transport = FakeCloudTransport::new();
+    scripted_native_grant(&transport);
+    let mut deps_two = deps(&transport, &memory);
+    deps_two.native_mx = Some(&mx);
+    deps_two.native_port_override = Some(sink_two.port);
+    let result = run_send_job(&deps_two, &mut journal, &send_job_id, generation).unwrap();
+    assert_eq!(
+        result,
+        SubmissionResult::Terminal("partially_submitted".to_string())
+    );
+    let state = sink_two.state();
+    assert_eq!(state.messages.len(), 1, "only the deferred recipient ran");
+    assert_eq!(
+        state.messages[0].rcpt_to,
+        vec!["legal@partner.example".to_string()],
+        "the permanently bounced recipient is never re-RCPTed"
+    );
+    let rows = journal.load_recipients(&send_job_id, generation).unwrap();
+    assert_eq!(status_of(&rows, "r1"), "bounced");
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.recipient_ref == "r1")
+            .unwrap()
+            .smtp_code,
+        Some(550),
+        "the preserved bounce keeps its original 550"
+    );
+    assert_eq!(status_of(&rows, "r2"), "submitted");
+    // The settled event carries BOTH prior and new outcomes.
+    let settled = transport
+        .events()
+        .into_iter()
+        .find(|event| event["phase"] == "settled")
+        .unwrap();
+    let per_recipient = settled["per_recipient"].as_array().unwrap();
+    assert!(per_recipient
+        .iter()
+        .any(|entry| entry["recipient_ref"] == "r1" && entry["delivery_state"] == "bounced"));
+    assert!(per_recipient
+        .iter()
+        .any(|entry| entry["recipient_ref"] == "r2" && entry["delivery_state"] == "submitted"));
+}
+
+#[test]
+fn preflight_qualification_history_survives_expiry() {
+    // Review R2-6: previous_qualified is durable HISTORY — an expired
+    // qualified run still counts, so a later regression reads degraded.
+    let dir = temp_dir("preflight-history");
+    let journal = open_journal(&dir);
+    journal
+        .connection()
+        .execute(
+            "INSERT INTO email_native_preflight_runs
+             (preflight_id, profile_ref, domain, ran_at_ms, expires_at_ms, result,
+              qualified, eligible, result_sha256, result_json)
+             VALUES ('pf-old', 'profile-test', 'acme.example', 1, 2, 'qualified',
+                     1, 0, 'sha', '{}')",
+            [],
+        )
+        .unwrap();
+    // expires_at_ms=2 is long past — history must still count.
+    assert!(super::remote::preflight_previously_qualified(
+        &journal,
+        "profile-test",
+        "acme.example"
+    ));
+    assert!(!super::remote::preflight_previously_qualified(
+        &journal,
+        "profile-test",
+        "other.example"
+    ));
+}
+
+#[test]
+fn device_minted_contract_ids_are_uuidv7() {
+    // Review R2-9: §1 — device-minted opaque ids are UUIDv7.
+    let dir = temp_dir("uuidv7");
+    let mut journal = open_journal(&dir);
+    let command = contract::parse_email_command(
+        contract::EMAIL_COMMAND_SEND,
+        &json!({
+            "command_id": "email-send:job-v7:1",
+            "send_job_id": "job-v7",
+            "generation": 1,
+            "binding_id": "bind-1",
+            "target_device_id": "device-test",
+        }),
+    )
+    .unwrap();
+    let ack =
+        journal_command_before_ack(&mut journal, &command, "live_intake", "device-test").unwrap();
+    let status_event_id = ack.first_status_event_id.unwrap();
+    let parsed = uuid::Uuid::parse_str(&status_event_id).unwrap();
+    assert_eq!(parsed.get_version_num(), 7, "status_event_id is UUIDv7");
+    // Preflight ids too.
+    let run = crate::email::preflight::PreflightRun::build(
+        "device-test",
+        "profile-test",
+        "acme.example",
+        &crate::email::preflight::PreflightObservations::default(),
+        false,
+    );
+    let parsed = uuid::Uuid::parse_str(&run.preflight_id).unwrap();
+    assert_eq!(parsed.get_version_num(), 7, "preflight_id is UUIDv7");
 }

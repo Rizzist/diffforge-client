@@ -639,11 +639,11 @@ pub fn leased_grant_for(
     use crate::email::cloud_transport::{NativeGrant, PrepareGrant};
     use crate::email::mime::{EnvelopeRecipient, PrepareEnvelope};
     PrepareOutcome::Leased(Box::new(PrepareGrant {
-        lease_id: format!("lease-{}", uuid::Uuid::new_v4()),
+        lease_id: format!("lease-{}", uuid::Uuid::now_v7()),
         lease_epoch: 1,
         fence_token: "fence-test-token".to_string(),
         expires_at_ms: now_ms_for_fake() + 120_000,
-        mime_transfer_id: format!("transfer-{}", uuid::Uuid::new_v4()),
+        mime_transfer_id: format!("transfer-{}", uuid::Uuid::now_v7()),
         mime_path: mime_path.to_string(),
         mime_sha256: crate::email::contract::sha256_hex(mime_bytes),
         mime_size_bytes: mime_bytes.len() as u64,

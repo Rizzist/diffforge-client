@@ -7357,10 +7357,13 @@ fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Res
     if row.event_kind == crate::email::contract::EMAIL_SEND_EVENT_KIND {
         // email-v1 §9.3: settlement acks (applied/audit incl. the
         // stale_generation SUCCESS shape) are recorded on the journal's
-        // email_send_events row keyed by status_event_id.
-        if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
-            crate::email::remote::email_record_send_event_cloud_ack(&payload, response);
-        }
+        // email_send_events row keyed by status_event_id. A malformed,
+        // mismatched, or unpersistable ack propagates Err HERE — before the
+        // acked-update/delete below — so the durable outbox row survives and
+        // retries until a valid ack is parsed AND journaled (review R2-1).
+        let payload = serde_json::from_str::<Value>(&row.payload_json)
+            .map_err(|error| format!("email send event outbox payload corrupt: {error}"))?;
+        crate::email::remote::email_record_send_event_cloud_ack(&payload, response)?;
     }
     if row.event_kind == "device_live_state_snapshot"
         || row.event_kind == "device_workspaces_snapshot"

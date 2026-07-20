@@ -277,7 +277,7 @@ impl EmailCloudTransport for WsCloudTransport {
                 "command_id": command_id,
                 "binding_id": binding_id,
                 "last_lease_epoch": contract::u64_to_wire(last_lease_epoch),
-                "client_request_id": uuid::Uuid::new_v4().to_string(),
+                "client_request_id": uuid::Uuid::now_v7().to_string(),
             }),
         )?;
         let data = response
@@ -342,10 +342,14 @@ impl EmailCloudTransport for WsCloudTransport {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // Generation is REQUIRED and bounded u32 (§1): a missing or
+        // out-of-range value must never silently become 0 or wrap — that
+        // would mint a different idempotency identity than the payload.
         let generation = payload
             .get("generation")
             .and_then(Value::as_u64)
-            .unwrap_or_default() as u32;
+            .and_then(|raw| u32::try_from(raw).ok())
+            .ok_or_else(|| "send event payload missing or out-of-range generation".to_string())?;
         let status_event_id = payload
             .get("status_event_id")
             .and_then(Value::as_str)

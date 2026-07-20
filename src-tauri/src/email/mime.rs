@@ -136,12 +136,16 @@ pub fn verify_mime(
 
     let from_addresses = header_value("from");
     let identity_lower = identity_address.to_ascii_lowercase();
-    if !from_addresses
-        .iter()
-        .any(|address| address == &identity_lower)
+    // From is bound to EXACTLY the granted identity (review R2-7): a second
+    // mailbox riding the From list is both an impersonation surface and a
+    // bcc-disclosure channel.
+    if from_addresses.is_empty()
+        || !from_addresses
+            .iter()
+            .all(|address| address == &identity_lower)
     {
         return Err(format!(
-            "MIME From does not carry the granted identity address {identity_address}"
+            "MIME From must carry exactly the granted identity address {identity_address}"
         ));
     }
 
@@ -163,13 +167,33 @@ pub fn verify_mime(
         .collect();
 
     // Bcc envelope addresses must not leak into ANY transmitted
-    // address-bearing header — To/Cc, Reply-To, and the resent variants all
-    // disclose the address to every visible recipient (§3b).
-    let transmitted_addresses: BTreeSet<String> = ["to", "cc", "reply-to", "resent-to", "resent-cc"]
+    // mailbox-bearing header (review R2-7): To/Cc, Reply-To, From/Sender,
+    // Return-Path, and every resent variant all disclose the address to
+    // visible recipients. The scan is structural — each header value is
+    // parsed as an address list, never substring-matched. The granted
+    // identity itself is exempt: a self-bcc (archive copy) discloses
+    // nothing, since the sender's own address is already visible by
+    // construction.
+    let transmitted_addresses: BTreeSet<String> = [
+        "to",
+        "cc",
+        "reply-to",
+        "from",
+        "sender",
+        "return-path",
+        "resent-to",
+        "resent-cc",
+        "resent-from",
+        "resent-sender",
+    ]
+    .iter()
+    .flat_map(|name| header_value(name))
+    .collect();
+    if let Some(leaked) = envelope_bcc
         .iter()
-        .flat_map(|name| header_value(name))
-        .collect();
-    if let Some(leaked) = envelope_bcc.intersection(&transmitted_addresses).next() {
+        .filter(|address| *address != &identity_lower)
+        .find(|address| transmitted_addresses.contains(*address))
+    {
         return Err(format!("bcc recipient leaked into MIME headers: {leaked}"));
     }
     // Visible headers must match the envelope's to/cc set exactly.
@@ -348,6 +372,51 @@ mod tests {
             benign.len() as u64,
             "ops@acme.example",
             &bcc_envelope,
+        )
+        .is_ok());
+        // From carrying a SECOND mailbox is rejected outright — even when it
+        // is the leaked bcc address (review R2-7's example).
+        let from_leak = b"From: ops@acme.example, archive@acme.example\r\nTo: billing@partner.example\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            from_leak,
+            &sha256_hex(from_leak),
+            from_leak.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // Sender leaking an envelope-bcc address is rejected.
+        let sender_leak = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nSender: archive@acme.example\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            sender_leak,
+            &sha256_hex(sender_leak),
+            sender_leak.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // Return-Path leaking an envelope-bcc address is rejected.
+        let return_path_leak = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nReturn-Path: <archive@acme.example>\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            return_path_leak,
+            &sha256_hex(return_path_leak),
+            return_path_leak.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // A self-bcc (envelope bcc = the granted identity) stays legal: the
+        // sender's own address in From discloses nothing.
+        let self_bcc_envelope = envelope(&[
+            ("to", "billing@partner.example"),
+            ("bcc", "ops@acme.example"),
+        ]);
+        assert!(verify_mime(
+            BODY,
+            &sha256_hex(BODY),
+            BODY.len() as u64,
+            "ops@acme.example",
+            &self_bcc_envelope,
         )
         .is_ok());
     }

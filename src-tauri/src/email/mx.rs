@@ -114,13 +114,22 @@ pub enum MxErrorDisposition {
     Transport(String),
 }
 
-pub fn mx_error_disposition(error: &mail_auth::hickory_resolver::proto::ProtoError) -> MxErrorDisposition {
+pub fn mx_error_disposition(
+    error: &mail_auth::hickory_resolver::proto::ProtoError,
+) -> MxErrorDisposition {
     use mail_auth::hickory_resolver::proto::op::ResponseCode;
     use mail_auth::hickory_resolver::proto::ProtoErrorKind;
     match error.kind() {
         ProtoErrorKind::NoRecordsFound(no_records) => match no_records.response_code {
+            // Only an authoritative empty answer is NODATA. SERVFAIL,
+            // REFUSED, and every other code is a server/transport failure —
+            // retryable, and NEVER an A/AAAA fallback candidate (a flaky
+            // resolver must not reroute mail to the bare domain).
+            ResponseCode::NoError => MxErrorDisposition::NoData,
             ResponseCode::NXDomain => MxErrorDisposition::NxDomain,
-            _ => MxErrorDisposition::NoData,
+            other => MxErrorDisposition::Transport(format!(
+                "mx lookup answered {other:?} (no records)"
+            )),
         },
         _ => MxErrorDisposition::Transport(error.to_string()),
     }
@@ -292,6 +301,19 @@ mod tests {
             mx_error_disposition(&transport),
             MxErrorDisposition::Transport(_)
         ));
+        // SERVFAIL/REFUSED are server failures, NOT NODATA (review R2-8):
+        // they must never trigger the bare-domain A/AAAA fallback.
+        for code in [ResponseCode::ServFail, ResponseCode::Refused] {
+            let query = Query::query(Name::from_ascii("nomx.example.").unwrap(), RecordType::MX);
+            let error = ProtoError::from(NoRecords::new(query, code));
+            assert!(
+                matches!(
+                    mx_error_disposition(&error),
+                    MxErrorDisposition::Transport(_)
+                ),
+                "{code:?} must classify as transport"
+            );
+        }
     }
 
     #[test]

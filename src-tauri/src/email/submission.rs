@@ -18,6 +18,7 @@
 
 use std::cell::RefCell;
 
+use secrecy::ExposeSecret;
 use serde_json::{json, Map, Value};
 
 use super::cloud_transport::{EmailCloudTransport, PrepareGrant, PrepareOutcome, RenewOutcome};
@@ -135,7 +136,7 @@ fn emit_phase_event(
     device_id: &str,
     phase: SendPhase,
 ) -> Result<(), String> {
-    let status_event_id = uuid::Uuid::new_v4().to_string();
+    let status_event_id = uuid::Uuid::now_v7().to_string();
     let payload = send_event_payload(
         job,
         device_id,
@@ -172,7 +173,7 @@ fn settle(
     provider_queue_id: Option<&str>,
     error_class: &str,
 ) -> Result<SubmissionResult, String> {
-    let status_event_id = uuid::Uuid::new_v4().to_string();
+    let status_event_id = uuid::Uuid::now_v7().to_string();
     // The settled payload reflects the post-settlement job state.
     let mut settled_job = job.clone();
     settled_job.phase = SendPhase::Settled.as_str().to_string();
@@ -225,7 +226,7 @@ fn settle(
     Ok(SubmissionResult::Terminal(journaled_outcome))
 }
 
-fn recipient_state_value(recipient: &RecipientRow) -> Value {
+pub(crate) fn recipient_state_value(recipient: &RecipientRow) -> Value {
     let mut entry = json!({
         "recipient_ref": recipient.recipient_ref,
         "role": recipient.role,
@@ -503,7 +504,9 @@ fn run_leased_send(
             retry_at_ms: None,
         })
         .collect();
-    journal.replace_recipients(&send_job_id, generation, &recipients)?;
+    // INSERT-only seeding (review R2-4): rows carrying an outcome from a
+    // previous execution of this generation are preserved, never reset.
+    journal.seed_recipients(&send_job_id, generation, &recipients)?;
 
     if grant.mode == "native" {
         return run_native_transaction(deps, journal, job, &grant, &mime_bytes);
@@ -580,31 +583,17 @@ fn run_native_transaction(
             ))
         }
     };
-
-    // ---- §10.2 recheck facts observed once per run (IP + port 25) ----
-    let last_egress: Option<(String, Option<bool>)> = journal
-        .connection()
-        .query_row(
-            "SELECT egress_ip, port25_open FROM email_egress_ip_observations
-             ORDER BY observed_at_ms DESC LIMIT 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?.map(|value| value != 0),
-                ))
-            },
-        )
-        .optional()
-        .map_err(|error| format!("native egress observation lookup failed: {error}"))?;
-    let source_ip_authorized = native.authorized_ips.is_empty()
-        || last_egress
-            .as_ref()
-            .is_some_and(|(ip, _)| native.authorized_ips.iter().any(|allowed| allowed == ip));
-    let port25_reachable = last_egress
-        .as_ref()
-        .and_then(|(_, port25)| *port25)
-        .unwrap_or(true);
+    // The RESOLVED private key's fingerprint is derived and compared — the
+    // journal row's stored claim is never trusted (review R2-2): a rotated
+    // or corrupted secret behind the same locator must not sign.
+    match super::dkim::fingerprint_of_private_pem(dkim_key_pem.expose_secret()) {
+        Ok(derived) if derived.eq_ignore_ascii_case(&native.dkim_pubkey_fingerprint) => {}
+        _ => {
+            return Ok(SubmissionResult::Abandoned(
+                "dkim_key_unavailable".to_string(),
+            ))
+        }
+    }
 
     // ---- renew the lease before entering SMTP (fence check) ----
     let lease_expires = Cell::new(grant.expires_at_ms);
@@ -662,6 +651,21 @@ fn run_native_transaction(
     let fallback_resolver = super::mx::HickoryMxResolver;
     let resolver: &dyn super::mx::MxResolver = deps.native_mx.unwrap_or(&fallback_resolver);
 
+    // Rows carrying an outcome from a previous execution of THIS generation
+    // are never retried (review R2-4): a permanent bounce stays bounced;
+    // only pending/deferred recipients run.
+    let skip_terminal: std::collections::BTreeSet<String> = journal
+        .load_recipients(&send_job_id, generation)?
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.status.as_str(),
+                "submitted" | "bounced" | "delivery_unknown"
+            )
+        })
+        .map(|row| row.recipient_ref.clone())
+        .collect();
+
     // The hooks and the loop body share the journal sequentially (RefCell —
     // deliver_recipient invokes the hook strictly inline).
     let journal_cell = RefCell::new(journal);
@@ -672,18 +676,67 @@ fn run_native_transaction(
     // misclassified outcome.
     let hook_abort: RefCell<Option<String>> = RefCell::new(None);
 
-    let mut outcomes: Vec<(String, NativeRecipientOutcome)> = Vec::new();
+    // FRESH §10.2 facts, requeried/rederived on EVERY evaluation (review
+    // R2-2): the newest egress observation (source IP + port-25 evidence)
+    // and the credential store's CURRENT key material. Missing evidence
+    // fails CLOSED — nothing defaults to true.
+    let secrets = deps.secrets;
+    let grant_fingerprint = native.dkim_pubkey_fingerprint.clone();
+    let authorized_ips = native.authorized_ips.clone();
+    let recheck_locator = locator.clone();
+    let fresh_facts = || -> NativePreDataFacts {
+        use rusqlite::OptionalExtension as _;
+        let observation: Option<(String, Option<bool>)> = journal_cell
+            .borrow()
+            .connection()
+            .query_row(
+                "SELECT egress_ip, port25_open FROM email_egress_ip_observations
+                 ORDER BY observed_at_ms DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?.map(|value| value != 0),
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let source_ip_authorized = if authorized_ips.is_empty() {
+            true
+        } else {
+            observation
+                .as_ref()
+                .is_some_and(|(ip, _)| authorized_ips.iter().any(|allowed| allowed == ip))
+        };
+        let port25_reachable = observation
+            .as_ref()
+            .and_then(|(_, port25)| *port25)
+            .unwrap_or(false);
+        let dkim_fingerprint_matches = secrets
+            .resolve_locator(&recheck_locator)
+            .ok()
+            .flatten()
+            .and_then(|pem| super::dkim::fingerprint_of_private_pem(pem.expose_secret()).ok())
+            .is_some_and(|derived| derived.eq_ignore_ascii_case(&grant_fingerprint));
+        NativePreDataFacts {
+            source_ip_authorized,
+            lease_valid: now_ms() < lease_expires.get(),
+            dkim_fingerprint_matches,
+            port25_reachable,
+        }
+    };
+
     for recipient in &grant.envelope.recipients {
+        if skip_terminal.contains(&recipient.recipient_ref) {
+            continue;
+        }
         let attempt = {
             let mut guard = journal_cell.borrow_mut();
             guard.begin_attempt(&send_job_id, generation, Some(&recipient.domain))?
         };
-        let recheck = |_host: &str| NativePreDataFacts {
-            source_ip_authorized,
-            lease_valid: now_ms() < lease_expires.get(),
-            dkim_fingerprint_matches: true, // verified against the grant above
-            port25_reachable,
-        };
+        let recheck = |_host: &str| fresh_facts();
         let native_deps = NativeDeps {
             mx: resolver,
             dkim_key_pem: dkim_key_pem.clone(),
@@ -696,6 +749,16 @@ fn run_native_transaction(
             recheck_facts: &recheck,
         };
         let before_data = || -> Result<(), String> {
+            // §10.2: every DATA is preceded by FRESH fact rechecks — source
+            // IP, lease, DKIM key, port-25 — evaluated NOW, not at run start
+            // (review R2-2). fresh_facts fails closed on missing evidence.
+            let facts = fresh_facts();
+            if !facts.all_ok() {
+                let check = facts.first_failure().unwrap_or("unknown");
+                let reason = format!("native_preflight_recheck:{check}");
+                *hook_abort.borrow_mut() = Some(reason.clone());
+                return Err(reason);
+            }
             let mut guard = journal_cell.borrow_mut();
             let journal: &mut EmailJournal = &mut *guard;
             let job = journal
@@ -779,6 +842,16 @@ fn run_native_transaction(
                     SendPhase::Connecting.as_str(),
                     "native_error",
                 )?;
+                guard.record_recipient_outcome_full(
+                    &send_job_id,
+                    generation,
+                    &recipient.recipient_ref,
+                    "deferred",
+                    None,
+                    Some("deferred"),
+                    Some(&error.chars().take(300).collect::<String>()),
+                    None,
+                )?;
                 crate::log_terminal_status_event(
                     "backend.email.native_recipient_error",
                     json!({
@@ -788,15 +861,11 @@ fn run_native_transaction(
                         "error": error,
                     }),
                 );
-                outcomes.push((
-                    recipient.recipient_ref.clone(),
-                    NativeRecipientOutcome::Deferred { retry_at_ms: None },
-                ));
                 continue;
             }
         };
-        // A hook abort (cancel/fence) misclassifies through the SMTP layer —
-        // the recorded reason wins over the reported outcome.
+        // A hook abort (cancel/fence/fact-recheck) misclassifies through the
+        // SMTP layer — the recorded reason wins over the reported outcome.
         if let Some(reason) = abort_reason {
             let journal = journal_cell.into_inner();
             journal.finish_attempt(
@@ -806,6 +875,8 @@ fn run_native_transaction(
                 SendPhase::MailFromSent.as_str(),
                 if reason == "cancel_requested" {
                     "cancelled"
+                } else if reason.starts_with("native_preflight_recheck:") {
+                    "preflight_recheck_failed"
                 } else {
                     "fenced"
                 },
@@ -828,6 +899,17 @@ fn run_native_transaction(
                     "cancelled",
                 );
             }
+            // §6b.1 / review R2-3: once ANY recipient crossed DATA, the pair
+            // terminalizes NOW (partially_submitted / delivery_unknown from
+            // the journaled rows) — never a nonterminal Abandoned that could
+            // strand a data_started job.
+            let crossed = journal
+                .load_job(&send_job_id, generation)?
+                .map(|row| row.data_started)
+                .unwrap_or(false);
+            if crossed {
+                return settle_native_from_rows(deps, journal, &send_job_id, generation);
+            }
             return Ok(SubmissionResult::Abandoned(reason));
         }
         {
@@ -843,24 +925,38 @@ fn run_native_transaction(
                         "preflight_recheck_failed",
                     )?;
                     drop(guard);
+                    let journal = journal_cell.into_inner();
                     // §10.2: a failed pre-DATA fact abort is not a wire
-                    // event; stop non-terminally for re-qualification.
+                    // event for THIS recipient — but if an earlier recipient
+                    // already crossed DATA, the pair terminalizes now
+                    // (review R2-3); otherwise stop non-terminally for
+                    // re-qualification.
+                    let crossed = journal
+                        .load_job(&send_job_id, generation)?
+                        .map(|row| row.data_started)
+                        .unwrap_or(false);
+                    if crossed {
+                        return settle_native_from_rows(deps, journal, &send_job_id, generation);
+                    }
                     return Ok(SubmissionResult::Abandoned(format!(
                         "native_preflight_recheck:{check}"
                     )));
                 }
                 NativeRecipientOutcome::Submitted { smtp_code } => {
-                    journal.update_recipient_status(
+                    // FULL-durability at the recipient's 2xx (review R2-3):
+                    // this row is the crash-survivable record recovery uses
+                    // to keep the recipient `submitted`.
+                    journal.record_recipient_outcome_full(
                         &send_job_id,
                         generation,
                         &recipient.recipient_ref,
                         "submitted",
                         Some(*smtp_code),
-                        None,
                         Some("accepted"),
                         None,
                         None,
                     )?;
+                    email_killpoint("post_native_recipient_submitted");
                     journal.finish_attempt(
                         &send_job_id,
                         generation,
@@ -871,12 +967,11 @@ fn run_native_transaction(
                     apply_rate_outcome(journal, &recipient.domain, &outcome)?;
                 }
                 NativeRecipientOutcome::Deferred { retry_at_ms } => {
-                    journal.update_recipient_status(
+                    journal.record_recipient_outcome_full(
                         &send_job_id,
                         generation,
                         &recipient.recipient_ref,
                         "deferred",
-                        None,
                         None,
                         Some("deferred"),
                         None,
@@ -892,13 +987,12 @@ fn run_native_transaction(
                     apply_rate_outcome(journal, &recipient.domain, &outcome)?;
                 }
                 NativeRecipientOutcome::Bounced { smtp_code } => {
-                    journal.update_recipient_status(
+                    journal.record_recipient_outcome_full(
                         &send_job_id,
                         generation,
                         &recipient.recipient_ref,
                         "bounced",
                         *smtp_code,
-                        None,
                         Some("rejected_permanent"),
                         None,
                         None,
@@ -912,12 +1006,11 @@ fn run_native_transaction(
                     )?;
                 }
                 NativeRecipientOutcome::DeliveryUnknown => {
-                    journal.update_recipient_status(
+                    journal.record_recipient_outcome_full(
                         &send_job_id,
                         generation,
                         &recipient.recipient_ref,
                         "delivery_unknown",
-                        None,
                         None,
                         None,
                         Some("native delivery ambiguous at/after DATA"),
@@ -933,30 +1026,33 @@ fn run_native_transaction(
                 }
             }
         }
-        outcomes.push((recipient.recipient_ref.clone(), outcome));
     }
     let journal = journal_cell.into_inner();
+    settle_native_from_rows(deps, journal, &send_job_id, generation)
+}
 
-    // ---- aggregate per §6b.1 ----
-    let any_unknown = outcomes
-        .iter()
-        .any(|(_, outcome)| matches!(outcome, NativeRecipientOutcome::DeliveryUnknown));
-    let submitted_codes: Vec<u16> = outcomes
-        .iter()
-        .filter_map(|(_, outcome)| match outcome {
-            NativeRecipientOutcome::Submitted { smtp_code } => Some(*smtp_code),
-            _ => None,
-        })
-        .collect();
-    let all_bounced = !outcomes.is_empty()
-        && outcomes
-            .iter()
-            .all(|(_, outcome)| matches!(outcome, NativeRecipientOutcome::Bounced { .. }));
-
+/// Aggregate a native run per §6b.1 from the JOURNALED recipient rows — the
+/// single source that includes both this execution's outcomes and any
+/// preserved rows from previous executions of the same generation (reviews
+/// R2-3/R2-4). Terminal whenever the rows say so, and ALWAYS terminal once
+/// the DATA boundary was crossed.
+fn settle_native_from_rows(
+    deps: &SubmissionDeps<'_>,
+    journal: &mut EmailJournal,
+    send_job_id: &str,
+    generation: u32,
+) -> Result<SubmissionResult, String> {
     let job = journal
-        .load_job(&send_job_id, generation)?
+        .load_job(send_job_id, generation)?
         .ok_or_else(|| "job vanished post-native-run".to_string())?;
-    let rows = journal.load_recipients(&send_job_id, generation)?;
+    let rows = journal.load_recipients(send_job_id, generation)?;
+    let any_unknown = rows.iter().any(|row| row.status == "delivery_unknown");
+    let submitted_code = rows
+        .iter()
+        .find(|row| row.status == "submitted")
+        .map(|row| row.smtp_code.unwrap_or(250));
+    let all_submitted = !rows.is_empty() && rows.iter().all(|row| row.status == "submitted");
+    let all_bounced = !rows.is_empty() && rows.iter().all(|row| row.status == "bounced");
     let per_recipient: Vec<Value> = rows.iter().map(recipient_state_value).collect();
 
     if any_unknown {
@@ -972,17 +1068,14 @@ fn run_native_transaction(
             "delivery_unknown",
         );
     }
-    if let Some(best_code) = submitted_codes.first().copied() {
-        // Provider acceptance journaled BEFORE reported; recipient rows were
-        // flipped per-recipient already (pass None).
-        journal.mark_data_completed(&send_job_id, generation, Some(best_code), "accepted", None)?;
+    if let Some(best_code) = submitted_code {
+        // Provider acceptance journaled BEFORE reported; recipient rows
+        // already carry their FULL-durability outcomes (pass None).
+        journal.mark_data_completed(send_job_id, generation, Some(best_code), "accepted", None)?;
         email_killpoint("post_data_completed_journal");
         let job = journal
-            .load_job(&send_job_id, generation)?
+            .load_job(send_job_id, generation)?
             .ok_or_else(|| "job vanished post-DATA".to_string())?;
-        let rows = journal.load_recipients(&send_job_id, generation)?;
-        let per_recipient: Vec<Value> = rows.iter().map(recipient_state_value).collect();
-        let all_submitted = submitted_codes.len() == outcomes.len();
         let sanitized = contract::SanitizedResponse {
             smtp_code: Some(best_code),
             enhanced_code: None,
@@ -1017,9 +1110,9 @@ fn run_native_transaction(
             "policy",
         );
     }
-    // Only deferrals (greylisting / temporary refusals) — non-terminal when
-    // the DATA boundary was never crossed; once crossed, the pair may never
-    // re-enter SMTP (§10.1) and settles delivery_unknown.
+    // Only deferrals/pending remain — non-terminal when the DATA boundary
+    // was never crossed; once crossed, the pair may never re-enter SMTP
+    // (§10.1) and settles delivery_unknown.
     if job.data_started {
         return settle(
             journal,

@@ -264,7 +264,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "diffforge-email-vault-test-{}-{}",
             std::process::id(),
-            uuid::Uuid::new_v4()
+            uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir

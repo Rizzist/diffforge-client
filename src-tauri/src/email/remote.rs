@@ -708,6 +708,27 @@ async fn run_credential_probe(state: &crate::CloudMcpState, event: &Value, profi
     }
 }
 
+/// Previous qualification decides failed-vs-degraded (§10.2). This is
+/// durable HISTORY, deliberately independent of the 24h eligibility expiry:
+/// a device that qualified once and regresses later — even after the window
+/// lapsed — reads `degraded`, never `failed`/`pending` (review R2-6).
+pub(crate) fn preflight_previously_qualified(
+    journal: &EmailJournal,
+    profile_ref: &str,
+    domain: &str,
+) -> bool {
+    journal
+        .connection()
+        .query_row(
+            "SELECT COUNT(1) FROM email_native_preflight_runs
+             WHERE profile_ref = ?1 AND domain = ?2 AND result = 'qualified'",
+            rusqlite::params![profile_ref, domain],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .unwrap_or(false)
+}
+
 async fn run_preflight_snapshot(
     state: &crate::CloudMcpState,
     profile_ref: String,
@@ -719,19 +740,7 @@ async fn run_preflight_snapshot(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let journal = EmailJournal::open_default()?;
         let credentials = super::credentials::CredentialStack::new();
-        // Previous qualification decides failed-vs-degraded (§10.2): a run
-        // that was `qualified` and has not expired counts.
-        let previous_qualified: bool = journal
-            .connection()
-            .query_row(
-                "SELECT COUNT(1) FROM email_native_preflight_runs
-                 WHERE profile_ref = ?1 AND domain = ?2 AND result = 'qualified'
-                   AND expires_at_ms > ?3",
-                rusqlite::params![profile_ref, domain, now_ms()],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|count| count > 0)
-            .unwrap_or(false);
+        let previous_qualified = preflight_previously_qualified(&journal, &profile_ref, &domain);
         let observations = super::preflight::collect_observations(
             &journal,
             &credentials,
@@ -799,7 +808,7 @@ async fn run_preflight_snapshot(
                 "contract": contract::EMAIL_CONTRACT,
                 "schema_version": contract::EMAIL_SCHEMA_VERSION,
                 "result": wire,
-                "client_request_id": uuid::Uuid::new_v4().to_string(),
+                "client_request_id": uuid::Uuid::now_v7().to_string(),
             });
             if let Err(error) = crate::cloud_mcp_ws_request_with_timeout(
                 state,
@@ -844,30 +853,43 @@ pub fn parse_send_event_ack(
     Ok((parsed.applied, parsed.audit))
 }
 
-/// Record a §9.3 settlement ack routed back from the durable outbox
-/// (`cloud_mcp_outbox_mark_acked` email_send_event arm). Sync — called from
-/// the outbox drain's blocking context.
-pub fn email_record_send_event_cloud_ack(payload: &Value, response: &Value) {
-    let Some(status_event_id) = payload
+/// Testable core of the §9.3 ack settlement: parse the ack EXACTLY against
+/// the event the payload names, then persist it on the given journal. Any
+/// Err means the ack was NOT recorded — the caller must keep the durable
+/// outbox row alive so the send retries and a well-formed ack can land.
+pub fn email_apply_send_event_cloud_ack(
+    journal: &mut EmailJournal,
+    payload: &Value,
+    response: &Value,
+) -> Result<(), String> {
+    let status_event_id = payload
         .get("status_event_id")
         .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return;
-    };
-    let result = match parse_send_event_ack(&status_event_id, response) {
-        Ok((applied, audit)) => (|| {
-            let mut journal = EmailJournal::open_default()?;
-            journal.record_cloud_ack(&status_event_id, applied, audit.as_deref())
-        })(),
-        Err(error) => Err(error),
-    };
-    if let Err(error) = result {
+        .ok_or_else(|| "send event outbox payload missing status_event_id".to_string())?;
+    let (applied, audit) = parse_send_event_ack(status_event_id, response)?;
+    journal.record_cloud_ack(status_event_id, applied, audit.as_deref())
+}
+
+/// Record a §9.3 settlement ack routed back from the durable outbox
+/// (`cloud_mcp_outbox_mark_acked` email_send_event arm). Sync — called from
+/// the outbox drain's blocking context. Err ⇒ the outbox row must NOT be
+/// deleted (review R2-1): the journal event stays unacked, so the durable
+/// retry has to stay alive until a valid ack is both parsed AND persisted.
+pub fn email_record_send_event_cloud_ack(payload: &Value, response: &Value) -> Result<(), String> {
+    let result = (|| {
+        let mut journal = EmailJournal::open_default()?;
+        email_apply_send_event_cloud_ack(&mut journal, payload, response)
+    })();
+    if let Err(error) = result.as_ref() {
         crate::log_terminal_status_event(
             "backend.email.send_event_ack_record_failed",
-            json!({ "status_event_id": status_event_id, "error": error }),
+            json!({
+                "status_event_id": payload.get("status_event_id"),
+                "error": error,
+            }),
         );
     }
+    result
 }
 
 /// Startup journal recovery (plan §4.3: "journal recovery before cloud
@@ -958,7 +980,7 @@ pub async fn email_account_sync_resume_hook(state: &crate::CloudMcpState) {
                 .collect::<Vec<_>>(),
             "runtime": super::capability::runtime_kind(),
             "credential_store": credentials.health().as_str(),
-            "client_request_id": uuid::Uuid::new_v4().to_string(),
+            "client_request_id": uuid::Uuid::now_v7().to_string(),
         }))
     })
     .await
@@ -1077,7 +1099,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "diffforge-email-remote-test-{}-{}",
             std::process::id(),
-            uuid::Uuid::new_v4()
+            uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         EmailJournal::open_at(&dir.join("journal.sqlite")).unwrap()

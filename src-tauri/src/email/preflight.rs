@@ -100,6 +100,10 @@ pub struct PreflightObservations {
     pub port25_open: Option<bool>,
     pub ptr_fcrdns_ok: Option<bool>,
     pub helo_hostname_resolves: Option<bool>,
+    /// When the HELO check CANNOT be observed on this device (no EHLO
+    /// hostname configured), the reason lands here and the check reports
+    /// `unavailable` — never an inferred verdict (review R2-5).
+    pub helo_unavailable: Option<String>,
     pub dnsbl_listed: Option<bool>,
     pub always_on: Option<bool>,
     pub clock_skew_ms: Option<i64>,
@@ -126,13 +130,87 @@ fn requested(requested_checks: &[String], check_id: &str) -> bool {
     requested_checks.is_empty() || requested_checks.iter().any(|entry| entry == check_id)
 }
 
+/// Persist one egress observation row (§10.1 `email_egress_ip_observations`)
+/// — the durable evidence both the preflight checks and the native pre-DATA
+/// fact rechecks consume (reviews R2-2/R2-5).
+pub fn record_egress_observation(
+    journal: &super::journal::EmailJournal,
+    egress_ip: &str,
+    port25_open: Option<bool>,
+    source: &str,
+) -> Result<(), String> {
+    journal
+        .connection()
+        .execute(
+            "INSERT INTO email_egress_ip_observations
+             (observed_at_ms, egress_ip, source, port25_open, profile_ref)
+             VALUES (?1, ?2, ?3, ?4, NULL)",
+            rusqlite::params![now_ms(), egress_ip, source, port25_open.map(|open| open as i64)],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("egress observation insert failed: {error}"))
+}
+
+/// The local interface address the OS would route external traffic through
+/// (a UDP `connect()` assigns the source address without sending a packet).
+/// For a machine with a real public IP — the native use-case — this IS the
+/// egress IP; behind NAT/CGNAT it honestly reports the private address and
+/// the `public_ip` check fails with remediation.
+pub fn observe_local_egress_ip() -> Option<IpAddr> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    socket.connect(("8.8.8.8", 53)).ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
+/// Live outbound port-25 probe against a well-known always-up MX. Some(true)
+/// = a TCP connect succeeded; Some(false) = every resolved address refused
+/// or timed out (the classic ISP port-25 block); None = could not resolve —
+/// unobserved, never inferred (review R2-5).
+fn probe_port25_egress() -> Option<bool> {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::SocketAddr> = ("gmail-smtp-in.l.google.com", 25)
+        .to_socket_addrs()
+        .ok()?
+        .collect();
+    if addrs.is_empty() {
+        return None;
+    }
+    for addr in addrs.iter().take(3) {
+        if std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(5)).is_ok() {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Clock-skew measurement against an HTTP `Date` header (second precision —
+/// ample for the 5s gate). None = probe failed: unobserved/pending.
+fn probe_clock_skew_ms() -> Option<i64> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?
+        .head("https://www.cloudflare.com/")
+        .send()
+        .ok()?;
+    let date = response.headers().get(reqwest::header::DATE)?.to_str().ok()?;
+    let server = httpdate::parse_http_date(date).ok()?;
+    let server_ms = server
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some(now_ms() - server_ms)
+}
+
 /// Collect real observations for the operator-triggered preflight run
-/// (review #12). Local checks (journal, credential store, runtime) are
-/// always cheap; DNS-backed checks (SPF/DKIM/DMARC/PTR/HELO/DNSBL) resolve
-/// through hickory only when requested; the egress IP and its stability
-/// come from the journal's `email_egress_ip_observations` history. The
-/// seed test stays operator-run (pending here). NEVER called from unit
-/// tests — those drive `evaluate_checks` with fakes.
+/// (reviews #12/R2-5). Local checks (journal, credential store, runtime)
+/// are always cheap; the egress IP + port-25 are OBSERVED live and
+/// persisted to `email_egress_ip_observations`; clock skew is measured;
+/// DNS-backed checks (SPF/DKIM/DMARC/PTR/DNSBL) resolve through hickory,
+/// with SPF evaluated structurally (RFC 7208 via mail-auth) against the
+/// observed egress IP. HELO reports `unavailable` (no device-side EHLO
+/// hostname) and the seed test stays operator-run (pending). NEVER called
+/// from unit tests — those drive `evaluate_checks` with fakes.
 pub fn collect_observations(
     journal: &super::journal::EmailJournal,
     credentials: &super::credentials::CredentialStack,
@@ -160,6 +238,38 @@ pub fn collect_observations(
             super::capability::runtime_kind(),
             "daemon" | "background"
         ));
+    }
+    if requested(requested_checks, "clock_skew") {
+        observations.clock_skew_ms = probe_clock_skew_ms();
+    }
+    if requested(requested_checks, "helo_hostname") {
+        observations.helo_unavailable = Some(
+            "no EHLO hostname is configured device-side; the native grant binds it at send time"
+                .to_string(),
+        );
+    }
+
+    // ---- LIVE egress observation, persisted (public_ip / static_ip /
+    // port25 / ptr / dnsbl / spf all consume it) ----
+    let needs_egress = [
+        "public_ip",
+        "static_ip",
+        "port25_egress",
+        "ptr_fcrdns",
+        "dnsbl_clean",
+        "spf_published",
+    ]
+    .iter()
+    .any(|id| requested(requested_checks, id));
+    if needs_egress {
+        if let Some(ip) = observe_local_egress_ip() {
+            let port25 = if requested(requested_checks, "port25_egress") {
+                probe_port25_egress()
+            } else {
+                None
+            };
+            let _ = record_egress_observation(journal, &ip.to_string(), port25, "local_interface");
+        }
     }
 
     // ---- egress IP history (public_ip / static_ip / port25) ----
@@ -286,26 +396,39 @@ fn collect_dns_observations(
         };
 
         if requested(requested_checks, "spf_published") {
-            observations.spf_authorizes_egress =
-                txt_of(format!("{domain}.")).await.map(|records| {
-                    records.iter().any(|record| {
-                        let spf = record.trim_start();
-                        spf.starts_with("v=spf1")
-                            && match observations.egress_ip {
-                                // Approximation, honest by remediation text:
-                                // the record must name the egress ip or
-                                // delegate via include/redirect/a/mx.
-                                Some(ip) => {
-                                    spf.contains(&ip.to_string())
-                                        || spf.contains("include:")
-                                        || spf.contains("redirect=")
-                                        || spf.contains(" a")
-                                        || spf.contains(" mx")
-                                }
-                                None => true,
+            // STRUCTURAL SPF evaluation (review R2-5): the full RFC 7208
+            // check_host() via mail-auth — ip4/ip6/a/mx/include/redirect and
+            // macros are parsed and EVALUATED against the observed egress
+            // IP. No egress evidence, or a resolver failure ⇒ unobserved
+            // (pending) — a record merely containing `include:` is NOT a
+            // pass.
+            observations.spf_authorizes_egress = match observations.egress_ip {
+                None => None,
+                Some(ip) => {
+                    match mail_auth::MessageAuthenticator::new_system_conf()
+                        .or_else(|_| mail_auth::MessageAuthenticator::new_cloudflare())
+                    {
+                        Err(_) => None,
+                        Ok(authenticator) => {
+                            let sender = format!("postmaster@{domain}");
+                            let output = authenticator
+                                .verify_spf(
+                                    mail_auth::spf::verify::SpfParameters::verify_mail_from(
+                                        ip, domain, domain, &sender,
+                                    ),
+                                )
+                                .await;
+                            match output.result() {
+                                mail_auth::SpfResult::Pass => Some(true),
+                                // TempError = the evaluation itself could
+                                // not complete: unobserved, never a verdict.
+                                mail_auth::SpfResult::TempError => None,
+                                _ => Some(false),
                             }
-                    })
-                });
+                        }
+                    }
+                }
+            };
         }
         if requested(requested_checks, "dkim_published") {
             if let Some((selector, local_pub_b64)) = local_dkim.as_ref() {
@@ -465,12 +588,26 @@ pub fn evaluate_checks(observations: &PreflightObservations) -> Vec<CheckResult>
         "forward-confirmed reverse DNS",
         "PTR must resolve to the EHLO hostname and back",
     ));
-    checks.push(bool_check(
-        "helo_hostname",
-        observations.helo_hostname_resolves,
-        "EHLO name resolves to egress ip",
-        "publish an A record for the EHLO hostname pointing at the egress ip",
-    ));
+    // helo_hostname: honest tri-state — a device that HAS no EHLO hostname
+    // to check reports `unavailable` (review R2-5), never an inferred pass.
+    checks.push(match observations.helo_unavailable.as_deref() {
+        Some(reason) if observations.helo_hostname_resolves.is_none() => CheckResult {
+            check_id: "helo_hostname",
+            status: CheckStatus::Unavailable,
+            required: true,
+            observed: reason.to_string(),
+            expected: "EHLO name resolves to egress ip".to_string(),
+            remediation: Some(
+                "qualify with the native grant's EHLO hostname (bound at send time)".to_string(),
+            ),
+        },
+        _ => bool_check(
+            "helo_hostname",
+            observations.helo_hostname_resolves,
+            "EHLO name resolves to egress ip",
+            "publish an A record for the EHLO hostname pointing at the egress ip",
+        ),
+    });
     // dnsbl_clean: advisory; listed => warn, not fail.
     checks.push({
         let (status, observed) = match observations.dnsbl_listed {
@@ -596,9 +733,11 @@ pub fn overall_result(checks: &[CheckResult], previous_qualified: bool) -> &'sta
     let any_regression = checks
         .iter()
         .any(|check| matches!(check.status, CheckStatus::Fail | CheckStatus::Warn));
+    // Unavailable counts as incomplete observation (review R2-5): a check
+    // that could not run must never let the run read `qualified`.
     let any_pending = checks
         .iter()
-        .any(|check| check.status == CheckStatus::Pending);
+        .any(|check| matches!(check.status, CheckStatus::Pending | CheckStatus::Unavailable));
     let seed_pass = checks
         .iter()
         .find(|check| check.check_id == "seed_test")
@@ -657,7 +796,7 @@ impl PreflightRun {
         let result = overall_result(&checks, previous_qualified).to_string();
         let ran_at_ms = now_ms();
         PreflightRun {
-            preflight_id: uuid::Uuid::new_v4().to_string(),
+            preflight_id: uuid::Uuid::now_v7().to_string(),
             device_id: device_id.to_string(),
             profile_ref: profile_ref.to_string(),
             domain: domain.to_string(),
@@ -726,6 +865,7 @@ mod tests {
             port25_open: Some(true),
             ptr_fcrdns_ok: Some(true),
             helo_hostname_resolves: Some(true),
+            helo_unavailable: None,
             dnsbl_listed: Some(false),
             always_on: Some(true),
             clock_skew_ms: Some(41),
@@ -780,6 +920,26 @@ mod tests {
         let checks = evaluate_checks(&obs);
         assert_eq!(overall_result(&checks, true), "degraded");
         assert_eq!(overall_result(&checks, false), "failed");
+    }
+
+    #[test]
+    fn unavailable_check_blocks_qualified_never_inferred() {
+        // Review R2-5: a check that CANNOT run reports `unavailable` and the
+        // run can never read `qualified` off it.
+        let mut obs = qualified_observations();
+        obs.helo_hostname_resolves = None;
+        obs.helo_unavailable = Some("no EHLO hostname configured".to_string());
+        let checks = evaluate_checks(&obs);
+        let helo = checks
+            .iter()
+            .find(|check| check.check_id == "helo_hostname")
+            .unwrap();
+        assert_eq!(helo.status, CheckStatus::Unavailable);
+        assert!(helo.observed.contains("no EHLO hostname"));
+        assert_eq!(overall_result(&checks, false), "pending");
+        // Unavailable is incompleteness, not a regression: still pending
+        // (never a phantom `degraded`) for a previously qualified device.
+        assert_eq!(overall_result(&checks, true), "pending");
     }
 
     #[test]
