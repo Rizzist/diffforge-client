@@ -1,0 +1,16 @@
+{
+  "description": "commit.json whose single PUT is the atomic acceptance flip for the receipt's job objects (SS3).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A",
+    "edge_id": "edge-iad-1",
+    "account_count": 2,
+    "job_keys": [
+      "df/email-queue/edge-iad-1/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/job-acct_mfrggzdfmztwq2lknnwg23tpob.json",
+      "df/email-queue/edge-iad-1/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/job-acct_nbswy3dpeb3w64tmmqqq2lknnw.json"
+    ],
+    "committed_at_ms": 1784900000188
+  }
+}

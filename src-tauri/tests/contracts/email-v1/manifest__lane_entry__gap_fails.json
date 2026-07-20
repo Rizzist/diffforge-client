@@ -1,0 +1,34 @@
+{
+  "description": "Lane entry with segments [1..5] and [7..9]: seq 6 is missing, composition MUST fail closed (SS7).",
+  "expect": "reject:segment_gap",
+  "payload": {
+    "name": "email",
+    "scope": "account",
+    "lane": "events",
+    "base": {
+      "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/sections/email/1-01J2ZKQ5E8XY0123456789ABCD/section.sqlite.zst",
+      "gen": 1,
+      "sha256": "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2",
+      "size": 524288,
+      "base_seq": 0
+    },
+    "segments": [
+      {
+        "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/lanes/email/1-5-01J2ZKQ5E8XY0123456789ABCD.jsonl.zst",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size": 8192,
+        "first_seq": 1,
+        "last_seq": 5
+      },
+      {
+        "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/lanes/email/7-9-01J2ZKQ5E8XY0123456789ABCD.jsonl.zst",
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "size": 4096,
+        "first_seq": 7,
+        "last_seq": 9
+      }
+    ],
+    "covered_seq": 9,
+    "compaction_gen": 1
+  }
+}

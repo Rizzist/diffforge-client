@@ -1,0 +1,18 @@
+{
+  "description": "email_settings_get naming a settings section that does not exist (SS8).",
+  "expect": "reject:unknown_settings_section",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "sections": [
+        "telemetry"
+      ]
+    },
+    "error": {
+      "code": "unknown_settings_section",
+      "message": "no settings section named telemetry",
+      "retryable": false
+    }
+  }
+}

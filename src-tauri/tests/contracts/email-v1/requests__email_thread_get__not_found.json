@@ -1,0 +1,17 @@
+{
+  "description": "email_thread_get for a thread_id that does not exist in this mailbox (SS8).",
+  "expect": "reject:not_found",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "thread_id": "019f9382-9902-7bcd-9ef0-213243546599",
+      "limit": 20
+    },
+    "error": {
+      "code": "not_found",
+      "message": "unknown thread_id",
+      "retryable": false
+    }
+  }
+}

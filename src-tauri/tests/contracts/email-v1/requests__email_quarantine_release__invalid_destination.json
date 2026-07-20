@@ -1,0 +1,21 @@
+{
+  "description": "email_quarantine_release with a destination that is not a valid location (SS8).",
+  "expect": "reject:invalid_destination",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c006-7000-8000-000000000006",
+      "message_uids": [
+        "019f9382-9911-7abc-8def-102132435466"
+      ],
+      "destination": "outbox",
+      "expected_mailbox_revision": "4313"
+    },
+    "error": {
+      "code": "invalid_destination",
+      "message": "destination must be a mailbox location",
+      "retryable": false
+    }
+  }
+}

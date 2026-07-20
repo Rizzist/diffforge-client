@@ -1,0 +1,19 @@
+{
+  "description": "purge_finalized content-free completion record (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4335",
+    "kind": "purge_finalized",
+    "at_ms": 1784900007202,
+    "payload": {
+      "purge": {
+        "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+        "state": "finalized",
+        "finalized_at_ms": 1784900007202
+      }
+    }
+  }
+}

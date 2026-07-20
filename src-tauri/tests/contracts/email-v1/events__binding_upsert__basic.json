@@ -1,0 +1,23 @@
+{
+  "description": "binding_upsert after-image of the email_sender_bindings row; device_profile_ref opaque, no secrets (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4326",
+    "kind": "binding_upsert",
+    "at_ms": 1784900004952,
+    "payload": {
+      "binding": {
+        "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+        "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+        "profile_ref": "profile-9c41d2aa",
+        "target_device_id": "019f9382-d001-7000-8000-0000000000d1",
+        "mode": "provider",
+        "enabled": true,
+        "revision": "4"
+      }
+    }
+  }
+}

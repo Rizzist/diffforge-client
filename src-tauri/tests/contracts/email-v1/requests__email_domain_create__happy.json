@@ -1,0 +1,47 @@
+{
+  "description": "email_domain_create returning the pending DomainRow plus the expected DNS records to publish (SS5b/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c019-7000-8000-000000000019",
+      "domain": "acme.example"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_domain_create",
+      "id": "req-0026",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4324",
+        "email_mutation_seq": "4324",
+        "coverage": null,
+        "result": {
+          "domain": {
+            "domain": "acme.example",
+            "state": "pending",
+            "mx_state": "unchecked",
+            "catch_all": false,
+            "revision": "1"
+          },
+          "dns_expected": [
+            {
+              "type": "MX",
+              "name": "acme.example",
+              "value": "mx1.diffforge-mail.example",
+              "priority": 10
+            },
+            {
+              "type": "TXT",
+              "name": "_dfmail-verify.acme.example",
+              "value": "dfmail-verify=01J2ZK7Q8R9S6T5V4W3X2Y1Z0A"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

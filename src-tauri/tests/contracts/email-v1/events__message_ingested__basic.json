@@ -1,0 +1,106 @@
+{
+  "description": "message_ingested after-image: full email_messages row plus InboundRecipient rows (no delivery fields), object refs and receipt_id (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4312",
+    "kind": "message_ingested",
+    "at_ms": 1784900001452,
+    "payload": {
+      "message": {
+        "message_uid": "019f9382-9901-7abc-8def-102132435465",
+        "thread_id": "019f9382-9902-7bcd-9ef0-213243546576",
+        "direction": "inbound",
+        "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A",
+        "rfc_message_id": "<20260724133320.8f3a1c@mx.partner.example>",
+        "references": [],
+        "from": "Maya Chen <maya.chen@partner.example>",
+        "to": [
+          "Acme Ops <ops@acme.example>"
+        ],
+        "cc": [],
+        "subject": "Q3 invoice attached",
+        "snippet": "Hi team, the Q3 invoice is attached. Net-30 as usual - let me know if anything looks off.",
+        "inline_text": "Hi team,\n\nThe Q3 invoice is attached. Net-30 as usual - let me know if anything looks off.\n\n- Maya",
+        "inline_text_truncated": false,
+        "date_hdr": "Fri, 24 Jul 2026 13:33:20 +0000",
+        "internal_date_ms": 1784900001452,
+        "size_bytes": 48123,
+        "auth_summary": {
+          "spf": "pass",
+          "dkim": "pass",
+          "dmarc": "pass",
+          "score": 0
+        },
+        "current_derivation_id": "12-1",
+        "has_attachments": true,
+        "attachment_count": 1,
+        "location": "inbox",
+        "workflow_status": "todo",
+        "semantic_category": "finance",
+        "flags": 1,
+        "classification_state": "classified",
+        "purge_state": "none",
+        "revision_seq": "1"
+      },
+      "recipients": [
+        {
+          "role": "to",
+          "address": "ops@acme.example",
+          "display_name": "Acme Ops"
+        }
+      ],
+      "objects": [
+        {
+          "kind": "raw",
+          "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/ingress/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/raw/9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08-48123",
+          "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+          "size_bytes": 48123,
+          "media_type": "message/rfc822",
+          "scan_state": "clean",
+          "purge_state": "none"
+        },
+        {
+          "kind": "manifest",
+          "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/messages/019f9382-9901-7abc-8def-102132435465/derivations/12-1/manifest/8277e0910d750195b448797616e091ad8277e0910d750195b448797616e091ad-640",
+          "sha256": "8277e0910d750195b448797616e091ad8277e0910d750195b448797616e091ad",
+          "size_bytes": 640,
+          "media_type": "application/json",
+          "scan_state": "clean",
+          "purge_state": "none"
+        },
+        {
+          "kind": "plain",
+          "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/messages/019f9382-9901-7abc-8def-102132435465/derivations/12-1/plain/0cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e269772661-812",
+          "sha256": "0cc175b9c0f1b6a831c399e2697726610cc175b9c0f1b6a831c399e269772661",
+          "size_bytes": 812,
+          "media_type": "text/plain",
+          "scan_state": "clean",
+          "purge_state": "none"
+        },
+        {
+          "kind": "html",
+          "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/messages/019f9382-9901-7abc-8def-102132435465/derivations/12-1/html/92eb5ffee6ae2fec3ad71c777531578f92eb5ffee6ae2fec3ad71c777531578f-2144",
+          "sha256": "92eb5ffee6ae2fec3ad71c777531578f92eb5ffee6ae2fec3ad71c777531578f",
+          "size_bytes": 2144,
+          "media_type": "text/html",
+          "scan_state": "clean",
+          "purge_state": "none"
+        },
+        {
+          "kind": "attachment",
+          "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/messages/019f9382-9901-7abc-8def-102132435465/attachments/p2/4a8a08f09d37b73795649038408b5f334a8a08f09d37b73795649038408b5f33-18744",
+          "sha256": "4a8a08f09d37b73795649038408b5f334a8a08f09d37b73795649038408b5f33",
+          "size_bytes": 18744,
+          "media_type": "application/pdf",
+          "filename": "q3-invoice.pdf",
+          "scan_state": "clean",
+          "purge_state": "none"
+        }
+      ],
+      "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A"
+    }
+  }
+}

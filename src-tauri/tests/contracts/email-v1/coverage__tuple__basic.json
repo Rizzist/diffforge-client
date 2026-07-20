@@ -1,0 +1,9 @@
+{
+  "description": "The SSE.6 force_seal_and_wait coverage tuple: envelope-free engine surface with engine-native scalars; seq/epoch become string u64s only when embedded in email payloads (SS0.2/SS5b/SS7).",
+  "expect": "valid",
+  "payload": {
+    "seq": 4312,
+    "epoch": 7,
+    "manifest_key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/manifests/epoch-7/manifest-000000004312.json"
+  }
+}

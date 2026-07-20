@@ -1,0 +1,53 @@
+{
+  "description": "email_search happy path; projection rows annotated with matched_fields (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "query": "invoice from:partner.example",
+      "filters": {
+        "has_attachments": true
+      },
+      "limit": 25
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_search",
+      "id": "req-0005",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "items": [
+          {
+            "thread_id": "019f9382-9902-7bcd-9ef0-213243546576",
+            "subject": "Q3 invoice attached",
+            "preview": "Hi team, the Q3 invoice is attached. Net-30 as usual - let me know if anything looks off.",
+            "participants": "Maya Chen, Acme Ops",
+            "message_count": 2,
+            "unread_count": 1,
+            "latest_at_ms": 1784900001452,
+            "latest_from": "Maya Chen <maya.chen@partner.example>",
+            "axes": {
+              "location": "inbox",
+              "workflow_status": "todo",
+              "semantic_category": "finance"
+            },
+            "label_ids": [
+              "019f9382-9905-7ef0-8123-5465768798a9"
+            ],
+            "flags": 1,
+            "has_attachments": true,
+            "auth_risk": "none",
+            "direction": "inbound",
+            "matched_fields": [
+              "subject",
+              "from"
+            ]
+          }
+        ],
+        "mailbox_revision": "4312"
+      }
+    }
+  }
+}

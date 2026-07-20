@@ -1,0 +1,34 @@
+{
+  "description": "Lane entry with base 4300 plus contiguous segments 4301-4305 and 4306-4309; covered_seq 4309 (SS7).",
+  "expect": "valid",
+  "payload": {
+    "name": "email",
+    "scope": "account",
+    "lane": "events",
+    "base": {
+      "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/sections/email/3-01J2ZKQ5E8XY0123456789ABCD/section.sqlite.zst",
+      "gen": 3,
+      "sha256": "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2",
+      "size": 1048576,
+      "base_seq": 4300
+    },
+    "segments": [
+      {
+        "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/lanes/email/4301-4305-01J2ZKQ5E8XY0123456789ABCD.jsonl.zst",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size": 20480,
+        "first_seq": 4301,
+        "last_seq": 4305
+      },
+      {
+        "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/lanes/email/4306-4309-01J2ZKQ5E8XY0123456789ABCD.jsonl.zst",
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "size": 16384,
+        "first_seq": 4306,
+        "last_seq": 4309
+      }
+    ],
+    "covered_seq": 4309,
+    "compaction_gen": 3
+  }
+}

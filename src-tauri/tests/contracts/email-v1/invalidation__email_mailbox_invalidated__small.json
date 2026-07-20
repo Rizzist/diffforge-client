@@ -1,0 +1,38 @@
+{
+  "description": "Coalesced web_only invalidation naming a few ids; no subjects, addresses, previews or bodies (SS9).",
+  "expect": "valid",
+  "payload": {
+    "kind": "email_mailbox_invalidated",
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "account_ns": "acct_mfrggzdfmztwq2lknnwg23tpob",
+    "mailbox_revision": "4313",
+    "previous_revision": "4311",
+    "change_id": "019f9382-990d-7678-89a1-dcedfe0f1021",
+    "scopes": [
+      "mailbox",
+      "counters"
+    ],
+    "thread_ids": [
+      "019f9382-9902-7bcd-9ef0-213243546576"
+    ],
+    "message_ids": [
+      "019f9382-9901-7abc-8def-102132435465"
+    ],
+    "draft_ids": [],
+    "send_job_ids": [],
+    "purge_ids": [],
+    "settings_scopes": [],
+    "counter_updates": [
+      {
+        "axis": "location",
+        "bucket": "inbox",
+        "total": 128,
+        "unread": 7
+      }
+    ],
+    "truncated": false,
+    "reason": "ingest",
+    "occurred_at_ms": 1784900001700
+  }
+}

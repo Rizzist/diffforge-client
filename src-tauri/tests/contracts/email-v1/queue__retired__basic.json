@@ -1,0 +1,46 @@
+{
+  "description": "Retired job marker: original job object plus appended ingested block, moved to email-queue-done on coverage (SS3).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A",
+    "edge_id": "edge-iad-1",
+    "account_ns": "acct_mfrggzdfmztwq2lknnwg23tpob",
+    "raw": {
+      "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/ingress/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/raw/9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08-48123",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "size_bytes": 48123
+    },
+    "edge_manifest": {
+      "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/ingress/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/edge-manifest/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824-2048",
+      "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "size_bytes": 2048
+    },
+    "route_snapshot": [
+      {
+        "address_digest": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+        "route_kind": "exact",
+        "domain": "acme.example"
+      }
+    ],
+    "mail_from": "maya.chen@partner.example",
+    "client_ip": "203.0.113.42",
+    "helo": "mx-out.partner.example",
+    "tls": {
+      "used": true,
+      "version": "TLSv1.3"
+    },
+    "accepted_at_ms": 1784900000123,
+    "ingested": {
+      "message_uid": "019f9382-9901-7abc-8def-102132435465",
+      "email_mutation_seq": "4312",
+      "coverage": {
+        "seq": "4312",
+        "epoch": "7",
+        "manifest_key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/manifests/epoch-7/manifest-000000004312.json"
+      },
+      "retired_at_ms": 1784900032000
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "description": "message_ingested whose normalized plain text exceeded the 32 KiB inline cap: inline_text_truncated true, full text only via object refs (SS5/SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4313",
+    "kind": "message_ingested",
+    "at_ms": 1784900001702,
+    "payload": {
+      "message": {
+        "message_uid": "019f9382-9911-7abc-8def-102132435466",
+        "thread_id": "019f9382-9902-7bcd-9ef0-213243546576",
+        "direction": "inbound",
+        "receipt_id": "01J2ZK7QGGABCDEFGH2JKMNPQR",
+        "rfc_message_id": "<20260724133515.77aa02@mx.partner.example>",
+        "references": [],
+        "from": "Maya Chen <maya.chen@partner.example>",
+        "to": [
+          "Acme Ops <ops@acme.example>"
+        ],
+        "cc": [],
+        "subject": "Q3 usage export (full report inline)",
+        "snippet": "Full quarterly usage export follows inline; the normalized text exceeds the inline cap and was truncated.",
+        "inline_text": "Full quarterly usage export follows inline. [... first 32 KiB of normalized plain text retained; remainder truncated at the 32768-byte cap ...]",
+        "inline_text_truncated": true,
+        "date_hdr": "Fri, 24 Jul 2026 13:33:20 +0000",
+        "internal_date_ms": 1784900001702,
+        "size_bytes": 512044,
+        "auth_summary": {
+          "spf": "pass",
+          "dkim": "pass",
+          "dmarc": "pass",
+          "score": 0
+        },
+        "current_derivation_id": "12-1",
+        "has_attachments": false,
+        "attachment_count": 0,
+        "location": "inbox",
+        "workflow_status": "todo",
+        "semantic_category": "reports",
+        "flags": 1,
+        "classification_state": "classified",
+        "purge_state": "none",
+        "revision_seq": "1"
+      },
+      "recipients": [
+        {
+          "role": "to",
+          "address": "ops@acme.example",
+          "display_name": "Acme Ops"
+        }
+      ],
+      "objects": [
+        {
+          "kind": "raw",
+          "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/ingress/01J2ZK7QGGABCDEFGH2JKMNPQR/raw/fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210-512044",
+          "sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+          "size_bytes": 512044,
+          "media_type": "message/rfc822",
+          "scan_state": "clean",
+          "purge_state": "none"
+        },
+        {
+          "kind": "plain",
+          "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/messages/019f9382-9911-7abc-8def-102132435466/derivations/12-1/plain/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-498211",
+          "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "size_bytes": 498211,
+          "media_type": "text/plain",
+          "scan_state": "clean",
+          "purge_state": "none"
+        }
+      ],
+      "receipt_id": "01J2ZK7QGGABCDEFGH2JKMNPQR"
+    }
+  }
+}

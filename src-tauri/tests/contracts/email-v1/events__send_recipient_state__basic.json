@@ -1,0 +1,28 @@
+{
+  "description": "send_recipient_state after-value: full OutboundRecipientState with SanitizedResponse - the only SMTP response representation on the wire (SS5b/SS6/SS9.6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4330",
+    "kind": "send_recipient_state",
+    "at_ms": 1784900005952,
+    "payload": {
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "recipient": {
+        "recipient_ref": "billing@partner.example",
+        "role": "to",
+        "address": "billing@partner.example",
+        "delivery_state": "submitted",
+        "response": {
+          "smtp_code": 250,
+          "enhanced_code": "2.0.0",
+          "response_class": "accepted"
+        },
+        "updated_at_ms": 1784900005952
+      }
+    }
+  }
+}

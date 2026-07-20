@@ -1,0 +1,140 @@
+{
+  "description": "email_native_preflight_get returning the stored full SS10.2 PreflightResult plus stored_revision (SS8/SS10).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "preflight_id": "019f9382-990a-7345-9678-a9bacbdcedfe"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_native_preflight_get",
+      "id": "req-0011",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "preflight": {
+          "contract": "diffforge.email.v1",
+          "schema_version": 1,
+          "preflight_id": "019f9382-990a-7345-9678-a9bacbdcedfe",
+          "device_id": "019f9382-d001-7000-8000-0000000000d1",
+          "profile_ref": "profile-9c41d2aa",
+          "domain": "acme.example",
+          "ran_at_ms": 1784899000000,
+          "expires_at_ms": 1784985400000,
+          "result": "qualified",
+          "egress_ip": "198.51.100.7",
+          "checks": [
+            {
+              "check_id": "public_ip",
+              "status": "pass",
+              "required": true,
+              "observed": "198.51.100.7 publicly routable",
+              "expected": "public, non-CGNAT, non-RFC1918"
+            },
+            {
+              "check_id": "static_ip",
+              "status": "pass",
+              "required": true,
+              "observed": "198.51.100.7 stable across 5 observations over 72h",
+              "expected": "publicly routable static IPv4"
+            },
+            {
+              "check_id": "port25_egress",
+              "status": "pass",
+              "required": true,
+              "observed": "outbound tcp/25 to seed host succeeded",
+              "expected": "outbound tcp/25 not blocked"
+            },
+            {
+              "check_id": "ptr_fcrdns",
+              "status": "pass",
+              "required": true,
+              "observed": "198.51.100.7 -> mail.acme.example -> 198.51.100.7",
+              "expected": "forward-confirmed reverse DNS"
+            },
+            {
+              "check_id": "helo_hostname",
+              "status": "pass",
+              "required": true,
+              "observed": "mail.acme.example resolves to egress ip",
+              "expected": "EHLO name resolves to egress ip"
+            },
+            {
+              "check_id": "dnsbl_clean",
+              "status": "pass",
+              "required": false,
+              "observed": "not listed on zen.spamhaus.org, bl.spamcop.net",
+              "expected": "not listed"
+            },
+            {
+              "check_id": "always_on",
+              "status": "pass",
+              "required": true,
+              "observed": "daemon uptime 21d, wake-capable",
+              "expected": "daemon or background runtime, always-on"
+            },
+            {
+              "check_id": "clock_skew",
+              "status": "pass",
+              "required": true,
+              "observed": "ntp offset 41ms",
+              "expected": "abs(offset) < 5s"
+            },
+            {
+              "check_id": "journal_health",
+              "status": "pass",
+              "required": true,
+              "observed": "email-send-journal.sqlite WAL healthy, last fsync ok",
+              "expected": "journal writable and fsync-safe"
+            },
+            {
+              "check_id": "credential_store",
+              "status": "pass",
+              "required": true,
+              "observed": "keychain unlocked, locators resolvable",
+              "expected": "healthy"
+            },
+            {
+              "check_id": "spf_published",
+              "status": "pass",
+              "required": true,
+              "observed": "v=spf1 ip4:198.51.100.7 -all",
+              "expected": "SPF record authorizing egress ip"
+            },
+            {
+              "check_id": "dkim_published",
+              "status": "pass",
+              "required": true,
+              "observed": "dfmail1._domainkey.acme.example TXT present",
+              "expected": "active selector public key published"
+            },
+            {
+              "check_id": "dmarc_published",
+              "status": "pass",
+              "required": true,
+              "observed": "v=DMARC1; p=quarantine; rua=mailto:dmarc@acme.example",
+              "expected": "DMARC policy published"
+            },
+            {
+              "check_id": "seed_test",
+              "status": "pass",
+              "required": false,
+              "observed": "seed message delivered; spf=pass dkim=pass dmarc=pass",
+              "expected": "seed delivery with aligned spf/dkim/dmarc pass"
+            }
+          ],
+          "seed": {
+            "seed_test_id": "seed-01J2ZK7QAAABBBCCCDDDEEEFF",
+            "spf": "pass",
+            "dkim": "pass",
+            "dmarc": "pass"
+          },
+          "result_sha256": "b2f5ff47436671b6e533d8dc3614845db2f5ff47436671b6e533d8dc3614845d"
+        },
+        "stored_revision": "7"
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "description": "Device email_send_attempts row recording one SMTP attempt(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_send_attempts",
+    "row": {
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "attempt": 1,
+      "started_at_ms": 1784900111000,
+      "ended_at_ms": 1784900125000,
+      "phase_reached": "settled",
+      "outcome": "submitted",
+      "dest_host_sanitized": "aspmx.l.google.com"
+    }
+  }
+}

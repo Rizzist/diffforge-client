@@ -1,0 +1,18 @@
+{
+  "description": "Companion command email_preflight_run: own minimal payload with optional requested_checks, non-destructive (SS9.4).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "command_id": "019f9382-990c-7900-8000-0000000000c2",
+    "command_kind": "email_preflight_run",
+    "profile_ref": "profile-9c41d2aa",
+    "domain": "acme.example",
+    "requested_checks": [
+      "public_ip",
+      "port25_egress",
+      "ptr_fcrdns"
+    ],
+    "target_device_id": "019f9382-d001-7000-8000-0000000000d1"
+  }
+}

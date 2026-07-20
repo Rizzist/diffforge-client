@@ -1,0 +1,20 @@
+{
+  "description": "label_upsert after-image of the label row (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4317",
+    "kind": "label_upsert",
+    "at_ms": 1784900002702,
+    "payload": {
+      "label": {
+        "label_id": "019f9382-9905-7ef0-8123-5465768798a9",
+        "name": "Vendors",
+        "color": "#7aa2f7",
+        "revision": "2"
+      }
+    }
+  }
+}

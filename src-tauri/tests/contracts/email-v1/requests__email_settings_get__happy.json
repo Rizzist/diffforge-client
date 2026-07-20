@@ -1,0 +1,43 @@
+{
+  "description": "email_settings_get for named sections returning typed SettingsSectionRow entries (SS5b/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "sections": [
+        "classification",
+        "retention"
+      ]
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_settings_get",
+      "id": "req-0008",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "sections": [
+          {
+            "section": "classification",
+            "revision": "9",
+            "values": {
+              "enabled": true,
+              "auto_file": true,
+              "spam_action": "quarantine",
+              "monthly_allowance": 2000
+            }
+          },
+          {
+            "section": "retention",
+            "revision": "4",
+            "values": {
+              "retention_days": 365,
+              "trash_days": 30
+            }
+          }
+        ]
+      }
+    }
+  }
+}

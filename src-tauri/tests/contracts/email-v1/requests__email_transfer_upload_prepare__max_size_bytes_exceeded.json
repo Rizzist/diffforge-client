@@ -1,0 +1,26 @@
+{
+  "description": "email_transfer_upload_prepare declaring a size above the transfer max_bytes cap (SS8).",
+  "expect": "reject:max_size_bytes_exceeded",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c00e-7000-8000-00000000000e",
+      "owner": {
+        "kind": "draft",
+        "id": "019f9382-9903-7cde-8f01-324354657687",
+        "revision_seq": "2"
+      },
+      "part_kind": "attachment",
+      "filename": "raw-video.mov",
+      "media_type": "video/quicktime",
+      "sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "size_bytes": 209715200
+    },
+    "error": {
+      "code": "max_size_bytes_exceeded",
+      "message": "size_bytes exceeds max_bytes 26214400",
+      "retryable": false
+    }
+  }
+}

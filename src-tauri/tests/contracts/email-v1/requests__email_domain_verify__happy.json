@@ -1,0 +1,35 @@
+{
+  "description": "email_domain_verify with matching expected_revision: DomainRow flips to verified (SS5b/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c01b-7000-8000-00000000001b",
+      "domain": "acme.example",
+      "expected_revision": "1"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_domain_verify",
+      "id": "req-0027",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4325",
+        "email_mutation_seq": "4325",
+        "coverage": null,
+        "result": {
+          "domain": {
+            "domain": "acme.example",
+            "state": "verified",
+            "mx_state": "ok",
+            "catch_all": false,
+            "revision": "2"
+          }
+        }
+      }
+    }
+  }
+}

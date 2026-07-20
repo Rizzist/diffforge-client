@@ -1,0 +1,36 @@
+{
+  "description": "email_draft_update against the current base_revision_seq with inline body under 32 KiB (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c009-7000-8000-000000000009",
+      "draft_id": "019f9382-9903-7cde-8f01-324354657687",
+      "base_revision_seq": "1",
+      "fields": {
+        "to": [
+          "billing@partner.example"
+        ],
+        "subject": "Re: Q3 invoice attached"
+      },
+      "body_inline": "Thanks - paid today."
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_draft_update",
+      "id": "req-0016",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4317",
+        "email_mutation_seq": "4317",
+        "coverage": null,
+        "result": {
+          "revision_seq": "2"
+        }
+      }
+    }
+  }
+}

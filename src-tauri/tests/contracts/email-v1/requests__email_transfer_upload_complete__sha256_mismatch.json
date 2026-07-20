@@ -1,0 +1,19 @@
+{
+  "description": "email_transfer_upload_complete whose observed_sha256 differs from the declared sha256 (SS8).",
+  "expect": "reject:sha256_mismatch",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c010-7000-8000-000000000010",
+      "transfer_id": "019f9382-990b-7456-8789-bacbdcedfe0f",
+      "observed_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "observed_size_bytes": 18744
+    },
+    "error": {
+      "code": "sha256_mismatch",
+      "message": "uploaded bytes do not match declared sha256",
+      "retryable": false
+    }
+  }
+}

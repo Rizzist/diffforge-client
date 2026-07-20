@@ -46,10 +46,11 @@ concurrency:
 jobs:
   # email-v1: the device email stack's test suite (journal laws, submission
   # matrix vs the loopback SMTP sink, crash matrix, fixture shape tests)
-  # runs on every release build across all three OSes. The suite is
-  # self-contained — fixture-corpus tests skip when the sibling
-  # cloud-diffforge checkout is absent (CI), and nothing touches live
-  # infrastructure.
+  # runs on every release build across all three OSes. The frozen fixture
+  # corpus is VENDORED at src-tauri/tests/contracts/email-v1 (pinned by
+  # email-v1.vendored.lock) and REQUIRED — corpus tests can never silently
+  # skip in CI. The frontend email contract tests run in the same job.
+  # Nothing touches live infrastructure.
   email-tests:
     strategy:
       fail-fast: false
@@ -69,15 +70,46 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
             libayatana-appindicator3-dev librsvg2-dev libasound2-dev \
             libdbus-1-dev pkg-config
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-      - name: Run email test suite
+      - name: Verify vendored fixture corpus lock
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import hashlib, os, sys
+          base = 'src-tauri/tests/contracts/email-v1'
+          names = sorted(n for n in os.listdir(base) if n.endswith('.json'))
+          outer = hashlib.sha256()
+          for n in names:
+              with open(os.path.join(base, n), 'rb') as f:
+                  b = f.read()
+              outer.update(n.encode()); outer.update(b'\n')
+              outer.update(hashlib.sha256(b).hexdigest().encode()); outer.update(b'\n')
+          computed = outer.hexdigest()
+          with open('src-tauri/tests/contracts/email-v1.vendored.lock') as f:
+              pinned = f.read().split()[0]
+          if len(names) < 140:
+              sys.exit(f'corpus unexpectedly small: {len(names)} files')
+          if computed != pinned:
+              sys.exit(f'vendored corpus drifted: computed {computed}, pinned {pinned}')
+          print(f'corpus ok: {len(names)} files, {computed}')
+          EOF
+      - name: Run email test suite (fixtures required)
         env:
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
+          EMAIL_V1_FIXTURES_DIR: ${{ github.workspace }}/src-tauri/tests/contracts/email-v1
+          EMAIL_V1_REQUIRE_FIXTURES: "1"
         run: cargo test --manifest-path src-tauri/Cargo.toml email::
+      - name: Run frontend email contract tests
+        run: |
+          npm ci
+          node --test src/email/emailDeliveryContract.test.js
 
   build-macos:
     strategy:

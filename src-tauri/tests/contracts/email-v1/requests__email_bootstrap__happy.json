@@ -1,0 +1,85 @@
+{
+  "description": "email_bootstrap happy path: entitlements, revision, counters, LabelRow/DomainRow/IdentityRow/BindingRow lists, per-section settings revisions, earliest_change_seq (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_bootstrap",
+      "id": "req-0001",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "entitlements": {
+          "plan": "plus",
+          "email_enabled": true,
+          "native_send_eligible": false
+        },
+        "mailbox_revision": "4312",
+        "counters": {
+          "location": {
+            "inbox": {
+              "total": 128,
+              "unread": 7
+            },
+            "archive": {
+              "total": 954,
+              "unread": 0
+            }
+          }
+        },
+        "labels": [
+          {
+            "label_id": "019f9382-9905-7ef0-8123-5465768798a9",
+            "name": "Vendors",
+            "color": "#7aa2f7",
+            "revision": "2"
+          }
+        ],
+        "settings": [
+          {
+            "section": "classification",
+            "revision": "9"
+          },
+          {
+            "section": "retention",
+            "revision": "9"
+          }
+        ],
+        "domains": [
+          {
+            "domain": "acme.example",
+            "state": "active",
+            "mx_state": "ok",
+            "catch_all": false,
+            "revision": "4"
+          }
+        ],
+        "identities": [
+          {
+            "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+            "display_name": "Acme Ops",
+            "address": "ops@acme.example",
+            "enabled": true,
+            "revision": "11"
+          }
+        ],
+        "bindings": [
+          {
+            "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+            "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+            "profile_ref": "profile-9c41d2aa",
+            "target_device_id": "019f9382-d001-7000-8000-0000000000d1",
+            "mode": "provider",
+            "enabled": true,
+            "revision": "12"
+          }
+        ],
+        "earliest_change_seq": "3100"
+      }
+    }
+  }
+}

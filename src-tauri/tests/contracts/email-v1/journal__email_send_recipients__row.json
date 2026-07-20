@@ -1,0 +1,20 @@
+{
+  "description": "Device email_send_recipients row for one envelope recipient(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_send_recipients",
+    "row": {
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "recipient_ref": "r1",
+      "role": "to",
+      "address": "billing@partner.example",
+      "domain": "partner.example",
+      "status": "submitted",
+      "smtp_code": 250,
+      "enhanced_code": "2.0.0",
+      "response_sanitized": "250 2.0.0 accepted",
+      "updated_at_ms": 1784900125000
+    }
+  }
+}

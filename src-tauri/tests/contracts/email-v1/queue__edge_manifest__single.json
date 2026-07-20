@@ -1,0 +1,52 @@
+{
+  "description": "Edge manifest for a single-recipient-account receipt; evidence only, no SPF/DKIM/DMARC verdicts (SS3).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.edge_manifest.v1",
+    "schema_version": 1,
+    "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A",
+    "edge_id": "edge-iad-1",
+    "accepted_at_ms": 1784900000123,
+    "policy_version": "edge-policy-2026-07",
+    "smtputf8": false,
+    "eightbitmime": true,
+    "size_bytes": 48123,
+    "recipient_count": 1,
+    "per_account": [
+      {
+        "account_ns": "acct_mfrggzdfmztwq2lknnwg23tpob",
+        "route_snapshot": [
+          {
+            "address_digest": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+            "route_kind": "exact",
+            "domain": "acme.example"
+          }
+        ]
+      }
+    ],
+    "transport": {
+      "client_ip": "203.0.113.42",
+      "client_port": 46822,
+      "helo": "mx-out.partner.example",
+      "tls_used": true,
+      "tls_version": "TLSv1.3",
+      "banner_delay_ms": 180
+    },
+    "dnsbl": [
+      {
+        "list": "zen.spamhaus.org",
+        "listed": false,
+        "checked_at_ms": 1784900000098
+      },
+      {
+        "list": "bl.spamcop.net",
+        "listed": false,
+        "checked_at_ms": 1784900000101
+      }
+    ],
+    "raw": {
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "size_bytes": 48123
+    }
+  }
+}

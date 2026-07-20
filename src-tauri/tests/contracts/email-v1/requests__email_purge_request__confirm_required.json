@@ -1,0 +1,24 @@
+{
+  "description": "email_purge_request without confirm: destructive ops require confirm true (SS8).",
+  "expect": "reject:confirm_required",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c022-7000-8000-000000000022",
+      "scope": {
+        "kind": "thread",
+        "ids": [
+          "019f9382-9902-7bcd-9ef0-213243546576"
+        ]
+      },
+      "confirm": false,
+      "expected_revision": "9"
+    },
+    "error": {
+      "code": "confirm_required",
+      "message": "destructive operation requires confirm: true",
+      "retryable": false
+    }
+  }
+}

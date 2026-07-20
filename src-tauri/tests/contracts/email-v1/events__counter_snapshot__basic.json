@@ -1,0 +1,40 @@
+{
+  "description": "counter_snapshot full counters map; periodic after-values, never deltas (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4332",
+    "kind": "counter_snapshot",
+    "at_ms": 1784900006452,
+    "payload": {
+      "counters": {
+        "location": {
+          "inbox": {
+            "total": 128,
+            "unread": 7
+          },
+          "archive": {
+            "total": 954,
+            "unread": 0
+          },
+          "trash": {
+            "total": 12,
+            "unread": 0
+          }
+        },
+        "semantic_category": {
+          "finance": {
+            "total": 61,
+            "unread": 3
+          },
+          "reports": {
+            "total": 17,
+            "unread": 1
+          }
+        }
+      }
+    }
+  }
+}

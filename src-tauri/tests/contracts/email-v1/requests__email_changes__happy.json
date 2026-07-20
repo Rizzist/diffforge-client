@@ -1,0 +1,36 @@
+{
+  "description": "email_changes incremental catch-up from since_seq; ChangeEntry carries exactly seq/entity_kind/entity_id/op - the v1 free-form hint is deleted (SS5b/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "since_seq": "4310",
+      "limit": 100
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_changes",
+      "id": "req-0006",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "current_seq": "4312",
+        "changes": [
+          {
+            "seq": "4311",
+            "entity_kind": "thread",
+            "entity_id": "019f9382-9902-7bcd-9ef0-213243546576",
+            "op": "update"
+          },
+          {
+            "seq": "4312",
+            "entity_kind": "message",
+            "entity_id": "019f9382-9901-7abc-8def-102132435465",
+            "op": "insert"
+          }
+        ]
+      }
+    }
+  }
+}

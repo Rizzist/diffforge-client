@@ -1,0 +1,45 @@
+{
+  "description": "email_messages_mutate applying read plus label_add to one message; SS0 mutation-result envelope with changed ids (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c001-7000-8000-000000000001",
+      "expected_mailbox_revision": "4312",
+      "targets": {
+        "kind": "message",
+        "ids": [
+          "019f9382-9901-7abc-8def-102132435465"
+        ]
+      },
+      "ops": [
+        {
+          "op": "read"
+        },
+        {
+          "op": "label_add",
+          "value": "019f9382-9905-7ef0-8123-5465768798a9"
+        }
+      ]
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_messages_mutate",
+      "id": "req-0012",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4313",
+        "email_mutation_seq": "4313",
+        "coverage": null,
+        "result": {
+          "changed_ids": [
+            "019f9382-9901-7abc-8def-102132435465"
+          ]
+        }
+      }
+    }
+  }
+}

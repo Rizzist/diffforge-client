@@ -1,0 +1,19 @@
+{
+  "description": "Lane entry with base only, no segments: covered_seq equals base_seq (SS7).",
+  "expect": "valid",
+  "payload": {
+    "name": "email",
+    "scope": "account",
+    "lane": "events",
+    "base": {
+      "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/sections/email/3-01J2ZKQ5E8XY0123456789ABCD/section.sqlite.zst",
+      "gen": 3,
+      "sha256": "c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2",
+      "size": 1048576,
+      "base_seq": 4300
+    },
+    "segments": [],
+    "covered_seq": 4300,
+    "compaction_gen": 3
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "description": "email_domain_verify while the required verification DNS records are not yet published: structured refusal not_ready with missing_records (SS0/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c01c-7000-8000-00000000001c",
+      "domain": "acme.example",
+      "expected_revision": "1"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_domain_verify",
+      "id": "req-0015",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4314",
+        "email_mutation_seq": "4314",
+        "coverage": null,
+        "result": {
+          "refusal": "not_ready",
+          "missing_records": [
+            {
+              "type": "TXT",
+              "name": "_dfmail-challenge.acme.example",
+              "value": "df-verify-01J2ZK7Q8R9S6T5V4W3X2Y1Z0A"
+            },
+            {
+              "type": "MX",
+              "name": "acme.example",
+              "value": "mx1.diffforge.ai",
+              "priority": 10
+            }
+          ]
+        }
+      }
+    }
+  }
+}

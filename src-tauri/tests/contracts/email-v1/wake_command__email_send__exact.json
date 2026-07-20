@@ -1,0 +1,14 @@
+{
+  "description": "Wake command payload, exactly these fields and nothing else: no recipients, hashes, keys or tokens (SS9).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "command_id": "email-send:019f9382-9904-7def-9012-435465768798:1",
+    "command_kind": "email_send",
+    "send_job_id": "019f9382-9904-7def-9012-435465768798",
+    "generation": 1,
+    "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+    "target_device_id": "019f9382-d001-7000-8000-0000000000d1"
+  }
+}

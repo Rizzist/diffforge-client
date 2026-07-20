@@ -1,0 +1,51 @@
+{
+  "description": "Event for generation 1 arriving while the job's current generation is 2: SUCCESS ack with applied false, audit stale_generation - recorded audit-only, never an error; the device may mark the event cloud-acked (SS9.3).",
+  "expect": "valid",
+  "payload": {
+    "event": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "status_event_id": "019f9382-990c-7567-9890-cbdcedfe0f13",
+      "command_id": "email-send:019f9382-9904-7def-9012-435465768798:1",
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "device_id": "019f9382-d001-7000-8000-0000000000d1",
+      "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+      "phase": "settled",
+      "phase_rank": 10,
+      "mode": "provider",
+      "lease_id": "019f9382-990e-7789-9ab2-edfe0f102132",
+      "lease_epoch": "1",
+      "mime_sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+      "data_started": true,
+      "occurred_at_ms": 1784900140000,
+      "per_recipient": [
+        {
+          "recipient_ref": "r1",
+          "role": "to",
+          "address": "billing@partner.example",
+          "delivery_state": "submitted",
+          "response": {
+            "smtp_code": 250,
+            "enhanced_code": "2.0.0",
+            "response_class": "accepted"
+          },
+          "updated_at_ms": 1784900140000
+        }
+      ],
+      "response": {
+        "smtp_code": 250,
+        "enhanced_code": "2.0.0",
+        "response_class": "accepted"
+      },
+      "error_class": "none"
+    },
+    "ack": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "status_event_id": "019f9382-990c-7567-9890-cbdcedfe0f13",
+      "applied": false,
+      "audit": "stale_generation"
+    }
+  }
+}

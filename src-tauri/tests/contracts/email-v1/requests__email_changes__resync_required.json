@@ -1,0 +1,24 @@
+{
+  "description": "email_changes with since_seq older than the truncated change log: structured refusal resync_required with current_seq and earliest_change_seq; client must snapshot-resync (SS0/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "since_seq": "2000",
+      "limit": 100
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_changes",
+      "id": "req-0007",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "refusal": "resync_required",
+        "current_seq": "4312",
+        "earliest_change_seq": "3100"
+      }
+    }
+  }
+}

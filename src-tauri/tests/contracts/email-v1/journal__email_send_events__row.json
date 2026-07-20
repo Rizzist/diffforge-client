@@ -1,0 +1,16 @@
+{
+  "description": "Device email_send_events row: status_event_id PK, payload hash, outbox handoff and cloud ack(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_send_events",
+    "row": {
+      "status_event_id": "019f9382-990c-7567-9890-cbdcedfe0f11",
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "payload_sha256": "8fa14cdd754f91cc6554c9e71929cce78fa14cdd754f91cc6554c9e71929cce7",
+      "outbox_state": "acked",
+      "handed_off_at_ms": 1784900125100,
+      "cloud_acked_at_ms": 1784900126000
+    }
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "description": "email_purge_request with confirm true (destructive): coverage tuple returned because purge intent is a force-seal consumer (SS7/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c021-7000-8000-000000000021",
+      "scope": {
+        "kind": "thread",
+        "ids": [
+          "019f9382-9902-7bcd-9ef0-213243546576"
+        ]
+      },
+      "confirm": true,
+      "expected_revision": "9"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_purge_request",
+      "id": "req-0030",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4330",
+        "email_mutation_seq": "4330",
+        "coverage": {
+          "seq": "4330",
+          "epoch": "7",
+          "manifest_key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/manifests/epoch-7/manifest-000000004330.json"
+        },
+        "result": {
+          "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+          "state": "intent_recorded"
+        }
+      }
+    }
+  }
+}

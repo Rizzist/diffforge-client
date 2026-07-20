@@ -1,0 +1,67 @@
+{
+  "description": "email_rule_upsert row-shaped with expected_revision (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c01f-7000-8000-00000000001f",
+      "rule": {
+        "rule_id": "019f9382-9906-7f01-9234-65768798a9ba",
+        "kind": "route",
+        "predicate": {
+          "all": [
+            {
+              "field": "from_domain",
+              "op": "eq",
+              "value": "partner.example"
+            }
+          ]
+        },
+        "action": {
+          "set_location": "inbox",
+          "label_add": "019f9382-9905-7ef0-8123-5465768798a9"
+        },
+        "priority": 10,
+        "enabled": true,
+        "revision": "3"
+      },
+      "expected_revision": "2"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_rule_upsert",
+      "id": "req-0029",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4327",
+        "email_mutation_seq": "4327",
+        "coverage": null,
+        "result": {
+          "rule": {
+            "rule_id": "019f9382-9906-7f01-9234-65768798a9ba",
+            "kind": "route",
+            "predicate": {
+              "all": [
+                {
+                  "field": "from_domain",
+                  "op": "eq",
+                  "value": "partner.example"
+                }
+              ]
+            },
+            "action": {
+              "set_location": "inbox",
+              "label_add": "019f9382-9905-7ef0-8123-5465768798a9"
+            },
+            "priority": 10,
+            "enabled": true,
+            "revision": "3"
+          }
+        }
+      }
+    }
+  }
+}

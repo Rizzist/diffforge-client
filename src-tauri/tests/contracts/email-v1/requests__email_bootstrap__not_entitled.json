@@ -1,0 +1,15 @@
+{
+  "description": "email_bootstrap for an account without the email entitlement (SS8).",
+  "expect": "reject:not_entitled",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1
+    },
+    "error": {
+      "code": "not_entitled",
+      "message": "email is not enabled for this account",
+      "retryable": false
+    }
+  }
+}

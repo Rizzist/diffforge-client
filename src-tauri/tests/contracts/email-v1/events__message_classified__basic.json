@@ -1,0 +1,22 @@
+{
+  "description": "message_classified run summary after-image (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4315",
+    "kind": "message_classified",
+    "at_ms": 1784900002202,
+    "payload": {
+      "message_uid": "019f9382-9901-7abc-8def-102132435465",
+      "run": {
+        "category": "finance",
+        "status": "ok",
+        "confidence": 0.94,
+        "spam_action": "none"
+      },
+      "revision_seq": "3"
+    }
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "description": "email_sender_capabilities_sync from a healthy daemon runtime; response returns accepted revision and bindings (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "capability_version": 3,
+      "modes": [
+        "provider",
+        "native"
+      ],
+      "profiles": [
+        {
+          "profile_ref": "profile-9c41d2aa",
+          "has_credentials": true,
+          "mode": "provider",
+          "last_test": {
+            "at_ms": 1784890000000,
+            "ok": true
+          }
+        }
+      ],
+      "runtime": "daemon",
+      "credential_store": "healthy"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_sender_capabilities_sync",
+      "id": "req-0031",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4326",
+        "email_mutation_seq": "4326",
+        "coverage": null,
+        "result": {
+          "accepted_revision": "12",
+          "min_required_version": 2,
+          "bindings": [
+            {
+              "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+              "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+              "profile_ref": "profile-9c41d2aa",
+              "target_device_id": "019f9382-d001-7000-8000-0000000000d1",
+              "mode": "provider",
+              "enabled": true,
+              "revision": "12"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

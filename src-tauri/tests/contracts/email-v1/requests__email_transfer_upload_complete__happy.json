@@ -1,0 +1,40 @@
+{
+  "description": "email_transfer_upload_complete with observed hash and size matching the prepared transfer (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c00f-7000-8000-00000000000f",
+      "transfer_id": "019f9382-990b-7456-8789-bacbdcedfe0f",
+      "observed_sha256": "4a8a08f09d37b73795649038408b5f334a8a08f09d37b73795649038408b5f33",
+      "observed_size_bytes": 18744
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_transfer_upload_complete",
+      "id": "req-0020",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4317",
+        "email_mutation_seq": "4317",
+        "coverage": null,
+        "result": {
+          "object_ref": {
+            "kind": "attachment",
+            "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/messages/019f9382-9901-7abc-8def-102132435465/attachments/p2/4a8a08f09d37b73795649038408b5f334a8a08f09d37b73795649038408b5f33-18744",
+            "sha256": "4a8a08f09d37b73795649038408b5f334a8a08f09d37b73795649038408b5f33",
+            "size_bytes": 18744,
+            "media_type": "application/pdf",
+            "filename": "q3-report.pdf",
+            "scan_state": "pending",
+            "purge_state": "none"
+          },
+          "scan_state": "pending"
+        }
+      }
+    }
+  }
+}

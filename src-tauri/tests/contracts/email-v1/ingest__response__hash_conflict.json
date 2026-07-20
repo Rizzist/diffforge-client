@@ -1,0 +1,10 @@
+{
+  "description": "Ingest response outcome=hash_conflict: same receipt_id with a different raw sha256 - security conflict; the edge moves the job to email-queue-quarantine/, never overwrites (SS3/SS4/SS6b).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.ingest.v1",
+    "schema_version": 1,
+    "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A",
+    "outcome": "hash_conflict"
+  }
+}

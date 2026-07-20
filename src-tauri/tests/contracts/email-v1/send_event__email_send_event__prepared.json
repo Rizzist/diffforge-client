@@ -1,0 +1,28 @@
+{
+  "description": "Phase prepared (phase_rank 2): adds mode, lease_id, lease_epoch; mime and data_started fields still absent (SS9.2). Paired ack (SS9.3).",
+  "expect": "valid",
+  "payload": {
+    "event": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "status_event_id": "019f9382-990c-7567-9890-cbdcedfe0f21",
+      "command_id": "email-send:019f9382-9904-7def-9012-435465768798:1",
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "device_id": "019f9382-d001-7000-8000-0000000000d1",
+      "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+      "phase": "prepared",
+      "phase_rank": 2,
+      "occurred_at_ms": 1784900110600,
+      "mode": "provider",
+      "lease_id": "019f9382-990e-7789-9ab2-edfe0f102132",
+      "lease_epoch": "1"
+    },
+    "ack": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "status_event_id": "019f9382-990c-7567-9890-cbdcedfe0f21",
+      "applied": true
+    }
+  }
+}

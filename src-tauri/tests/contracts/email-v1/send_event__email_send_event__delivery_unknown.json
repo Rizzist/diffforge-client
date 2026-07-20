@@ -1,0 +1,43 @@
+{
+  "description": "Terminal delivery_unknown settlement: connection lost at/after DATA with no server response; error_class delivery_unknown, never auto-retried (SS6b/SS9/SS10). Paired ack applied (SS9.3).",
+  "expect": "valid",
+  "payload": {
+    "ack": {
+      "applied": true,
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "status_event_id": "019f9382-990c-7567-9890-cbdcedfe0f12"
+    },
+    "event": {
+      "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+      "command_id": "email-send:019f9382-9904-7def-9012-435465768798:1",
+      "contract": "diffforge.email.v1",
+      "data_started": true,
+      "device_id": "019f9382-d001-7000-8000-0000000000d1",
+      "error_class": "delivery_unknown",
+      "generation": 1,
+      "lease_epoch": "1",
+      "lease_id": "019f9382-990e-7789-9ab2-edfe0f102132",
+      "mime_sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+      "mode": "provider",
+      "occurred_at_ms": 1784900123000,
+      "per_recipient": [
+        {
+          "address": "billing@partner.example",
+          "delivery_state": "delivery_unknown",
+          "recipient_ref": "r1",
+          "response": {
+            "response_class": "connection_failed"
+          },
+          "role": "to",
+          "updated_at_ms": 1784900123000
+        }
+      ],
+      "phase": "settled",
+      "phase_rank": 10,
+      "schema_version": 1,
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "status_event_id": "019f9382-990c-7567-9890-cbdcedfe0f12"
+    }
+  }
+}

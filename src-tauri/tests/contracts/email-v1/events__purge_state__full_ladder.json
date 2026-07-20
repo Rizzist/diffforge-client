@@ -1,0 +1,135 @@
+{
+  "description": "Happy-path purge ladder: one purge_state event per SS6b.4 transition from intent_recorded through finalized, closed by the canonical purge_finalized kind - there is no purge_completed kind (SS6/SS6b.4).",
+  "expect": "valid",
+  "payload": {
+    "events": [
+      {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "email_event_schema_version": 1,
+        "seq": "4340",
+        "kind": "purge_state",
+        "at_ms": 1784900505000,
+        "payload": {
+          "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+          "state": "coverage_pending",
+          "previous_state": "intent_recorded",
+          "attempt_count": 0
+        }
+      },
+      {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "email_event_schema_version": 1,
+        "seq": "4341",
+        "kind": "purge_state",
+        "at_ms": 1784900510000,
+        "payload": {
+          "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+          "state": "compacting",
+          "previous_state": "coverage_pending",
+          "attempt_count": 0
+        }
+      },
+      {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "email_event_schema_version": 1,
+        "seq": "4342",
+        "kind": "purge_state",
+        "at_ms": 1784900515000,
+        "payload": {
+          "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+          "state": "compacted",
+          "previous_state": "compacting",
+          "attempt_count": 0
+        }
+      },
+      {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "email_event_schema_version": 1,
+        "seq": "4343",
+        "kind": "purge_state",
+        "at_ms": 1784900520000,
+        "payload": {
+          "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+          "state": "successor_epoch_pending",
+          "previous_state": "compacted",
+          "attempt_count": 0
+        }
+      },
+      {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "email_event_schema_version": 1,
+        "seq": "4344",
+        "kind": "purge_state",
+        "at_ms": 1784900525000,
+        "payload": {
+          "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+          "state": "floor_published",
+          "previous_state": "successor_epoch_pending",
+          "attempt_count": 0
+        }
+      },
+      {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "email_event_schema_version": 1,
+        "seq": "4345",
+        "kind": "purge_state",
+        "at_ms": 1784900530000,
+        "payload": {
+          "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+          "state": "objects_deleting",
+          "previous_state": "floor_published",
+          "attempt_count": 0
+        }
+      },
+      {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "email_event_schema_version": 1,
+        "seq": "4346",
+        "kind": "purge_state",
+        "at_ms": 1784900535000,
+        "payload": {
+          "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+          "state": "zero_verify",
+          "previous_state": "objects_deleting",
+          "attempt_count": 0
+        }
+      },
+      {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "email_event_schema_version": 1,
+        "seq": "4347",
+        "kind": "purge_state",
+        "at_ms": 1784900540000,
+        "payload": {
+          "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+          "state": "finalized",
+          "previous_state": "zero_verify",
+          "attempt_count": 0
+        }
+      },
+      {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "email_event_schema_version": 1,
+        "seq": "4348",
+        "kind": "purge_finalized",
+        "at_ms": 1784900545000,
+        "payload": {
+          "purge": {
+            "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+            "state": "finalized",
+            "finalized_at_ms": 1784900545000
+          }
+        }
+      }
+    ]
+  }
+}

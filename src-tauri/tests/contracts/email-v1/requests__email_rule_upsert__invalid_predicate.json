@@ -1,0 +1,31 @@
+{
+  "description": "email_rule_upsert whose predicate_json does not parse as a predicate tree (SS8).",
+  "expect": "reject:invalid_predicate",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c020-7000-8000-000000000020",
+      "rule": {
+        "rule_id": "019f9382-9906-7f01-9234-65768798a9ba",
+        "kind": "route",
+        "predicate": {
+          "frobnicate": []
+        },
+        "action": {
+          "set_location": "inbox",
+          "label_add": "019f9382-9905-7ef0-8123-5465768798a9"
+        },
+        "priority": 10,
+        "enabled": true,
+        "revision": "3"
+      },
+      "expected_revision": "2"
+    },
+    "error": {
+      "code": "invalid_predicate",
+      "message": "predicate_json root must be all/any/not",
+      "retryable": false
+    }
+  }
+}

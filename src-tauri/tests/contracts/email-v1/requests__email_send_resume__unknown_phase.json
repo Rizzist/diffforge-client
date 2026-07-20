@@ -1,0 +1,24 @@
+{
+  "description": "email_send_resume reporting an unknown SMTP phase: unknown phases fail closed (SS0/SS8).",
+  "expect": "reject:unknown_phase",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "capability_version": 3,
+      "journal_summaries": [
+        {
+          "send_job_id": "019f9382-9904-7def-9012-435465768798",
+          "generation": 1,
+          "phase": "quantum_smtp",
+          "lease_epoch": "1"
+        }
+      ]
+    },
+    "error": {
+      "code": "unknown_phase",
+      "message": "phase quantum_smtp is not a known SMTP phase",
+      "retryable": false
+    }
+  }
+}

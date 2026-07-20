@@ -1,0 +1,17 @@
+{
+  "description": "email_sender_profiles row: secret locators only, never secret material(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_sender_profiles",
+    "row": {
+      "profile_ref": "profile-9c41d2aa",
+      "mode": "provider",
+      "provider_kind": "gmail_oauth",
+      "secret_locator": "keychain://diffforge/email/profile-9c41d2aa",
+      "has_credentials": true,
+      "created_at_ms": 1784800000000,
+      "last_test_at_ms": 1784890000000,
+      "last_test_ok": true
+    }
+  }
+}

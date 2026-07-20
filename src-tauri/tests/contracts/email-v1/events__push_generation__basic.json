@@ -1,0 +1,19 @@
+{
+  "description": "push_generation PushGenerationRow after-image: scope_key, string push-generation counter, updated_at_ms (SS0/SS5b/SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4333",
+    "kind": "push_generation",
+    "at_ms": 1784900006702,
+    "payload": {
+      "push": {
+        "scope_key": "mailbox",
+        "generation": "41",
+        "updated_at_ms": 1784900006702
+      }
+    }
+  }
+}

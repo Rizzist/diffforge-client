@@ -1,0 +1,32 @@
+{
+  "description": "email_purge_status returning the purge job row mid-deletion (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "purge_id": "019f9382-9909-7234-8567-98a9bacbdced"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_purge_status",
+      "id": "req-0010",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "purge": {
+          "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+          "scope": {
+            "kind": "thread",
+            "ids": [
+              "019f9382-9902-7bcd-9ef0-213243546576"
+            ]
+          },
+          "state": "objects_deleting",
+          "attempt_count": 1,
+          "floor_seq": "4340"
+        }
+      }
+    }
+  }
+}

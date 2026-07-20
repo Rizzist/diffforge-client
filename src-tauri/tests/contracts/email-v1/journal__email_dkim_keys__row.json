@@ -1,0 +1,15 @@
+{
+  "description": "email_dkim_keys row: public fingerprint plus locator, lifecycle state active|next|retired(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_dkim_keys",
+    "row": {
+      "domain": "acme.example",
+      "selector": "dfmail1",
+      "state": "active",
+      "pubkey_fingerprint_sha256": "2510c39011c5be704182423e3a695e912510c39011c5be704182423e3a695e91",
+      "secret_locator": "keychain://diffforge/email/dkim/acme.example/dfmail1",
+      "created_at_ms": 1784800000000
+    }
+  }
+}

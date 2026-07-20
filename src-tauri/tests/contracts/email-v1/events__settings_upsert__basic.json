@@ -1,0 +1,24 @@
+{
+  "description": "settings_upsert section after-image with its revision (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4322",
+    "kind": "settings_upsert",
+    "at_ms": 1784900003952,
+    "payload": {
+      "section": {
+        "section": "classification",
+        "revision": "9",
+        "values": {
+          "enabled": true,
+          "auto_file": true,
+          "spam_action": "quarantine",
+          "monthly_allowance": 2000
+        }
+      }
+    }
+  }
+}

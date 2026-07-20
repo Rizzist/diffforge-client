@@ -1,0 +1,10 @@
+{
+  "description": "Ingest response outcome=deletion_fenced: the account deletion fence is active; the edge quarantines the job and no stale queue object may ever revive mail for a fenced account (SS4.4/SS4.5/SS6b.7).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.ingest.v1",
+    "schema_version": 1,
+    "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A",
+    "outcome": "deletion_fenced"
+  }
+}

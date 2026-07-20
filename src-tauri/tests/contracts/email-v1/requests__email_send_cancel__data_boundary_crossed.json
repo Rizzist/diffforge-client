@@ -1,0 +1,31 @@
+{
+  "description": "email_send_cancel after DATA started: structured refusal data_boundary_crossed (was a v1 outer error; converted per SS0.4) - the cancel window closed at data_started evidence (SS0/SS6b/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c014-7000-8000-000000000014",
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_send_cancel",
+      "id": "req-0024",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4331",
+        "email_mutation_seq": "4331",
+        "coverage": null,
+        "result": {
+          "refusal": "data_boundary_crossed",
+          "state": "submitting",
+          "data_started": true
+        }
+      }
+    }
+  }
+}

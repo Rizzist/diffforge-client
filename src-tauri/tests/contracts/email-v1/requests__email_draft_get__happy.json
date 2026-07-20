@@ -1,0 +1,35 @@
+{
+  "description": "email_draft_get returning the draft row (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "draft_id": "019f9382-9903-7cde-8f01-324354657687"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_draft_get",
+      "id": "req-0009",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "draft": {
+          "draft_id": "019f9382-9903-7cde-8f01-324354657687",
+          "thread_id": "019f9382-9902-7bcd-9ef0-213243546576",
+          "revision_seq": "2",
+          "author": "human",
+          "fields": {
+            "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+            "to": [
+              "billing@partner.example"
+            ],
+            "cc": [],
+            "subject": "Re: Q3 invoice attached"
+          },
+          "body_inline": "Thanks - paid today."
+        }
+      }
+    }
+  }
+}

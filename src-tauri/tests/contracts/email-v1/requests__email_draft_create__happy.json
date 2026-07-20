@@ -1,0 +1,31 @@
+{
+  "description": "email_draft_create as a reply, returning draft_id and revision_seq 1 (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c007-7000-8000-000000000007",
+      "reply_to_message_uid": "019f9382-9901-7abc-8def-102132435465",
+      "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+      "author": "human"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_draft_create",
+      "id": "req-0015",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4316",
+        "email_mutation_seq": "4316",
+        "coverage": null,
+        "result": {
+          "draft_id": "019f9382-9903-7cde-8f01-324354657687",
+          "revision_seq": "1"
+        }
+      }
+    }
+  }
+}

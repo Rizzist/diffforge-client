@@ -1,0 +1,28 @@
+{
+  "description": "Same client_request_id replayed with a DIFFERENT operation hash: outer error idempotency_conflict - first-writer-wins, nothing re-executes (SS0.4).",
+  "expect": "reject:idempotency_conflict",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c001-7000-8000-000000000001",
+      "expected_mailbox_revision": "4313",
+      "targets": {
+        "kind": "message",
+        "ids": [
+          "019f9382-9901-7abc-8def-102132435465"
+        ]
+      },
+      "ops": [
+        {
+          "op": "unread"
+        }
+      ]
+    },
+    "error": {
+      "code": "idempotency_conflict",
+      "message": "client_request_id was already used with a different operation hash",
+      "retryable": false
+    }
+  }
+}

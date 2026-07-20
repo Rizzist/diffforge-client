@@ -1,0 +1,35 @@
+{
+  "description": "draft_upsert after-image of the draft row plus its immutable revision ref (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4327",
+    "kind": "draft_upsert",
+    "at_ms": 1784900005202,
+    "payload": {
+      "draft": {
+        "draft_id": "019f9382-9903-7cde-8f01-324354657687",
+        "thread_id": "019f9382-9902-7bcd-9ef0-213243546576",
+        "revision_seq": "2",
+        "author": "human",
+        "fields": {
+          "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+          "to": [
+            "billing@partner.example"
+          ],
+          "cc": [],
+          "subject": "Re: Q3 invoice attached"
+        },
+        "body_inline": "Thanks - paid today."
+      },
+      "revision_ref": {
+        "revision_seq": "2",
+        "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/drafts/019f9382-9903-7cde-8f01-324354657687/revisions/2/manifest/e1671797c52e15f763380b45e841ec32e1671797c52e15f763380b45e841ec32-96",
+        "sha256": "e1671797c52e15f763380b45e841ec32e1671797c52e15f763380b45e841ec32",
+        "size_bytes": 96
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "description": "purge_state ladder transition coverage_pending -> compacting: every SS6b.4 transition emits one (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4341",
+    "kind": "purge_state",
+    "at_ms": 1784900510000,
+    "payload": {
+      "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+      "state": "compacting",
+      "previous_state": "coverage_pending",
+      "attempt_count": 0
+    }
+  }
+}

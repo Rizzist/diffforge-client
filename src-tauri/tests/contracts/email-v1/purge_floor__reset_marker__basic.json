@@ -1,0 +1,12 @@
+{
+  "description": "Content of checkpoints/resets/1784900500000-email-purge.json - exactly contract, schema_version, floor_seq, purge_id, purge_epoch, published_at_ms; composition refuses pre-floor events (SS2/SS7.3).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "floor_seq": "4340",
+    "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+    "purge_epoch": "8",
+    "published_at_ms": 1784900500000
+  }
+}

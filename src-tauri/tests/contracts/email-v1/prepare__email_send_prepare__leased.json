@@ -1,0 +1,70 @@
+{
+  "description": "email_send_prepare granting a lease in native mode: lease with memory-only fence_token, mime descriptor, envelope, identity and native DKIM block (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "command_id": "email-send:019f9382-9904-7def-9012-435465768798:1",
+      "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+      "last_lease_epoch": "0",
+      "client_request_id": "019f9382-c040-7000-8000-000000000040"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_send_prepare",
+      "id": "req-9001",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4327",
+        "email_mutation_seq": "4327",
+        "coverage": null,
+        "result": {
+          "status": "leased",
+          "lease": {
+            "lease_id": "019f9382-990e-7789-9ab2-edfe0f102132",
+            "lease_epoch": "1",
+            "fence_token": "fence-9b2f4a6c8d0e",
+            "expires_at_ms": 1784900170500
+          },
+          "mime": {
+            "transfer_id": "019f9382-990b-7456-8789-bacbdcedfe10",
+            "path": "/v1/transfers/download/019f9382-990b-7456-8789-bacbdcedfe10",
+            "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "size_bytes": 51234
+          },
+          "envelope": {
+            "mail_from": "bounces@acme.example",
+            "recipients": [
+              {
+                "recipient_ref": "r1",
+                "role": "to",
+                "address": "billing@partner.example",
+                "domain": "partner.example"
+              }
+            ]
+          },
+          "identity": {
+            "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+            "display_name": "Acme Ops",
+            "address": "ops@acme.example"
+          },
+          "mode": "native",
+          "native": {
+            "dkim_domain": "acme.example",
+            "dkim_selector": "dfmail1",
+            "dkim_pubkey_fingerprint": "2510c39011c5be704182423e3a695e912510c39011c5be704182423e3a695e91",
+            "ehlo": "mail.acme.example",
+            "authorized_ips": [
+              "198.51.100.7"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

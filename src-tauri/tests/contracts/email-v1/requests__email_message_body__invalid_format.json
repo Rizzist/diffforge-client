@@ -1,0 +1,17 @@
+{
+  "description": "email_message_body with unknown format value rich (SS8).",
+  "expect": "reject:invalid_format",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "message_uid": "019f9382-9901-7abc-8def-102132435465",
+      "format": "rich"
+    },
+    "error": {
+      "code": "invalid_format",
+      "message": "format must be plain or html",
+      "retryable": false
+    }
+  }
+}

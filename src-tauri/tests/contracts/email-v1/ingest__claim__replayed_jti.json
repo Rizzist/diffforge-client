@@ -1,0 +1,21 @@
+{
+  "description": "Otherwise-valid claim replayed with a jti already present in the hop-local nonce cache (SS4). kid is hop-namespaced; job_key bound on both hops, storage_client_id bound on hop 2 (SS4.2).",
+  "expect": "reject:jti_replayed",
+  "payload": {
+    "v": 1,
+    "iss": "balancer",
+    "aud": "cloud-diffforge-email-ingest",
+    "kid": "balancer:balancer-k5",
+    "account_ns": "acct_mfrggzdfmztwq2lknnwg23tpob",
+    "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A",
+    "job_key": "df/email-queue/edge-iad-1/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/job-acct_mfrggzdfmztwq2lknnwg23tpob.json",
+    "storage_client_id": "scid-7f3d9a2e41c8",
+    "method": "POST",
+    "path": "/v1/internal/api/email/ingest",
+    "body_sha256": "865c0c0b4ab0e063e5caa3387c1a8741865c0c0b4ab0e063e5caa3387c1a8741",
+    "iat": 1784900002,
+    "nbf": 1784899997,
+    "exp": 1784900047,
+    "jti": "019f9382-990f-789a-8bc3-fe0f10213247"
+  }
+}

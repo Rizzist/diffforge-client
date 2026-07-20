@@ -1,0 +1,35 @@
+{
+  "description": "send_job_upsert full send-job row after-image; every state transition emits one (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4329",
+    "kind": "send_job_upsert",
+    "at_ms": 1784900005702,
+    "payload": {
+      "send_job": {
+        "send_job_id": "019f9382-9904-7def-9012-435465768798",
+        "generation": 1,
+        "message_uid": "019f9382-9914-7abc-8def-102132435467",
+        "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+        "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+        "target_device_id": "019f9382-d001-7000-8000-0000000000d1",
+        "state": "offered",
+        "lease_epoch": "1",
+        "lease_expires_at_ms": 1784900170500,
+        "mime_ref": {
+          "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/outbound/019f9382-9904-7def-9012-435465768798/generations/1/mime/ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad-51234",
+          "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+          "size_bytes": 51234
+        },
+        "human_confirm": {
+          "client_request_id": "019f9382-c0aa-7000-8000-0000000000aa",
+          "at_ms": 1784900109500
+        },
+        "released_at_ms": 1784900110000
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "description": "u64-as-string spot check: every SS0.2-listed counter serializes as a decimal string (no sign, no leading zeros); bounded u32s, size_bytes and *_at_ms stay JSON numbers (SS0.2).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_mutation_seq": "18446744073709551615",
+    "mailbox_revision": "18446744073709551615",
+    "coverage": {
+      "seq": "18446744073709551615",
+      "epoch": "42",
+      "manifest_key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/manifests/epoch-42/manifest.json"
+    },
+    "lease_epoch": "7",
+    "revision_seq": "12",
+    "generation": 3,
+    "attempt_count": 2,
+    "phase_rank": 6,
+    "size_bytes": 48123,
+    "occurred_at_ms": 1784900125000
+  }
+}

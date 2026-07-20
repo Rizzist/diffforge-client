@@ -1,0 +1,23 @@
+{
+  "description": "email_message_body plain format small enough to return inline: BodyResult discriminated on source=inline (SS5b/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "message_uid": "019f9382-9901-7abc-8def-102132435465",
+      "format": "plain"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_message_body",
+      "id": "req-0004",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "source": "inline",
+        "text": "Hi team,\n\nThe Q3 invoice is attached. Net-30 as usual - let me know if anything looks off.\n\n- Maya"
+      }
+    }
+  }
+}

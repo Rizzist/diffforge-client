@@ -1,0 +1,40 @@
+{
+  "description": "email_messages_mutate with a stale expected_mailbox_revision: structured refusal revision_conflict; no spine bump occurred (SS0/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c002-7000-8000-000000000002",
+      "expected_mailbox_revision": "4290",
+      "targets": {
+        "kind": "message",
+        "ids": [
+          "019f9382-9901-7abc-8def-102132435465"
+        ]
+      },
+      "ops": [
+        {
+          "op": "trash"
+        }
+      ]
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_messages_mutate",
+      "id": "req-0013",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4315",
+        "email_mutation_seq": "4315",
+        "coverage": null,
+        "result": {
+          "refusal": "revision_conflict",
+          "current_revision": "4315"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "description": "email_purge_status for an unknown purge_id (SS8).",
+  "expect": "reject:not_found",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "purge_id": "019f9382-9909-7234-8567-98a9bacbdcff"
+    },
+    "error": {
+      "code": "not_found",
+      "message": "unknown purge_id",
+      "retryable": false
+    }
+  }
+}

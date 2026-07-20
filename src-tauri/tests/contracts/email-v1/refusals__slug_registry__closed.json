@@ -1,0 +1,21 @@
+{
+  "description": "The closed SS0.4 refusal-slug registry, exactly these 11: a refusal is a structured result with a refusal discriminant; unknown slugs fail closed and everything state-shaped is a refusal, never an outer error (SS0.3/SS0.4).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "refusal_slugs": [
+      "already_terminal",
+      "cancelled",
+      "conflict_copy",
+      "credential_required",
+      "data_boundary_crossed",
+      "fenced",
+      "generation_conflict",
+      "not_ready",
+      "resync_required",
+      "revision_conflict",
+      "superseded"
+    ]
+  }
+}

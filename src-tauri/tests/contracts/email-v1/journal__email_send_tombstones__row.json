@@ -1,0 +1,15 @@
+{
+  "description": "Device email_send_tombstones row: no time-based deletion, compaction only after cloud generation-retired ack(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_send_tombstones",
+    "row": {
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "terminal_outcome": "submitted",
+      "journaled_at_ms": 1784900125000,
+      "cloud_generation_retired_acked": true,
+      "compacted": false
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "description": "Ingest response outcome=duplicate for a redelivered receipt: original ingest's message_uid and seq returned; coverage is current (SS4).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.ingest.v1",
+    "schema_version": 1,
+    "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A",
+    "outcome": "duplicate",
+    "message_uid": "019f9382-9901-7abc-8def-102132435465",
+    "email_mutation_seq": "4312",
+    "coverage": {
+      "seq": "4312",
+      "epoch": "7",
+      "manifest_key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/manifests/epoch-7/manifest-000000004312.json"
+    }
+  }
+}

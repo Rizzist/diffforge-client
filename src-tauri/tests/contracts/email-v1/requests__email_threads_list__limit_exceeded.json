@@ -1,0 +1,20 @@
+{
+  "description": "email_threads_list with limit 500 above the contract cap of 100 (SS8).",
+  "expect": "reject:limit_exceeded",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "view": {
+        "axis": "location",
+        "value": "inbox"
+      },
+      "limit": 500
+    },
+    "error": {
+      "code": "limit_exceeded",
+      "message": "limit must be <= 100",
+      "retryable": false
+    }
+  }
+}

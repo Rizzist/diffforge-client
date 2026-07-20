@@ -1,0 +1,52 @@
+{
+  "description": "email_send_resume after reconnect: journal summaries in, reoffered command payloads and stale generations out (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "capability_version": 3,
+      "journal_summaries": [
+        {
+          "send_job_id": "019f9382-9904-7def-9012-435465768798",
+          "generation": 1,
+          "phase": "lease_held",
+          "lease_epoch": "1"
+        },
+        {
+          "send_job_id": "019f9382-9912-7def-9012-435465768799",
+          "generation": 1,
+          "phase": "received",
+          "lease_epoch": "0"
+        }
+      ]
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_send_resume",
+      "id": "req-0032",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "reoffers": [
+          {
+            "contract": "diffforge.email.v1",
+            "schema_version": 1,
+            "command_id": "email-send:019f9382-9904-7def-9012-435465768798:1",
+            "command_kind": "email_send",
+            "send_job_id": "019f9382-9904-7def-9012-435465768798",
+            "generation": 1,
+            "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+            "target_device_id": "019f9382-d001-7000-8000-0000000000d1"
+          }
+        ],
+        "stale": [
+          {
+            "send_job_id": "019f9382-9912-7def-9012-435465768799",
+            "generation": 1
+          }
+        ]
+      }
+    }
+  }
+}

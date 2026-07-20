@@ -1,0 +1,12 @@
+{
+  "description": "Cloud->device email_generation_retired ack: sent once cloud durably settled/tombstoned the generation; the device MAY compact the matching journal tombstone only after receiving it (SS9.4/SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "kind": "email_generation_retired",
+    "send_job_id": "019f9382-9904-7def-9012-435465768798",
+    "generation": 1,
+    "retired_at_ms": 1784900126000
+  }
+}

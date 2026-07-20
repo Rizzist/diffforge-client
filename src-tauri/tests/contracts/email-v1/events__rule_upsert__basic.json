@@ -1,0 +1,34 @@
+{
+  "description": "rule_upsert after-image of the rule row (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4320",
+    "kind": "rule_upsert",
+    "at_ms": 1784900003452,
+    "payload": {
+      "rule": {
+        "rule_id": "019f9382-9906-7f01-9234-65768798a9ba",
+        "kind": "route",
+        "predicate": {
+          "all": [
+            {
+              "field": "from_domain",
+              "op": "eq",
+              "value": "partner.example"
+            }
+          ]
+        },
+        "action": {
+          "set_location": "inbox",
+          "label_add": "019f9382-9905-7ef0-8123-5465768798a9"
+        },
+        "priority": 10,
+        "enabled": true,
+        "revision": "3"
+      }
+    }
+  }
+}

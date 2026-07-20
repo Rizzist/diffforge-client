@@ -1,0 +1,19 @@
+{
+  "description": "email_draft_create referencing an identity_id that does not exist (SS8).",
+  "expect": "reject:identity_not_found",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c008-7000-8000-000000000008",
+      "reply_to_message_uid": "019f9382-9901-7abc-8def-102132435465",
+      "identity_id": "019f9382-9907-7012-8345-768798a9baff",
+      "author": "human"
+    },
+    "error": {
+      "code": "identity_not_found",
+      "message": "unknown identity_id",
+      "retryable": false
+    }
+  }
+}

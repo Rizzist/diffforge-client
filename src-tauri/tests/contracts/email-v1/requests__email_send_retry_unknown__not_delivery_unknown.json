@@ -1,0 +1,35 @@
+{
+  "description": "email_send_retry_unknown on a job that is not in delivery_unknown state: structured refusal generation_conflict with the current (generation, state) (SS0/SS6b/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c018-7000-8000-000000000018",
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "duplicate_ack": true,
+      "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_send_retry_unknown",
+      "id": "req-0027",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4332",
+        "email_mutation_seq": "4332",
+        "coverage": null,
+        "result": {
+          "refusal": "generation_conflict",
+          "current": {
+            "generation": 1,
+            "state": "submitted"
+          }
+        }
+      }
+    }
+  }
+}

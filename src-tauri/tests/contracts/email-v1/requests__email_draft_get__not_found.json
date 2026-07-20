@@ -1,0 +1,16 @@
+{
+  "description": "email_draft_get for an unknown draft_id (SS8).",
+  "expect": "reject:not_found",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "draft_id": "019f9382-9903-7cde-8f01-324354657699"
+    },
+    "error": {
+      "code": "not_found",
+      "message": "unknown draft_id",
+      "retryable": false
+    }
+  }
+}

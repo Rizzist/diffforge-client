@@ -1,0 +1,20 @@
+{
+  "description": "email_transfer_download_prepare for part attachment without the required part_id (SS8).",
+  "expect": "reject:part_id_required",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "ref": {
+        "ref_kind": "message_part",
+        "message_uid": "019f9382-9901-7abc-8def-102132435465",
+        "part": "attachment"
+      }
+    },
+    "error": {
+      "code": "part_id_required",
+      "message": "part_id is required when part is attachment",
+      "retryable": false
+    }
+  }
+}

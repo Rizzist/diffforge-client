@@ -1,0 +1,31 @@
+{
+  "description": "email_send_retry_unknown on a delivery_unknown job with duplicate_ack: generation bumps (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c017-7000-8000-000000000017",
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 2,
+      "duplicate_ack": true,
+      "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_send_retry_unknown",
+      "id": "req-0025",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4323",
+        "email_mutation_seq": "4323",
+        "coverage": null,
+        "result": {
+          "generation": 3
+        }
+      }
+    }
+  }
+}

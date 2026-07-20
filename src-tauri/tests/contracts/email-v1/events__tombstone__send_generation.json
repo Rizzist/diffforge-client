@@ -1,0 +1,17 @@
+{
+  "description": "Unified tombstone for entity_kind send_generation: emitted when a generation bump retires the old (send_job_id, generation); entity_id is the retired pair (SS6/SS6b.6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4338",
+    "kind": "tombstone",
+    "at_ms": 1784900008452,
+    "payload": {
+      "entity_kind": "send_generation",
+      "entity_id": "019f9382-9904-7def-9012-435465768798:1",
+      "seq": "4338"
+    }
+  }
+}

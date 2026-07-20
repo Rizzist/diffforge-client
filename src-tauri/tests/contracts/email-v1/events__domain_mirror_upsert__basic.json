@@ -1,0 +1,22 @@
+{
+  "description": "domain_mirror_upsert DomainRow after-image with orthogonal mx_state (SS5b/SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4323",
+    "kind": "domain_mirror_upsert",
+    "at_ms": 1784900004202,
+    "payload": {
+      "domain": {
+        "domain": "acme.example",
+        "state": "active",
+        "mx_state": "ok",
+        "catch_all": false,
+        "revision": "2",
+        "dns_checked_at_ms": 1784899990000
+      }
+    }
+  }
+}

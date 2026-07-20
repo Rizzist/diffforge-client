@@ -1,0 +1,37 @@
+{
+  "description": "email_sender_binding_upsert with a stale expected_revision: structured refusal revision_conflict carrying the current revision (SS0/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c01e-7000-8000-00000000001e",
+      "binding": {
+        "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+        "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+        "profile_ref": "profile-9c41d2aa",
+        "target_device_id": "019f9382-d001-7000-8000-0000000000d1",
+        "mode": "provider",
+        "enabled": true
+      },
+      "expected_revision": "1"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_sender_binding_upsert",
+      "id": "req-0033",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4326",
+        "email_mutation_seq": "4326",
+        "coverage": null,
+        "result": {
+          "refusal": "revision_conflict",
+          "current_revision": "12"
+        }
+      }
+    }
+  }
+}

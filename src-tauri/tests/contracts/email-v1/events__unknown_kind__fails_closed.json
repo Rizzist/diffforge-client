@@ -1,0 +1,15 @@
+{
+  "description": "Event with unknown kind future_kind_v9: replay MUST fail closed, never skip-and-continue (SS0/SS6).",
+  "expect": "reject:unknown_event_kind",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4399",
+    "kind": "future_kind_v9",
+    "at_ms": 1784900009999,
+    "payload": {
+      "anything": "consumers must not interpret this"
+    }
+  }
+}

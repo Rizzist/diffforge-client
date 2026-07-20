@@ -1,0 +1,20 @@
+{
+  "description": "ingress_receipt row after-image binding receipt_id to message_uid and ingest seq (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4331",
+    "kind": "ingress_receipt",
+    "at_ms": 1784900006202,
+    "payload": {
+      "receipt": {
+        "receipt_id": "01J2ZK7QGGABCDEFGH2JKMNPQR",
+        "message_uid": "019f9382-9911-7abc-8def-102132435466",
+        "email_mutation_seq": "4313",
+        "ingested_at_ms": 1784900001702
+      }
+    }
+  }
+}

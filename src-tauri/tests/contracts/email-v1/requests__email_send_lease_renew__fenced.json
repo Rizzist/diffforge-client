@@ -1,0 +1,27 @@
+{
+  "description": "email_send_lease_renew after a higher lease epoch fenced this holder: structured refusal fenced with current_lease_epoch; the holder must stop before the next SMTP boundary (SS0/SS6b/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "lease_id": "019f9382-990e-7789-9ab2-edfe0f102132",
+      "lease_epoch": "1",
+      "fence_token": "fence-9b2f4a6c8d0e",
+      "phase": "downloading"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_send_lease_renew",
+      "id": "req-0034",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "refusal": "fenced",
+        "current_lease_epoch": "2"
+      }
+    }
+  }
+}

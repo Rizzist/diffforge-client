@@ -1,0 +1,20 @@
+{
+  "description": "email_send_queue without human_confirm (agent author cannot supply it): REQUIRED confirm missing (SS8).",
+  "expect": "reject:human_confirm_required",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c012-7000-8000-000000000012",
+      "draft_id": "019f9382-9903-7cde-8f01-324354657687",
+      "revision_seq": "2",
+      "identity_id": "019f9382-9907-7012-8345-768798a9bacb",
+      "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc"
+    },
+    "error": {
+      "code": "human_confirm_required",
+      "message": "sending requires an explicit human confirmation",
+      "retryable": false
+    }
+  }
+}

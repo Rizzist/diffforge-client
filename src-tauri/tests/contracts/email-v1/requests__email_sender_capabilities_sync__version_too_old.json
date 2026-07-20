@@ -1,0 +1,22 @@
+{
+  "description": "email_sender_capabilities_sync with capability_version below min_required_version (SS8).",
+  "expect": "reject:capability_version_too_old",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "capability_version": 1,
+      "modes": [
+        "provider"
+      ],
+      "profiles": [],
+      "runtime": "gui",
+      "credential_store": "healthy"
+    },
+    "error": {
+      "code": "capability_version_too_old",
+      "message": "min_required_version is 2; update the client",
+      "retryable": false
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "description": "Device email_domain_rate_state row: per-destination-domain pacing and backoff(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_domain_rate_state",
+    "row": {
+      "domain": "partner.example",
+      "window_started_at_ms": 1784900100000,
+      "sent_in_window": 14,
+      "deferred_in_window": 1
+    }
+  }
+}

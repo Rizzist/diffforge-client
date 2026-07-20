@@ -1,0 +1,15 @@
+{
+  "description": "Device email_native_preflight_checks row for a single check outcome(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_native_preflight_checks",
+    "row": {
+      "preflight_id": "019f9382-990a-7345-9678-a9bacbdcedfe",
+      "check_id": "ptr_fcrdns",
+      "status": "pass",
+      "required": true,
+      "observed": "198.51.100.7 -> mail.acme.example -> 198.51.100.7",
+      "expected": "forward-confirmed reverse DNS"
+    }
+  }
+}

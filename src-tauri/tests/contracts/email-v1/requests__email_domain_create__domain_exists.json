@@ -1,0 +1,17 @@
+{
+  "description": "email_domain_create for a domain already registered on this account (SS8).",
+  "expect": "reject:domain_exists",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c01a-7000-8000-00000000001a",
+      "domain": "acme.example"
+    },
+    "error": {
+      "code": "domain_exists",
+      "message": "domain already exists on this account",
+      "retryable": false
+    }
+  }
+}

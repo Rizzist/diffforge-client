@@ -1,0 +1,25 @@
+{
+  "description": "Phase received (phase_rank 1): common fields ONLY - ids exist, no mode/lease/mime yet; per-phase fields are absent below their phase (SS9.2). Paired ack (SS9.3).",
+  "expect": "valid",
+  "payload": {
+    "event": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "status_event_id": "019f9382-990c-7567-9890-cbdcedfe0f20",
+      "command_id": "email-send:019f9382-9904-7def-9012-435465768798:1",
+      "send_job_id": "019f9382-9904-7def-9012-435465768798",
+      "generation": 1,
+      "device_id": "019f9382-d001-7000-8000-0000000000d1",
+      "binding_id": "019f9382-9908-7123-9456-8798a9bacbdc",
+      "phase": "received",
+      "phase_rank": 1,
+      "occurred_at_ms": 1784900110100
+    },
+    "ack": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "status_event_id": "019f9382-990c-7567-9890-cbdcedfe0f20",
+      "applied": true
+    }
+  }
+}

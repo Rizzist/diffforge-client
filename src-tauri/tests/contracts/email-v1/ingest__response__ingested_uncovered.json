@@ -1,0 +1,13 @@
+{
+  "description": "Ingest response outcome=ingested with coverage null: ingested but not yet sealed, job marker must NOT be retired (SS4).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.ingest.v1",
+    "schema_version": 1,
+    "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A",
+    "outcome": "ingested",
+    "message_uid": "019f9382-9901-7abc-8def-102132435465",
+    "email_mutation_seq": "4312",
+    "coverage": null
+  }
+}

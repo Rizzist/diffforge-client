@@ -1,0 +1,44 @@
+{
+  "description": "email_transfer_upload_prepare for a draft attachment returning the one-use PUT target (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c00d-7000-8000-00000000000d",
+      "owner": {
+        "kind": "draft",
+        "id": "019f9382-9903-7cde-8f01-324354657687",
+        "revision_seq": "2"
+      },
+      "part_kind": "attachment",
+      "filename": "q3-report.pdf",
+      "media_type": "application/pdf",
+      "sha256": "4a8a08f09d37b73795649038408b5f334a8a08f09d37b73795649038408b5f33",
+      "size_bytes": 18744
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_transfer_upload_prepare",
+      "id": "req-0019",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4316",
+        "email_mutation_seq": "4316",
+        "coverage": null,
+        "result": {
+          "transfer_id": "019f9382-990b-7456-8789-bacbdcedfe0f",
+          "path": "/v1/transfers/upload/019f9382-990b-7456-8789-bacbdcedfe0f",
+          "method": "PUT",
+          "headers": {
+            "content-type": "application/pdf"
+          },
+          "expires_at_ms": 1784900360000,
+          "max_size_bytes": 26214400
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "description": "Device email_native_preflight_runs row summarizing one preflight execution(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_native_preflight_runs",
+    "row": {
+      "preflight_id": "019f9382-990a-7345-9678-a9bacbdcedfe",
+      "profile_ref": "profile-9c41d2aa",
+      "domain": "acme.example",
+      "ran_at_ms": 1784899000000,
+      "expires_at_ms": 1784985400000,
+      "qualified": true,
+      "eligible": true,
+      "result_sha256": "b2f5ff47436671b6e533d8dc3614845db2f5ff47436671b6e533d8dc3614845d"
+    }
+  }
+}

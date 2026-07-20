@@ -1,0 +1,11 @@
+{
+  "description": "u64 spot check rejection: email_mutation_seq above 2^53 encoded as a JSON number instead of a decimal string - parsers MUST refuse; the SS0.2 list is string-only on the wire (SS0.2).",
+  "expect": "reject:u64_number_encoding",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_mutation_seq": 18446744073709551615,
+    "mailbox_revision": "4312",
+    "coverage": null
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "description": "message_state after-image carrying only the changed axes plus revision_seq (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4314",
+    "kind": "message_state",
+    "at_ms": 1784900001952,
+    "payload": {
+      "message_uid": "019f9382-9901-7abc-8def-102132435465",
+      "location": "archive",
+      "workflow_status": "done",
+      "flags": 3,
+      "revision_seq": "2"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "description": "address_upsert after-image of the email_addresses row (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4324",
+    "kind": "address_upsert",
+    "at_ms": 1784900004452,
+    "payload": {
+      "address": {
+        "address": "ops@acme.example",
+        "domain": "acme.example",
+        "route_kind": "exact",
+        "enabled": true,
+        "revision": "1"
+      }
+    }
+  }
+}

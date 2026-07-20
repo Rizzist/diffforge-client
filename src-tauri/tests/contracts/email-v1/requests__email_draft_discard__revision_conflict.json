@@ -1,0 +1,30 @@
+{
+  "description": "email_draft_discard with a stale revision_seq: structured refusal revision_conflict carrying current_revision_seq (SS0/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c00c-7000-8000-00000000000c",
+      "draft_id": "019f9382-9903-7cde-8f01-324354657687",
+      "revision_seq": "1"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_draft_discard",
+      "id": "req-0019",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4318",
+        "email_mutation_seq": "4318",
+        "coverage": null,
+        "result": {
+          "refusal": "revision_conflict",
+          "current_revision_seq": "3"
+        }
+      }
+    }
+  }
+}

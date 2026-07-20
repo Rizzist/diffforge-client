@@ -1,0 +1,32 @@
+{
+  "description": "email_transfer_download_prepare (non-mutation) for a message attachment via DownloadRef ref_kind=message_part, returning a one-use TransferDescriptor (SS5b/SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "ref": {
+        "ref_kind": "message_part",
+        "message_uid": "019f9382-9901-7abc-8def-102132435465",
+        "part": "attachment",
+        "part_id": "p2"
+      }
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_transfer_download_prepare",
+      "id": "req-0021",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "transfer": {
+          "transfer_id": "019f9382-990b-7456-8789-bacbdcedfe10",
+          "path": "/v1/transfers/download/019f9382-990b-7456-8789-bacbdcedfe10",
+          "expected_sha256": "4a8a08f09d37b73795649038408b5f334a8a08f09d37b73795649038408b5f33",
+          "size_bytes": 18744,
+          "expires_at_ms": 1784900420000
+        }
+      }
+    }
+  }
+}

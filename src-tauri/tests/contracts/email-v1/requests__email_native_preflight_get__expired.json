@@ -1,0 +1,16 @@
+{
+  "description": "email_native_preflight_get for a preflight past its 24h expires_at_ms (SS8/SS10).",
+  "expect": "reject:preflight_expired",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "preflight_id": "019f9382-990a-7345-9678-a9bacbdcedff"
+    },
+    "error": {
+      "code": "preflight_expired",
+      "message": "preflight result expired; run preflight again",
+      "retryable": false
+    }
+  }
+}

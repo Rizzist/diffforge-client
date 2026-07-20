@@ -1,0 +1,20 @@
+{
+  "description": "Edge->balancer hop claim: aud balancer-email-dispatch, exp = iat+45 <= iat+60, body hash matches the pointer body; verified at now~1784900010s (SS4). kid is hop-namespaced; job_key bound on both hops (SS4.2).",
+  "expect": "valid",
+  "payload": {
+    "v": 1,
+    "iss": "edge-iad-1",
+    "aud": "balancer-email-dispatch",
+    "kid": "edge:edge-iad-1-k2",
+    "account_ns": "acct_mfrggzdfmztwq2lknnwg23tpob",
+    "receipt_id": "01J2ZK7Q8R9S6T5V4W3X2Y1Z0A",
+    "job_key": "df/email-queue/edge-iad-1/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/job-acct_mfrggzdfmztwq2lknnwg23tpob.json",
+    "method": "POST",
+    "path": "/v1/internal/email/dispatch",
+    "body_sha256": "865c0c0b4ab0e063e5caa3387c1a8741865c0c0b4ab0e063e5caa3387c1a8741",
+    "iat": 1784900000,
+    "nbf": 1784899995,
+    "exp": 1784900045,
+    "jti": "019f9382-990f-789a-8bc3-fe0f10213243"
+  }
+}

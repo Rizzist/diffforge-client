@@ -1,0 +1,37 @@
+{
+  "description": "purge_intent purge-job row with frozen object refs recorded before any deletion (SS6).",
+  "expect": "valid",
+  "payload": {
+    "contract": "diffforge.email.v1",
+    "schema_version": 1,
+    "email_event_schema_version": 1,
+    "seq": "4334",
+    "kind": "purge_intent",
+    "at_ms": 1784900006952,
+    "payload": {
+      "purge": {
+        "purge_id": "019f9382-9909-7234-8567-98a9bacbdced",
+        "scope": {
+          "kind": "thread",
+          "ids": [
+            "019f9382-9902-7bcd-9ef0-213243546576"
+          ]
+        },
+        "frozen_refs": [
+          {
+            "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/ingress/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/raw/9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08-48123",
+            "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "size_bytes": 48123
+          },
+          {
+            "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/messages/019f9382-9901-7abc-8def-102132435465/attachments/p2/4a8a08f09d37b73795649038408b5f334a8a08f09d37b73795649038408b5f33-18744",
+            "sha256": "4a8a08f09d37b73795649038408b5f334a8a08f09d37b73795649038408b5f33",
+            "size_bytes": 18744
+          }
+        ],
+        "state": "intent_recorded",
+        "attempt_count": 0
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "description": "Device email_egress_ip_observations row feeding static-ip stability checks(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_egress_ip_observations",
+    "row": {
+      "observed_at_ms": 1784899000000,
+      "egress_ip": "198.51.100.7",
+      "source": "preflight_seed",
+      "port25_open": true,
+      "profile_ref": "profile-9c41d2aa"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "description": "email_classification_correct in create_rule mode returning the minted rule_id (SS8).",
+  "expect": "valid",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c003-7000-8000-000000000003",
+      "message_uid": "019f9382-9901-7abc-8def-102132435465",
+      "category": "finance",
+      "mode": "create_rule",
+      "expected_mailbox_revision": "4313"
+    },
+    "response": {
+      "kind": "email_response",
+      "request_kind": "email_classification_correct",
+      "id": "req-0013",
+      "data": {
+        "contract": "diffforge.email.v1",
+        "schema_version": 1,
+        "duplicate": false,
+        "mailbox_revision": "4314",
+        "email_mutation_seq": "4314",
+        "coverage": null,
+        "result": {
+          "rule_id": "019f9382-9906-7f01-9234-65768798a9ba"
+        }
+      }
+    }
+  }
+}

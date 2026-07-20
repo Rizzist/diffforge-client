@@ -1,0 +1,20 @@
+{
+  "description": "email_classification_correct with unknown mode auto (SS8).",
+  "expect": "reject:invalid_mode",
+  "payload": {
+    "request": {
+      "contract": "diffforge.email.v1",
+      "schema_version": 1,
+      "client_request_id": "019f9382-c004-7000-8000-000000000004",
+      "message_uid": "019f9382-9901-7abc-8def-102132435465",
+      "category": "finance",
+      "mode": "auto",
+      "expected_mailbox_revision": "4313"
+    },
+    "error": {
+      "code": "invalid_mode",
+      "message": "mode must be message_only or create_rule",
+      "retryable": false
+    }
+  }
+}

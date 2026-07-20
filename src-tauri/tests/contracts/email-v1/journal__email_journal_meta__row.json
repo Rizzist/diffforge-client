@@ -1,0 +1,11 @@
+{
+  "description": "email_journal_meta k/v row: versioned-marker schema state(envelope-free per SS0.1; SS10.1).",
+  "expect": "valid",
+  "payload": {
+    "table": "email_journal_meta",
+    "row": {
+      "k": "journal_schema_version",
+      "v": "1"
+    }
+  }
+}
