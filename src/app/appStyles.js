@@ -33,6 +33,7 @@ import { Language } from "@styled-icons/material-rounded/Language";
 import { LightMode } from "@styled-icons/material-rounded/LightMode";
 import { Login } from "@styled-icons/material-rounded/Login";
 import { Logout } from "@styled-icons/material-rounded/Logout";
+import { MailOutline } from "@styled-icons/material-rounded/MailOutline";
 import { Memory } from "@styled-icons/material-rounded/Memory";
 import { Mic } from "@styled-icons/material-rounded/Mic";
 import { MicOff } from "@styled-icons/material-rounded/MicOff";
@@ -24885,6 +24886,10 @@ export const ButtonTerminalIcon = styled(TerminalIcon)`
 `;
 
 export const ButtonKeyIcon = styled(Key)`
+  ${buttonIconSize}
+`;
+
+export const ButtonMailIcon = styled(MailOutline)`
   ${buttonIconSize}
 `;
 

@@ -991,6 +991,7 @@ import {
   ButtonBotIcon,
   ButtonTerminalIcon,
   ButtonKeyIcon,
+  ButtonMailIcon,
   ButtonMicIcon,
   ButtonNotificationIcon,
   ButtonProcessIcon,
@@ -1126,6 +1127,13 @@ import AccountTokenomicsView, { warmAccountTokenomics } from "../tokenomics/Acco
 import DevicesView from "../devices/DevicesView.jsx";
 
 const AuraMode = lazy(() => import("../aura/AuraMode.jsx"));
+// Email Delivery settings load lazily (plan §4.3): the panel + its invoke
+// wiring stay out of the main bundle until the tab is opened.
+const EmailDeliverySettingsPanel = lazy(() =>
+  import("../email/EmailDeliverySettingsPanel.jsx").then((module) => ({
+    default: module.EmailDeliverySettingsPanel,
+  })),
+);
 
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
@@ -1189,6 +1197,7 @@ const SETTINGS_TAB_GENERAL = "general";
 const SETTINGS_TAB_NOTIFICATIONS = "notifications";
 const SETTINGS_TAB_PERMISSIONS = "permissions";
 const SETTINGS_TAB_SSH = "ssh";
+const SETTINGS_TAB_EMAIL = "email";
 const NOTIFICATION_PREFERENCES_CHANGED_EVENT = "forge-notification-preferences-changed";
 const WEB_NOTIFICATION_SETTINGS_URL = "https://diffforge.ai/dashboard?tab=settings&settings=notifications";
 const LOOPSPACE_NOTIFICATION_OVERRIDE_LABELS = {
@@ -29261,7 +29270,7 @@ export default function App() {
 
   const showSettingsView = useCallback((tab = SETTINGS_TAB_GENERAL) => {
     setSettingsTab(
-      [SETTINGS_TAB_NOTIFICATIONS, SETTINGS_TAB_PERMISSIONS, SETTINGS_TAB_SSH].includes(tab)
+      [SETTINGS_TAB_NOTIFICATIONS, SETTINGS_TAB_PERMISSIONS, SETTINGS_TAB_SSH, SETTINGS_TAB_EMAIL].includes(tab)
         ? tab
         : SETTINGS_TAB_GENERAL,
     );
@@ -56957,6 +56966,14 @@ export default function App() {
                       <ButtonTerminalIcon aria-hidden="true" />
                       <span>SSH clients</span>
                     </SettingsTabButton>
+                    <SettingsTabButton
+                      data-active={settingsTab === SETTINGS_TAB_EMAIL ? "true" : undefined}
+                      onClick={() => setSettingsTab(SETTINGS_TAB_EMAIL)}
+                      type="button"
+                    >
+                      <ButtonMailIcon aria-hidden="true" />
+                      <span>Email Delivery</span>
+                    </SettingsTabButton>
                   </SettingsTabNav>
 
                   {settingsTab === SETTINGS_TAB_GENERAL ? (
@@ -57819,6 +57836,10 @@ export default function App() {
                     </>
                   ) : settingsTab === SETTINGS_TAB_SSH ? (
                     <SshSettingsPanel />
+                  ) : settingsTab === SETTINGS_TAB_EMAIL ? (
+                    <Suspense fallback={null}>
+                      <EmailDeliverySettingsPanel />
+                    </Suspense>
                   ) : (
                     <AccountSettingsPanel>
                       <SettingsSectionHeader>
