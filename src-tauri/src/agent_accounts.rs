@@ -1683,7 +1683,21 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
                         .map(|home| home.join(".credentials.json").is_file())
                         .unwrap_or(false)
                 });
-            let auth_ready = !email.is_empty() || credentials_present;
+            // A captured snapshot on a Keychain-backed install carries the
+            // identity plus a fossil credential file whose token can never
+            // refresh; presenting it as authenticated hides the designed
+            // "needs login until used once" state — unless the default home
+            // is signed into this same account, in which case launches fall
+            // through to the live Keychain token and the profile is usable.
+            let snapshot_token_fossil = dir.is_some_and(|dir| {
+                agent_accounts_claude_default_store_is_keychain_backed()
+                    && agent_accounts_claude_credentials_expired_ms(&dir.join(".credentials.json"))
+                        .is_some_and(|expired_ms| {
+                            expired_ms > AGENT_ACCOUNTS_CLAUDE_FOSSIL_TOKEN_AGE_MS
+                        })
+                    && !agent_accounts_claude_profile_matches_default_identity(dir)
+            });
+            let auth_ready = (!email.is_empty() || credentials_present) && !snapshot_token_fossil;
             json!({
                 "email": email,
                 "auth_ready": auth_ready,
@@ -2718,6 +2732,24 @@ fn agent_accounts_capture_launch_account_binding(
         if profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID && profile_home.is_none() {
             continue;
         }
+        // Same-account fallthrough: on Keychain-backed macOS installs a
+        // captured profile's credential snapshot is a fossil (the live OAuth
+        // token never leaves the Keychain), so spawning from the snapshot dir
+        // starts an unauthenticated CLI. When the captured profile names the
+        // account that is currently signed into the default home, launch from
+        // the default home so the live Keychain token is used — the pane
+        // keeps its profile stamp; only the credential source changes.
+        let profile_home = match profile_home {
+            Some(dir)
+                if kind == "claude"
+                    && profile_id != AGENT_ACCOUNTS_DEFAULT_PROFILE_ID
+                    && agent_accounts_claude_default_store_is_keychain_backed()
+                    && agent_accounts_claude_profile_matches_default_identity(&dir) =>
+            {
+                agent_accounts_default_home("claude").or(Some(dir))
+            }
+            other => other,
+        };
         // The Default selector can resolve to a captured effective profile.
         // In that case the captured profile root, not the mutable native
         // OpenCode XDG store, is the launch authority. Key this decision from
@@ -3551,8 +3583,13 @@ fn agent_accounts_snapshot_refresh_in_cycle_with_auth(
                 return false;
             };
             let credentials_source = default_home.join(".credentials.json");
-            let credentials_snapshot = (force_credentials
+            // Never propagate a fossil: on Keychain-backed installs the
+            // default credential file's token expired long ago (the live
+            // token is Keychain-only), and copying it makes captured profiles
+            // look authenticated while spawning dead logins.
+            let credentials_snapshot = ((force_credentials
                 || agent_accounts_source_is_newer(&credentials_source, &credentials_destination))
+                && !agent_accounts_claude_default_store_is_keychain_backed())
             .then(|| agent_accounts_read_stable_file(&credentials_source))
             .flatten();
             if credentials_snapshot.is_none() {
@@ -3667,6 +3704,73 @@ fn agent_accounts_snapshot_refresh_in_cycle_with_auth(
             changed
         }
     }
+}
+
+/// Milliseconds since this Claude credential file's OAuth access token
+/// expired; None when the file is unreadable or records no expiry.
+fn agent_accounts_claude_credentials_expired_ms(path: &Path) -> Option<u64> {
+    let snapshot = agent_accounts_read_stable_file(path)?;
+    let value = serde_json::from_slice::<Value>(&snapshot.bytes).ok()?;
+    let expires_at = value
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(Value::as_u64)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some(now.saturating_sub(expires_at))
+}
+
+const AGENT_ACCOUNTS_CLAUDE_FOSSIL_TOKEN_AGE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+
+/// True when the default Claude install keeps its live OAuth token in the
+/// macOS Keychain: the default identity is present while the default
+/// `.credentials.json` is absent or its token expired weeks ago. In that
+/// mode credential-file snapshots are fossils — every real login/refresh
+/// lands in the Keychain and never reaches the file, so captured profiles
+/// can carry identity but not a usable token.
+#[cfg(target_os = "macos")]
+fn agent_accounts_claude_default_store_is_keychain_backed() -> bool {
+    let Some(default_home) = agent_accounts_default_home("claude") else {
+        return false;
+    };
+    let email = agent_accounts_profile_identity("claude", None)["email"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if email.is_empty() {
+        return false;
+    }
+    let credentials_path = default_home.join(".credentials.json");
+    if !credentials_path.is_file() {
+        return true;
+    }
+    agent_accounts_claude_credentials_expired_ms(&credentials_path)
+        .is_some_and(|expired_ms| expired_ms > AGENT_ACCOUNTS_CLAUDE_FOSSIL_TOKEN_AGE_MS)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn agent_accounts_claude_default_store_is_keychain_backed() -> bool {
+    false
+}
+
+/// A captured Claude profile naming the SAME account that is currently
+/// signed into the default home.
+fn agent_accounts_claude_profile_matches_default_identity(dir: &Path) -> bool {
+    let profile_email = agent_accounts_email_key(
+        agent_accounts_profile_identity("claude", Some(dir))["email"]
+            .as_str()
+            .unwrap_or_default(),
+    );
+    if profile_email.is_empty() {
+        return false;
+    }
+    let default_email = agent_accounts_email_key(
+        agent_accounts_profile_identity("claude", None)["email"]
+            .as_str()
+            .unwrap_or_default(),
+    );
+    profile_email == default_email
 }
 
 fn agent_accounts_neutralize_captured_claude_identity(profile_dir: &Path) -> bool {

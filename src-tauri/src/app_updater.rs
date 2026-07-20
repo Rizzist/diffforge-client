@@ -834,18 +834,52 @@ async fn app_update_all_terminals_idle(app: &AppHandle) -> bool {
 
 #[cfg(target_os = "linux")]
 fn app_update_validate_platform_install_target() -> Result<(), String> {
-    let appimage = std::env::var_os("APPIMAGE")
-        .map(|value| value.to_string_lossy().trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "Linux app updates require an AppImage launch with APPIMAGE set; refusing to run the updater for this install."
-                .to_string()
-        })?;
-    if !std::path::Path::new(&appimage).is_file() {
+    // Some launch paths (older installs, extracted runtimes, env-sanitizing
+    // wrappers) start the daemon without the AppImage runtime's APPIMAGE
+    // variable. The updater (and tauri-plugin-updater's install step, which
+    // reads APPIMAGE itself) still has a well-defined target: fall back to
+    // the installer-provisioned path, then the stable install locations, and
+    // export APPIMAGE so the plugin sees the same target.
+    let candidates = std::env::var_os("APPIMAGE")
+        .map(|value| PathBuf::from(value.to_string_lossy().trim().to_string()))
+        .into_iter()
+        .chain(
+            std::env::var_os("DIFFFORGE_APPIMAGE_PATH")
+                .map(|value| PathBuf::from(value.to_string_lossy().trim().to_string())),
+        )
+        .chain([PathBuf::from("/opt/diffforge/diffforge-ai.AppImage")])
+        .chain(
+            crate::user_home_dir()
+                .map(|home| home.join(".local/share/diffforge/diffforge-ai.AppImage")),
+        )
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    let Some(appimage) = candidates.iter().find(|path| path.is_file()) else {
+        let described = candidates
+            .first()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if described.is_empty() {
+            return Err(
+                "Linux app updates require an AppImage launch with APPIMAGE set; refusing to run the updater for this install."
+                    .to_string(),
+            );
+        }
         return Err(format!(
-            "Linux app updates require APPIMAGE to point at the running AppImage; path is not a file: {}",
-            app_update_scrub_external_text(&appimage)
+            "Linux app updates require APPIMAGE to point at the running AppImage; no install target found (checked from: {})",
+            app_update_scrub_external_text(&described)
         ));
+    };
+    if std::env::var_os("APPIMAGE")
+        .map(|value| PathBuf::from(value.to_string_lossy().trim().to_string()))
+        .as_deref()
+        != Some(appimage.as_path())
+    {
+        std::env::set_var("APPIMAGE", appimage);
+        log_terminal_status_event(
+            "backend.app_update.appimage_target_fallback",
+            json!({ "target": appimage.to_string_lossy() }),
+        );
     }
     Ok(())
 }

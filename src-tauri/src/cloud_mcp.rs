@@ -19789,6 +19789,14 @@ fn cloud_mcp_remote_command_field_bool(event: &Value, keys: &[&str]) -> Option<b
 }
 
 fn cloud_mcp_remote_workspace_requires_foreground(event: &Value) -> bool {
+    // Daemon mode has no windows and no AppShell: a foreground-defaulted
+    // activation would be journaled into the UI-handoff queue and wait forever
+    // for a webview that never mounts (the dashboard omits show_window, and
+    // omission historically meant foreground). Headless devices always take
+    // the Rust-owned execution path.
+    if crate::daemon_mode_active() {
+        return false;
+    }
     cloud_mcp_remote_command_field_bool(event, &["show_window"]).unwrap_or(true)
 }
 
