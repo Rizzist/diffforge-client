@@ -7544,6 +7544,7 @@ fn todo_store_force_webview_snapshot_listed(item: &mut Value) {
 }
 
 fn todo_store_copy_lifecycle_fields_from_stored(stored: &Value, item: &mut Value) {
+    let incoming_attempt_seq = todo_dispatch_queue_item_attempt_seq(item);
     let Some(object) = item.as_object_mut() else {
         return;
     };
@@ -7597,6 +7598,14 @@ fn todo_store_copy_lifecycle_fields_from_stored(stored: &Value, item: &mut Value
             }
         }
     }
+    // Attempt monotonicity (max-merge): the requeue attempt fence lives in
+    // this counter, and a webview snapshot that dropped or predates it must
+    // never rewind the stored row's attempt — that would let a delayed
+    // settler of the previous attempt falsely settle the fresh one.
+    let attempt_seq = todo_dispatch_queue_item_attempt_seq(stored).max(incoming_attempt_seq);
+    if attempt_seq > 0 {
+        object.insert("attempt_seq".to_string(), json!(attempt_seq));
+    }
     object.insert("lifecycle_owner".to_string(), json!("rust"));
     object.insert("rust_owned".to_string(), json!(true));
 }
@@ -7627,6 +7636,30 @@ fn todo_store_sanitize_webview_snapshot_lifecycle(
             let incoming_status = todo_store_item_status(&item);
             if !incoming_status.is_empty() && incoming_status != "listed" {
                 todo_store_force_webview_snapshot_listed(&mut item);
+            }
+            item
+        })
+        .collect()
+}
+
+/// Attempt monotonicity for full-snapshot sync (max-merge): an incoming item
+/// with a missing or LOWER `attempt_seq` never lowers the stored row's
+/// attempt. The requeue fence lives in this counter — an outdated webview
+/// echoing the queue back through sync must not rewind it, or a delayed
+/// settler of the previous attempt would falsely settle the fresh attempt.
+fn todo_store_max_merge_attempt_seq_core(stored_items: &[Value], items: Vec<Value>) -> Vec<Value> {
+    if stored_items.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .map(|mut item| {
+            let Some(stored) = todo_store_find_stored_logical_item(stored_items, &item) else {
+                return item;
+            };
+            let stored_attempt_seq = todo_dispatch_queue_item_attempt_seq(stored);
+            if stored_attempt_seq > todo_dispatch_queue_item_attempt_seq(&item) {
+                todo_store_set_item_attempt_seq(&mut item, stored_attempt_seq);
             }
             item
         })
@@ -8302,15 +8335,20 @@ fn todo_dispatch_active_queue_item_ids_for_pane_matching(
 /// than the settler's are skipped: a requeue that landed between the
 /// settler's receipt save and this queue settle bumped the row for a fresh
 /// attempt, and settling it here would silently swallow the new attempt.
+/// Returns `true` when the settle was fenced off by the row's NEWER attempt
+/// (the row was requeued after the settler's observation). Callers that
+/// track per-command "handled" state must NOT record a fenced-off command as
+/// handled — the row still belongs to a different (usually fresher) attempt
+/// and another settlement path must remain free to settle it.
 fn todo_dispatch_queue_mark_settled(
     app: Option<&AppHandle>,
     workspace_id: &str,
     command_id: &str,
     status: &str,
     settler_attempt_seq: Option<u64>,
-) {
+) -> bool {
     let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
-        return;
+        return false;
     };
     let _store_guard = todo_dispatch_queue_store_guard();
     let receipt_entry = todo_dispatch_load(workspace_id)
@@ -8361,7 +8399,7 @@ fn todo_dispatch_queue_mark_settled(
     let normalized_target = todo_store_normalize_lifecycle_status(status);
     let snapshot = todo_dispatch_queue_read(&path);
     let Some(items) = snapshot.get("items").and_then(Value::as_array).cloned() else {
-        return;
+        return false;
     };
     let mut changed = false;
     let mut completed_item_id = String::new();
@@ -8475,6 +8513,7 @@ fn todo_dispatch_queue_mark_settled(
     if let (Some(app), Some(item)) = (app, lifecycle_item.as_ref()) {
         todo_dispatch_emit_loopspace_batch_lifecycle(app, item);
     }
+    attempt_fence_skipped
 }
 
 pub(crate) fn todo_dispatch_mark_active_for_pane_interrupted(
@@ -8774,7 +8813,7 @@ fn todo_dispatch_active_queue_item_ids_for_swarm(
 }
 
 pub(crate) fn todo_dispatch_mark_active_for_swarm_completed(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     workspace_id: &str,
     swarm_id: &str,
     run_id: &str,
@@ -8837,20 +8876,27 @@ pub(crate) fn todo_dispatch_mark_active_for_swarm_completed(
             }
             let observed_attempt_seq = todo_dispatch_receipt_attempt_seq(&receipt);
             let _ = todo_dispatch_record_receipt_internal(
-                Some(app),
+                app,
                 workspace_id,
                 receipt,
                 "swarm_run_settled",
             );
             if !command_id.trim().is_empty() {
-                todo_dispatch_queue_mark_settled(
-                    Some(app),
+                let attempt_fence_skipped = todo_dispatch_queue_mark_settled(
+                    app,
                     workspace_id,
                     &command_id,
                     todo_status,
                     observed_attempt_seq,
                 );
-                settled.insert(command_id);
+                // A fence-skipped settle handled NOTHING: the receipt carried
+                // a previous attempt's stamp while the row was requeued. The
+                // row-fallback pass below reads the row's CURRENT attempt and
+                // must remain free to settle it — recording the command as
+                // handled here would strand the row running forever.
+                if !attempt_fence_skipped {
+                    settled.insert(command_id);
+                }
             }
         }
     }
@@ -8862,7 +8908,7 @@ pub(crate) fn todo_dispatch_mark_active_for_swarm_completed(
             continue;
         }
         todo_dispatch_queue_mark_settled(
-            Some(app),
+            app,
             workspace_id,
             &command_id,
             todo_status,
@@ -10425,6 +10471,336 @@ mod todo_store_tests {
              NEW attempt queued — the stale settler may not settle the fresh row"
         );
         assert_eq!(requeued_attempt, 1);
+
+        // SYNC-AFTER-REQUEUE leg: an outdated webview echoes the queue back
+        // as a full snapshot WITHOUT attempt_seq (the field its normalizer
+        // used to drop). The queue_sync core pipeline must not rewind the
+        // stored row's attempt, and the delayed attempt-0 settler must STILL
+        // be fenced off afterwards.
+        let stored_items = queue_path
+            .as_ref()
+            .map(|path| todo_dispatch_queue_read(path))
+            .and_then(|snapshot| snapshot.get("items").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut item| {
+                // Production requeue stamps rust ownership on the row; mirror
+                // that so sanitize exercises the stored-lifecycle whitelist.
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("rust_owned".to_string(), json!(true));
+                    object.insert("lifecycle_owner".to_string(), json!("rust"));
+                }
+                item
+            })
+            .collect::<Vec<_>>();
+        todo_dispatch_queue_write(&workspace_id, &stored_items);
+        let webview_echo = vec![json!({
+            "id": "todo-fence",
+            "remote_command": { "command_id": "command-fence" },
+            "status": "queued",
+            "target_terminal_id": "pane-a",
+            "text": "do the thing",
+            "todo_status": "queued",
+            "workspace_id": workspace_id,
+        })];
+        let synced = todo_store_sanitize_webview_snapshot_lifecycle(&stored_items, webview_echo);
+        let synced = todo_store_keep_settled_sweep_flips_core(stored_items.clone(), synced);
+        let synced = todo_store_apply_newer_store_status_core(&stored_items, synced);
+        let synced =
+            todo_store_retain_settled_items_core(stored_items.clone(), synced, &HashSet::new());
+        let synced = todo_store_max_merge_attempt_seq_core(&stored_items, synced);
+        todo_dispatch_queue_write(&workspace_id, &synced);
+        let read_fence_row = || {
+            queue_path
+                .as_ref()
+                .map(|path| todo_dispatch_queue_read(path))
+                .and_then(|snapshot| snapshot.get("items").and_then(Value::as_array).cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .find(|item| todo_dispatch_queue_item_command_id(item) == "command-fence")
+        };
+        let synced_row = read_fence_row().expect("synced queue keeps the requeued row");
+        assert_eq!(
+            todo_dispatch_queue_item_attempt_seq(&synced_row),
+            1,
+            "a full webview sync without attempt_seq must not erase the \
+             requeue attempt from the stored row"
+        );
+        // The delayed attempt-0 settler (resolves its attempt from the
+        // superseded receipt) must still skip the fresh attempt post-sync.
+        todo_dispatch_queue_mark_settled(None, &workspace_id, "command-fence", "completed", None);
+        let post_settle_row = read_fence_row().expect("row survives the fenced settle");
+        assert_eq!(
+            todo_store_item_status(&post_settle_row),
+            "queued",
+            "after a sync-after-requeue, the stale settler must still be \
+             fenced off the fresh attempt"
+        );
+        assert_eq!(todo_dispatch_queue_item_attempt_seq(&post_settle_row), 1);
+
+        if let Some(path) = receipt_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(path) = queue_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Ok(mut cache) = TODO_DISPATCH_RECEIPTS_CACHE
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            cache.remove(&todo_dispatch_safe_workspace_id(&workspace_id));
+        }
+    }
+
+    /// A requeued swarm todo whose re-dispatch left an OLD attempt stamp on
+    /// the receipt (the pre-fix attempt-less running write merged into the
+    /// superseded previous-attempt entry) must STILL settle its queue row
+    /// when the new run completes: the receipt-path settle is fenced off by
+    /// the row's newer attempt, and a fenced-off settle must not be recorded
+    /// as handled — the row fallback (which reads the row's CURRENT attempt)
+    /// settles the row completed at the new attempt.
+    #[test]
+    fn requeued_swarm_todo_completion_settles_row_at_new_attempt_via_row_fallback() {
+        let workspace_id = format!("test-swarm-requeue-fallback-{}", uuid::Uuid::new_v4());
+        let receipt_path = todo_dispatch_store_path(&workspace_id);
+
+        // Attempt 0 dispatched into the swarm and completed.
+        todo_dispatch_queue_write(
+            &workspace_id,
+            &[json!({
+                "id": "todo-swarm",
+                "remote_command": { "command_id": "command-swarm" },
+                "status": "running",
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-old",
+                "text": "do the swarm thing",
+                "todo_status": "running",
+                "workspace_id": workspace_id,
+            })],
+        );
+        // Fresh receipt: creation stamps the row's CURRENT attempt (0).
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-swarm",
+                "item_id": "todo-swarm",
+                "status": "completed",
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-old",
+                "text": "do the swarm thing",
+            }),
+            "test_first_attempt_completed",
+        )
+        .unwrap();
+        // Requeue: supersede the settled receipt, bump the row to attempt 1,
+        // and re-dispatch into a NEW swarm run.
+        todo_dispatch_clear_settled_receipts_for_requeue(
+            None,
+            &workspace_id,
+            &["todo-swarm".to_string(), "command-swarm".to_string()],
+            "todo_queue_manual_queue",
+            Some(1),
+        );
+        todo_dispatch_queue_write(
+            &workspace_id,
+            &[json!({
+                "id": "todo-swarm",
+                "remote_command": { "command_id": "command-swarm" },
+                "status": "running",
+                "attempt_seq": 1,
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-new",
+                "text": "do the swarm thing",
+                "todo_status": "running",
+                "workspace_id": workspace_id,
+            })],
+        );
+        // Pre-fix dispatch shape: the running write carries NO attempt_seq,
+        // so it cannot clear the superseded markers and the entry keeps the
+        // OLD attempt stamp (0) under the new run id.
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-swarm",
+                "item_id": "todo-swarm",
+                "status": "running",
+                "status_reason": "todo_queue_swarm_run_started",
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-new",
+                "text": "do the swarm thing",
+                "workspace_id": workspace_id,
+            }),
+            "backend_swarm_dispatch",
+        )
+        .unwrap();
+        let stale_receipt = todo_dispatch_load(&workspace_id)
+            .get("command-swarm")
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            todo_dispatch_receipt_attempt_seq(&stale_receipt),
+            Some(0),
+            "precondition: the attempt-less running write must leave the \
+             receipt stamped with the OLD attempt"
+        );
+
+        // The new run completes: the row must settle COMPLETED at attempt 1
+        // (receipt path fenced off, row fallback settles).
+        let settled_count = todo_dispatch_mark_active_for_swarm_completed(
+            None,
+            &workspace_id,
+            "swarm-1",
+            "run-new",
+            "completed",
+        );
+        assert!(
+            settled_count >= 1,
+            "the completed swarm run must settle its queue row"
+        );
+        let queue_path = todo_dispatch_data_path("queues", &workspace_id);
+        let row = queue_path
+            .as_ref()
+            .map(|path| todo_dispatch_queue_read(path))
+            .and_then(|snapshot| snapshot.get("items").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|item| todo_dispatch_queue_item_command_id(item) == "command-swarm")
+            .expect("the requeued swarm row must survive settlement");
+        assert_eq!(
+            todo_store_item_status(&row),
+            "completed",
+            "a finished requeued swarm run must not leave its row running"
+        );
+        assert_eq!(todo_dispatch_queue_item_attempt_seq(&row), 1);
+
+        if let Some(path) = receipt_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Some(path) = queue_path {
+            let _ = fs::remove_file(path);
+        }
+        if let Ok(mut cache) = TODO_DISPATCH_RECEIPTS_CACHE
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+        {
+            cache.remove(&todo_dispatch_safe_workspace_id(&workspace_id));
+        }
+    }
+
+    /// The fixed swarm dispatch stamps the row's attempt into its running
+    /// receipt, which clears the superseded markers (new lineage) and lets
+    /// completion settle the row through the RECEIPT path at the new attempt.
+    #[test]
+    fn attempt_stamped_swarm_dispatch_receipt_clears_supersede_and_settles_new_attempt() {
+        let workspace_id = format!("test-swarm-requeue-stamped-{}", uuid::Uuid::new_v4());
+        let receipt_path = todo_dispatch_store_path(&workspace_id);
+
+        todo_dispatch_queue_write(
+            &workspace_id,
+            &[json!({
+                "id": "todo-swarm",
+                "remote_command": { "command_id": "command-swarm" },
+                "status": "running",
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-old",
+                "text": "do the swarm thing",
+                "todo_status": "running",
+                "workspace_id": workspace_id,
+            })],
+        );
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-swarm",
+                "item_id": "todo-swarm",
+                "status": "completed",
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-old",
+                "text": "do the swarm thing",
+            }),
+            "test_first_attempt_completed",
+        )
+        .unwrap();
+        todo_dispatch_clear_settled_receipts_for_requeue(
+            None,
+            &workspace_id,
+            &["todo-swarm".to_string(), "command-swarm".to_string()],
+            "todo_queue_manual_queue",
+            Some(1),
+        );
+        todo_dispatch_queue_write(
+            &workspace_id,
+            &[json!({
+                "id": "todo-swarm",
+                "remote_command": { "command_id": "command-swarm" },
+                "status": "running",
+                "attempt_seq": 1,
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-new",
+                "text": "do the swarm thing",
+                "todo_status": "running",
+                "workspace_id": workspace_id,
+            })],
+        );
+        // Fixed dispatch shape: the running receipt carries the row attempt.
+        todo_dispatch_record_receipt_internal(
+            None,
+            &workspace_id,
+            json!({
+                "command_id": "command-swarm",
+                "item_id": "todo-swarm",
+                "status": "running",
+                "status_reason": "todo_queue_swarm_run_started",
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-1",
+                "swarm_run_id": "run-new",
+                "attempt_seq": 1,
+                "text": "do the swarm thing",
+                "workspace_id": workspace_id,
+            }),
+            "backend_swarm_dispatch",
+        )
+        .unwrap();
+        let receipt = todo_dispatch_load(&workspace_id)
+            .get("command-swarm")
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert!(
+            !todo_dispatch_receipt_is_superseded(&receipt),
+            "the attempt-stamped running write must clear the superseded \
+             markers — the entry is the new attempt's live lineage"
+        );
+        assert_eq!(todo_dispatch_receipt_attempt_seq(&receipt), Some(1));
+
+        let settled_count = todo_dispatch_mark_active_for_swarm_completed(
+            None,
+            &workspace_id,
+            "swarm-1",
+            "run-new",
+            "completed",
+        );
+        assert!(settled_count >= 1);
+        let queue_path = todo_dispatch_data_path("queues", &workspace_id);
+        let row = queue_path
+            .as_ref()
+            .map(|path| todo_dispatch_queue_read(path))
+            .and_then(|snapshot| snapshot.get("items").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|item| todo_dispatch_queue_item_command_id(item) == "command-swarm")
+            .expect("the requeued swarm row must survive settlement");
+        assert_eq!(todo_store_item_status(&row), "completed");
+        assert_eq!(todo_dispatch_queue_item_attempt_seq(&row), 1);
 
         if let Some(path) = receipt_path {
             let _ = fs::remove_file(path);
@@ -12874,6 +13250,10 @@ async fn todo_dispatch_queue_sync(
         // visible list (completed todos above all) survive the full-snapshot
         // rewrite so Todos History keeps showing them.
         let items = todo_store_retain_settled_items_core(stored_items, items, &tombstoned);
+        // Attempt fence carry-through: whatever survived the passes above,
+        // a stored row's requeue attempt is never lowered by a webview
+        // snapshot (max-merge; missing attempts normalize to 0).
+        let items = todo_store_max_merge_attempt_seq_core(&previous_items, items);
         let changed_items = todo_store_changed_items_for_sync(&previous_items, &items);
         todo_dispatch_queue_write(&workspace_id, &items);
         todo_store_orphan_sweep_trigger("todo_dispatch_queue_sync");
@@ -15342,6 +15722,11 @@ async fn todo_dispatch_backend_submit_swarm(
         "target_kind": "swarm",
         "target_swarm_id": swarm_id,
         "swarm_run_id": run_id,
+        // The queue-row attempt this dispatch acts on. Required on requeued
+        // rows: an attempt-less running write cannot clear the previous
+        // attempt's superseded markers, so completion would observe the OLD
+        // attempt, fail the row fence, and strand the row running forever.
+        "attempt_seq": todo_dispatch_queue_item_attempt_seq(item),
         "text": prompt.chars().take(180).collect::<String>(),
         "workspace_id": workspace_id,
         "workspace_name": workspace_name,

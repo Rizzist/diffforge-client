@@ -12552,6 +12552,12 @@ function normalizeTodoQueueItem(item) {
   const agentSessionMetadata = getTodoQueueAgentSessionMetadata(item);
   const canonicalLifecycle = getTodoQueueCanonicalLifecycle(item);
   const lifecycleOwner = String(item.lifecycle_owner || "").trim();
+  // Requeue attempt fence: the Rust store bumps attempt_seq when a row is
+  // requeued. Dropping it here would let a full webview sync rewrite the row
+  // without it (missing normalizes to attempt 0 in Rust), reopening stale
+  // settlement of the fresh attempt.
+  const attemptSeqRaw = Number(item.attempt_seq);
+  const attemptSeq = Number.isSafeInteger(attemptSeqRaw) && attemptSeqRaw > 0 ? attemptSeqRaw : 0;
   const todoStatus = canonicalLifecycle.status;
   const todoStatusUpdatedAt = String(canonicalLifecycle.status_updated_at || "").trim();
   const todoCompletedAt = String(item.todo_completed_at || item.completed_at || "").trim();
@@ -12586,6 +12592,7 @@ function normalizeTodoQueueItem(item) {
     ...(remoteCommand ? { remote_command: remoteCommand } : {}),
     ...(lifecycleOwner ? { lifecycle_owner: lifecycleOwner } : {}),
     ...(item.rust_owned === true ? { rust_owned: true } : {}),
+    ...(attemptSeq > 0 ? { attempt_seq: attemptSeq } : {}),
     ...(queuedAt ? { queued_at: queuedAt } : {}),
     ...(inputs.length ? { inputs, todo_inputs: inputs, input_count: inputs.length } : {}),
     ...agentSessionMetadata,
@@ -12741,6 +12748,9 @@ function buildTodoQueueCloudSyncItem(item, {
       lifecycle_owner: normalizedItem.lifecycle_owner,
     } : {}),
     ...(normalizedItem.rust_owned === true ? { rust_owned: true } : {}),
+    ...(Number.isSafeInteger(normalizedItem.attempt_seq) && normalizedItem.attempt_seq > 0 ? {
+      attempt_seq: normalizedItem.attempt_seq,
+    } : {}),
     workspace_id: effectiveWorkspaceId,
     ...(note ? {
       note: {

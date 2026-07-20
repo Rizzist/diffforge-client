@@ -12921,6 +12921,13 @@ async fn cloud_mcp_open_global_ws(
     if state.global_ws_perma_offline.load(Ordering::SeqCst) {
         return Err(cloud_mcp_offline_mode_message().to_string());
     }
+    // Account-context birth certificate: the epoch this socket was created
+    // under, captured BEFORE any auth/connect/handshake await. Every later
+    // acceptance decision for this socket (the ready frame above all)
+    // compares against this value — a socket born under account A must never
+    // be adopted by account B's runtime after a switch, even while it is
+    // still handshaking (published sender, no connection id yet).
+    let socket_account_epoch = state.account_epoch.load(Ordering::SeqCst);
     cloud_mcp_record_signin_diagnostic(
         state,
         "websocket.open",
@@ -13199,12 +13206,23 @@ async fn cloud_mcp_open_global_ws(
                 }
                 match incoming {
                     Ok(Message::Text(text)) => {
-                        cloud_mcp_handle_global_ws_message(state, text.as_str(), &termio_binary)
-                            .await
+                        cloud_mcp_handle_global_ws_message(
+                            state,
+                            text.as_str(),
+                            &termio_binary,
+                            socket_account_epoch,
+                        )
+                        .await
                     }
                     Ok(Message::Binary(bytes)) => {
                         if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                            cloud_mcp_handle_global_ws_message(state, &text, &termio_binary).await;
+                            cloud_mcp_handle_global_ws_message(
+                                state,
+                                &text,
+                                &termio_binary,
+                                socket_account_epoch,
+                            )
+                            .await;
                         } else {
                             cloud_mcp_store_ws_inbound(
                                 "binary",
@@ -13249,6 +13267,18 @@ async fn cloud_mcp_open_global_ws(
                     ready_seen = runtime.global_ws_connected
                         && runtime.global_ws_connection_id.is_some()
                         && runtime.global_ws_message_token.is_some();
+                }
+                // A socket still handshaking under an account context that no
+                // longer exists must die here: the ready gate above refused to
+                // stamp it connected, so close the transport and let the
+                // reconnect loop open a fresh socket under the CURRENT epoch.
+                if !ready_seen
+                    && state.account_epoch.load(Ordering::SeqCst) != socket_account_epoch
+                {
+                    break Err(
+                        "Cloud MCP account context changed during websocket handshake; closing stale socket."
+                            .to_string(),
+                    );
                 }
                 if inbound_frame_seen {
                     last_inbound_at = Instant::now();
@@ -18266,6 +18296,7 @@ async fn cloud_mcp_handle_global_ws_message(
     state: &CloudMcpState,
     text: &str,
     termio_binary: &Arc<AtomicBool>,
+    socket_account_epoch: u64,
 ) {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return;
@@ -18329,6 +18360,38 @@ async fn cloud_mcp_handle_global_ws_message(
             .await;
             return;
         };
+        // Epoch-at-creation gate: a ready frame is only acceptable on a
+        // socket born under the CURRENT account context. A socket opened
+        // under account A whose handshake straddled an A→B switch would
+        // otherwise be stamped connected here — with B's runtime adopting
+        // A's authenticated connection (persistent cross-account state
+        // contamination). Refuse the frame entirely; the handshake watchdog
+        // in the socket loop closes the stale transport right after this.
+        let current_account_epoch = state.account_epoch.load(Ordering::SeqCst);
+        if socket_account_epoch != current_account_epoch {
+            log_cloud_sync_event(
+                "ws.ready_rejected_stale_account_epoch",
+                json!({
+                    "connection_id": connection_id,
+                    "socket_account_epoch": socket_account_epoch,
+                    "current_account_epoch": current_account_epoch,
+                }),
+            );
+            cloud_mcp_record_connection_diagnostic(
+                state,
+                "rust.cloud_mcp.websocket.ready",
+                "error",
+                "Cloud MCP app websocket ready frame arrived on a socket from a previous account context; rejected.",
+                json!({
+                    "client_identity": "appwrite_account",
+                    "source_client_id": CLOUD_MCP_RUST_CLIENT_ID,
+                    "socket_account_epoch": socket_account_epoch,
+                    "current_account_epoch": current_account_epoch,
+                }),
+            )
+            .await;
+            return;
+        }
         let initial_account_asset_state = message
             .get("initial_account_asset_state")
             .cloned()
@@ -18361,11 +18424,12 @@ async fn cloud_mcp_handle_global_ws_message(
         cloud_mcp_note_sync_connection(false, "desktop_registering");
         let ready_message = message.clone();
         let state_for_initial = state.clone();
-        // The ready frame arrived on THIS connection under the CURRENT
-        // account context; captured here so the initial live-state apply can
-        // be dropped if an account switch lands before the spawned task
-        // commits it.
-        let ready_account_epoch = state.account_epoch.load(Ordering::SeqCst);
+        // The epoch this SOCKET was created under (verified above to equal
+        // the current epoch). Deliberately not re-read here: a socket born
+        // under an older account context must never be assigned the current
+        // epoch, so the initial live-state apply is dropped if an account
+        // switch lands before the spawned task commits it.
+        let ready_account_epoch = socket_account_epoch;
         tauri::async_runtime::spawn(async move {
             if let Some(initial_account_asset_state) = initial_account_asset_state {
                 let bytes = cloud_mcp_sync_payload_bytes(&initial_account_asset_state);
@@ -40536,8 +40600,14 @@ fn cloud_mcp_account_scope_change_requires_disconnect(
     account_context_changed: bool,
     global_ws_connected: bool,
     connection_id_present: bool,
+    socket_published: bool,
 ) -> bool {
-    account_context_changed && (global_ws_connected || connection_id_present)
+    // `socket_published` covers the handshake window: a socket that has
+    // published its sender but not yet received its ready frame reports
+    // neither `connected` nor a connection id, yet it was authenticated under
+    // the OLD account context and must be torn down on a switch — otherwise
+    // its later ready frame would connect account A's socket into account B.
+    account_context_changed && (global_ws_connected || connection_id_present || socket_published)
 }
 
 async fn cloud_mcp_apply_desktop_auth_session(
@@ -40625,6 +40695,10 @@ async fn cloud_mcp_apply_desktop_auth_session(
             let mut snapshots = state.runtime_snapshots.lock().await;
             *snapshots = CloudMcpRuntimeSnapshots::default();
         }
+        // A handshaking socket has no connection id yet, but its published
+        // sender makes it findable — and killable — here. Sampled before the
+        // runtime lock (lock order: never hold both at once).
+        let handshaking_socket_published = state.global_ws_tx.lock().await.is_some();
         let websocket_was_established = {
             let mut runtime = state.inner.lock().await;
             runtime.account_key = account_key.clone();
@@ -40635,6 +40709,7 @@ async fn cloud_mcp_apply_desktop_auth_session(
                 true,
                 runtime.global_ws_connected,
                 runtime.global_ws_connection_id.is_some(),
+                handshaking_socket_published,
             )
         };
         if websocket_was_established {
@@ -66544,17 +66619,84 @@ mod cloud_mcp_tests {
     #[test]
     fn initial_account_scope_hydration_does_not_report_a_websocket_disconnect() {
         assert!(!cloud_mcp_account_scope_change_requires_disconnect(
-            true, false, false
+            true, false, false, false
         ));
         assert!(cloud_mcp_account_scope_change_requires_disconnect(
-            true, true, false
+            true, true, false, false
         ));
         assert!(cloud_mcp_account_scope_change_requires_disconnect(
-            true, false, true
+            true, false, true, false
         ));
         assert!(!cloud_mcp_account_scope_change_requires_disconnect(
-            false, true, true
+            false, true, true, true
         ));
+        // A HANDSHAKING socket (published sender, not yet connected, no
+        // connection id) must be disconnected by an account switch too:
+        // skipping it leaves account A's authenticated socket alive to be
+        // adopted by account B when its ready frame lands.
+        assert!(cloud_mcp_account_scope_change_requires_disconnect(
+            true, false, false, true
+        ));
+    }
+
+    /// Epoch-at-creation gate: a `cloud_app_ws_ready` frame arriving on a
+    /// socket that was created under a PREVIOUS account epoch must be
+    /// rejected outright — the runtime must not be stamped connected and the
+    /// old socket's connection id / message token must never be adopted by
+    /// the new account context.
+    #[tokio::test]
+    async fn ready_frame_from_socket_born_under_older_account_epoch_is_rejected() {
+        let state = CloudMcpState::new();
+        let termio_binary = Arc::new(AtomicBool::new(false));
+        let ready_frame = json!({
+            "kind": "cloud_app_ws_ready",
+            "message_auth": {
+                "connection_id": "connection-account-a",
+                "message_token": "token-account-a",
+            },
+        })
+        .to_string();
+
+        // The socket was created under account A's epoch...
+        let socket_account_epoch = state.account_epoch.load(Ordering::SeqCst);
+        // ...then an A→B account switch bumps the epoch mid-handshake...
+        state.account_epoch.fetch_add(1, Ordering::SeqCst);
+        // ...so the late ready frame must be refused.
+        cloud_mcp_handle_global_ws_message(
+            &state,
+            &ready_frame,
+            &termio_binary,
+            socket_account_epoch,
+        )
+        .await;
+        {
+            let runtime = state.inner.lock().await;
+            assert!(
+                !runtime.global_ws_connected,
+                "a stale-epoch ready frame must not mark the websocket connected"
+            );
+            assert!(
+                runtime.global_ws_connection_id.is_none(),
+                "a stale-epoch ready frame must not stamp its connection id \
+                 into the new account's runtime"
+            );
+            assert!(
+                runtime.global_ws_message_token.is_none(),
+                "a stale-epoch ready frame must not stamp its message token \
+                 into the new account's runtime"
+            );
+        }
+
+        // The same frame under the CURRENT epoch is accepted normally.
+        let current_epoch = state.account_epoch.load(Ordering::SeqCst);
+        cloud_mcp_handle_global_ws_message(&state, &ready_frame, &termio_binary, current_epoch)
+            .await;
+        let runtime = state.inner.lock().await;
+        assert!(runtime.global_ws_connected);
+        assert_eq!(
+            runtime.global_ws_connection_id.as_deref(),
+            Some("connection-account-a")
+        );
     }
 
     fn workspace_consistency_catalog_path(data_root: &Path) -> PathBuf {

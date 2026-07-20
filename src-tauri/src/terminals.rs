@@ -19384,22 +19384,28 @@ fn terminal_activity_watchdog_headless_total_bytes(
         .unwrap_or_default()
 }
 
+/// Prompt-marker liveness reads the CURRENT VT screen, never the raw output
+/// tail. The tail is an append-only byte journal: a TUI footer (OpenCode's
+/// "ctrl+p commands", a composer `›` line) stays in those bytes even after
+/// the CLI overwrote it in place or exited to its wrapper shell — scanning
+/// them lets a dead agent look input-ready and feeds queued prompts into a
+/// bare shell. The parsed grid only contains what is visible right now, so
+/// overwritten or scrolled-away markers cannot satisfy the gate. The scan is
+/// limited to the bottom rows of the visible screen (composer/footer
+/// territory) so stale transcript echoes higher up cannot satisfy it either.
+/// A raw-tail chunk scan remains acceptable only for paths with no VT state;
+/// every headless buffer here carries one, so none use it.
 fn terminal_headless_tail_has_prompt_marker(
     headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
 ) -> bool {
     let Ok(output) = headless_output.lock() else {
         return false;
     };
-    let tail = output.tail.iter().copied().collect::<Vec<_>>();
-    if tail.is_empty() {
+    let rows = output.vt_screen_bottom_rows(8);
+    if rows.is_empty() {
         return false;
     }
-    let start = tail.len().saturating_sub(TERMINAL_STARTUP_READY_SCAN_BYTES);
-    let text = String::from_utf8_lossy(&tail[start..]);
-    let mut recent_lines = text.lines().rev().take(8).collect::<Vec<_>>();
-    recent_lines.reverse();
-    let recent_text = recent_lines.join("\n");
-    terminal_output_current_prompt_marker(&recent_text)
+    terminal_output_current_prompt_marker(&rows.join("\n"))
 }
 
 fn terminal_headless_tail_has_mcp_startup_marker(
@@ -40433,6 +40439,46 @@ notifications = true
 
         headless_output.lock().unwrap().append(b"> ");
         assert!(terminal_headless_tail_has_prompt_marker(&headless_output));
+    }
+
+    /// Settled-decay liveness evidence must come from the LIVE screen: a
+    /// footer that the CLI overwrote (or that a screen clear removed) stays
+    /// in the append-only raw tail forever, and treating those stale bytes
+    /// as a current prompt marker lets a pane whose agent exited to its
+    /// wrapper shell decay to input-ready — queued prompts then get typed
+    /// into a bare shell.
+    #[test]
+    fn overwritten_footer_does_not_satisfy_the_prompt_marker() {
+        let headless_output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::default()));
+        // OpenCode-style footer currently visible on screen: marker holds.
+        headless_output
+            .lock()
+            .unwrap()
+            .append(b"opencode session\r\nctrl+p commands");
+        assert!(terminal_headless_tail_has_prompt_marker(&headless_output));
+
+        // The CLI exits: the live screen is cleared and only the wrapper
+        // shell remains. The footer bytes are still in the raw tail, but the
+        // VT screen no longer shows them — the marker must NOT hold.
+        headless_output
+            .lock()
+            .unwrap()
+            .append(b"\x1b[2J\x1b[Hbash-5.2$ ls src\r\n");
+        assert!(
+            !terminal_headless_tail_has_prompt_marker(&headless_output),
+            "a footer that is no longer on the live screen must not satisfy \
+             the settled-decay prompt marker"
+        );
+
+        // Same for a composer glyph overwritten IN PLACE on its own row.
+        let overwritten = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::default()));
+        overwritten.lock().unwrap().append(b"\xe2\x9d\xaf ");
+        assert!(terminal_headless_tail_has_prompt_marker(&overwritten));
+        overwritten
+            .lock()
+            .unwrap()
+            .append(b"\r\x1b[2Kprocess exited\r\n");
+        assert!(!terminal_headless_tail_has_prompt_marker(&overwritten));
     }
 
     #[test]

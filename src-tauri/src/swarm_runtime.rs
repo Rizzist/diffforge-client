@@ -2218,7 +2218,7 @@ async fn swarm_mark_run_settled(
         .await?;
         swarm_emit_state(app, workspace_id, swarm_id);
         let _ = todo_dispatch_mark_active_for_swarm_completed(
-            app,
+            Some(app),
             workspace_id,
             swarm_id,
             run_id,

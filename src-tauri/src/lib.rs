@@ -1410,6 +1410,26 @@ impl TerminalHeadlessOutputBuffer {
         state
     }
 
+    /// The bottom `count` rows of the CURRENT VT screen as plain text, with
+    /// trailing blank rows trimmed. Unlike the raw `tail` (an append-only
+    /// byte journal), this reflects what a viewer actually sees right now:
+    /// content that was overwritten in place or scrolled away by later
+    /// output — a TUI footer after the CLI exited to its wrapper shell —
+    /// is NOT here, so liveness detectors keyed on visible markers cannot be
+    /// satisfied by stale bytes.
+    fn vt_screen_bottom_rows(&self, count: usize) -> Vec<String> {
+        let screen = self.vt.screen();
+        let (_, cols) = screen.size();
+        let mut rows: Vec<String> = screen.rows(0, cols).collect();
+        while rows.last().is_some_and(|row| row.trim().is_empty()) {
+            rows.pop();
+        }
+        if rows.len() > count {
+            rows.drain(..rows.len() - count);
+        }
+        rows
+    }
+
     fn snapshot(&self, pane_id: &str, instance_id: u64) -> TerminalHeadlessOutputSnapshot {
         let bytes = self.tail.iter().copied().collect::<Vec<_>>();
         TerminalHeadlessOutputSnapshot {
