@@ -31,33 +31,99 @@ pub struct VerifiedMime {
     pub header_recipients: Vec<String>,
 }
 
-/// Extract addr-spec addresses from a TEXT-form header value — the fallback
-/// for headers mail-parser surfaces as raw text (e.g. Return-Path).
-fn extract_addresses_from_text(value: &str) -> Vec<String> {
+/// Split a TEXT-form address list on TOP-LEVEL commas only — commas inside
+/// quoted strings (`"a,b"@dom`) and inside angle brackets (obsolete routes
+/// `<@a,@b:user@dom>`) never split.
+fn split_address_list(value: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for part in value.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut angle_depth = 0usize;
+    for ch in value.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
             continue;
         }
-        let address = if let (Some(open), Some(close)) = (part.rfind('<'), part.rfind('>')) {
-            if open < close {
-                part[open + 1..close].trim().to_string()
-            } else {
-                part.to_string()
+        match ch {
+            '\\' if in_quotes => {
+                current.push(ch);
+                escaped = true;
             }
-        } else {
-            part.split_whitespace()
-                .find(|token| token.contains('@'))
-                .unwrap_or("")
-                .trim_matches(|c| c == '"' || c == ';')
-                .to_string()
-        };
-        if address.contains('@') {
-            out.push(address.to_ascii_lowercase());
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            '<' if !in_quotes => {
+                angle_depth += 1;
+                current.push(ch);
+            }
+            '>' if !in_quotes => {
+                angle_depth = angle_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if !in_quotes && angle_depth == 0 => {
+                out.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
         }
     }
+    out.push(current);
     out
+}
+
+/// Normalize ONE text-form address token to a comparable addr-spec — the
+/// SAME normalization the structured path uses (review R5): the angle-addr
+/// form takes the bracketed addr-spec (obsolete routes included); the bare
+/// form must BE an addr-spec (quoted local parts with escapes handled by
+/// `normalize_addr_spec`). None = no comparable addr-spec in this token.
+fn normalize_address_token(token: &str) -> Option<String> {
+    let token = token.trim();
+    if let (Some(open), Some(close)) = (token.rfind('<'), token.rfind('>')) {
+        if open < close {
+            return normalize_addr_spec(token[open + 1..close].trim());
+        }
+        // Mismatched angle brackets: nothing comparable here.
+        return None;
+    }
+    if token.contains('<') || token.contains('>') {
+        return None;
+    }
+    normalize_addr_spec(token)
+}
+
+/// Extract comparable addr-specs from a TEXT-form header value (the form
+/// mail-parser yields for Return-Path). FAIL CLOSED (review R5): a
+/// non-empty text value that yields no comparable addr-spec — or any
+/// individual token that cannot be normalized — rejects the message, same
+/// as the structured-path rule; ad-hoc quote stripping is gone.
+fn extract_addresses_from_text(value: &str) -> Result<Vec<String>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for token in split_address_list(trimmed) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match normalize_address_token(token) {
+            Some(address) => out.push(address),
+            None => {
+                return Err(format!(
+                    "text address header entry has no comparable addr-spec: {token:?}"
+                ))
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "text address header value has no comparable addr-spec: {trimmed:?}"
+        ));
+    }
+    Ok(out)
 }
 
 /// Normalize a raw addr-spec for comparison (review R4-3): strip the RFC
@@ -95,9 +161,20 @@ fn normalize_addr_spec(raw: &str) -> Option<String> {
         }
         out
     } else {
+        // An UNQUOTED local part carrying whitespace or quote characters is
+        // not a valid addr-spec — never guess at one (fail closed upstream).
+        if local.chars().any(|ch| ch.is_whitespace() || ch == '"') {
+            return None;
+        }
         local.to_string()
     };
     if local.is_empty() {
+        return None;
+    }
+    if domain
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '<' | '>'))
+    {
         return None;
     }
     Some(format!("{local}@{domain}").to_ascii_lowercase())
@@ -153,18 +230,24 @@ fn addresses_of(value: &mail_parser::HeaderValue<'_>) -> Result<Vec<String>, Str
             }
         }
         HeaderValue::Text(text) => {
-            for token in extract_addresses_from_text(text) {
-                push(&token)?;
-            }
+            // Already-normalized addr-specs; failures are already rejects.
+            out.extend(extract_addresses_from_text(text)?);
         }
         HeaderValue::TextList(items) => {
             for item in items {
-                for token in extract_addresses_from_text(item) {
-                    push(&token)?;
-                }
+                out.extend(extract_addresses_from_text(item)?);
             }
         }
-        _ => {}
+        // A truly empty value discloses nothing.
+        HeaderValue::Empty => {}
+        // An address-designated header carrying a non-address value is
+        // parser confusion — fail closed, never a silent skip (review R5:
+        // exhaustive enumeration, no catch-all Ok).
+        HeaderValue::DateTime(_) | HeaderValue::ContentType(_) | HeaderValue::Received(_) => {
+            return Err(
+                "address header carries a non-address value; fails closed".to_string(),
+            );
+        }
     }
     Ok(out)
 }
@@ -548,6 +631,30 @@ mod tests {
             unmatchable,
             &sha256_hex(unmatchable),
             unmatchable.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // Round-5 repro: Return-Path rides mail-parser's TEXT form — a
+        // quoted-local bcc address there must normalize and leak-match
+        // (the old ad-hoc quote stripping produced `archive"@…` ≠ bcc).
+        let text_quoted_leak = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nReturn-Path: \"archive\"@acme.example\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            text_quoted_leak,
+            &sha256_hex(text_quoted_leak),
+            text_quoted_leak.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // Garbage in a TEXT-form address header fails closed even with no
+        // bcc match — a non-empty value with no comparable addr-spec could
+        // be exactly the smuggled form.
+        let text_garbage = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nReturn-Path: utterly not an address\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            text_garbage,
+            &sha256_hex(text_garbage),
+            text_garbage.len() as u64,
             "ops@acme.example",
             &bcc_envelope,
         )
