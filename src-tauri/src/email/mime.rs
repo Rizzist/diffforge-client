@@ -31,43 +31,9 @@ pub struct VerifiedMime {
     pub header_recipients: Vec<String>,
 }
 
-/// Unfold headers (RFC 5322 continuation lines) and return (name, value)
-/// pairs for the top-level header block.
-fn parse_headers(bytes: &[u8]) -> Vec<(String, String)> {
-    let end = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| position + 2)
-        .or_else(|| {
-            bytes
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|position| position + 1)
-        })
-        .unwrap_or(bytes.len());
-    let header_text = String::from_utf8_lossy(&bytes[..end]);
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for raw_line in header_text.split('\n') {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        if line.is_empty() {
-            continue;
-        }
-        if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
-            if let Some(last) = headers.last_mut() {
-                last.1.push(' ');
-                last.1.push_str(line.trim());
-            }
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
-        }
-    }
-    headers
-}
-
-/// Extract addr-spec addresses from a structured address header value.
-fn extract_addresses(value: &str) -> Vec<String> {
+/// Extract addr-spec addresses from a TEXT-form header value — the fallback
+/// for headers mail-parser surfaces as raw text (e.g. Return-Path).
+fn extract_addresses_from_text(value: &str) -> Vec<String> {
     let mut out = Vec::new();
     for part in value.split(',') {
         let part = part.trim();
@@ -94,6 +60,41 @@ fn extract_addresses(value: &str) -> Vec<String> {
     out
 }
 
+/// Lowercased addr-specs from a STRUCTURALLY parsed header value (review
+/// R3-5): mail-parser's RFC 5322 parser handles group syntax
+/// (`hidden:archive@x;`), comments, and quoted local parts — the shapes a
+/// comma/whitespace splitter can be evaded through.
+fn addresses_of(value: &mail_parser::HeaderValue<'_>) -> Vec<String> {
+    use mail_parser::{Address, HeaderValue};
+    let mut out = Vec::new();
+    match value {
+        HeaderValue::Address(Address::List(list)) => {
+            for addr in list {
+                if let Some(address) = addr.address.as_deref() {
+                    out.push(address.to_ascii_lowercase());
+                }
+            }
+        }
+        HeaderValue::Address(Address::Group(groups)) => {
+            for group in groups {
+                for addr in &group.addresses {
+                    if let Some(address) = addr.address.as_deref() {
+                        out.push(address.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        HeaderValue::Text(text) => out.extend(extract_addresses_from_text(text)),
+        HeaderValue::TextList(items) => {
+            for item in items {
+                out.extend(extract_addresses_from_text(item));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Verify downloaded MIME bytes against the prepare grant. Every failure is
 /// terminal for the attempt (the device never patches the frozen MIME).
 pub fn verify_mime(
@@ -116,25 +117,35 @@ pub fn verify_mime(
         ));
     }
 
-    let headers = parse_headers(bytes);
-    let header_value = |name: &str| -> Vec<String> {
-        headers
+    // Structural RFC 5322 parse (review R3-5): every header decision below
+    // works on mail-parser's address parser output — group syntax, comments,
+    // and quoted local parts are normalized to addr-specs, so none of them
+    // can smuggle an address past the comparisons. An unparsable message
+    // fails closed.
+    let parsed = mail_parser::MessageParser::default()
+        .parse(bytes)
+        .ok_or_else(|| "frozen MIME failed RFC 5322 parsing".to_string())?;
+    use mail_parser::HeaderName;
+    let header_value = |wanted: &[HeaderName<'static>]| -> Vec<String> {
+        parsed
+            .headers()
             .iter()
-            .filter(|(header, _)| header == name)
-            .flat_map(|(_, value)| extract_addresses(value))
+            .filter(|header| wanted.iter().any(|name| name == &header.name))
+            .flat_map(|header| addresses_of(header.value()))
             .collect()
     };
 
     // Bcc must never appear as a header in the frozen MIME (§3b) — and the
     // standardized resent variant is just as much of a disclosure channel.
-    if headers
+    if parsed
+        .headers()
         .iter()
-        .any(|(name, _)| name == "bcc" || name == "resent-bcc")
+        .any(|header| matches!(header.name, HeaderName::Bcc | HeaderName::ResentBcc))
     {
         return Err("frozen MIME must not carry a Bcc or Resent-Bcc header".to_string());
     }
 
-    let from_addresses = header_value("from");
+    let from_addresses = header_value(&[HeaderName::From]);
     let identity_lower = identity_address.to_ascii_lowercase();
     // From is bound to EXACTLY the granted identity (review R2-7): a second
     // mailbox riding the From list is both an impersonation surface and a
@@ -149,9 +160,9 @@ pub fn verify_mime(
         ));
     }
 
-    let header_recipients: BTreeSet<String> = header_value("to")
+    let header_recipients: BTreeSet<String> = header_value(&[HeaderName::To])
         .into_iter()
-        .chain(header_value("cc"))
+        .chain(header_value(&[HeaderName::Cc]))
         .collect();
     let envelope_visible: BTreeSet<String> = envelope
         .recipients
@@ -167,27 +178,26 @@ pub fn verify_mime(
         .collect();
 
     // Bcc envelope addresses must not leak into ANY transmitted
-    // mailbox-bearing header (review R2-7): To/Cc, Reply-To, From/Sender,
-    // Return-Path, and every resent variant all disclose the address to
-    // visible recipients. The scan is structural — each header value is
-    // parsed as an address list, never substring-matched. The granted
+    // mailbox-bearing header (reviews R2-7/R3-5): To/Cc, Reply-To,
+    // From/Sender, Return-Path, and every resent variant all disclose the
+    // address to visible recipients. The scan is structural — RFC 5322
+    // parsed, so groups/comments/quoting cannot evade it. The granted
     // identity itself is exempt: a self-bcc (archive copy) discloses
     // nothing, since the sender's own address is already visible by
     // construction.
-    let transmitted_addresses: BTreeSet<String> = [
-        "to",
-        "cc",
-        "reply-to",
-        "from",
-        "sender",
-        "return-path",
-        "resent-to",
-        "resent-cc",
-        "resent-from",
-        "resent-sender",
-    ]
-    .iter()
-    .flat_map(|name| header_value(name))
+    let transmitted_addresses: BTreeSet<String> = header_value(&[
+        HeaderName::To,
+        HeaderName::Cc,
+        HeaderName::ReplyTo,
+        HeaderName::From,
+        HeaderName::Sender,
+        HeaderName::ReturnPath,
+        HeaderName::ResentTo,
+        HeaderName::ResentCc,
+        HeaderName::ResentFrom,
+        HeaderName::ResentSender,
+    ])
+    .into_iter()
     .collect();
     if let Some(leaked) = envelope_bcc
         .iter()
@@ -401,6 +411,27 @@ mod tests {
             return_path_leak,
             &sha256_hex(return_path_leak),
             return_path_leak.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // RFC 5322 GROUP syntax must not evade the scan (review R3-5): the
+        // bcc address hidden inside a display-group still leaks.
+        let group_leak = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nReply-To: hidden:archive@acme.example;\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            group_leak,
+            &sha256_hex(group_leak),
+            group_leak.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // Comment/quoting obfuscation must not evade it either.
+        let comment_leak = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nResent-Cc: (archival) \"a\" <archive@acme.example>\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            comment_leak,
+            &sha256_hex(comment_leak),
+            comment_leak.len() as u64,
             "ops@acme.example",
             &bcc_envelope,
         )

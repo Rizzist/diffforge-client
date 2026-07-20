@@ -1372,7 +1372,8 @@ impl EmailJournal {
                 return Err(format!("unknown settlement audit slug: {audit_slug}"));
             }
         }
-        self.connection
+        let updated = self
+            .connection
             .execute(
                 "UPDATE email_send_events
                  SET outbox_state = 'acked', cloud_acked_at_ms = ?2, cloud_applied = ?3,
@@ -1380,8 +1381,17 @@ impl EmailJournal {
                  WHERE status_event_id = ?1",
                 params![status_event_id, now_ms(), applied as i64, audit],
             )
-            .map(|_| ())
-            .map_err(|error| format!("email send event ack record failed: {error}"))
+            .map_err(|error| format!("email send event ack record failed: {error}"))?;
+        // Zero rows means the journal holds NO such event (review R3-8): the
+        // ack was not persisted anywhere, so this must be an error — the
+        // caller's durable outbox row has to survive and retry, never be
+        // deleted on the strength of an UPDATE that matched nothing.
+        if updated == 0 {
+            return Err(format!(
+                "settlement ack matched no journal event: {status_event_id}"
+            ));
+        }
+        Ok(())
     }
 
     /// Events not yet cloud-acked for ONE (send_job_id, generation), oldest
@@ -1682,13 +1692,31 @@ impl EmailJournal {
                     )
                     .map_err(|error| format!("email recovery recipient force failed: {error}"))?;
             }
-            let (outcome, error_class) = if persisted_success {
+            let status_event_id = uuid::Uuid::now_v7().to_string();
+            let recipients = self.load_recipients(&job.send_job_id, job.generation)?;
+            // The FULL-durable recipient rows decide the job outcome BEFORE
+            // any blanket classification (review R3-2): a crash after the
+            // final recipient's durable 2xx (job phase still `data_started`)
+            // recovers as `submitted`, and a settled mix with no pending
+            // rows recovers `partially_submitted` — delivery_unknown is
+            // reserved for genuinely unknowable (pending) recipients.
+            let any_pending = recipients
+                .iter()
+                .any(|recipient| recipient.status == "pending");
+            let any_submitted = recipients
+                .iter()
+                .any(|recipient| recipient.status == "submitted");
+            let all_submitted = !recipients.is_empty()
+                && recipients
+                    .iter()
+                    .all(|recipient| recipient.status == "submitted");
+            let (outcome, error_class) = if persisted_success || all_submitted {
                 ("submitted", "none")
+            } else if !recipients.is_empty() && !any_pending && any_submitted {
+                ("partially_submitted", "none")
             } else {
                 ("delivery_unknown", "delivery_unknown")
             };
-            let status_event_id = uuid::Uuid::now_v7().to_string();
-            let recipients = self.load_recipients(&job.send_job_id, job.generation)?;
             // Per-recipient KNOWN outcomes survive recovery (review R2-3): a
             // recipient whose FULL-durability row already carries an outcome
             // (submitted/bounced/deferred/…) reports THAT outcome; only

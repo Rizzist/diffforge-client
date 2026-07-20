@@ -342,13 +342,15 @@ impl EmailCloudTransport for WsCloudTransport {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        // Generation is REQUIRED and bounded u32 (§1): a missing or
-        // out-of-range value must never silently become 0 or wrap — that
-        // would mint a different idempotency identity than the payload.
+        // Generation is REQUIRED, bounded u32, and starts at 1 (§1): a
+        // missing, zero, or out-of-range value must never silently default
+        // or wrap — that would mint a different idempotency identity than
+        // the payload.
         let generation = payload
             .get("generation")
             .and_then(Value::as_u64)
             .and_then(|raw| u32::try_from(raw).ok())
+            .filter(|generation| *generation >= 1)
             .ok_or_else(|| "send event payload missing or out-of-range generation".to_string())?;
         let status_event_id = payload
             .get("status_event_id")

@@ -231,12 +231,14 @@ pub fn save_profile(
     request: &ProfileSaveRequest,
 ) -> Result<SenderProfile, String> {
     request.validate()?;
-    let profile_ref = request.profile_ref.clone().unwrap_or_else(|| {
-        format!(
-            "profile-{}",
-            &uuid::Uuid::now_v7().simple().to_string()[..12]
-        )
-    });
+    // The FULL UUIDv7 rides the ref (review R3-1): the first 12 hex digits
+    // are just the millisecond timestamp, so a truncated form collides for
+    // profiles created in the same millisecond and the upsert's ON CONFLICT
+    // would silently overwrite the first.
+    let profile_ref = request
+        .profile_ref
+        .clone()
+        .unwrap_or_else(|| format!("profile-{}", uuid::Uuid::now_v7().simple()));
     let existing = load_row(journal, &profile_ref)?;
     let (secret_locator, has_credentials) = match request.secret.as_deref() {
         None => existing
@@ -508,6 +510,31 @@ mod tests {
         assert!(summary.contains("\"has_secret\":true"));
         let _ = delete_profile(&mut journal, &stack, "profile-x").unwrap();
         assert!(list_profiles(&journal).unwrap().is_empty());
+    }
+
+    #[test]
+    fn minted_profile_refs_never_collide_within_a_millisecond() {
+        // Review R3-1: the ref carries the FULL UUIDv7 — a burst of creates
+        // inside one millisecond must yield distinct refs, and the upsert
+        // must never silently overwrite an existing profile.
+        let mut journal = temp_journal();
+        let stack = CredentialStack::new();
+        let request = ProfileSaveRequest::from_value(&serde_json::json!({
+            "mode": "provider",
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+        }))
+        .unwrap();
+        let mut refs = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            refs.insert(
+                save_profile(&mut journal, &stack, &request)
+                    .unwrap()
+                    .profile_ref,
+            );
+        }
+        assert_eq!(refs.len(), 64, "same-millisecond refs must not collide");
+        assert_eq!(list_profiles(&journal).unwrap().len(), 64);
     }
 
     #[test]

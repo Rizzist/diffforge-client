@@ -776,6 +776,41 @@ fn killpoint_scenario_runner() {
         format!("{send_job_id}:{generation}"),
     )
     .unwrap();
+    if stage == "native_send" {
+        // Native crash matrix: full native run against the in-process sink
+        // (killpoint post_native_recipient_submitted fires after the FULL
+        // per-recipient outcome write).
+        use crate::email::mx::{FakeMxResolver, MxResolution, MxTarget};
+        let fingerprint = seed_native_dkim_key(&journal, &memory, "acme.example");
+        seed_native_evidence(&journal);
+        let transport = FakeCloudTransport::new();
+        transport.put_mime("mime://job", TEST_MIME.to_vec());
+        let mut grant = leased_grant_for(
+            "mime://job",
+            TEST_MIME,
+            "bounce@acme.example",
+            "ops@acme.example",
+            &[("to", "billing@partner.example")],
+            "native",
+        );
+        if let PrepareOutcome::Leased(inner) = &mut grant {
+            inner.native.as_mut().unwrap().dkim_pubkey_fingerprint = fingerprint;
+        }
+        transport.script_prepare(Ok(grant));
+        let mx = FakeMxResolver::new();
+        mx.set(
+            "partner.example",
+            MxResolution::Targets(vec![MxTarget {
+                host: "localhost".to_string(),
+                priority: 10,
+            }]),
+        );
+        let mut submission_deps = deps(&transport, &memory);
+        submission_deps.native_mx = Some(&mx);
+        submission_deps.native_port_override = Some(sink.port);
+        let _ = run_send_job(&submission_deps, &mut journal, &send_job_id, generation);
+        return;
+    }
     let transport = FakeCloudTransport::new();
     scripted_prepare(&transport, "provider");
     let _ = run_send_job(
@@ -2714,4 +2749,321 @@ fn device_minted_contract_ids_are_uuidv7() {
     );
     let parsed = uuid::Uuid::parse_str(&run.preflight_id).unwrap();
     assert_eq!(parsed.get_version_num(), 7, "preflight_id is UUIDv7");
+    // Minted profile refs carry the FULL UUIDv7 (review R3-1).
+    let stack = crate::email::credentials::CredentialStack::new();
+    let request = profiles::ProfileSaveRequest::from_value(&json!({
+        "mode": "provider",
+        "smtp_host": "smtp.example.com",
+        "smtp_port": 587,
+    }))
+    .unwrap();
+    let profile = profiles::save_profile(&mut journal, &stack, &request).unwrap();
+    let suffix = profile
+        .profile_ref
+        .strip_prefix("profile-")
+        .expect("profile- prefix");
+    let parsed = uuid::Uuid::parse_str(suffix).expect("full uuid suffix");
+    assert_eq!(parsed.get_version_num(), 7, "profile_ref carries full UUIDv7");
+}
+
+// =====================================================================
+// Round-3 regressions: row-decided recovery outcomes (R3-2), post-renewal
+// fact rechecks (R3-3), zero-row acks (R3-8), outbox-arm ordering (R3-8),
+// production collect_observations (coverage), and the native killpoint in
+// the subprocess crash matrix (coverage).
+// =====================================================================
+
+#[test]
+fn crash_matrix_native_recipient_submitted_recovers_submitted() {
+    // The crash lands AFTER the sole recipient's FULL-durable submitted row
+    // (killpoint post_native_recipient_submitted) with the job still at
+    // phase data_started — recovery must trust the durable rows and settle
+    // the job `submitted`, never delivery_unknown (reviews R2-3/R3-2).
+    run_killpoint_case(&KillpointExpectation {
+        killpoint: "post_native_recipient_submitted",
+        stage: "native_send",
+        recovery_outcome: Some("submitted"),
+        already_terminal: None,
+        data_started: true,
+        sink_abort_at_body_byte: None,
+    });
+}
+
+#[test]
+fn recovery_outcome_is_decided_by_durable_recipient_rows() {
+    // Review R3-2: all recipients durably submitted ⇒ job submitted even at
+    // phase data_started; a settled mix with no pending rows ⇒
+    // partially_submitted.
+    let dir = temp_dir("recovery-rows");
+    let mut journal = open_journal(&dir);
+    let recipient = |job: &str, suffix: &str| RecipientRow {
+        recipient_ref: format!("r{suffix}"),
+        role: "to".to_string(),
+        address: format!("user{suffix}@partner.example"),
+        domain: "partner.example".to_string(),
+        status: "pending".to_string(),
+        smtp_code: None,
+        enhanced_code: None,
+        response_class: None,
+        response_sanitized: Some(job.to_string()),
+        retry_at_ms: None,
+    };
+
+    // Job A: BOTH recipients durably submitted, crash before aggregation.
+    journal
+        .record_send_command("job-all", 1, "cmd-all", "bind-1", "hash-all", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    journal
+        .seed_recipients(
+            "job-all",
+            1,
+            &[recipient("job-all", "1"), recipient("job-all", "2")],
+        )
+        .unwrap();
+    journal.mark_data_started("job-all", 1).unwrap();
+    for suffix in ["1", "2"] {
+        journal
+            .record_recipient_outcome_full(
+                "job-all",
+                1,
+                &format!("r{suffix}"),
+                "submitted",
+                Some(250),
+                Some("accepted"),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    // Job B: settled mix (submitted + bounced), no pending rows.
+    journal
+        .record_send_command("job-mix", 1, "cmd-mix", "bind-1", "hash-mix", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    journal
+        .seed_recipients(
+            "job-mix",
+            1,
+            &[recipient("job-mix", "1"), recipient("job-mix", "2")],
+        )
+        .unwrap();
+    journal.mark_data_started("job-mix", 1).unwrap();
+    journal
+        .record_recipient_outcome_full(
+            "job-mix",
+            1,
+            "r1",
+            "submitted",
+            Some(250),
+            Some("accepted"),
+            None,
+            None,
+        )
+        .unwrap();
+    journal
+        .record_recipient_outcome_full(
+            "job-mix",
+            1,
+            "r2",
+            "bounced",
+            Some(550),
+            Some("rejected_permanent"),
+            None,
+            None,
+        )
+        .unwrap();
+
+    let settled = journal.recover_after_restart("device-test").unwrap();
+    let outcome_of = |job: &str| {
+        settled
+            .iter()
+            .find(|(job_id, _, _)| job_id == job)
+            .map(|(_, _, outcome)| outcome.clone())
+            .unwrap()
+    };
+    assert_eq!(outcome_of("job-all"), "submitted");
+    assert_eq!(outcome_of("job-mix"), "partially_submitted");
+    // Per-recipient states report the durable truth.
+    let (event, _) = journal.load_settled_event("job-mix", 1).unwrap().unwrap();
+    let per_recipient = event.payload["per_recipient"].as_array().unwrap();
+    assert!(per_recipient
+        .iter()
+        .any(|entry| entry["recipient_ref"] == "r1" && entry["delivery_state"] == "submitted"));
+    assert!(per_recipient
+        .iter()
+        .any(|entry| entry["recipient_ref"] == "r2" && entry["delivery_state"] == "bounced"));
+}
+
+#[test]
+fn native_expired_renewal_expiry_blocks_data() {
+    use super::cloud_transport::RenewOutcome;
+    use crate::email::mx::{FakeMxResolver, MxResolution, MxTarget};
+
+    // Review R3-3: the AUTHORITATIVE fact check runs AFTER the pre-DATA
+    // renewal returns. A renewal that comes back already expired must abort
+    // before DATA — under the old order (facts before renewal) the stale
+    // pre-renewal expiry would have been accepted.
+    let sink = SmtpSink::start(SinkMode::Plain, SinkBehavior::default());
+    let dir = temp_dir("native-expired-renewal");
+    let mut journal = open_journal(&dir);
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink.port);
+    let fingerprint = seed_native_dkim_key(&journal, &memory, "acme.example");
+    seed_native_evidence(&journal);
+
+    let transport = FakeCloudTransport::new();
+    transport.put_mime("mime://job", TEST_MIME.to_vec());
+    let mut grant = leased_grant_for(
+        "mime://job",
+        TEST_MIME,
+        "bounce@acme.example",
+        "ops@acme.example",
+        &[("to", "billing@partner.example")],
+        "native",
+    );
+    if let PrepareOutcome::Leased(inner) = &mut grant {
+        inner.native.as_mut().unwrap().dkim_pubkey_fingerprint = fingerprint;
+    }
+    transport.script_prepare(Ok(grant));
+    // Pre-SMTP renewal: healthy. Recipient pre-DATA renewal: returns an
+    // expiry already in the past.
+    transport.script_renew(Ok(RenewOutcome::Extended {
+        expires_at_ms: now_plus_two_minutes(),
+    }));
+    transport.script_renew(Ok(RenewOutcome::Extended {
+        expires_at_ms: now_plus_two_minutes() - 240_000,
+    }));
+    let mx = FakeMxResolver::new();
+    mx.set(
+        "partner.example",
+        MxResolution::Targets(vec![MxTarget {
+            host: "localhost".to_string(),
+            priority: 10,
+        }]),
+    );
+    let mut submission_deps = deps(&transport, &memory);
+    submission_deps.native_mx = Some(&mx);
+    submission_deps.native_port_override = Some(sink.port);
+
+    let result = run_send_job(&submission_deps, &mut journal, &send_job_id, generation).unwrap();
+    assert_eq!(
+        result,
+        SubmissionResult::Abandoned("native_preflight_recheck:lease".to_string())
+    );
+    assert_eq!(sink.state().messages.len(), 0, "DATA never crossed");
+    let job = journal.load_job(&send_job_id, generation).unwrap().unwrap();
+    assert!(!job.data_started);
+    assert!(job.terminal_outcome.is_none());
+}
+
+#[test]
+fn settlement_ack_for_unknown_event_is_an_error() {
+    use super::remote::email_apply_send_event_cloud_ack;
+    // Review R3-8: a zero-row UPDATE (no such journal event) must be an
+    // error so the caller's outbox row survives — not silent success.
+    let dir = temp_dir("ack-zero-row");
+    let mut journal = open_journal(&dir);
+    let valid = json!({
+        "contract": contract::EMAIL_CONTRACT,
+        "schema_version": 1,
+        "status_event_id": "evt-ghost",
+        "applied": true,
+    });
+    assert!(email_apply_send_event_cloud_ack(
+        &mut journal,
+        &json!({"status_event_id": "evt-ghost"}),
+        &valid
+    )
+    .is_err());
+    // audit: null is malformed end-to-end (review R3-7) — the event stays
+    // unacked.
+    journal
+        .record_send_command("job-null", 1, "cmd-null", "bind-1", "hash-null", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    let event = PendingEventRow {
+        status_event_id: "evt-null".to_string(),
+        send_job_id: "job-null".to_string(),
+        generation: 1,
+        payload: json!({"phase": "settled", "status_event_id": "evt-null"}),
+    };
+    journal
+        .journal_terminal("job-null", 1, "submitted", &event)
+        .unwrap();
+    let null_audit = json!({
+        "contract": contract::EMAIL_CONTRACT,
+        "schema_version": 1,
+        "status_event_id": "evt-null",
+        "applied": false,
+        "audit": serde_json::Value::Null,
+    });
+    assert!(email_apply_send_event_cloud_ack(
+        &mut journal,
+        &json!({"status_event_id": "evt-null"}),
+        &null_audit
+    )
+    .is_err());
+    assert!(journal
+        .pending_events()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.status_event_id == "evt-null"));
+}
+
+#[test]
+fn outbox_email_arm_propagates_before_ack_deletion() {
+    // Review R3-8 routing: the cloud_mcp outbox arm must propagate email ack
+    // failures with `?` BEFORE the acked-update/delete statements run —
+    // source-ordering guard in the repo's established wiring-test style.
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cloud_mcp.rs"),
+    )
+    .expect("cloud_mcp.rs readable");
+    let start = source
+        .find("fn cloud_mcp_outbox_mark_acked")
+        .expect("mark_acked present");
+    let body = &source[start..start + 8_000];
+    let email_arm = body
+        .find("email_record_send_event_cloud_ack(&payload, response)?")
+        .expect("email arm must propagate with ?");
+    let acked_update = body.find("SET status='acked'").expect("acked update present");
+    assert!(
+        email_arm < acked_update,
+        "email ack failures must propagate BEFORE the outbox row is acked/deleted"
+    );
+}
+
+#[test]
+fn collect_observations_runs_local_checks_without_network() {
+    // Coverage (R3): the PRODUCTION observation collector executes — local
+    // checks only, so nothing touches the network.
+    let dir = temp_dir("collect-obs");
+    let journal = open_journal(&dir);
+    let credentials = crate::email::credentials::CredentialStack::new();
+    let requested: Vec<String> = ["journal_health", "credential_store", "helo_hostname"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let observations = crate::email::preflight::collect_observations(
+        &journal,
+        &credentials,
+        "profile-test",
+        "acme.example",
+        &requested,
+    );
+    assert_eq!(observations.journal_healthy, Some(true));
+    assert!(observations.credential_store_healthy.is_some());
+    assert!(
+        observations.helo_unavailable.is_some(),
+        "HELO honestly reports unavailable"
+    );
+    // Non-requested probes stay unobserved.
+    assert!(observations.egress_ip.is_none());
+    assert!(observations.clock_skew_ms.is_none());
+    assert!(observations.spf_authorizes_egress.is_none());
+    assert!(observations.port25_open.is_none());
 }

@@ -268,7 +268,18 @@ pub fn collect_observations(
             } else {
                 None
             };
-            let _ = record_egress_observation(journal, &ip.to_string(), port25, "local_interface");
+            if let Err(error) =
+                record_egress_observation(journal, &ip.to_string(), port25, "local_interface")
+            {
+                // A journal that cannot record evidence is unhealthy — the
+                // failure PROPAGATES into the run's result (review R3-4)
+                // instead of being discarded while stale rows keep serving.
+                observations.journal_healthy = Some(false);
+                crate::log_terminal_status_event(
+                    "backend.email.egress_observation_write_failed",
+                    serde_json::json!({ "error": error }),
+                );
+            }
         }
     }
 
@@ -296,6 +307,8 @@ pub fn collect_observations(
         || requested(requested_checks, "static_ip")
         || requested(requested_checks, "ptr_fcrdns")
         || requested(requested_checks, "dnsbl_clean")
+        || requested(requested_checks, "spf_published")
+        || requested(requested_checks, "port25_egress")
     {
         if let Some((latest_ip, _)) = egress_history.first() {
             observations.egress_ip = latest_ip.parse().ok();
@@ -306,9 +319,12 @@ pub fn collect_observations(
         }
     }
     if requested(requested_checks, "port25_egress") {
+        // ONLY the newest observation's verdict counts (review R3-4): an
+        // older non-NULL result — possibly from a different IP — must never
+        // shadow a currently-unobservable probe. Newest NULL = unobserved.
         observations.port25_open = egress_history
-            .iter()
-            .find_map(|(_, port25_open)| *port25_open);
+            .first()
+            .and_then(|(_, port25_open)| *port25_open);
     }
 
     // ---- DNS-backed checks ----
@@ -326,8 +342,8 @@ pub fn collect_observations(
         collect_dns_observations(journal, domain, requested_checks, &mut observations);
     }
 
-    // clock_skew and seed_* stay unobserved here: the skew reference and the
-    // seed round-trip are cloud/operator-owned (pending until they run).
+    // seed_* stays unobserved here: the seed round-trip is operator-owned
+    // (pending until it runs).
     observations
 }
 
@@ -487,10 +503,23 @@ fn collect_dns_observations(
                 );
                 observations.dnsbl_listed = match resolver.ipv4_lookup(query).await {
                     Ok(lookup) => Some(lookup.iter().next().is_some()),
-                    // NXDOMAIN / NODATA = not listed; transport errors stay
-                    // unobserved (pending) rather than lying either way.
-                    Err(error) if error.is_no_records_found() => Some(false),
-                    Err(_) => None,
+                    // Only an AUTHORITATIVE empty answer means not listed
+                    // (review R3-10, mirroring mx.rs): NXDOMAIN/NODATA →
+                    // clean; SERVFAIL/REFUSED/other codes are transport
+                    // failures and stay unobserved rather than lying.
+                    Err(error) => {
+                        use mail_auth::hickory_resolver::proto::op::ResponseCode;
+                        use mail_auth::hickory_resolver::proto::ProtoErrorKind;
+                        match error.kind() {
+                            ProtoErrorKind::NoRecordsFound(no_records) => {
+                                match no_records.response_code {
+                                    ResponseCode::NoError | ResponseCode::NXDomain => Some(false),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
                 };
             }
         }

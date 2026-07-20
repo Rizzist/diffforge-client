@@ -4875,6 +4875,7 @@ dependencies = [
  "libc",
  "lzma-rs",
  "mail-auth",
+ "mail-parser",
  "notify",
  "objc2",
  "objc2-app-kit",

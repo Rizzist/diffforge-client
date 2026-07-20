@@ -749,34 +749,26 @@ fn run_native_transaction(
             recheck_facts: &recheck,
         };
         let before_data = || -> Result<(), String> {
-            // §10.2: every DATA is preceded by FRESH fact rechecks — source
-            // IP, lease, DKIM key, port-25 — evaluated NOW, not at run start
-            // (review R2-2). fresh_facts fails closed on missing evidence.
-            let facts = fresh_facts();
-            if !facts.all_ok() {
-                let check = facts.first_failure().unwrap_or("unknown");
-                let reason = format!("native_preflight_recheck:{check}");
-                *hook_abort.borrow_mut() = Some(reason.clone());
-                return Err(reason);
-            }
-            let mut guard = journal_cell.borrow_mut();
-            let journal: &mut EmailJournal = &mut *guard;
-            let job = journal
-                .load_job(&send_job_id, generation)
-                .map_err(|error| format!("native pre-DATA check failed: {error}"))?
-                .ok_or_else(|| "job vanished before DATA".to_string())?;
-            // Cancel honored strictly before the FIRST data_started.
-            if job.cancel_requested && !job.data_started {
-                *hook_abort.borrow_mut() = Some("cancel_requested".to_string());
-                return Err("cancel_requested".to_string());
-            }
-            if job.superseded {
-                *hook_abort.borrow_mut() = Some("superseded".to_string());
-                return Err("superseded".to_string());
-            }
-            let first_crossing = !job.data_started;
+            let first_crossing = {
+                let mut guard = journal_cell.borrow_mut();
+                let journal: &mut EmailJournal = &mut *guard;
+                let job = journal
+                    .load_job(&send_job_id, generation)
+                    .map_err(|error| format!("native pre-DATA check failed: {error}"))?
+                    .ok_or_else(|| "job vanished before DATA".to_string())?;
+                // Cancel honored strictly before the FIRST data_started.
+                if job.cancel_requested && !job.data_started {
+                    *hook_abort.borrow_mut() = Some("cancel_requested".to_string());
+                    return Err("cancel_requested".to_string());
+                }
+                if job.superseded {
+                    *hook_abort.borrow_mut() = Some("superseded".to_string());
+                    return Err("superseded".to_string());
+                }
+                !job.data_started
+            };
             // Renew the fence one last time before this recipient's DATA.
-            match deps_transport.lease_renew(
+            let renewed_expiry = match deps_transport.lease_renew(
                 &send_job_id,
                 generation,
                 &grant.lease_id,
@@ -785,13 +777,8 @@ fn run_native_transaction(
                 SendPhase::MailFromSent.as_str(),
             ) {
                 Ok(RenewOutcome::Extended { expires_at_ms }) => {
-                    let _ = journal.extend_lease(
-                        &send_job_id,
-                        generation,
-                        grant.lease_epoch,
-                        expires_at_ms,
-                    );
                     lease_expires.set(expires_at_ms);
+                    expires_at_ms
                 }
                 Ok(RenewOutcome::Refused { slug, .. }) => {
                     *hook_abort.borrow_mut() = Some(format!("lease_{slug}"));
@@ -801,7 +788,23 @@ fn run_native_transaction(
                     *hook_abort.borrow_mut() = Some(format!("renew_failed:{error}"));
                     return Err(format!("renew_failed:{error}"));
                 }
+            };
+            // §10.2 / review R3-3: the AUTHORITATIVE fact recheck runs AFTER
+            // the renewal round-trip returned, immediately before DATA — a
+            // renewal can take seconds, so facts evaluated earlier (per-MX
+            // recheck) could be stale by now. fresh_facts re-derives lease
+            // validity (against the just-returned expiry), DKIM key, egress
+            // IP, and port-25 evidence, failing closed on anything missing.
+            let facts = fresh_facts();
+            if !facts.all_ok() {
+                let check = facts.first_failure().unwrap_or("unknown");
+                let reason = format!("native_preflight_recheck:{check}");
+                *hook_abort.borrow_mut() = Some(reason.clone());
+                return Err(reason);
             }
+            let mut guard = journal_cell.borrow_mut();
+            let journal: &mut EmailJournal = &mut *guard;
+            let _ = journal.extend_lease(&send_job_id, generation, grant.lease_epoch, renewed_expiry);
             journal
                 .mark_data_started(&send_job_id, generation)
                 .map_err(|error| format!("data_started journal failed: {error}"))?;

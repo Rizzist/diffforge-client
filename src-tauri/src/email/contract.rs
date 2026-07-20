@@ -460,7 +460,12 @@ pub fn parse_settlement_ack(
         .and_then(Value::as_bool)
         .ok_or_else(|| "settlement ack missing boolean applied".to_string())?;
     let audit = match value.get("audit") {
-        None | Some(Value::Null) => None,
+        None => None,
+        // §0.2: the ONLY semantic null in the contract is `coverage` — an
+        // explicit `audit: null` is malformed and fails closed (review R3-7).
+        Some(Value::Null) => {
+            return Err("settlement ack audit must be absent, never null".to_string());
+        }
         Some(Value::String(slug)) => {
             if !SETTLEMENT_AUDITS.contains(&slug.as_str()) {
                 return Err(format!("settlement ack audit slug fails closed: {slug}"));
@@ -778,6 +783,11 @@ mod tests {
         let mut bad_audit = good.clone();
         bad_audit["audit"] = json!("mystery");
         assert!(parse_settlement_ack(&bad_audit, "evt-1").is_err());
+        // §0.2: the only semantic null in the contract is `coverage` — an
+        // explicit audit: null is malformed, never treated as absent (R3-7).
+        let mut null_audit = good.clone();
+        null_audit["audit"] = Value::Null;
+        assert!(parse_settlement_ack(&null_audit, "evt-1").is_err());
         // A generic {ok:true} shape never acks anything.
         assert!(parse_settlement_ack(&json!({"ok": true}), "evt-1").is_err());
     }
