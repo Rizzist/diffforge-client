@@ -18,14 +18,14 @@ pub fn runtime_kind() -> &'static str {
     }
 }
 
-/// HONEST capability advertisement (review #11): the native MX/DKIM/rate
-/// engine exists and is fully tested, but it has no production caller in the
-/// send state machine yet — a leased native job cannot execute end-to-end.
-/// Until the lease-aware, journaled native worker is wired in, the device
-/// MUST NOT advertise native mode: advertising it would let the cloud lease
-/// native jobs that stall nonterminally and get reoffered forever. Flip this
-/// to true ONLY together with that wiring.
-pub const NATIVE_SEND_WIRED: bool = false;
+/// HONEST capability advertisement (review #11): native mode is advertised
+/// ONLY while the lease-aware, journaled native delivery worker is wired
+/// into the send state machine — `submission::run_native_transaction`
+/// executes leased native jobs end-to-end (journaled DKIM key, per-recipient
+/// MX transactions, §10.2 pre-DATA fact rechecks, §6b.1 aggregation). If
+/// that wiring is ever removed, this MUST flip back to false so the cloud
+/// never leases native jobs that would stall nonterminally.
+pub const NATIVE_SEND_WIRED: bool = true;
 
 /// The §8 `modes` list this device truthfully supports end-to-end.
 pub fn supported_modes() -> Vec<&'static str> {
@@ -91,17 +91,13 @@ mod tests {
     }
 
     #[test]
-    fn native_mode_stays_gated_until_worker_wired() {
-        // Regression tripwire: if someone flips NATIVE_SEND_WIRED they must
-        // ALSO wire the lease-aware journaled native path into
-        // submission::run_leased_send (which currently abandons native
-        // grants). This assertion makes the flip a conscious two-site change.
-        assert!(
-            !NATIVE_SEND_WIRED,
-            "flipping NATIVE_SEND_WIRED requires wiring the native delivery worker \
-             into the send state machine (submission.rs run_leased_send)"
-        );
-        assert_eq!(supported_modes(), vec!["provider"]);
+    fn native_mode_advertised_only_with_the_wired_worker() {
+        // Regression tripwire: NATIVE_SEND_WIRED and the state-machine
+        // wiring (submission::run_native_transaction, exercised end-to-end
+        // by email::tests::native_leased_job_executes_end_to_end) move
+        // together. If the wiring is removed, flip the const back to false.
+        assert!(NATIVE_SEND_WIRED);
+        assert_eq!(supported_modes(), vec!["provider", "native"]);
     }
 
     #[test]
