@@ -7354,6 +7354,14 @@ fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Res
             let _ = cloud_mcp_asset_mark_sync_acked_from_payload(Some(&payload), response);
         }
     }
+    if row.event_kind == crate::email::contract::EMAIL_SEND_EVENT_KIND {
+        // email-v1 §9.3: settlement acks (applied/audit incl. the
+        // stale_generation SUCCESS shape) are recorded on the journal's
+        // email_send_events row keyed by status_event_id.
+        if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
+            crate::email::remote::email_record_send_event_cloud_ack(&payload, response);
+        }
+    }
     if row.event_kind == "device_live_state_snapshot"
         || row.event_kind == "device_workspaces_snapshot"
         || cloud_mcp_device_live_unit_event_kind(&row.event_kind)
@@ -17693,6 +17701,16 @@ async fn cloud_mcp_apply_account_sync_resume_response(
                 .await;
         }
     }
+    // email-v1 resume flow: re-hand pending §9.2 events to the durable
+    // outbox, refresh sender capabilities/bindings, and run
+    // email_send_resume — reoffers replay through the journal-before-ack
+    // intake. Spawned so email backlog never delays the other domains.
+    {
+        let email_state = state.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::email::remote::email_account_sync_resume_hook(&email_state).await;
+        });
+    }
 }
 
 async fn cloud_mcp_apply_account_sync_resume_remote_commands(
@@ -17730,6 +17748,19 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
     for event in events {
         if !cloud_mcp_remote_command_matches_device(&event) {
             skipped_device += 1;
+            continue;
+        }
+        // email-v1 §9.4 journal-before-ack — the account-sync-resume REPLAY
+        // path takes the exact same email special-case ahead of the generic
+        // receipt claim + "received" ack as live intake.
+        if crate::email::remote::email_try_handle_remote_command(
+            state,
+            &event,
+            "account_sync_resume_replay",
+        )
+        .await
+        {
+            applied += 1;
             continue;
         }
         if cloud_mcp_handle_remote_command_cancel(state, &event).await {
@@ -20783,6 +20814,12 @@ pub(crate) fn cloud_mcp_ensure_remote_command_listener(
             if agent_account_push_handle_remote_status(&app, &event) {
                 continue;
             }
+            // email-v1 §9.4: cloud→device email events that are not remote
+            // commands (today the email_generation_retired ack that unlocks
+            // journal tombstone compaction).
+            if crate::email::remote::email_try_handle_ws_event(&event_kind, &event).await {
+                continue;
+            }
             if cloud_mcp_is_workspace_todo_wake_event(&event_kind, &event) {
                 let _ = app.emit(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, event.clone());
                 if event_kind != "remote_command_requested" {
@@ -20901,6 +20938,20 @@ pub(crate) fn cloud_mcp_ensure_remote_command_listener(
                 }
             }
             if !cloud_mcp_remote_command_matches_device(&event) {
+                continue;
+            }
+            // email-v1 §9.4 journal-before-ack: email wake/companion commands
+            // are special-cased AHEAD of the generic receipt claim and the
+            // generic "received" ack. The email intake durably journals
+            // (send_job_id, generation, command_id, payload_hash) BEFORE any
+            // ack leaves this device.
+            if crate::email::remote::email_try_handle_remote_command(
+                &state_clone,
+                &event,
+                "live_intake",
+            )
+            .await
+            {
                 continue;
             }
             if cloud_mcp_handle_remote_command_cancel(&state_clone, &event).await {
@@ -27142,6 +27193,12 @@ fn cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
             | "asset_upload"
             | "download_asset"
             | "asset_download"
+            // email-v1 §9.4 wake + companion commands: always rust-owned —
+            // the webview never handles them (journal-before-ack lives in
+            // the Rust intake special-case).
+            | "email_send"
+            | "email_credential_probe"
+            | "email_preflight_run"
             | "local_script_run"
             | "run_local_script"
             | "script_run"
@@ -28796,7 +28853,24 @@ fn cloud_mcp_desktop_device_profile() -> Value {
         })
         .clone();
     desktop_auth_apply_provisioning_profile_correlation(&mut profile);
+    // Fold the email capability block into the device profile so the cloud
+    // knows this device's email capability version / modes / credential
+    // health and can suppress `email_send` below its minimum (email-v1 §9.5).
+    // Recomputed per call (not cached) because credential-store health and
+    // runtime kind change at runtime.
+    if let Some(object) = profile.as_object_mut() {
+        object.insert(
+            "email_capability".to_string(),
+            crate::email::capability::email_capability_block(),
+        );
+    }
     profile
+}
+
+/// The stable device id used by the email stack for §9.2 events and
+/// preflight results (same identity the device profile presents).
+pub(crate) fn cloud_mcp_email_device_id() -> String {
+    cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"]).unwrap_or_default()
 }
 
 #[tauri::command(rename_all = "snake_case")]

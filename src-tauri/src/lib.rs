@@ -47,6 +47,7 @@ use tokio_tungstenite::{
 
 mod codex_config;
 pub mod coordination;
+pub mod email;
 mod energy_impact;
 
 const DEFAULT_API_BASE_URL: &str = "https://diffforge.ai/api";
@@ -3397,6 +3398,16 @@ fn log_terminal_diagnostic_event(app: &AppHandle, phase: &str, fields: Value) {
 }
 
 fn log_terminal_status_event(phase: &str, fields: Value) {
+    if daemon_mode_active() && phase.starts_with("backend.app_update.") {
+        // Release builds disable the JSONL diagnostic sinks, so headless BYOC
+        // daemons would otherwise have zero OTA visibility. systemd captures
+        // stderr into journald; keep it to one terse sanitized line per event.
+        eprintln!(
+            "diffforge-ota {} {}",
+            clean_terminal_telemetry_text(phase),
+            app_update_scrub_external_text(&fields.to_string())
+        );
+    }
     if !terminal_status_logging_enabled() {
         forward_terminal_status_to_energy_if_needed(phase, "backend", fields);
         return;
@@ -10508,6 +10519,11 @@ fn run_app(daemon: bool) {
             // Rust terminal/workspace evidence or a 45s timeout before being
             // reclassified.
             todo_store_startup_sweep(app.handle());
+            // email-v1 (plan §4.3): journal recovery runs before the cloud
+            // connection can deliver wake commands — crashed sends classify
+            // per the device crash matrix (terminal-if-persisted, else
+            // delivery_unknown; pre-DATA jobs stay resumable).
+            email::remote::email_startup_journal_recovery();
             register_terminal_input_event_listener(app);
             register_terminal_coordination_event_bridge(app);
 
@@ -10975,6 +10991,12 @@ fn run_app(daemon: bool) {
             ssh_profiles_list,
             ssh_profile_save,
             ssh_profile_delete,
+            email::ui::email_delivery_profiles_list,
+            email::ui::email_delivery_profile_save,
+            email::ui::email_delivery_profile_delete,
+            email::ui::email_delivery_profile_probe,
+            email::ui::email_delivery_capability_snapshot,
+            email::ui::email_delivery_preflight_local,
             app_enter_background,
             app_exit_background,
             app_background_mode_state,
