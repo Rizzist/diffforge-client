@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use lettre::address::Address;
 use lettre::transport::smtp::client::{Certificate, SmtpConnection, TlsParameters};
-use lettre::transport::smtp::extension::ClientId;
 use lettre::transport::smtp::commands::{Data, Mail, Quit, Rcpt};
+use lettre::transport::smtp::extension::ClientId;
 use lettre::transport::smtp::response::Response;
 use secrecy::{ExposeSecret, SecretString};
 
@@ -224,8 +224,8 @@ impl SmtpSession {
                 let mut connection =
                     SmtpConnection::connect(server, Some(target.timeout), &client_id, None, None)
                         .map_err(|error| {
-                            classify_transport_error(&error, ResponseClass::ConnectionFailed)
-                        })?;
+                        classify_transport_error(&error, ResponseClass::ConnectionFailed)
+                    })?;
                 if !connection.can_starttls() {
                     let _ = connection.command(Quit);
                     return Err(SmtpFailure::new(
@@ -352,7 +352,12 @@ impl SmtpSession {
             return Err(classify_response_failure(&response));
         }
 
-        super::email_killpoint("mid_data");
+        // Killpoint honesty (review #17): this client-side point fires after
+        // the server's 354 but BEFORE any body byte leaves the device — it is
+        // named for exactly that window. The true mid-body death is injected
+        // by the SINK (`mid_data_body`, test_support.rs), which aborts the
+        // process only after body bytes are on the wire.
+        super::email_killpoint("post_data_354_pre_body");
         let final_response = self.connection.message(message).map_err(|error| {
             let mut failure = classify_transport_error(&error, ResponseClass::ConnectionFailed);
             failure.at_or_after_data = true;
@@ -541,7 +546,10 @@ mod tests {
                 || Ok(()),
             )
             .unwrap_err();
-        assert!(error.at_or_after_data, "mid-DATA loss must mark the boundary");
+        assert!(
+            error.at_or_after_data,
+            "mid-DATA loss must mark the boundary"
+        );
     }
 
     #[test]

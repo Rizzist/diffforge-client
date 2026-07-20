@@ -10373,6 +10373,14 @@ fn run_app(daemon: bool) {
             startup_settings_initialize(app.handle());
             tray_click_settings_initialize(app.handle());
             cloud_mcp_register_sync_status_app(app.handle());
+            // email-v1 (plan §4.3 / review #1): journal recovery runs
+            // SYNCHRONOUSLY here, strictly before the remote-command
+            // listener and before any task can open the cloud connection.
+            // A crashed `data_started` generation is terminalized
+            // (delivery_unknown / submitted-if-persisted) before any wake
+            // command can possibly re-offer it — the DATA boundary is
+            // crossed at most once per generation.
+            email::remote::email_startup_journal_recovery();
             let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
             let cloud_mcp_app = app.handle().clone();
             if daemon {
@@ -10519,11 +10527,6 @@ fn run_app(daemon: bool) {
             // Rust terminal/workspace evidence or a 45s timeout before being
             // reclassified.
             todo_store_startup_sweep(app.handle());
-            // email-v1 (plan §4.3): journal recovery runs before the cloud
-            // connection can deliver wake commands — crashed sends classify
-            // per the device crash matrix (terminal-if-persisted, else
-            // delivery_unknown; pre-DATA jobs stay resumable).
-            email::remote::email_startup_journal_recovery();
             register_terminal_input_event_listener(app);
             register_terminal_coordination_event_bridge(app);
 

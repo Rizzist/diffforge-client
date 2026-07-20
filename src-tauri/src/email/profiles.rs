@@ -107,9 +107,7 @@ impl ProfileSaveRequest {
         let smtp_port = value
             .get("smtp_port")
             .and_then(Value::as_u64)
-            .map(|port| {
-                u16::try_from(port).map_err(|_| "smtp_port out of range".to_string())
-            })
+            .map(|port| u16::try_from(port).map_err(|_| "smtp_port out of range".to_string()))
             .transpose()?;
         // secret: only treated as touched when the key is present.
         let secret = match value.get("secret") {
@@ -187,9 +185,7 @@ fn map_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SenderProfile> {
         has_credentials: row.get::<_, i64>(10)? != 0,
         created_at_ms: row.get(11)?,
         last_test_at_ms: row.get(12)?,
-        last_test_ok: row
-            .get::<_, Option<i64>>(13)?
-            .map(|value| value != 0),
+        last_test_ok: row.get::<_, Option<i64>>(13)?.map(|value| value != 0),
     })
 }
 
@@ -235,10 +231,12 @@ pub fn save_profile(
     request: &ProfileSaveRequest,
 ) -> Result<SenderProfile, String> {
     request.validate()?;
-    let profile_ref = request
-        .profile_ref
-        .clone()
-        .unwrap_or_else(|| format!("profile-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
+    let profile_ref = request.profile_ref.clone().unwrap_or_else(|| {
+        format!(
+            "profile-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        )
+    });
     let existing = load_row(journal, &profile_ref)?;
     let (secret_locator, has_credentials) = match request.secret.as_deref() {
         None => existing
@@ -299,8 +297,7 @@ pub fn save_profile(
             ],
         )
         .map_err(|error| format!("email profile save failed: {error}"))?;
-    load_row(journal, &profile_ref)?
-        .ok_or_else(|| "email profile vanished after save".to_string())
+    load_row(journal, &profile_ref)?.ok_or_else(|| "email profile vanished after save".to_string())
 }
 
 pub fn delete_profile(
@@ -361,8 +358,8 @@ pub fn binding_profile_ref(
     let Some(raw) = journal.meta_get(BINDINGS_CACHE_META_KEY)? else {
         return Ok(None);
     };
-    let bindings: Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("bindings cache corrupt: {error}"))?;
+    let bindings: Value =
+        serde_json::from_str(&raw).map_err(|error| format!("bindings cache corrupt: {error}"))?;
     Ok(bindings.as_array().and_then(|items| {
         items.iter().find_map(|binding| {
             let matches = binding
@@ -426,7 +423,10 @@ mod tests {
         // store through the trait directly where needed. Profile tests use a
         // stack whose OS backend may be unavailable in CI, so secrets go
         // through set/resolve on the memory store via a stack-free path.
-        (CredentialStack::new(), std::sync::Arc::new(MemoryCredentialStore::new()))
+        (
+            CredentialStack::new(),
+            std::sync::Arc::new(MemoryCredentialStore::new()),
+        )
     }
 
     #[test]

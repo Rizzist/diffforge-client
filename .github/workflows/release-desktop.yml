@@ -48,7 +48,7 @@ jobs:
   # matrix vs the loopback SMTP sink, crash matrix, fixture shape tests)
   # runs on every release build across all three OSes. The frozen fixture
   # corpus is VENDORED at src-tauri/tests/contracts/email-v1 (pinned by
-  # email-v1.vendored.lock) and REQUIRED — corpus tests can never silently
+  # email-v1.lock) and REQUIRED — corpus tests can never silently
   # skip in CI. The frontend email contract tests run in the same job.
   # Nothing touches live infrastructure.
   email-tests:
@@ -91,7 +91,7 @@ jobs:
               outer.update(n.encode()); outer.update(b'\n')
               outer.update(hashlib.sha256(b).hexdigest().encode()); outer.update(b'\n')
           computed = outer.hexdigest()
-          with open('src-tauri/tests/contracts/email-v1.vendored.lock') as f:
+          with open('src-tauri/tests/contracts/email-v1.lock') as f:
               pinned = f.read().split()[0]
           if len(names) < 140:
               sys.exit(f'corpus unexpectedly small: {len(names)} files')

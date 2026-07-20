@@ -57,12 +57,20 @@ impl NativePreDataFacts {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeRecipientOutcome {
-    Submitted { smtp_code: u16 },
-    Deferred { retry_at_ms: Option<i64> },
-    Bounced { smtp_code: Option<u16> },
+    Submitted {
+        smtp_code: u16,
+    },
+    Deferred {
+        retry_at_ms: Option<i64>,
+    },
+    Bounced {
+        smtp_code: Option<u16>,
+    },
     DeliveryUnknown,
     /// Pre-DATA preflight recheck failed — abort without touching the wire.
-    PreflightAborted { check: &'static str },
+    PreflightAborted {
+        check: &'static str,
+    },
 }
 
 pub struct NativeDeps<'a> {
@@ -177,11 +185,8 @@ pub fn deliver_recipient(
                 return Ok(NativeRecipientOutcome::Submitted { smtp_code: code });
             }
             Err(failure) => {
-                let decision = classify_retry(
-                    failure.response_class,
-                    failure.at_or_after_data,
-                    attempt,
-                );
+                let decision =
+                    classify_retry(failure.response_class, failure.at_or_after_data, attempt);
                 match decision {
                     RetryDecision::DeliveryUnknown => {
                         // Never retransmit (§10.1). Terminal for this recipient.
@@ -412,7 +417,9 @@ mod tests {
 
     #[test]
     fn tls_failure_never_downgrades() {
-        assert!(tls_advertised_failure_never_downgrades(ResponseClass::TlsFailed));
+        assert!(tls_advertised_failure_never_downgrades(
+            ResponseClass::TlsFailed
+        ));
         assert!(!tls_advertised_failure_never_downgrades(
             ResponseClass::RejectedPermanent
         ));

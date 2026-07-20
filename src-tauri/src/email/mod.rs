@@ -49,20 +49,30 @@ pub mod ui;
 /// `EMAIL_V1_REQUIRE_FIXTURES=1` forces a failure.
 #[cfg(test)]
 pub fn test_fixtures_dir() -> Option<std::path::PathBuf> {
-    let candidate = std::env::var("EMAIL_V1_FIXTURES_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../cloud-diffforge/tests/contracts/email-v1")
-        });
-    if candidate.is_dir() {
-        return Some(candidate);
+    if let Ok(explicit) = std::env::var("EMAIL_V1_FIXTURES_DIR") {
+        let explicit = std::path::PathBuf::from(explicit);
+        if explicit.is_dir() {
+            return Some(explicit);
+        }
+        panic!(
+            "EMAIL_V1_FIXTURES_DIR set but not a directory: {}",
+            explicit.display()
+        );
+    }
+    // Sibling checkout first (source of truth), then the VENDORED corpus
+    // (src-tauri/tests/contracts/email-v1, pinned by email-v1.lock) so the
+    // suite runs the frozen shapes even without cloud-diffforge present.
+    for candidate in [
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../cloud-diffforge/tests/contracts/email-v1"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/contracts/email-v1"),
+    ] {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
     }
     if std::env::var("EMAIL_V1_REQUIRE_FIXTURES").as_deref() == Ok("1") {
-        panic!(
-            "EMAIL_V1_REQUIRE_FIXTURES=1 but fixture corpus missing at {}",
-            candidate.display()
-        );
+        panic!("EMAIL_V1_REQUIRE_FIXTURES=1 but no fixture corpus found");
     }
     None
 }

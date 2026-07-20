@@ -26,7 +26,10 @@ use super::profiles;
 pub fn run_email_cli(args: &[String]) -> i32 {
     match dispatch(args) {
         Ok(value) => {
-            println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).unwrap_or_default()
+            );
             0
         }
         Err(error) => {
@@ -45,7 +48,9 @@ fn dispatch(args: &[String]) -> Result<Value, String> {
         Some("dkim") => dkim_command(&mut journal, &credentials, &args[1..]),
         Some("preflight") => preflight_command(&journal, &args[1..]),
         Some("help") | None => Ok(usage()),
-        Some(other) => Err(format!("unknown subcommand `{other}`. Try `diffforge email help`.")),
+        Some(other) => Err(format!(
+            "unknown subcommand `{other}`. Try `diffforge email help`."
+        )),
     }
 }
 
@@ -121,9 +126,8 @@ fn vault_command(args: &[String]) -> Result<Value, String> {
             if EncryptedVault::exists_at(&path) {
                 return Err("vault already exists".to_string());
             }
-            let passphrase = read_secret_from_tty_or_stdin(
-                "Set a vault passphrase (read from stdin): ",
-            )?;
+            let passphrase =
+                read_secret_from_tty_or_stdin("Set a vault passphrase (read from stdin): ")?;
             let _ = EncryptedVault::create(&path, passphrase)?;
             Ok(json!({ "created": true, "vault_path": path.display().to_string() }))
         }

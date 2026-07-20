@@ -131,6 +131,14 @@ pub struct SinkBehavior {
     pub data_final_response: String,
     /// Drop the connection midway through receiving DATA (post-354).
     pub drop_mid_data: bool,
+    /// Crash-matrix hook (review #17): once the sink has observed this many
+    /// BODY bytes, fire `email_killpoint("mid_data_body")` — killing the
+    /// whole test subprocess while the CLIENT is still inside
+    /// `connection.message()` with real body bytes on the wire. This is the
+    /// honest mid-DATA killpoint: the death happens after partial body
+    /// transmission, not before the first byte. (The sink runs in-process in
+    /// the crash matrix, so the abort takes the client down with it.)
+    pub abort_process_at_body_byte: Option<usize>,
     /// Accept the full body then close WITHOUT any final response — the
     /// classic delivery_unknown producer.
     pub drop_after_data_before_response: bool,
@@ -152,6 +160,7 @@ impl Default for SinkBehavior {
             data_command_response: "354 end data with <CR><LF>.<CR><LF>".to_string(),
             data_final_response: "250 2.0.0 queued as sink-0001".to_string(),
             drop_mid_data: false,
+            abort_process_at_body_byte: None,
             drop_after_data_before_response: false,
             drop_after_greeting: false,
             advertise_starttls: true,
@@ -456,6 +465,13 @@ fn handle_connection(
                     break;
                 }
                 data.extend_from_slice(&raw_line);
+                if let Some(threshold) = behavior.abort_process_at_body_byte {
+                    if data.len() >= threshold {
+                        // Body bytes are ON THE WIRE and observed; kill the
+                        // process (client included) mid-DATA (review #17).
+                        crate::email::email_killpoint("mid_data_body");
+                    }
+                }
                 if behavior.drop_mid_data && data.len() > 64 {
                     return Ok(()); // simulate connection loss mid-DATA
                 }
@@ -696,6 +712,9 @@ mod tests {
         assert!(line.starts_with("221"));
         let state = sink.state();
         assert_eq!(state.connections, 1);
-        assert!(state.transcript.iter().any(|entry| entry.starts_with("EHLO")));
+        assert!(state
+            .transcript
+            .iter()
+            .any(|entry| entry.starts_with("EHLO")));
     }
 }

@@ -18,6 +18,24 @@ pub fn runtime_kind() -> &'static str {
     }
 }
 
+/// HONEST capability advertisement (review #11): the native MX/DKIM/rate
+/// engine exists and is fully tested, but it has no production caller in the
+/// send state machine yet — a leased native job cannot execute end-to-end.
+/// Until the lease-aware, journaled native worker is wired in, the device
+/// MUST NOT advertise native mode: advertising it would let the cloud lease
+/// native jobs that stall nonterminally and get reoffered forever. Flip this
+/// to true ONLY together with that wiring.
+pub const NATIVE_SEND_WIRED: bool = false;
+
+/// The §8 `modes` list this device truthfully supports end-to-end.
+pub fn supported_modes() -> Vec<&'static str> {
+    if NATIVE_SEND_WIRED {
+        vec!["provider", "native"]
+    } else {
+        vec!["provider"]
+    }
+}
+
 /// The `email_capability` object folded into
 /// `cloud_mcp_desktop_device_profile` (§28273 region). Content-free about
 /// individual profiles; the full capability list rides
@@ -28,13 +46,13 @@ pub fn email_capability_block() -> Value {
     let credential_store = super::credentials::cached_store_health().as_str();
     json!({
         "capability_version": EMAIL_CAPABILITY_VERSION,
-        "modes": ["provider", "native"],
+        "modes": supported_modes(),
         "runtime": runtime_kind(),
         "credential_store": credential_store,
-        // Native send is only offered when the runtime can stay reachable
-        // (daemon or background) — a foreground-only GUI cannot host the
-        // always-on wake path, though provider mode still works.
-        "native_capable": matches!(runtime_kind(), "daemon" | "background"),
+        // Native send additionally requires a runtime that can stay
+        // reachable (daemon or background) — a foreground-only GUI cannot
+        // host the always-on wake path, though provider mode still works.
+        "native_capable": NATIVE_SEND_WIRED && matches!(runtime_kind(), "daemon" | "background"),
     })
 }
 
@@ -55,14 +73,35 @@ mod tests {
             block["capability_version"].as_u64(),
             Some(EMAIL_CAPABILITY_VERSION)
         );
-        assert_eq!(
-            block["modes"],
-            json!(["provider", "native"]),
-            "both modes advertised"
-        );
+        // Honest advertisement (review #11): native is only listed when the
+        // native delivery worker is actually wired into the state machine.
+        if NATIVE_SEND_WIRED {
+            assert_eq!(block["modes"], json!(["provider", "native"]));
+        } else {
+            assert_eq!(
+                block["modes"],
+                json!(["provider"]),
+                "no phantom native mode"
+            );
+            assert_eq!(block["native_capable"], json!(false));
+        }
         assert!(block["runtime"].is_string());
         assert!(block["credential_store"].is_string());
         assert!(block["native_capable"].is_boolean());
+    }
+
+    #[test]
+    fn native_mode_stays_gated_until_worker_wired() {
+        // Regression tripwire: if someone flips NATIVE_SEND_WIRED they must
+        // ALSO wire the lease-aware journaled native path into
+        // submission::run_leased_send (which currently abandons native
+        // grants). This assertion makes the flip a conscious two-site change.
+        assert!(
+            !NATIVE_SEND_WIRED,
+            "flipping NATIVE_SEND_WIRED requires wiring the native delivery worker \
+             into the send state machine (submission.rs run_leased_send)"
+        );
+        assert_eq!(supported_modes(), vec!["provider"]);
     }
 
     #[test]

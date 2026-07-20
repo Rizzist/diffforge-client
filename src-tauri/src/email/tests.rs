@@ -52,14 +52,11 @@ fn seed_send_job(
         }),
     )
     .unwrap();
-    let ack = journal_command_before_ack(journal, &command, "live_intake").unwrap();
+    let ack = journal_command_before_ack(journal, &command, "live_intake", "device-test").unwrap();
     assert_eq!(ack.result, "accepted");
 
     let locator = memory
-        .set(
-            "profile-test",
-            &secrecy::SecretString::from("app-password"),
-        )
+        .set("profile-test", &secrecy::SecretString::from("app-password"))
         .unwrap();
     journal
         .connection()
@@ -90,6 +87,8 @@ fn deps<'a>(
         device_id: "device-test".to_string(),
         extra_root_cert_pem: Some(SINK_TLS_CERT_PEM.to_string()),
         connect_host_override: Some("127.0.0.1".to_string()),
+        native_mx: None,
+        native_port_override: None,
     }
 }
 
@@ -134,7 +133,15 @@ fn tombstone_law_survives_restart_and_gates_compaction() {
     {
         let mut journal = open_journal(&dir);
         journal
-            .record_send_command(send_job_id, 1, "email-send:job-ts:1", "bind-1", "hash-a", "test")
+            .record_send_command(
+                send_job_id,
+                1,
+                "email-send:job-ts:1",
+                "bind-1",
+                "hash-a",
+                "test",
+                |_| json!({"p": 1}),
+            )
             .unwrap();
         let event = PendingEventRow {
             status_event_id: "evt-settled".to_string(),
@@ -156,12 +163,31 @@ fn tombstone_law_survives_restart_and_gates_compaction() {
     {
         let mut journal = open_journal(&dir);
         let intake = journal
-            .record_send_command(send_job_id, 1, "email-send:job-ts:1", "bind-1", "hash-a", "test")
+            .record_send_command(
+                send_job_id,
+                1,
+                "email-send:job-ts:1",
+                "bind-1",
+                "hash-a",
+                "test",
+                |_| json!({"p": 1}),
+            )
             .unwrap();
-        assert!(matches!(intake, CommandIntake::Duplicate { .. } | CommandIntake::Tombstoned { .. }));
+        assert!(matches!(
+            intake,
+            CommandIntake::Duplicate { .. } | CommandIntake::Tombstoned { .. }
+        ));
         // Ack the settled event as cloud-received, then retire + compact.
         journal.record_cloud_ack("evt-settled", true, None).unwrap();
         assert!(journal.record_generation_retired(send_job_id, 1).unwrap());
+        // The intake-journaled `received` event still gates compaction until
+        // its own ack lands (review #4: it exists from the intake txn).
+        assert_eq!(journal.compact_retired_tombstones().unwrap(), 0);
+        for entry in journal.pending_events_for(send_job_id, 1).unwrap() {
+            journal
+                .record_cloud_ack(&entry.status_event_id, true, None)
+                .unwrap();
+        }
         assert_eq!(journal.compact_retired_tombstones().unwrap(), 1);
         // The tombstone ROW itself survives compaction (no time-based
         // deletion, dominance persists); the bulky rows are gone.
@@ -171,9 +197,20 @@ fn tombstone_law_survives_restart_and_gates_compaction() {
         assert!(journal.load_job(send_job_id, 1).unwrap().is_none());
         // Post-compaction redelivery is still refused.
         let intake = journal
-            .record_send_command(send_job_id, 1, "email-send:job-ts:1", "bind-1", "hash-a", "test")
+            .record_send_command(
+                send_job_id,
+                1,
+                "email-send:job-ts:1",
+                "bind-1",
+                "hash-a",
+                "test",
+                |_| json!({"p": 1}),
+            )
             .unwrap();
-        assert!(matches!(intake, CommandIntake::Tombstoned { .. } | CommandIntake::Duplicate { .. }));
+        assert!(matches!(
+            intake,
+            CommandIntake::Tombstoned { .. } | CommandIntake::Duplicate { .. }
+        ));
     }
 }
 
@@ -182,7 +219,7 @@ fn compaction_waits_for_event_acks_even_after_retirement() {
     let dir = temp_dir("compaction-ack");
     let mut journal = open_journal(&dir);
     journal
-        .record_send_command("job-c", 1, "email-send:job-c:1", "bind-1", "hash", "test")
+        .record_send_command("job-c", 1, "email-send:job-c:1", "bind-1", "hash", "test", |_| json!({"p": 1}))
         .unwrap();
     let event = PendingEventRow {
         status_event_id: "evt-c".to_string(),
@@ -190,11 +227,22 @@ fn compaction_waits_for_event_acks_even_after_retirement() {
         generation: 1,
         payload: json!({"phase": "settled"}),
     };
-    journal.journal_terminal("job-c", 1, "submitted", &event).unwrap();
+    journal
+        .journal_terminal("job-c", 1, "submitted", &event)
+        .unwrap();
     journal.record_generation_retired("job-c", 1).unwrap();
     // The settled event is not cloud-acked yet: compaction must hold.
     assert_eq!(journal.compact_retired_tombstones().unwrap(), 0);
-    journal.record_cloud_ack("evt-c", false, Some("stale_generation")).unwrap();
+    journal
+        .record_cloud_ack("evt-c", false, Some("stale_generation"))
+        .unwrap();
+    // The intake-journaled `received` event (review #4) still holds it.
+    assert_eq!(journal.compact_retired_tombstones().unwrap(), 0);
+    for entry in journal.pending_events_for("job-c", 1).unwrap() {
+        journal
+            .record_cloud_ack(&entry.status_event_id, true, None)
+            .unwrap();
+    }
     assert_eq!(journal.compact_retired_tombstones().unwrap(), 1);
 }
 
@@ -203,10 +251,14 @@ fn phase_ranks_never_regress() {
     let dir = temp_dir("phase");
     let mut journal = open_journal(&dir);
     journal
-        .record_send_command("job-p", 1, "cmd", "bind-1", "hash", "test")
+        .record_send_command("job-p", 1, "cmd", "bind-1", "hash", "test", |_| json!({"p": 1}))
         .unwrap();
-    assert!(journal.advance_phase("job-p", 1, SendPhase::Downloading).unwrap());
-    assert!(!journal.advance_phase("job-p", 1, SendPhase::Prepared).unwrap());
+    assert!(journal
+        .advance_phase("job-p", 1, SendPhase::Downloading)
+        .unwrap());
+    assert!(!journal
+        .advance_phase("job-p", 1, SendPhase::Prepared)
+        .unwrap());
     let job = journal.load_job("job-p", 1).unwrap().unwrap();
     assert_eq!(job.phase, "downloading");
     assert_eq!(job.phase_rank, 4);
@@ -217,12 +269,12 @@ fn cancel_window_closes_at_data_started() {
     let dir = temp_dir("cancel");
     let mut journal = open_journal(&dir);
     journal
-        .record_send_command("job-x", 1, "cmd", "bind-1", "hash", "test")
+        .record_send_command("job-x", 1, "cmd", "bind-1", "hash", "test", |_| json!({"p": 1}))
         .unwrap();
     assert!(journal.request_cancel("job-x", 1).unwrap().is_ok());
     // Reset for the second half: new job that reaches data_started.
     journal
-        .record_send_command("job-y", 1, "cmd-y", "bind-1", "hash-y", "test")
+        .record_send_command("job-y", 1, "cmd-y", "bind-1", "hash-y", "test", |_| json!({"p": 1}))
         .unwrap();
     journal.mark_data_started("job-y", 1).unwrap();
     let refused = journal.request_cancel("job-y", 1).unwrap();
@@ -235,7 +287,7 @@ fn recovery_classifies_per_crash_matrix() {
     let mut journal = open_journal(&dir);
     // Job A: data_started, nothing persisted → delivery_unknown.
     journal
-        .record_send_command("job-a", 1, "cmd-a", "bind-1", "hash-a", "test")
+        .record_send_command("job-a", 1, "cmd-a", "bind-1", "hash-a", "test", |_| json!({"p": 1}))
         .unwrap();
     journal
         .replace_recipients(
@@ -258,26 +310,34 @@ fn recovery_classifies_per_crash_matrix() {
     journal.mark_data_started("job-a", 1).unwrap();
     // Job B: data_completed with persisted 250 → terminal-if-persisted.
     journal
-        .record_send_command("job-b", 1, "cmd-b", "bind-1", "hash-b", "test")
+        .record_send_command("job-b", 1, "cmd-b", "bind-1", "hash-b", "test", |_| json!({"p": 1}))
         .unwrap();
     journal.mark_data_started("job-b", 1).unwrap();
     journal
-        .mark_data_completed("job-b", 1, Some(250), "accepted")
+        .mark_data_completed("job-b", 1, Some(250), "accepted", None)
         .unwrap();
     // Job C: pre-DATA (downloading) → left resumable.
     journal
-        .record_send_command("job-c", 1, "cmd-c", "bind-1", "hash-c", "test")
+        .record_send_command("job-c", 1, "cmd-c", "bind-1", "hash-c", "test", |_| json!({"p": 1}))
         .unwrap();
-    journal.advance_phase("job-c", 1, SendPhase::Downloading).unwrap();
+    journal
+        .advance_phase("job-c", 1, SendPhase::Downloading)
+        .unwrap();
 
     let settled = journal.recover_after_restart("device-test").unwrap();
     let by_job: std::collections::BTreeMap<String, String> = settled
         .iter()
         .map(|(job, _, outcome)| (job.clone(), outcome.clone()))
         .collect();
-    assert_eq!(by_job.get("job-a").map(String::as_str), Some("delivery_unknown"));
+    assert_eq!(
+        by_job.get("job-a").map(String::as_str),
+        Some("delivery_unknown")
+    );
     assert_eq!(by_job.get("job-b").map(String::as_str), Some("submitted"));
-    assert!(!by_job.contains_key("job-c"), "pre-DATA jobs stay resumable");
+    assert!(
+        !by_job.contains_key("job-c"),
+        "pre-DATA jobs stay resumable"
+    );
     // delivery_unknown is tombstoned — never auto-retried.
     assert!(journal.tombstone("job-a", 1).unwrap().is_some());
     // Pre-DATA job appears in resume summaries.
@@ -313,8 +373,13 @@ fn provider_happy_path_journals_before_reporting() {
     let transport = FakeCloudTransport::new();
     scripted_prepare(&transport, "provider");
 
-    let result = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation)
-        .unwrap();
+    let result = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
     assert_eq!(result, SubmissionResult::Terminal("submitted".to_string()));
 
     // The sink received exactly one TLS-protected authenticated message.
@@ -330,7 +395,10 @@ fn provider_happy_path_journals_before_reporting() {
     assert_eq!(job.terminal_outcome.as_deref(), Some("submitted"));
     assert_eq!(job.last_smtp_code, Some(250));
     assert!(job.data_started);
-    assert!(journal.tombstone(&send_job_id, generation).unwrap().is_some());
+    assert!(journal
+        .tombstone(&send_job_id, generation)
+        .unwrap()
+        .is_some());
 
     // Events walked the ladder in rank order and settled exactly once.
     let phases = transport.event_phases();
@@ -341,10 +409,7 @@ fn provider_happy_path_journals_before_reporting() {
     let mut sorted = ranks.clone();
     sorted.sort_unstable();
     assert_eq!(ranks, sorted, "phase events emit in rank order: {phases:?}");
-    assert_eq!(
-        phases.iter().filter(|phase| *phase == "settled").count(),
-        1
-    );
+    assert_eq!(phases.iter().filter(|phase| *phase == "settled").count(), 1);
     // The settled event carries per-recipient submitted + sanitized 250.
     let settled = transport
         .events()
@@ -360,8 +425,13 @@ fn provider_happy_path_journals_before_reporting() {
     let wire = settled.to_string();
     assert!(!wire.contains("queued as sink-0001"));
     // Re-running the settled pair is refused — tombstone dominates.
-    let rerun = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation)
-        .unwrap();
+    let rerun = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
     assert!(matches!(rerun, SubmissionResult::NotRunnable(_)));
 }
 
@@ -379,8 +449,13 @@ fn auth_535_abandons_without_tombstone() {
     let transport = FakeCloudTransport::new();
     scripted_prepare(&transport, "provider");
 
-    let result = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation)
-        .unwrap();
+    let result = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
     assert_eq!(
         result,
         SubmissionResult::Abandoned("credential_failure".to_string())
@@ -389,7 +464,10 @@ fn auth_535_abandons_without_tombstone() {
     // cloud's credential_required → released → re-offer cycle (§6b.1).
     let job = journal.load_job(&send_job_id, generation).unwrap().unwrap();
     assert!(job.terminal_outcome.is_none());
-    assert!(journal.tombstone(&send_job_id, generation).unwrap().is_none());
+    assert!(journal
+        .tombstone(&send_job_id, generation)
+        .unwrap()
+        .is_none());
     assert!(!transport.event_phases().contains(&"settled".to_string()));
 }
 
@@ -414,8 +492,13 @@ fn rcpt_550_settles_provider_rejected() {
     let transport = FakeCloudTransport::new();
     scripted_prepare(&transport, "provider");
 
-    let result = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation)
-        .unwrap();
+    let result = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
     assert_eq!(
         result,
         SubmissionResult::Terminal("provider_rejected".to_string())
@@ -447,8 +530,13 @@ fn lost_final_response_settles_delivery_unknown_never_retries() {
     let transport = FakeCloudTransport::new();
     scripted_prepare(&transport, "provider");
 
-    let result = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation)
-        .unwrap();
+    let result = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
     assert_eq!(
         result,
         SubmissionResult::Terminal("delivery_unknown".to_string())
@@ -468,11 +556,23 @@ fn lost_final_response_settles_delivery_unknown_never_retries() {
         "delivery_unknown"
     );
     // NEVER auto-retried: the tombstone refuses a re-run.
-    let rerun = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation)
-        .unwrap();
+    let rerun = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
     assert!(matches!(rerun, SubmissionResult::NotRunnable(_)));
     // Only ONE message attempt ever hit the wire.
-    assert!(sink.state().transcript.iter().filter(|line| line.starts_with("DATA")).count() <= 1);
+    assert!(
+        sink.state()
+            .transcript
+            .iter()
+            .filter(|line| line.starts_with("DATA"))
+            .count()
+            <= 1
+    );
 }
 
 #[test]
@@ -482,11 +582,19 @@ fn cancel_before_data_settles_cancelled() {
     let mut journal = open_journal(&dir);
     let memory = MemoryCredentialStore::new();
     let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink.port);
-    journal.request_cancel(&send_job_id, generation).unwrap().unwrap();
+    journal
+        .request_cancel(&send_job_id, generation)
+        .unwrap()
+        .unwrap();
     let transport = FakeCloudTransport::new();
 
-    let result = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation)
-        .unwrap();
+    let result = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
     assert_eq!(result, SubmissionResult::Terminal("cancelled".to_string()));
     assert_eq!(sink.state().messages.len(), 0, "nothing sent");
     assert_eq!(*transport.prepare_calls.lock().unwrap(), 0);
@@ -509,7 +617,12 @@ fn prepare_refusals_follow_the_ladder() {
         result,
         SubmissionResult::Abandoned("credential_required".to_string())
     );
-    assert!(journal.load_job(&job_a, 1).unwrap().unwrap().terminal_outcome.is_none());
+    assert!(journal
+        .load_job(&job_a, 1)
+        .unwrap()
+        .unwrap()
+        .terminal_outcome
+        .is_none());
 
     // cancelled → terminal cancelled.
     let (job_b, _) = seed_send_job(&mut journal, &memory, 2525);
@@ -546,9 +659,17 @@ fn lease_fence_stops_before_smtp_boundary() {
         current_lease_epoch: Some(2),
     }));
 
-    let result = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation)
-        .unwrap();
-    assert_eq!(result, SubmissionResult::Abandoned("lease_fenced".to_string()));
+    let result = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        SubmissionResult::Abandoned("lease_fenced".to_string())
+    );
     assert_eq!(sink.state().messages.len(), 0, "fenced holder never sent");
     let job = journal.load_job(&send_job_id, generation).unwrap().unwrap();
     assert!(job.terminal_outcome.is_none(), "non-terminal for re-offer");
@@ -573,10 +694,19 @@ fn mime_verification_failure_settles_failed_without_sending() {
     )));
     transport.put_mime("mime://job", b"tampered bytes".to_vec());
 
-    let result = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation)
-        .unwrap();
+    let result = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
     assert_eq!(result, SubmissionResult::Terminal("failed".to_string()));
-    assert_eq!(sink.state().messages.len(), 0, "unverified bytes never sent");
+    assert_eq!(
+        sink.state().messages.len(),
+        0,
+        "unverified bytes never sent"
+    );
 }
 
 // =====================================================================
@@ -596,8 +726,16 @@ fn killpoint_scenario_runner() {
     let journal_path = std::path::PathBuf::from(config["journal_path"].as_str().unwrap());
     let stage = config["stage"].as_str().unwrap_or("send");
 
-    // The sink runs INSIDE the subprocess (loopback only).
-    let sink = SmtpSink::start(SinkMode::Plain, SinkBehavior::default());
+    // The sink runs INSIDE the subprocess (loopback only). The mid-DATA
+    // killpoint is SINK-driven (review #17): the sink aborts the process
+    // only after observing real body bytes on the wire.
+    let behavior = SinkBehavior {
+        abort_process_at_body_byte: config["sink_abort_at_body_byte"]
+            .as_u64()
+            .map(|value| value as usize),
+        ..SinkBehavior::default()
+    };
+    let sink = SmtpSink::start(SinkMode::Plain, behavior);
     let mut journal = EmailJournal::open_at(&journal_path).expect("journal open");
     let memory = MemoryCredentialStore::new();
 
@@ -615,7 +753,7 @@ fn killpoint_scenario_runner() {
             }),
         )
         .unwrap();
-        let _ = journal_command_before_ack(&mut journal, &command, "live_intake");
+        let _ = journal_command_before_ack(&mut journal, &command, "live_intake", "device-test");
         // Reaching here means the killpoint did not fire — the parent will
         // fail on exit-status expectations if it expected an abort.
         return;
@@ -629,7 +767,12 @@ fn killpoint_scenario_runner() {
     .unwrap();
     let transport = FakeCloudTransport::new();
     scripted_prepare(&transport, "provider");
-    let _ = run_send_job(&deps(&transport, &memory), &mut journal, &send_job_id, generation);
+    let _ = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    );
 }
 
 struct KillpointExpectation {
@@ -643,6 +786,9 @@ struct KillpointExpectation {
     already_terminal: Option<&'static str>,
     /// Expect data_started to be set at reopen.
     data_started: bool,
+    /// Sink-driven mid-DATA abort threshold (review #17): the subprocess
+    /// sink kills the process after observing this many body bytes.
+    sink_abort_at_body_byte: Option<usize>,
 }
 
 fn run_killpoint_case(case: &KillpointExpectation) {
@@ -651,6 +797,7 @@ fn run_killpoint_case(case: &KillpointExpectation) {
     let scenario = json!({
         "journal_path": journal_path.display().to_string(),
         "stage": case.stage,
+        "sink_abort_at_body_byte": case.sink_abort_at_body_byte,
     });
     let exe = std::env::current_exe().expect("test exe");
     let output = std::process::Command::new(&exe)
@@ -703,7 +850,9 @@ fn run_killpoint_case(case: &KillpointExpectation) {
                     }),
                 )
                 .unwrap();
-                let ack = journal_command_before_ack(&mut journal, &command, "replay").unwrap();
+                let ack =
+                    journal_command_before_ack(&mut journal, &command, "replay", "device-test")
+                        .unwrap();
                 assert_eq!(ack.result, "duplicate");
                 assert!(ack.first_status_event_id.is_some());
             }
@@ -712,8 +861,8 @@ fn run_killpoint_case(case: &KillpointExpectation) {
         return;
     }
 
-    let job_ref = std::fs::read_to_string(journal_path.with_extension("jobid"))
-        .expect("job id marker");
+    let job_ref =
+        std::fs::read_to_string(journal_path.with_extension("jobid")).expect("job id marker");
     let (send_job_id, generation) = job_ref.split_once(':').unwrap();
     let generation: u32 = generation.trim().parse().unwrap();
 
@@ -747,12 +896,13 @@ fn run_killpoint_case(case: &KillpointExpectation) {
             let entry = settled
                 .iter()
                 .find(|(job_id, gen, _)| job_id == send_job_id && *gen == generation)
-                .unwrap_or_else(|| {
-                    panic!("{}: recovery must settle the pair", case.killpoint)
-                });
+                .unwrap_or_else(|| panic!("{}: recovery must settle the pair", case.killpoint));
             assert_eq!(entry.2, outcome, "{}: recovery outcome", case.killpoint);
             // delivery_unknown / submitted both tombstone — never re-run.
-            assert!(journal.tombstone(send_job_id, generation).unwrap().is_some());
+            assert!(journal
+                .tombstone(send_job_id, generation)
+                .unwrap()
+                .is_some());
         }
         None => {
             assert!(
@@ -774,6 +924,7 @@ fn crash_matrix_intake_receipt_atomicity() {
         recovery_outcome: None,
         already_terminal: None,
         data_started: false,
+        sink_abort_at_body_byte: None,
     });
 }
 
@@ -785,6 +936,7 @@ fn crash_matrix_pre_transport_ack() {
         recovery_outcome: None,
         already_terminal: None,
         data_started: false,
+        sink_abort_at_body_byte: None,
     });
 }
 
@@ -796,6 +948,7 @@ fn crash_matrix_lease_receipt_is_resumable() {
         recovery_outcome: None,
         already_terminal: None,
         data_started: false,
+        sink_abort_at_body_byte: None,
     });
 }
 
@@ -807,6 +960,7 @@ fn crash_matrix_post_download_is_resumable() {
         recovery_outcome: None,
         already_terminal: None,
         data_started: false,
+        sink_abort_at_body_byte: None,
     });
 }
 
@@ -818,6 +972,7 @@ fn crash_matrix_post_verify_is_resumable() {
         recovery_outcome: None,
         already_terminal: None,
         data_started: false,
+        sink_abort_at_body_byte: None,
     });
 }
 
@@ -829,6 +984,7 @@ fn crash_matrix_post_auth_is_resumable() {
         recovery_outcome: None,
         already_terminal: None,
         data_started: false,
+        sink_abort_at_body_byte: None,
     });
 }
 
@@ -840,6 +996,7 @@ fn crash_matrix_post_mail_from_is_resumable() {
         recovery_outcome: None,
         already_terminal: None,
         data_started: false,
+        sink_abort_at_body_byte: None,
     });
 }
 
@@ -851,6 +1008,7 @@ fn crash_matrix_data_started_commit_recovers_delivery_unknown() {
         recovery_outcome: Some("delivery_unknown"),
         already_terminal: None,
         data_started: true,
+        sink_abort_at_body_byte: None,
     });
 }
 
@@ -862,17 +1020,37 @@ fn crash_matrix_pre_data_cmd_recovers_delivery_unknown() {
         recovery_outcome: Some("delivery_unknown"),
         already_terminal: None,
         data_started: true,
+        sink_abort_at_body_byte: None,
     });
 }
 
 #[test]
-fn crash_matrix_mid_data_recovers_delivery_unknown() {
+fn crash_matrix_post_354_pre_body_recovers_delivery_unknown() {
+    // Death after the server's 354 but before the first body byte — the
+    // pre-body edge of the DATA window.
     run_killpoint_case(&KillpointExpectation {
-        killpoint: "mid_data",
+        killpoint: "post_data_354_pre_body",
         stage: "send",
         recovery_outcome: Some("delivery_unknown"),
         already_terminal: None,
         data_started: true,
+        sink_abort_at_body_byte: None,
+    });
+}
+
+#[test]
+fn crash_matrix_mid_data_body_recovers_delivery_unknown() {
+    // The HONEST mid-DATA death (review #17): the sink kills the process
+    // only after real body bytes are on the wire, while the client is inside
+    // connection.message(). Recovery must classify delivery_unknown — the
+    // partial body is never retransmitted.
+    run_killpoint_case(&KillpointExpectation {
+        killpoint: "mid_data_body",
+        stage: "send",
+        recovery_outcome: Some("delivery_unknown"),
+        already_terminal: None,
+        data_started: true,
+        sink_abort_at_body_byte: Some(16),
     });
 }
 
@@ -887,6 +1065,7 @@ fn crash_matrix_post_2xx_pre_journal_recovers_delivery_unknown() {
         recovery_outcome: Some("delivery_unknown"),
         already_terminal: None,
         data_started: true,
+        sink_abort_at_body_byte: None,
     });
 }
 
@@ -900,6 +1079,7 @@ fn crash_matrix_post_data_completed_journal_recovers_submitted() {
         recovery_outcome: Some("submitted"),
         already_terminal: None,
         data_started: true,
+        sink_abort_at_body_byte: None,
     });
 }
 
@@ -913,6 +1093,7 @@ fn crash_matrix_post_journal_pre_report_keeps_terminal() {
         recovery_outcome: None,
         already_terminal: Some("submitted"),
         data_started: true,
+        sink_abort_at_body_byte: None,
     });
     // (pending-event re-handoff is exercised in
     // pending_events_rehandoff_after_crash below.)
@@ -923,7 +1104,7 @@ fn pending_events_rehandoff_after_crash() {
     let dir = temp_dir("pending");
     let mut journal = open_journal(&dir);
     journal
-        .record_send_command("job-p", 1, "cmd-p", "bind-1", "hash-p", "test")
+        .record_send_command("job-p", 1, "cmd-p", "bind-1", "hash-p", "test", |_| json!({"p": 1}))
         .unwrap();
     let event = PendingEventRow {
         status_event_id: "evt-p".to_string(),
@@ -931,15 +1112,32 @@ fn pending_events_rehandoff_after_crash() {
         generation: 1,
         payload: json!({"phase": "settled", "status_event_id": "evt-p"}),
     };
-    journal.journal_terminal("job-p", 1, "submitted", &event).unwrap();
+    journal
+        .journal_terminal("job-p", 1, "submitted", &event)
+        .unwrap();
+    // Two pending events: the intake-journaled `received` (review #4) and
+    // the settled terminal.
     let pending = journal.pending_events().unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].status_event_id, "evt-p");
-    // Handoff + cloud ack drains the pending queue.
+    assert_eq!(pending.len(), 2);
+    assert!(pending
+        .iter()
+        .any(|entry| entry.status_event_id == "evt-p"));
+    // Handoff + cloud ack drains the settled event from the pending queue.
     journal.mark_event_handed_off("evt-p").unwrap();
-    assert_eq!(journal.pending_events().unwrap().len(), 1, "handed_off still pending ack");
+    assert!(
+        journal
+            .pending_events()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.status_event_id == "evt-p"),
+        "handed_off still pending ack"
+    );
     journal.record_cloud_ack("evt-p", true, None).unwrap();
-    assert!(journal.pending_events().unwrap().is_empty());
+    assert!(!journal
+        .pending_events()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.status_event_id == "evt-p"));
 }
 
 // =====================================================================
@@ -947,9 +1145,10 @@ fn pending_events_rehandoff_after_crash() {
 // =====================================================================
 
 fn fixture(dir: &std::path::Path, name: &str) -> Value {
-    serde_json::from_str(&std::fs::read_to_string(dir.join(name)).unwrap_or_else(|error| {
-        panic!("fixture {name} unreadable: {error}")
-    }))
+    serde_json::from_str(
+        &std::fs::read_to_string(dir.join(name))
+            .unwrap_or_else(|error| panic!("fixture {name} unreadable: {error}")),
+    )
     .unwrap_or_else(|error| panic!("fixture {name} unparsable: {error}"))
 }
 
@@ -961,8 +1160,7 @@ fn fixtures_wake_commands_parse_with_exact_fields() {
     };
     let send = fixture(&dir, "wake_command__email_send__exact.json");
     let payload = &send["payload"];
-    let command =
-        contract::parse_email_command(contract::EMAIL_COMMAND_SEND, payload).unwrap();
+    let command = contract::parse_email_command(contract::EMAIL_COMMAND_SEND, payload).unwrap();
     if let contract::EmailCommand::Send {
         command_id,
         send_job_id,
@@ -1006,13 +1204,17 @@ fn fixtures_wake_commands_parse_with_exact_fields() {
     )
     .is_ok());
     let preflight = fixture(&dir, "wake_command__email_preflight_run__exact.json");
-    let parsed = contract::parse_email_command(
-        contract::EMAIL_COMMAND_PREFLIGHT_RUN,
-        &preflight["payload"],
-    )
-    .unwrap();
-    if let contract::EmailCommand::PreflightRun { requested_checks, .. } = parsed {
-        assert_eq!(requested_checks, vec!["public_ip", "port25_egress", "ptr_fcrdns"]);
+    let parsed =
+        contract::parse_email_command(contract::EMAIL_COMMAND_PREFLIGHT_RUN, &preflight["payload"])
+            .unwrap();
+    if let contract::EmailCommand::PreflightRun {
+        requested_checks, ..
+    } = parsed
+    {
+        assert_eq!(
+            requested_checks,
+            vec!["public_ip", "port25_egress", "ptr_fcrdns"]
+        );
         for check in &requested_checks {
             assert!(contract::PREFLIGHT_CHECK_IDS.contains(&check.as_str()));
         }
@@ -1049,10 +1251,16 @@ fn fixtures_send_events_respect_phase_field_rules() {
         // Per-phase presence rules (§9.2).
         let has = |key: &str| event.get(key).is_some();
         if phase.rank() >= SendPhase::Prepared.rank() {
-            assert!(has("mode") && has("lease_id") && has("lease_epoch"), "{name}");
+            assert!(
+                has("mode") && has("lease_id") && has("lease_epoch"),
+                "{name}"
+            );
             contract::u64_from_wire(&event["lease_epoch"]).expect("lease_epoch string");
         } else {
-            assert!(!has("mode") && !has("lease_id") && !has("lease_epoch"), "{name}");
+            assert!(
+                !has("mode") && !has("lease_id") && !has("lease_epoch"),
+                "{name}"
+            );
         }
         if phase.rank() >= SendPhase::Verified.rank() {
             assert!(has("mime_sha256") && has("data_started"), "{name}");
@@ -1069,8 +1277,7 @@ fn fixtures_send_events_respect_phase_field_rules() {
                         .unwrap_or_else(|error| panic!("{name}: {error}"));
                 }
             }
-            assert!(contract::ERROR_CLASSES
-                .contains(&event["error_class"].as_str().unwrap()));
+            assert!(contract::ERROR_CLASSES.contains(&event["error_class"].as_str().unwrap()));
         }
         // Ack shape (§9.3).
         assert_eq!(ack["status_event_id"], event["status_event_id"], "{name}");
@@ -1146,16 +1353,14 @@ fn fixtures_preflight_results_validate() {
         let wire = fixture(&dir, name);
         let payload = &wire["payload"];
         assert_eq!(payload["contract"], contract::EMAIL_CONTRACT, "{name}");
-        assert!(contract::PREFLIGHT_RESULTS
-            .contains(&payload["result"].as_str().unwrap()));
+        assert!(contract::PREFLIGHT_RESULTS.contains(&payload["result"].as_str().unwrap()));
         let checks = payload["checks"].as_array().unwrap();
         for check in checks {
             assert!(
                 contract::PREFLIGHT_CHECK_IDS.contains(&check["check_id"].as_str().unwrap()),
                 "{name}: closed check id"
             );
-            assert!(contract::PREFLIGHT_CHECK_STATUSES
-                .contains(&check["status"].as_str().unwrap()));
+            assert!(contract::PREFLIGHT_CHECK_STATUSES.contains(&check["status"].as_str().unwrap()));
         }
         // 24h expiry shape.
         let ran = payload["ran_at_ms"].as_i64().unwrap();
@@ -1225,7 +1430,13 @@ fn fixtures_capabilities_and_resume_shapes() {
     };
     let capabilities = fixture(&dir, "requests__email_sender_capabilities_sync__happy.json");
     let request = &capabilities["payload"]["request"];
-    for key in ["capability_version", "modes", "profiles", "runtime", "credential_store"] {
+    for key in [
+        "capability_version",
+        "modes",
+        "profiles",
+        "runtime",
+        "credential_store",
+    ] {
         assert!(request.get(key).is_some(), "capabilities request has {key}");
     }
     let result = &capabilities["payload"]["response"]["data"]["result"];
@@ -1237,7 +1448,9 @@ fn fixtures_capabilities_and_resume_shapes() {
     profiles::store_bindings_cache(&mut journal, &result["bindings"]).unwrap();
     let binding_id = result["bindings"][0]["binding_id"].as_str().unwrap();
     assert_eq!(
-        profiles::binding_profile_ref(&journal, binding_id).unwrap().as_deref(),
+        profiles::binding_profile_ref(&journal, binding_id)
+            .unwrap()
+            .as_deref(),
         result["bindings"][0]["profile_ref"].as_str()
     );
 
@@ -1269,7 +1482,11 @@ fn fixtures_capabilities_and_resume_shapes() {
         }
     }
     assert!(
-        saw_unknown || unknown["expect"].as_str().unwrap_or("").starts_with("reject:"),
+        saw_unknown
+            || unknown["expect"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("reject:"),
         "unknown-phase fixture must fail closed"
     );
 }
@@ -1301,7 +1518,10 @@ fn intake_wiring_special_cases_email_ahead_of_generic_ack_in_both_paths() {
         .find("\"Remote command received by desktop.\"")
         .expect("live generic ack");
     assert!(hook < claim, "email hook must run before the receipt claim");
-    assert!(hook < generic_ack, "email hook must run before the generic ack");
+    assert!(
+        hook < generic_ack,
+        "email hook must run before the generic ack"
+    );
 
     // Replay path: same ordering inside the resume-replay function.
     let replay_start = source
@@ -1318,14 +1538,21 @@ fn intake_wiring_special_cases_email_ahead_of_generic_ack_in_both_paths() {
         .find("\"Remote command received by desktop.\"")
         .expect("replay generic ack");
     assert!(hook < claim, "replay email hook before the receipt claim");
-    assert!(hook < generic_ack, "replay email hook before the generic ack");
+    assert!(
+        hook < generic_ack,
+        "replay email hook before the generic ack"
+    );
 
     // Dispatcher matcher owns the email kinds (webview never handles them).
     let matcher_start = source
         .find("fn cloud_mcp_remote_command_is_rust_owned_for_dispatcher")
         .expect("matcher present");
     let matcher = &source[matcher_start..matcher_start + 4_000];
-    for kind in ["\"email_send\"", "\"email_credential_probe\"", "\"email_preflight_run\""] {
+    for kind in [
+        "\"email_send\"",
+        "\"email_credential_probe\"",
+        "\"email_preflight_run\"",
+    ] {
         assert!(matcher.contains(kind), "matcher owns {kind}");
     }
 }
@@ -1348,10 +1575,17 @@ fn intake_ack_replay_carries_original_event_id_across_paths() {
         }),
     )
     .unwrap();
-    let live = journal_command_before_ack(&mut journal, &command, "live_intake").unwrap();
+    let live =
+        journal_command_before_ack(&mut journal, &command, "live_intake", "device-test").unwrap();
     assert_eq!(live.result, "accepted");
     let replay =
-        journal_command_before_ack(&mut journal, &command, "account_sync_resume_replay").unwrap();
+        journal_command_before_ack(
+        &mut journal,
+        &command,
+        "account_sync_resume_replay",
+        "device-test",
+    )
+    .unwrap();
     assert_eq!(replay.result, "duplicate");
     assert_eq!(replay.first_status_event_id, live.first_status_event_id);
     let ack_payload = super::remote::email_intake_ack_payload(
@@ -1365,4 +1599,583 @@ fn intake_ack_replay_carries_original_event_id_across_paths() {
         ack_payload["first_status_event_id"],
         json!(live.first_status_event_id.unwrap())
     );
+}
+
+// =====================================================================
+// Review-round regressions: the DATA boundary crosses at most once (#1),
+// duplicate settles re-hand the original event (#7), compaction never
+// weakens the generation fence (#5), identity beats tombstone dominance
+// (#6), full-range lease epochs fence correctly (#10), configured
+// credentials that cannot resolve stop before SMTP (#13), and leased
+// native jobs execute end-to-end (#11).
+// =====================================================================
+
+#[test]
+fn data_started_job_never_reenters_smtp() {
+    // Review #1 (CRITICAL): a duplicate wake for a pair that already crossed
+    // DATA terminalizes it BEFORE prepare — the transport's prepare must
+    // never be called and no SMTP session may open.
+    let dir = temp_dir("data-guard");
+    let mut journal = open_journal(&dir);
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, 2525);
+    journal
+        .replace_recipients(
+            &send_job_id,
+            generation,
+            &[RecipientRow {
+                recipient_ref: "r1".to_string(),
+                role: "to".to_string(),
+                address: "billing@partner.example".to_string(),
+                domain: "partner.example".to_string(),
+                status: "pending".to_string(),
+                smtp_code: None,
+                enhanced_code: None,
+                response_class: None,
+                response_sanitized: None,
+                retry_at_ms: None,
+            }],
+        )
+        .unwrap();
+    journal.mark_data_started(&send_job_id, generation).unwrap();
+
+    let transport = FakeCloudTransport::new(); // nothing scripted on purpose
+    let result = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        SubmissionResult::Terminal("delivery_unknown".to_string())
+    );
+    assert_eq!(
+        *transport.prepare_calls.lock().unwrap(),
+        0,
+        "prepare must never run for a data_started pair"
+    );
+    assert!(journal.tombstone(&send_job_id, generation).unwrap().is_some());
+    // The settled event was journaled and handed off.
+    assert!(transport
+        .event_phases()
+        .contains(&"settled".to_string()));
+    // A second duplicate run is refused outright.
+    let rerun = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
+    assert!(matches!(rerun, SubmissionResult::NotRunnable(_)));
+}
+
+#[test]
+fn restart_recovery_settles_before_any_intake_can_rerun() {
+    // Review #1: startup recovery is synchronous and runs before intake —
+    // after it, a redelivered wake dedupes and the worker refuses the pair.
+    let dir = temp_dir("restart-guard");
+    let mut journal = open_journal(&dir);
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, 2525);
+    journal.mark_data_started(&send_job_id, generation).unwrap();
+
+    // "Restart": recovery classifies the crashed pair first.
+    let settled = journal.recover_after_restart("device-test").unwrap();
+    assert!(settled
+        .iter()
+        .any(|(job, _, outcome)| job == &send_job_id && outcome == "delivery_unknown"));
+
+    // The duplicate wake then dedupes (tombstone/receipt) …
+    let command = contract::parse_email_command(
+        contract::EMAIL_COMMAND_SEND,
+        &json!({
+            "command_id": contract::email_send_command_id(&send_job_id, generation),
+            "send_job_id": send_job_id,
+            "generation": generation,
+            "binding_id": "bind-1",
+            "target_device_id": "device-test",
+        }),
+    )
+    .unwrap();
+    let ack = journal_command_before_ack(&mut journal, &command, "live_intake", "device-test")
+        .unwrap();
+    assert_eq!(ack.result, "duplicate");
+    // … and the worker path refuses to run it.
+    let transport = FakeCloudTransport::new();
+    let result = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
+    assert!(matches!(result, SubmissionResult::NotRunnable(_)));
+    assert_eq!(*transport.prepare_calls.lock().unwrap(), 0);
+}
+
+#[test]
+fn send_worker_claim_is_exclusive_per_pair() {
+    // Review #1: at most one send worker per (send_job_id, generation) per
+    // process — the duplicate spawn exits instead of racing SMTP.
+    let claim = super::remote::claim_send_worker("job-claim", 1).expect("first claim");
+    assert!(
+        super::remote::claim_send_worker("job-claim", 1).is_none(),
+        "second concurrent claim must be refused"
+    );
+    // A different generation is independent.
+    let other = super::remote::claim_send_worker("job-claim", 2).expect("other generation");
+    drop(other);
+    drop(claim);
+    // Release re-enables the pair.
+    assert!(super::remote::claim_send_worker("job-claim", 1).is_some());
+}
+
+#[test]
+fn duplicate_settle_rehands_original_event_never_a_new_one() {
+    // Review #7: journal_terminal inserts the settled event exactly once;
+    // the losing settle attempt must re-hand THAT event, never its own.
+    let dir = temp_dir("settle-race");
+    let mut journal = open_journal(&dir);
+    journal
+        .record_send_command(
+            "job-race",
+            1,
+            "cmd-race",
+            "bind-1",
+            "hash-race",
+            "test",
+            |_| json!({"p": 1}),
+        )
+        .unwrap();
+    let first = PendingEventRow {
+        status_event_id: "evt-first".to_string(),
+        send_job_id: "job-race".to_string(),
+        generation: 1,
+        payload: json!({"phase": "settled", "status_event_id": "evt-first"}),
+    };
+    assert!(journal
+        .journal_terminal("job-race", 1, "submitted", &first)
+        .unwrap());
+    // The losing writer's proposal is NOT inserted…
+    let second = PendingEventRow {
+        status_event_id: "evt-second".to_string(),
+        send_job_id: "job-race".to_string(),
+        generation: 1,
+        payload: json!({"phase": "settled", "status_event_id": "evt-second"}),
+    };
+    assert!(!journal
+        .journal_terminal("job-race", 1, "delivery_unknown", &second)
+        .unwrap());
+    // …and the pair's journaled settled event is still the ORIGINAL.
+    let (original, outbox_state) = journal
+        .load_settled_event("job-race", 1)
+        .unwrap()
+        .expect("settled event exists");
+    assert_eq!(original.status_event_id, "evt-first");
+    assert_eq!(outbox_state, "pending");
+    let count: i64 = journal
+        .connection()
+        .query_row(
+            "SELECT COUNT(1) FROM email_send_events
+             WHERE send_job_id = 'job-race' AND phase = 'settled'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "exactly one settled event per pair");
+    // The terminal outcome stays the winner's.
+    let job = journal.load_job("job-race", 1).unwrap().unwrap();
+    assert_eq!(job.terminal_outcome.as_deref(), Some("submitted"));
+}
+
+#[test]
+fn compacted_generation_still_fences_lower_generations() {
+    // Review #5: compaction deletes the job row but the tombstone must keep
+    // the generation high-water — a first-ever lower generation stays fenced.
+    let dir = temp_dir("fence-compaction");
+    let mut journal = open_journal(&dir);
+    journal
+        .record_send_command("job-hw", 2, "cmd-hw2", "bind-1", "hash-2", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    let event = PendingEventRow {
+        status_event_id: "evt-hw".to_string(),
+        send_job_id: "job-hw".to_string(),
+        generation: 2,
+        payload: json!({"phase": "settled"}),
+    };
+    journal
+        .journal_terminal("job-hw", 2, "submitted", &event)
+        .unwrap();
+    journal.record_cloud_ack("evt-hw", true, None).unwrap();
+    // The intake-journaled received event must also be acked for compaction.
+    let pending = journal.pending_events_for("job-hw", 2).unwrap();
+    for entry in pending {
+        journal
+            .record_cloud_ack(&entry.status_event_id, true, None)
+            .unwrap();
+    }
+    journal.record_generation_retired("job-hw", 2).unwrap();
+    assert_eq!(journal.compact_retired_tombstones().unwrap(), 1);
+    assert!(journal.load_job("job-hw", 2).unwrap().is_none());
+    // A NEVER-seen generation 1 arrives after compaction: still fenced.
+    let intake = journal
+        .record_send_command("job-hw", 1, "cmd-hw1", "bind-1", "hash-1", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            intake,
+            CommandIntake::FencedByHigherGeneration {
+                current_generation: 2
+            }
+        ),
+        "tombstoned high-water must fence: {intake:?}"
+    );
+}
+
+#[test]
+fn payload_hash_conflict_beats_tombstone_dominance() {
+    // Review #6: a reused command_id with a DIFFERENT payload hash is a
+    // security rejection even when the pair is tombstoned — identity wins.
+    let dir = temp_dir("hash-vs-tombstone");
+    let mut journal = open_journal(&dir);
+    journal
+        .record_send_command("job-sec", 1, "cmd-sec", "bind-1", "hash-A", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    let event = PendingEventRow {
+        status_event_id: "evt-sec".to_string(),
+        send_job_id: "job-sec".to_string(),
+        generation: 1,
+        payload: json!({"phase": "settled"}),
+    };
+    journal
+        .journal_terminal("job-sec", 1, "submitted", &event)
+        .unwrap();
+    // Same command id, tampered payload: SecurityRejected, not Tombstoned.
+    let intake = journal
+        .record_send_command("job-sec", 1, "cmd-sec", "bind-1", "hash-B", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    assert!(
+        matches!(intake, CommandIntake::SecurityRejected { .. }),
+        "identity check must precede tombstone dominance: {intake:?}"
+    );
+}
+
+#[test]
+fn lease_epoch_full_u64_range_fences_correctly() {
+    // Review #10: epochs above i64::MAX (and 2^53) must round-trip
+    // losslessly and keep the higher-fences-lower ordering.
+    let dir = temp_dir("epoch-range");
+    let mut journal = open_journal(&dir);
+    journal
+        .record_send_command("job-ep", 1, "cmd-ep", "bind-1", "hash-ep", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    let above_i64 = (i64::MAX as u64) + 7;
+    journal
+        .record_lease("job-ep", 1, "provider", "lease-1", above_i64, 1, "sha", 1)
+        .unwrap();
+    assert_eq!(
+        journal.load_job("job-ep", 1).unwrap().unwrap().lease_epoch,
+        above_i64,
+        "epoch above i64::MAX survives round-trip"
+    );
+    // A LOWER epoch is fenced.
+    assert!(
+        journal
+            .record_lease("job-ep", 1, "provider", "lease-0", 5, 1, "sha", 1)
+            .is_err(),
+        "older epoch must be fenced by the newer one"
+    );
+    // u64::MAX still supersedes.
+    journal
+        .record_lease("job-ep", 1, "provider", "lease-2", u64::MAX, 1, "sha", 1)
+        .unwrap();
+    assert!(journal
+        .record_lease("job-ep", 1, "provider", "lease-1", above_i64, 1, "sha", 1)
+        .is_err());
+    // Resume summaries serialize the unsigned decimal (no sign corruption).
+    let summaries = journal.resume_summaries().unwrap();
+    let entry = summaries
+        .iter()
+        .find(|entry| entry["send_job_id"] == "job-ep")
+        .unwrap();
+    assert_eq!(entry["lease_epoch"], json!(u64::MAX.to_string()));
+}
+
+#[test]
+fn atomic_data_completed_flips_recipients_in_the_same_txn() {
+    // Review #8: a persisted provider 2xx can never coexist with `pending`
+    // recipient rows — the flip happens in the same transaction.
+    let dir = temp_dir("atomic-250");
+    let mut journal = open_journal(&dir);
+    journal
+        .record_send_command("job-a250", 1, "cmd-a250", "bind-1", "hash", "test", |_| {
+            json!({"p": 1})
+        })
+        .unwrap();
+    journal
+        .replace_recipients(
+            "job-a250",
+            1,
+            &[RecipientRow {
+                recipient_ref: "r1".to_string(),
+                role: "to".to_string(),
+                address: "a@b.example".to_string(),
+                domain: "b.example".to_string(),
+                status: "pending".to_string(),
+                smtp_code: None,
+                enhanced_code: None,
+                response_class: None,
+                response_sanitized: None,
+                retry_at_ms: None,
+            }],
+        )
+        .unwrap();
+    journal.mark_data_started("job-a250", 1).unwrap();
+    journal
+        .mark_data_completed("job-a250", 1, Some(250), "accepted", Some("250 ok"))
+        .unwrap();
+    let rows = journal.load_recipients("job-a250", 1).unwrap();
+    assert!(rows
+        .iter()
+        .all(|row| row.status == "submitted" && row.smtp_code == Some(250)));
+    // Monotonic boundary (review #1): data_started can never regress a
+    // data_completed job.
+    assert!(journal.mark_data_started("job-a250", 1).is_err());
+    let job = journal.load_job("job-a250", 1).unwrap().unwrap();
+    assert_eq!(job.phase, "data_completed");
+}
+
+#[test]
+fn configured_credentials_unavailable_stops_before_smtp() {
+    // Review #13: a configured locator that no longer resolves must stop the
+    // run with a credential failure BEFORE any SMTP traffic.
+    let sink = SmtpSink::start(SinkMode::Plain, SinkBehavior::default());
+    let dir = temp_dir("cred-unavailable");
+    let mut journal = open_journal(&dir);
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink.port);
+    // Point the profile at a locator the store cannot resolve.
+    journal
+        .connection()
+        .execute(
+            "UPDATE email_sender_profiles
+             SET secret_locator = 'memory://diffforge/email/deleted'
+             WHERE profile_ref = 'profile-test'",
+            [],
+        )
+        .unwrap();
+    let transport = FakeCloudTransport::new();
+    scripted_prepare(&transport, "provider");
+    let result = run_send_job(
+        &deps(&transport, &memory),
+        &mut journal,
+        &send_job_id,
+        generation,
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        SubmissionResult::Abandoned("credential_failure".to_string())
+    );
+    assert_eq!(
+        sink.state().connections,
+        0,
+        "no SMTP connection without resolvable configured credentials"
+    );
+    // Non-terminal: the credential_required → re-offer cycle can retry.
+    let job = journal.load_job(&send_job_id, generation).unwrap().unwrap();
+    assert!(job.terminal_outcome.is_none());
+}
+
+// =====================================================================
+// Native delivery through the send state machine (review #11)
+// =====================================================================
+
+fn seed_native_dkim_key(
+    journal: &EmailJournal,
+    memory: &MemoryCredentialStore,
+    domain: &str,
+) -> String {
+    let key = crate::email::dkim::generate_rsa_dkim_key().unwrap();
+    let locator = memory.set("dkim-test", &key.private_key_pem).unwrap();
+    journal
+        .connection()
+        .execute(
+            "INSERT OR REPLACE INTO email_dkim_keys
+             (domain, selector, state, pubkey_fingerprint_sha256, public_key_b64,
+              secret_locator, created_at_ms)
+             VALUES (?1, 'dfmail1', 'active', ?2, ?3, ?4, 1)",
+            rusqlite::params![
+                domain,
+                key.pubkey_fingerprint_sha256,
+                key.public_key_b64,
+                locator
+            ],
+        )
+        .unwrap();
+    key.pubkey_fingerprint_sha256
+}
+
+#[test]
+fn native_leased_job_executes_end_to_end() {
+    use crate::email::mx::{FakeMxResolver, MxResolution, MxTarget};
+
+    let sink = SmtpSink::start(SinkMode::Plain, SinkBehavior::default());
+    let dir = temp_dir("native-e2e");
+    let mut journal = open_journal(&dir);
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink.port);
+    let fingerprint = seed_native_dkim_key(&journal, &memory, "acme.example");
+
+    let transport = FakeCloudTransport::new();
+    transport.put_mime("mime://job", TEST_MIME.to_vec());
+    let mut grant = leased_grant_for(
+        "mime://job",
+        TEST_MIME,
+        "bounce@acme.example",
+        "ops@acme.example",
+        &[("to", "billing@partner.example")],
+        "native",
+    );
+    if let PrepareOutcome::Leased(inner) = &mut grant {
+        inner.native.as_mut().unwrap().dkim_pubkey_fingerprint = fingerprint;
+    }
+    transport.script_prepare(Ok(grant));
+
+    let mx = FakeMxResolver::new();
+    mx.set(
+        "partner.example",
+        MxResolution::Targets(vec![MxTarget {
+            host: "localhost".to_string(),
+            priority: 10,
+        }]),
+    );
+    let mut submission_deps = deps(&transport, &memory);
+    submission_deps.native_mx = Some(&mx);
+    submission_deps.native_port_override = Some(sink.port);
+
+    let result = run_send_job(&submission_deps, &mut journal, &send_job_id, generation).unwrap();
+    assert_eq!(result, SubmissionResult::Terminal("submitted".to_string()));
+
+    // The sink received exactly one TLS-protected, DKIM-signed message.
+    let state = sink.state();
+    assert_eq!(state.messages.len(), 1);
+    assert!(state.messages[0].tls_active);
+    let body = String::from_utf8_lossy(&state.messages[0].data);
+    assert!(body.contains("DKIM-Signature"), "native mail is DKIM-signed");
+
+    // Journal: terminal + tombstone + per-recipient submitted + boundary.
+    let job = journal.load_job(&send_job_id, generation).unwrap().unwrap();
+    assert_eq!(job.terminal_outcome.as_deref(), Some("submitted"));
+    assert!(job.data_started);
+    assert!(journal.tombstone(&send_job_id, generation).unwrap().is_some());
+    let rows = journal.load_recipients(&send_job_id, generation).unwrap();
+    assert!(rows.iter().all(|row| row.status == "submitted"));
+    // The settled event reports per-recipient submitted, §9.6-sanitized.
+    let settled = transport
+        .events()
+        .into_iter()
+        .find(|event| event["phase"] == "settled")
+        .unwrap();
+    assert_eq!(settled["per_recipient"][0]["delivery_state"], "submitted");
+    assert_eq!(settled["error_class"], "none");
+    // Re-running the settled pair is refused — tombstone dominates.
+    let rerun = run_send_job(&submission_deps, &mut journal, &send_job_id, generation).unwrap();
+    assert!(matches!(rerun, SubmissionResult::NotRunnable(_)));
+}
+
+#[test]
+fn native_without_matching_dkim_key_abandons_without_wire_traffic() {
+    use crate::email::mx::{FakeMxResolver, MxResolution, MxTarget};
+
+    let sink = SmtpSink::start(SinkMode::Plain, SinkBehavior::default());
+    let dir = temp_dir("native-nokey");
+    let mut journal = open_journal(&dir);
+    let memory = MemoryCredentialStore::new();
+    let (send_job_id, generation) = seed_send_job(&mut journal, &memory, sink.port);
+    // NO active DKIM key journaled.
+
+    let transport = FakeCloudTransport::new();
+    scripted_prepare(&transport, "native");
+    let mx = FakeMxResolver::new();
+    mx.set(
+        "partner.example",
+        MxResolution::Targets(vec![MxTarget {
+            host: "localhost".to_string(),
+            priority: 10,
+        }]),
+    );
+    let mut submission_deps = deps(&transport, &memory);
+    submission_deps.native_mx = Some(&mx);
+    submission_deps.native_port_override = Some(sink.port);
+
+    let result = run_send_job(&submission_deps, &mut journal, &send_job_id, generation).unwrap();
+    assert_eq!(
+        result,
+        SubmissionResult::Abandoned("dkim_key_unavailable".to_string())
+    );
+    assert_eq!(sink.state().messages.len(), 0, "nothing on the wire");
+    // Non-terminal: re-offer after the key is provisioned re-executes.
+    let job = journal.load_job(&send_job_id, generation).unwrap().unwrap();
+    assert!(job.terminal_outcome.is_none());
+    assert!(!job.data_started);
+}
+
+#[test]
+fn vendored_corpus_matches_pinned_lock() {
+    // Review #16: the vendored corpus is pinned by email-v1.lock — sha256
+    // over, per .json file sorted by name: `name\n` + `hex(sha256(bytes))\n`.
+    use sha2::{Digest, Sha256};
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/contracts/email-v1");
+    if !base.is_dir() {
+        if std::env::var("EMAIL_V1_REQUIRE_FIXTURES").as_deref() == Ok("1") {
+            panic!("vendored corpus missing at {}", base.display());
+        }
+        eprintln!("vendored corpus absent; skipping lock verification");
+        return;
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&base)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".json"))
+        .collect();
+    names.sort();
+    assert!(names.len() >= 140, "corpus unexpectedly small: {}", names.len());
+    let mut outer = Sha256::new();
+    for name in &names {
+        let bytes = std::fs::read(base.join(name)).unwrap();
+        let inner: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        outer.update(name.as_bytes());
+        outer.update(b"\n");
+        outer.update(inner.as_bytes());
+        outer.update(b"\n");
+    }
+    let computed: String = outer
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let lock = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/contracts/email-v1.lock"),
+    )
+    .expect("email-v1.lock present");
+    let pinned = lock.split_whitespace().next().unwrap_or("");
+    assert_eq!(computed, pinned, "vendored corpus drifted from its lock");
 }

@@ -58,7 +58,9 @@ pub fn ordered_delivery_hosts(resolution: &MxResolution) -> Result<Vec<String>, 
                     .wrapping_add(group.len() as u64);
                 let mut index = group.len();
                 while index > 1 {
-                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     let pick = (seed >> 33) as usize % index;
                     index -= 1;
                     group.swap(pick, index);
@@ -98,6 +100,32 @@ pub fn classify_mx_records(records: Vec<MxTarget>) -> MxResolution {
     )
 }
 
+/// How an MX lookup error classifies (review #15). Matched STRUCTURALLY on
+/// hickory's error kind + response code — never on the error's display
+/// string, whose wording changes across hickory versions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MxErrorDisposition {
+    /// NXDOMAIN — the domain does not exist. Terminal, no fallback.
+    NxDomain,
+    /// NODATA — the domain exists but holds no MX records. RFC 5321 A/AAAA
+    /// fallback applies ONLY if an explicit address lookup finds records.
+    NoData,
+    /// Transport/server failure — retryable, never a fallback candidate.
+    Transport(String),
+}
+
+pub fn mx_error_disposition(error: &mail_auth::hickory_resolver::proto::ProtoError) -> MxErrorDisposition {
+    use mail_auth::hickory_resolver::proto::op::ResponseCode;
+    use mail_auth::hickory_resolver::proto::ProtoErrorKind;
+    match error.kind() {
+        ProtoErrorKind::NoRecordsFound(no_records) => match no_records.response_code {
+            ResponseCode::NXDomain => MxErrorDisposition::NxDomain,
+            _ => MxErrorDisposition::NoData,
+        },
+        _ => MxErrorDisposition::Transport(error.to_string()),
+    }
+}
+
 /// Production resolver over mail-auth's hickory re-export. Lookups run on a
 /// dedicated current-thread runtime so callers stay synchronous.
 pub struct HickoryMxResolver;
@@ -120,6 +148,33 @@ impl MxResolver for HickoryMxResolver {
             )
             .with_options(ResolverOpts::default())
             .build();
+
+            // RFC 5321 §5.1: the implicit-MX fallback to the bare domain is
+            // only valid when the domain actually holds address records — a
+            // NODATA answer for MX says nothing about A/AAAA, so we look
+            // them up explicitly instead of guessing.
+            async fn nodata_fallback(
+                resolver: &TokioResolver,
+                domain: &str,
+            ) -> Result<MxResolution, String> {
+                match resolver.lookup_ip(format!("{domain}.")).await {
+                    Ok(addresses) if addresses.iter().next().is_some() => {
+                        Ok(MxResolution::NoMx {
+                            fallback_hosts: vec![domain.to_string()],
+                        })
+                    }
+                    Ok(_) => Ok(MxResolution::NoSuchDomain),
+                    Err(error) => match mx_error_disposition(&error) {
+                        MxErrorDisposition::NxDomain | MxErrorDisposition::NoData => {
+                            Ok(MxResolution::NoSuchDomain)
+                        }
+                        MxErrorDisposition::Transport(text) => {
+                            Err(format!("a/aaaa fallback lookup failed: {text}"))
+                        }
+                    },
+                }
+            }
+
             match resolver.mx_lookup(format!("{domain}.")).await {
                 Ok(lookup) => {
                     let records: Vec<MxTarget> = lookup
@@ -131,25 +186,21 @@ impl MxResolver for HickoryMxResolver {
                         .collect();
                     let classified = classify_mx_records(records);
                     if let MxResolution::NoMx { .. } = classified {
-                        return Ok(MxResolution::NoMx {
-                            fallback_hosts: vec![domain.clone()],
-                        });
+                        // Empty answer set == NODATA: same explicit A/AAAA
+                        // verification path.
+                        return nodata_fallback(&resolver, &domain).await;
                     }
                     Ok(classified)
                 }
-                Err(error) => {
-                    let text = error.to_string();
-                    if text.contains("no record found") || text.contains("NXDomain") {
-                        // No MX: A/AAAA fallback on the bare domain — only
-                        // valid when the domain itself resolves; the SMTP
-                        // connect attempt settles that.
-                        Ok(MxResolution::NoMx {
-                            fallback_hosts: vec![domain.clone()],
-                        })
-                    } else {
+                Err(error) => match mx_error_disposition(&error) {
+                    // NXDOMAIN is terminal for the recipient domain — never
+                    // an A/AAAA fallback candidate.
+                    MxErrorDisposition::NxDomain => Ok(MxResolution::NoSuchDomain),
+                    MxErrorDisposition::NoData => nodata_fallback(&resolver, &domain).await,
+                    MxErrorDisposition::Transport(text) => {
                         Err(format!("mx lookup failed: {text}"))
                     }
-                }
+                },
             }
         })
     }
@@ -201,15 +252,51 @@ mod tests {
     #[test]
     fn priority_ordering_holds_with_tie_shuffle() {
         let resolution = classify_mx_records(vec![
-            MxTarget { host: "mx2.example.com.".to_string(), priority: 20 },
-            MxTarget { host: "mx1a.example.com.".to_string(), priority: 10 },
-            MxTarget { host: "mx1b.example.com.".to_string(), priority: 10 },
+            MxTarget {
+                host: "mx2.example.com.".to_string(),
+                priority: 20,
+            },
+            MxTarget {
+                host: "mx1a.example.com.".to_string(),
+                priority: 10,
+            },
+            MxTarget {
+                host: "mx1b.example.com.".to_string(),
+                priority: 10,
+            },
         ]);
         let hosts = ordered_delivery_hosts(&resolution).unwrap();
         assert_eq!(hosts.len(), 3);
         assert_eq!(hosts[2], "mx2.example.com", "highest number last");
         assert!(hosts[..2].contains(&"mx1a.example.com".to_string()));
         assert!(hosts[..2].contains(&"mx1b.example.com".to_string()));
+    }
+
+    #[test]
+    fn mx_error_disposition_is_structural_not_string_matched() {
+        use mail_auth::hickory_resolver::proto::op::{Query, ResponseCode};
+        use mail_auth::hickory_resolver::proto::rr::{Name, RecordType};
+        use mail_auth::hickory_resolver::proto::{NoRecords, ProtoError, ProtoErrorKind};
+
+        let query = Query::query(Name::from_ascii("nomx.example.").unwrap(), RecordType::MX);
+        // NODATA: the domain exists, no MX records → A/AAAA verification.
+        let nodata =
+            ProtoError::from(NoRecords::new(query.clone(), ResponseCode::NoError));
+        assert_eq!(mx_error_disposition(&nodata), MxErrorDisposition::NoData);
+        // NXDOMAIN: the domain does not exist → terminal, never a fallback.
+        let nxdomain = ProtoError::from(NoRecords::new(query, ResponseCode::NXDomain));
+        assert_eq!(mx_error_disposition(&nxdomain), MxErrorDisposition::NxDomain);
+        // A transport-class error is neither: retryable, no fallback.
+        let transport = ProtoError::from(ProtoErrorKind::Msg("connection refused".to_string()));
+        assert!(matches!(
+            mx_error_disposition(&transport),
+            MxErrorDisposition::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn no_such_domain_is_terminal_like_null_mx() {
+        assert!(ordered_delivery_hosts(&MxResolution::NoSuchDomain).is_err());
     }
 
     #[test]

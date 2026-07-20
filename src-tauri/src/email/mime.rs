@@ -125,14 +125,21 @@ pub fn verify_mime(
             .collect()
     };
 
-    // Bcc must never appear as a header in the frozen MIME (§3b).
-    if headers.iter().any(|(name, _)| name == "bcc") {
-        return Err("frozen MIME must not carry a Bcc header".to_string());
+    // Bcc must never appear as a header in the frozen MIME (§3b) — and the
+    // standardized resent variant is just as much of a disclosure channel.
+    if headers
+        .iter()
+        .any(|(name, _)| name == "bcc" || name == "resent-bcc")
+    {
+        return Err("frozen MIME must not carry a Bcc or Resent-Bcc header".to_string());
     }
 
     let from_addresses = header_value("from");
     let identity_lower = identity_address.to_ascii_lowercase();
-    if !from_addresses.iter().any(|address| address == &identity_lower) {
+    if !from_addresses
+        .iter()
+        .any(|address| address == &identity_lower)
+    {
         return Err(format!(
             "MIME From does not carry the granted identity address {identity_address}"
         ));
@@ -155,8 +162,14 @@ pub fn verify_mime(
         .map(|recipient| recipient.address.to_ascii_lowercase())
         .collect();
 
-    // Bcc envelope addresses must not leak into visible headers.
-    if let Some(leaked) = envelope_bcc.intersection(&header_recipients).next() {
+    // Bcc envelope addresses must not leak into ANY transmitted
+    // address-bearing header — To/Cc, Reply-To, and the resent variants all
+    // disclose the address to every visible recipient (§3b).
+    let transmitted_addresses: BTreeSet<String> = ["to", "cc", "reply-to", "resent-to", "resent-cc"]
+        .iter()
+        .flat_map(|name| header_value(name))
+        .collect();
+    if let Some(leaked) = envelope_bcc.intersection(&transmitted_addresses).next() {
         return Err(format!("bcc recipient leaked into MIME headers: {leaked}"));
     }
     // Visible headers must match the envelope's to/cc set exactly.
@@ -289,6 +302,54 @@ mod tests {
             ]),
         )
         .is_err());
+    }
+
+    #[test]
+    fn resent_bcc_and_all_address_header_leaks_are_rejected() {
+        let bcc_envelope = envelope(&[
+            ("to", "billing@partner.example"),
+            ("bcc", "archive@acme.example"),
+        ]);
+        // A Resent-Bcc header is rejected outright, like Bcc.
+        let resent = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nResent-Bcc: archive@acme.example\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            resent,
+            &sha256_hex(resent),
+            resent.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // Envelope-bcc leaking through Reply-To is rejected.
+        let reply_to = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nReply-To: archive@acme.example\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            reply_to,
+            &sha256_hex(reply_to),
+            reply_to.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // Envelope-bcc leaking through Resent-To is rejected.
+        let resent_to = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nResent-To: archive@acme.example\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            resent_to,
+            &sha256_hex(resent_to),
+            resent_to.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_err());
+        // A benign Reply-To (non-bcc address) still passes.
+        let benign = b"From: ops@acme.example\r\nTo: billing@partner.example\r\nReply-To: ops@acme.example\r\n\r\nhello\r\n";
+        assert!(verify_mime(
+            benign,
+            &sha256_hex(benign),
+            benign.len() as u64,
+            "ops@acme.example",
+            &bcc_envelope,
+        )
+        .is_ok());
     }
 
     #[test]

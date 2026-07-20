@@ -23,11 +23,7 @@ pub enum RetryDecision {
 
 /// Classify a pre-DATA / connect failure. `at_or_after_data` short-circuits
 /// to DeliveryUnknown regardless of class — the boundary fact wins.
-pub fn classify_retry(
-    class: ResponseClass,
-    at_or_after_data: bool,
-    attempt: u32,
-) -> RetryDecision {
+pub fn classify_retry(class: ResponseClass, at_or_after_data: bool, attempt: u32) -> RetryDecision {
     if at_or_after_data {
         return RetryDecision::DeliveryUnknown;
     }

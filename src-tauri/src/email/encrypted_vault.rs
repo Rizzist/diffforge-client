@@ -86,8 +86,7 @@ fn write_atomic_0600(path: &Path, contents: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "vault path has no parent".to_string())?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("vault dir create failed: {error}"))?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("vault dir create failed: {error}"))?;
     let temp = parent.join(format!(
         ".{}.tmp-{}",
         path.file_name()
@@ -153,8 +152,8 @@ impl EncryptedVault {
 
     /// Open + decrypt an existing vault.
     pub fn unlock(path: &Path, passphrase: SecretString) -> Result<Self, String> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|error| format!("vault read failed: {error}"))?;
+        let raw =
+            std::fs::read_to_string(path).map_err(|error| format!("vault read failed: {error}"))?;
         let envelope: Value = serde_json::from_str(&raw)
             .map_err(|error| format!("vault envelope corrupt: {error}"))?;
         let version = envelope.get("version").and_then(Value::as_u64).unwrap_or(0);
@@ -275,8 +274,7 @@ mod tests {
     fn vault_round_trip_and_wrong_passphrase() {
         let dir = temp_dir();
         let path = dir.join(VAULT_FILE);
-        let mut vault =
-            EncryptedVault::create(&path, SecretString::from("correct horse")).unwrap();
+        let mut vault = EncryptedVault::create(&path, SecretString::from("correct horse")).unwrap();
         vault
             .set("profile-a", &SecretString::from("app-password-123"))
             .unwrap();

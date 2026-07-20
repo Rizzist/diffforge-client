@@ -258,6 +258,26 @@ pub fn u64_to_wire(value: u64) -> String {
     value.to_string()
 }
 
+/// Lossless, order-preserving journal representation for full-range u64
+/// counters (`lease_epoch`): fixed-width 20-digit decimal TEXT. Lexicographic
+/// order == numeric order across the entire u64 range, so SQL TEXT
+/// comparisons (`lease_epoch <= ?`) fence correctly with no i64
+/// aliasing/corruption — and the form stays human-readable and consistent
+/// with the §0.2 u64-as-decimal-string wire rule.
+pub fn u64_to_sortable(value: u64) -> String {
+    format!("{value:020}")
+}
+
+/// Parse the fixed-width sortable representation back to a u64. Fail-closed:
+/// anything that is not exactly 20 ASCII digits (or overflows u64) errors.
+pub fn u64_from_sortable(text: &str) -> Result<u64, String> {
+    if text.len() != 20 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("not a sortable u64: {text}"));
+    }
+    text.parse::<u64>()
+        .map_err(|error| format!("sortable u64 out of range: {error}"))
+}
+
 /// Fail-closed u64-string parse: JSON numbers are refused for §0.2-listed
 /// counters (see fixture `u64__string__number_rejected`).
 pub fn u64_from_wire(value: &Value) -> Result<u64, String> {
@@ -392,6 +412,72 @@ impl SanitizedResponse {
     }
 }
 
+/// The §9.3 settlement ack, parsed EXACTLY:
+/// `{contract, schema_version, status_event_id, applied, audit?}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettlementAck {
+    pub status_event_id: String,
+    pub applied: bool,
+    pub audit: Option<String>,
+}
+
+/// Fail-closed §9.3 ack parser. Requires the exact envelope (contract +
+/// schema_version), a `status_event_id` MATCHING the event the device sent,
+/// a Boolean `applied` (never defaulted), and an audit slug from the closed
+/// registry when present. Anything else is an error — the event stays
+/// un-acked and compaction never proceeds on a malformed response.
+pub fn parse_settlement_ack(
+    value: &Value,
+    expected_status_event_id: &str,
+) -> Result<SettlementAck, String> {
+    let contract = value
+        .get("contract")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "settlement ack missing contract".to_string())?;
+    if contract != EMAIL_CONTRACT {
+        return Err(format!("settlement ack contract fails closed: {contract}"));
+    }
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "settlement ack missing schema_version".to_string())?;
+    if schema_version != EMAIL_SCHEMA_VERSION {
+        return Err(format!(
+            "settlement ack schema_version fails closed: {schema_version}"
+        ));
+    }
+    let status_event_id = value
+        .get("status_event_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "settlement ack missing status_event_id".to_string())?;
+    if status_event_id != expected_status_event_id {
+        return Err(format!(
+            "settlement ack status_event_id mismatch: expected {expected_status_event_id}, got {status_event_id}"
+        ));
+    }
+    let applied = value
+        .get("applied")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "settlement ack missing boolean applied".to_string())?;
+    let audit = match value.get("audit") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(slug)) => {
+            if !SETTLEMENT_AUDITS.contains(&slug.as_str()) {
+                return Err(format!("settlement ack audit slug fails closed: {slug}"));
+            }
+            Some(slug.clone())
+        }
+        Some(other) => {
+            return Err(format!("settlement ack audit must be a string: {other}"));
+        }
+    };
+    Ok(SettlementAck {
+        status_event_id: status_event_id.to_string(),
+        applied,
+        audit,
+    })
+}
+
 /// Extract + validate a wake/companion command payload (§9.4). Returns the
 /// parsed command or a fail-closed error. The payload may sit at the event
 /// root or under `payload`.
@@ -486,16 +572,32 @@ pub fn parse_email_command(kind: &str, payload: &Value) -> Result<EmailCommand, 
             command_id: command_text(payload, "command_id")?,
             profile_ref: command_text(payload, "profile_ref")?,
             domain: command_text(payload, "domain")?,
-            requested_checks: command_field(payload, "requested_checks")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            // §0.3 fail-closed: `check_id` is a closed registry. Non-string
+            // entries and unknown ids are malformed, never silently dropped.
+            requested_checks: match command_field(payload, "requested_checks") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => {
+                    let mut checks = Vec::with_capacity(items.len());
+                    for item in items {
+                        let Some(check_id) = item.as_str() else {
+                            return Err(
+                                "email_preflight_run requested_checks entries must be strings"
+                                    .to_string(),
+                            );
+                        };
+                        if !PREFLIGHT_CHECK_IDS.contains(&check_id) {
+                            return Err(format!(
+                                "email_preflight_run unknown check id fails closed: {check_id}"
+                            ));
+                        }
+                        checks.push(check_id.to_string());
+                    }
+                    checks
+                }
+                Some(_) => {
+                    return Err("email_preflight_run requested_checks must be an array".to_string())
+                }
+            },
             target_device_id: command_text(payload, "target_device_id")?,
         }),
         other => Err(format!("unknown email command kind: {other}")),
@@ -593,6 +695,94 @@ mod tests {
     }
 
     #[test]
+    fn sortable_u64_preserves_full_range_ordering() {
+        let values = [0u64, 1, 42, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX];
+        let sortables: Vec<String> = values.iter().map(|v| u64_to_sortable(*v)).collect();
+        let mut sorted = sortables.clone();
+        sorted.sort();
+        assert_eq!(sortables, sorted, "lexicographic == numeric across u64");
+        for (value, text) in values.iter().zip(sortables.iter()) {
+            assert_eq!(u64_from_sortable(text).unwrap(), *value);
+        }
+        assert!(u64_from_sortable("42").is_err(), "unpadded fails closed");
+        assert!(u64_from_sortable("-0000000000000000001").is_err());
+        assert!(
+            u64_from_sortable("99999999999999999999").is_err(),
+            "over u64::MAX"
+        );
+    }
+
+    #[test]
+    fn preflight_requested_checks_fail_closed() {
+        let base = json!({
+            "command_id": "cmd-1",
+            "profile_ref": "profile-1",
+            "domain": "acme.example",
+            "target_device_id": "device-1",
+        });
+        let mut valid = base.clone();
+        valid["requested_checks"] = json!(["public_ip", "port25_egress"]);
+        let parsed = parse_email_command(EMAIL_COMMAND_PREFLIGHT_RUN, &valid).unwrap();
+        if let EmailCommand::PreflightRun {
+            requested_checks, ..
+        } = parsed
+        {
+            assert_eq!(requested_checks, vec!["public_ip", "port25_egress"]);
+        } else {
+            panic!("expected preflight command");
+        }
+        // Unknown check id fails closed.
+        let mut unknown = base.clone();
+        unknown["requested_checks"] = json!(["public_ip", "mystery_check"]);
+        assert!(parse_email_command(EMAIL_COMMAND_PREFLIGHT_RUN, &unknown).is_err());
+        // Non-string entries fail closed (never silently discarded).
+        let mut non_string = base.clone();
+        non_string["requested_checks"] = json!(["public_ip", 42]);
+        assert!(parse_email_command(EMAIL_COMMAND_PREFLIGHT_RUN, &non_string).is_err());
+        // Non-array fails closed.
+        let mut non_array = base.clone();
+        non_array["requested_checks"] = json!("public_ip");
+        assert!(parse_email_command(EMAIL_COMMAND_PREFLIGHT_RUN, &non_array).is_err());
+        // Absent = run everything.
+        assert!(parse_email_command(EMAIL_COMMAND_PREFLIGHT_RUN, &base).is_ok());
+    }
+
+    #[test]
+    fn settlement_ack_parser_is_exact_typed() {
+        let good = json!({
+            "contract": EMAIL_CONTRACT,
+            "schema_version": 1,
+            "status_event_id": "evt-1",
+            "applied": false,
+            "audit": "stale_generation",
+        });
+        let ack = parse_settlement_ack(&good, "evt-1").unwrap();
+        assert!(!ack.applied);
+        assert_eq!(ack.audit.as_deref(), Some("stale_generation"));
+        // Missing applied must NOT default to true.
+        let missing_applied = json!({
+            "contract": EMAIL_CONTRACT,
+            "schema_version": 1,
+            "status_event_id": "evt-1",
+        });
+        assert!(parse_settlement_ack(&missing_applied, "evt-1").is_err());
+        // Mismatched status_event_id fails.
+        assert!(parse_settlement_ack(&good, "evt-2").is_err());
+        // Wrong contract / schema / unknown audit all fail closed.
+        let mut wrong_contract = good.clone();
+        wrong_contract["contract"] = json!("diffforge.other.v1");
+        assert!(parse_settlement_ack(&wrong_contract, "evt-1").is_err());
+        let mut wrong_schema = good.clone();
+        wrong_schema["schema_version"] = json!(2);
+        assert!(parse_settlement_ack(&wrong_schema, "evt-1").is_err());
+        let mut bad_audit = good.clone();
+        bad_audit["audit"] = json!("mystery");
+        assert!(parse_settlement_ack(&bad_audit, "evt-1").is_err());
+        // A generic {ok:true} shape never acks anything.
+        assert!(parse_settlement_ack(&json!({"ok": true}), "evt-1").is_err());
+    }
+
+    #[test]
     fn canonical_json_sorts_keys_bytewise() {
         let value = json!({"b": 1, "a": {"z": true, "aa": [2, 1]}, "A": "x"});
         assert_eq!(
@@ -659,7 +849,10 @@ mod tests {
         });
         let a = parse_email_command(EMAIL_COMMAND_SEND, &root).unwrap();
         let b = parse_email_command(EMAIL_COMMAND_SEND, &nested).unwrap();
-        assert_eq!(email_command_payload_hash(&a), email_command_payload_hash(&b));
+        assert_eq!(
+            email_command_payload_hash(&a),
+            email_command_payload_hash(&b)
+        );
         let tampered = json!({
             "command_id": "email-send:job-1:1",
             "send_job_id": "job-1",
@@ -668,6 +861,9 @@ mod tests {
             "target_device_id": "device-1",
         });
         let c = parse_email_command(EMAIL_COMMAND_SEND, &tampered).unwrap();
-        assert_ne!(email_command_payload_hash(&a), email_command_payload_hash(&c));
+        assert_ne!(
+            email_command_payload_hash(&a),
+            email_command_payload_hash(&c)
+        );
     }
 }

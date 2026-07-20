@@ -95,9 +95,9 @@ pub async fn email_delivery_preflight_local(
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let (journal, credentials) = open()?;
-        let journal_healthy = journal.health_check().map(|value| {
-            value.get("ok").and_then(Value::as_bool).unwrap_or(false)
-        });
+        let journal_healthy = journal
+            .health_check()
+            .map(|value| value.get("ok").and_then(Value::as_bool).unwrap_or(false));
         let credential_healthy = matches!(
             credentials.health(),
             super::credentials::CredentialStoreHealth::Healthy

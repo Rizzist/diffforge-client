@@ -72,6 +72,47 @@ pub fn classify_send_intake(intake: &CommandIntake) -> IntakeAck {
     }
 }
 
+/// Build the §9.2 phase-received event payload at intake time — rank-1
+/// fields only (no mode/lease/mime). Journaled ATOMICALLY with the receipt
+/// and job row so the ack's `first_status_event_id` always references a
+/// durable event, even if the process dies between ack and worker.
+pub fn received_event_payload(
+    command: &EmailCommand,
+    device_id: &str,
+    status_event_id: &str,
+) -> Value {
+    let EmailCommand::Send {
+        command_id,
+        send_job_id,
+        generation,
+        binding_id,
+        ..
+    } = command
+    else {
+        return Value::Null;
+    };
+    json!({
+        "contract": contract::EMAIL_CONTRACT,
+        "schema_version": contract::EMAIL_SCHEMA_VERSION,
+        "status_event_id": status_event_id,
+        "command_id": command_id,
+        "send_job_id": send_job_id,
+        "generation": generation,
+        "device_id": device_id,
+        "binding_id": binding_id,
+        "phase": "received",
+        "phase_rank": contract::SendPhase::Received.rank(),
+        "occurred_at_ms": now_ms(),
+    })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Journal a wake/companion command and return the ack. This is the single
 /// entry both intake paths call — the journal write commits inside here,
 /// strictly BEFORE the returned ack is emitted by the caller.
@@ -79,6 +120,7 @@ pub fn journal_command_before_ack(
     journal: &mut EmailJournal,
     command: &EmailCommand,
     source: &str,
+    device_id: &str,
 ) -> Result<IntakeAck, String> {
     let payload_hash = email_command_payload_hash(command);
     let ack = match command {
@@ -96,6 +138,7 @@ pub fn journal_command_before_ack(
                 binding_id,
                 &payload_hash,
                 source,
+                |status_event_id| received_event_payload(command, device_id, status_event_id),
             )?;
             classify_send_intake(&intake)
         }
@@ -113,10 +156,12 @@ pub fn journal_command_before_ack(
     Ok(ack)
 }
 
-/// The durable `remote_command_ack` payload (§9.4). Enqueued to the outbox
-/// AFTER the journal write, carrying the ack result + first_status_event_id.
-pub fn email_intake_ack_payload(
-    command: &EmailCommand,
+/// The durable `remote_command_ack` payload (§9.4) — kind/id parts form, so
+/// the fail-closed rejection of a malformed command (which never parses into
+/// an `EmailCommand`) builds the SAME shape.
+pub fn email_intake_ack_payload_parts(
+    command_kind: &str,
+    command_id: &str,
     ack: &IntakeAck,
     device_id: &str,
     target_device_id: &str,
@@ -125,8 +170,8 @@ pub fn email_intake_ack_payload(
         "contract": contract::EMAIL_CONTRACT,
         "schema_version": contract::EMAIL_SCHEMA_VERSION,
         "event_kind": "remote_command_ack",
-        "command_id": command.command_id(),
-        "command_kind": command.kind(),
+        "command_id": command_id,
+        "command_kind": command_kind,
         "status": ack.result,
         "ack": ack.result,
         "device_id": device_id,
@@ -142,31 +187,123 @@ pub fn email_intake_ack_payload(
     payload
 }
 
-/// Detect the cloud→device `email_generation_retired` ack (§9.4). Returns
-/// (send_job_id, generation) when the event is that kind.
-pub fn parse_generation_retired(event: &Value) -> Option<(String, u32)> {
-    let kind = event
+/// The durable `remote_command_ack` payload (§9.4). Enqueued to the outbox
+/// AFTER the journal write, carrying the ack result + first_status_event_id.
+pub fn email_intake_ack_payload(
+    command: &EmailCommand,
+    ack: &IntakeAck,
+    device_id: &str,
+    target_device_id: &str,
+) -> Value {
+    email_intake_ack_payload_parts(
+        command.kind(),
+        command.command_id(),
+        ack,
+        device_id,
+        target_device_id,
+    )
+}
+
+/// True when the event's kind names `email_generation_retired` — the strict
+/// parse below decides whether it is well-formed.
+pub fn is_generation_retired_event(event: &Value) -> bool {
+    event
         .get("kind")
         .or_else(|| event.get("event_kind"))
-        .and_then(Value::as_str)?;
-    if kind != EMAIL_GENERATION_RETIRED_KIND {
-        return None;
+        .and_then(Value::as_str)
+        == Some(EMAIL_GENERATION_RETIRED_KIND)
+}
+
+/// Strict parse of the cloud→device `email_generation_retired` ack (§9.4):
+/// exact contract + schema envelope, generation accepted as JSON number or
+/// §0.2 decimal string with a CHECKED u64→u32 conversion (no aliasing —
+/// 2^32+1 is an error, never generation 1).
+pub fn parse_generation_retired(event: &Value) -> Result<(String, u32), String> {
+    if !is_generation_retired_event(event) {
+        return Err("not an email_generation_retired event".to_string());
     }
-    let send_job_id = event.get("send_job_id").and_then(Value::as_str)?.to_string();
-    let generation = event.get("generation").and_then(Value::as_u64)? as u32;
-    Some((send_job_id, generation))
+    let contract_ok = event
+        .get("contract")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == contract::EMAIL_CONTRACT);
+    let schema_ok = event
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value == u64::from(contract::EMAIL_SCHEMA_VERSION));
+    if !contract_ok || !schema_ok {
+        return Err("generation_retired envelope fails closed (contract/schema)".to_string());
+    }
+    let send_job_id = event
+        .get("send_job_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "generation_retired missing send_job_id".to_string())?
+        .to_string();
+    let raw = match event.get("generation") {
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .ok_or_else(|| "generation_retired generation not unsigned".to_string())?,
+        Some(value @ Value::String(_)) => contract::u64_from_wire(value)?,
+        _ => return Err("generation_retired missing generation".to_string()),
+    };
+    let generation = u32::try_from(raw)
+        .map_err(|_| format!("generation_retired generation out of range: {raw}"))?;
+    Ok((send_job_id, generation))
+}
+
+/// Tri-state classification of a remote-command event (§9.4): not an email
+/// command at all, a valid one, or a RECOGNIZED-but-invalid one. The invalid
+/// case must be consumed with a fail-closed rejection — it must never fall
+/// through to the generic acknowledgement pipeline as if it were unknown.
+pub enum EmailCommandEvent {
+    NotEmail,
+    Valid(EmailCommand),
+    Invalid {
+        kind: String,
+        command_id: Option<String>,
+        error: String,
+    },
+}
+
+pub fn classify_email_command_event(event: &Value) -> EmailCommandEvent {
+    let Some(kind) = event
+        .get("command_kind")
+        .or_else(|| {
+            event
+                .get("payload")
+                .and_then(|inner| inner.get("command_kind"))
+        })
+        .and_then(Value::as_str)
+    else {
+        return EmailCommandEvent::NotEmail;
+    };
+    if !is_email_command_kind(kind) {
+        return EmailCommandEvent::NotEmail;
+    }
+    match parse_email_command(kind, event) {
+        Ok(command) => EmailCommandEvent::Valid(command),
+        Err(error) => EmailCommandEvent::Invalid {
+            kind: kind.to_string(),
+            command_id: event
+                .get("command_id")
+                .or_else(|| {
+                    event
+                        .get("payload")
+                        .and_then(|inner| inner.get("command_id"))
+                })
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            error,
+        },
+    }
 }
 
 /// Extract the command kind from a remote-command event (root or nested).
 pub fn event_email_command(event: &Value) -> Option<EmailCommand> {
-    let kind = event
-        .get("command_kind")
-        .or_else(|| event.get("payload").and_then(|inner| inner.get("command_kind")))
-        .and_then(Value::as_str)?;
-    if !is_email_command_kind(kind) {
-        return None;
+    match classify_email_command_event(event) {
+        EmailCommandEvent::Valid(command) => Some(command),
+        _ => None,
     }
-    parse_email_command(kind, event).ok()
 }
 
 /// True when this event is an email wake/companion command — used by the
@@ -174,7 +311,11 @@ pub fn event_email_command(event: &Value) -> Option<EmailCommand> {
 pub fn is_email_command_event(event: &Value) -> bool {
     event
         .get("command_kind")
-        .or_else(|| event.get("payload").and_then(|inner| inner.get("command_kind")))
+        .or_else(|| {
+            event
+                .get("payload")
+                .and_then(|inner| inner.get("command_kind"))
+        })
         .and_then(Value::as_str)
         .is_some_and(is_email_command_kind)
 }
@@ -185,26 +326,103 @@ pub fn is_email_command_event(event: &Value) -> bool {
 // threads and never ack before the journal commit returns.
 // ---------------------------------------------------------------------
 
+/// Send the DEDICATED §9.4 `remote_command_ack` — contract + schema at the
+/// root, top-level `first_status_event_id`, result in `status`/`ack`. Rides
+/// the durable outbox (idempotent per command + result) AND a best-effort
+/// live send. `rejected` also travels as `remote_command_ack` — never as a
+/// generic `remote_command_result`.
+async fn send_email_command_ack(
+    state: &crate::CloudMcpState,
+    command_kind: &str,
+    command_id: &str,
+    ack: &IntakeAck,
+    reject_reason: Option<&str>,
+    device_id: &str,
+    target_device_id: &str,
+) {
+    let mut payload =
+        email_intake_ack_payload_parts(command_kind, command_id, ack, device_id, target_device_id);
+    payload["ts_ms"] = json!(now_ms());
+    if let Some(reason) = reject_reason {
+        // Local diagnostic only — deliberately NOT named `error_class`, which
+        // is a §9.2 closed enum with different members.
+        payload["reject_reason"] = json!(reason);
+    }
+    let idempotency_key = format!("email-command-ack:{command_id}:{}", ack.result);
+    payload["idempotency_key"] = json!(idempotency_key.clone());
+    crate::cloud_mcp_enqueue_background_sync(
+        state,
+        idempotency_key,
+        "remote_command_ack",
+        payload.clone(),
+        crate::cloud_mcp_outbox_priority_for_event("remote_command_ack"),
+        "email_command_ack",
+    )
+    .await;
+    let _ = crate::cloud_mcp_send_event_over_app_ws_once(
+        state,
+        "remote_command_ack",
+        &payload,
+        "email-intake-ack-live",
+    )
+    .await;
+}
+
 /// Handle an email wake/companion command from EITHER intake path
 /// (`live_intake` or `account_sync_resume_replay`). Returns true when the
-/// event was an email command (handled here; the generic pipeline must skip
-/// it — including its generic "received" ack).
+/// event was a RECOGNIZED email command — valid or not — so the generic
+/// pipeline never acknowledges a malformed email command as if it were an
+/// ordinary one.
 pub async fn email_try_handle_remote_command(
     state: &crate::CloudMcpState,
     event: &Value,
     source: &'static str,
 ) -> bool {
-    let Some(command) = event_email_command(event) else {
-        return false;
-    };
     let device_id = crate::cloud_mcp_email_device_id();
+    let command = match classify_email_command_event(event) {
+        EmailCommandEvent::NotEmail => return false,
+        EmailCommandEvent::Invalid {
+            kind,
+            command_id,
+            error,
+        } => {
+            // A recognized-but-malformed email command is consumed with a
+            // fail-closed rejection ack (no journal receipt — nothing may
+            // execute, and redelivery re-rejects identically).
+            crate::log_terminal_status_event(
+                "backend.email.command_invalid",
+                json!({
+                    "command_kind": kind,
+                    "command_id": command_id,
+                    "source": source,
+                    "error": error,
+                }),
+            );
+            if let Some(command_id) = command_id.as_deref() {
+                send_email_command_ack(
+                    state,
+                    &kind,
+                    command_id,
+                    &IntakeAck::rejected(false),
+                    Some("invalid_payload"),
+                    &device_id,
+                    &device_id,
+                )
+                .await;
+            }
+            return true;
+        }
+        EmailCommandEvent::Valid(command) => command,
+    };
 
-    // 1) Journal BEFORE ack (§9.4). A journal failure means NO ack of
-    // acceptance — report failure so the cloud re-offers later.
+    // 1) Journal BEFORE ack (§9.4). A journal failure means NO ack of ANY
+    // kind — the command was not durably received, so the device stays
+    // silent and the cloud's at-least-once redelivery retries later.
     let journal_command = command.clone();
+    let journal_device_id = device_id.clone();
     let intake = tauri::async_runtime::spawn_blocking(move || {
         let mut journal = EmailJournal::open_default()?;
-        journal_command_before_ack(&mut journal, &journal_command, source)
+        journal_command_before_ack(&mut journal, &journal_command, source, &journal_device_id)
     })
     .await
     .map_err(|error| format!("email intake join failed: {error}"));
@@ -219,42 +437,38 @@ pub async fn email_try_handle_remote_command(
                     "error": error,
                 }),
             );
-            let _ = crate::cloud_mcp_send_remote_command_status_event(
-                state,
-                event,
-                "failed",
-                "Email command could not be journaled; not acknowledged.",
-                Some(&json!({ "reason": "journal_write_failed" })),
-            )
-            .await;
             return true;
         }
     };
 
-    // 2) Ack (rides the durable outbox via the status-event helper).
-    let details = json!({
-        "ack": ack.result,
-        "first_status_event_id": ack.first_status_event_id,
-        "security_rejected": ack.security_rejected,
-        "intake_source": source,
-    });
-    let message = match ack.result.as_str() {
-        "accepted" => "Email command journaled and accepted.",
-        "duplicate" => "Email command already journaled (duplicate).",
-        _ => {
-            if ack.security_rejected {
-                "Email command rejected: payload hash mismatch for command id."
-            } else {
-                "Email command rejected: fenced by a higher generation."
-            }
-        }
+    // 2) The dedicated §9.4 ack, authorized by the committed journal write.
+    let target_device_id = event
+        .get("target_device_id")
+        .or_else(|| {
+            event
+                .get("payload")
+                .and_then(|inner| inner.get("target_device_id"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or(&device_id)
+        .to_string();
+    let reject_reason = if ack.result == "rejected" {
+        Some(if ack.security_rejected {
+            "security_rejected"
+        } else {
+            "fenced_by_higher_generation"
+        })
+    } else {
+        None
     };
-    let _ = crate::cloud_mcp_send_remote_command_status_event(
+    send_email_command_ack(
         state,
-        event,
-        &ack.result,
-        message,
-        Some(&details),
+        command.kind(),
+        command.command_id(),
+        &ack,
+        reject_reason,
+        &device_id,
+        &target_device_id,
     )
     .await;
     if ack.security_rejected {
@@ -267,7 +481,9 @@ pub async fn email_try_handle_remote_command(
     // 3) Execute. Accepted commands always run; a DUPLICATE email_send whose
     // journal state is still non-terminal is a cloud re-offer — re-kick the
     // worker (same generation re-executes after lease expiry /
-    // credential_required recovery, §6b.1).
+    // credential_required recovery, §6b.1). The worker holds the atomic
+    // per-generation claim, so a duplicate spawn can never race the first
+    // into a second SMTP transaction.
     match &command {
         EmailCommand::Send {
             send_job_id,
@@ -275,13 +491,7 @@ pub async fn email_try_handle_remote_command(
             ..
         } => {
             if ack.should_execute() || ack.result == "duplicate" {
-                spawn_send_worker(
-                    state.clone(),
-                    send_job_id.clone(),
-                    *generation,
-                    device_id,
-                    ack.first_status_event_id.clone().filter(|_| ack.should_execute()),
-                );
+                spawn_send_worker(state.clone(), send_job_id.clone(), *generation, device_id);
             }
         }
         EmailCommand::CredentialProbe { profile_ref, .. } => {
@@ -292,11 +502,18 @@ pub async fn email_try_handle_remote_command(
         EmailCommand::PreflightRun {
             profile_ref,
             domain,
+            requested_checks,
             ..
         } => {
             if ack.should_execute() {
-                run_preflight_snapshot(state, event, profile_ref.clone(), domain.clone(), device_id)
-                    .await;
+                run_preflight_snapshot(
+                    state,
+                    profile_ref.clone(),
+                    domain.clone(),
+                    requested_checks.clone(),
+                    device_id,
+                )
+                .await;
             }
         }
     }
@@ -305,10 +522,21 @@ pub async fn email_try_handle_remote_command(
 
 /// Handle cloud→device email ws events that are NOT remote commands — today
 /// the §9.4 `email_generation_retired` ack, which unlocks tombstone
-/// compaction (§10.1). Returns true when consumed.
+/// compaction (§10.1). Returns true when consumed (including malformed
+/// retirement events, which are logged and dropped fail-closed).
 pub async fn email_try_handle_ws_event(_event_kind: &str, event: &Value) -> bool {
-    let Some((send_job_id, generation)) = parse_generation_retired(event) else {
+    if !is_generation_retired_event(event) {
         return false;
+    }
+    let (send_job_id, generation) = match parse_generation_retired(event) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            crate::log_terminal_status_event(
+                "backend.email.generation_retired_malformed",
+                json!({ "error": error }),
+            );
+            return true;
+        }
     };
     let result = tauri::async_runtime::spawn_blocking(move || {
         let mut journal = EmailJournal::open_default()?;
@@ -326,6 +554,34 @@ pub async fn email_try_handle_ws_event(_event_kind: &str, event: &Value) -> bool
     true
 }
 
+/// Atomic per-(send_job_id, generation) worker claim: at most ONE send
+/// worker per pair per process. Duplicate wake commands re-kick the worker,
+/// and without this claim two spawns could interleave their SMTP
+/// transactions and cross DATA twice for the same generation.
+static ACTIVE_SEND_WORKERS: std::sync::Mutex<std::collections::BTreeSet<(String, u32)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+pub(crate) struct SendWorkerClaim {
+    key: (String, u32),
+}
+
+impl Drop for SendWorkerClaim {
+    fn drop(&mut self) {
+        if let Ok(mut active) = ACTIVE_SEND_WORKERS.lock() {
+            active.remove(&self.key);
+        }
+    }
+}
+
+pub(crate) fn claim_send_worker(send_job_id: &str, generation: u32) -> Option<SendWorkerClaim> {
+    let key = (send_job_id.to_string(), generation);
+    let mut active = ACTIVE_SEND_WORKERS.lock().ok()?;
+    if !active.insert(key.clone()) {
+        return None;
+    }
+    Some(SendWorkerClaim { key })
+}
+
 /// Spawn the send worker for one (send_job_id, generation) on a blocking
 /// thread, panic-caught per the self-restarting worker shape — a panic is
 /// logged and the pair is left to the resume path (never silently lost).
@@ -334,17 +590,10 @@ pub fn spawn_send_worker(
     send_job_id: String,
     generation: u32,
     device_id: String,
-    received_event_id: Option<String>,
 ) {
     tauri::async_runtime::spawn_blocking(move || {
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_send_worker_once(
-                &state,
-                &send_job_id,
-                generation,
-                &device_id,
-                received_event_id.as_deref(),
-            )
+            run_send_worker_once(&state, &send_job_id, generation, &device_id)
         }));
         match run {
             Ok(Ok(result)) => {
@@ -386,40 +635,31 @@ fn run_send_worker_once(
     send_job_id: &str,
     generation: u32,
     device_id: &str,
-    received_event_id: Option<&str>,
 ) -> Result<super::submission::SubmissionResult, String> {
-    use super::cloud_transport::WsCloudTransport;
+    use super::cloud_transport::{EmailCloudTransport, WsCloudTransport};
     use super::credentials::CredentialStack;
-    use super::submission::{run_send_job, send_event_payload, SubmissionDeps};
+    use super::submission::{run_send_job, SubmissionDeps};
+
+    // Atomic per-generation claim: a second worker for the same pair (a
+    // duplicate wake racing the first) exits immediately instead of running
+    // a parallel SMTP transaction.
+    let Some(_claim) = claim_send_worker(send_job_id, generation) else {
+        return Ok(super::submission::SubmissionResult::NotRunnable(
+            "worker_already_active".to_string(),
+        ));
+    };
 
     let mut journal = EmailJournal::open_default()?;
     let transport = WsCloudTransport {
         state: state.clone(),
     };
-    // Emit the phase-received event first (its id is the ack's
-    // first_status_event_id) — journal row, then outbox handoff.
-    if let Some(status_event_id) = received_event_id {
-        if let Some(job) = journal.load_job(send_job_id, generation)? {
-            let payload = send_event_payload(
-                &job,
-                device_id,
-                super::contract::SendPhase::Received,
-                status_event_id,
-                None,
-                None,
-                None,
-                None,
-            );
-            journal.insert_send_event(
-                send_job_id,
-                generation,
-                super::contract::SendPhase::Received,
-                status_event_id,
-                &payload,
-            )?;
-            use super::cloud_transport::EmailCloudTransport;
-            transport.emit_send_event(&payload)?;
-            journal.mark_event_handed_off(status_event_id)?;
+    // Flush pending journal events for this pair first — this hands off the
+    // intake-journaled `received` event (the ack's first_status_event_id)
+    // and, on duplicate redelivery after a crash, any event the previous
+    // incarnation journaled but never handed to the outbox.
+    for event in journal.pending_events_for(send_job_id, generation)? {
+        if transport.emit_send_event(&event.payload).is_ok() {
+            journal.mark_event_handed_off(&event.status_event_id)?;
         }
     }
     let secrets = CredentialStack::new();
@@ -429,15 +669,14 @@ fn run_send_worker_once(
         device_id: device_id.to_string(),
         extra_root_cert_pem: None,
         connect_host_override: None,
+        // Production native delivery resolves MX live and dials port 25.
+        native_mx: None,
+        native_port_override: None,
     };
     run_send_job(&deps, &mut journal, send_job_id, generation)
 }
 
-async fn run_credential_probe(
-    state: &crate::CloudMcpState,
-    event: &Value,
-    profile_ref: String,
-) {
+async fn run_credential_probe(state: &crate::CloudMcpState, event: &Value, profile_ref: String) {
     let result = tauri::async_runtime::spawn_blocking(move || {
         let journal = EmailJournal::open_default()?;
         let credentials = super::credentials::CredentialStack::new();
@@ -471,32 +710,42 @@ async fn run_credential_probe(
 
 async fn run_preflight_snapshot(
     state: &crate::CloudMcpState,
-    event: &Value,
     profile_ref: String,
     domain: String,
+    requested_checks: Vec<String>,
     device_id: String,
 ) {
-    use super::preflight::{PreflightObservations, PreflightRun};
+    use super::preflight::PreflightRun;
     let result = tauri::async_runtime::spawn_blocking(move || {
         let journal = EmailJournal::open_default()?;
         let credentials = super::credentials::CredentialStack::new();
-        let journal_ok = journal
-            .health_check()
-            .ok()
-            .and_then(|value| value.get("ok").and_then(Value::as_bool));
-        let observations = PreflightObservations {
-            journal_healthy: journal_ok,
-            credential_store_healthy: Some(matches!(
-                credentials.health(),
-                super::credentials::CredentialStoreHealth::Healthy
-            )),
-            always_on: Some(matches!(
-                super::capability::runtime_kind(),
-                "daemon" | "background"
-            )),
-            ..PreflightObservations::default()
-        };
-        let run = PreflightRun::build(&device_id, &profile_ref, &domain, &observations, false);
+        // Previous qualification decides failed-vs-degraded (§10.2): a run
+        // that was `qualified` and has not expired counts.
+        let previous_qualified: bool = journal
+            .connection()
+            .query_row(
+                "SELECT COUNT(1) FROM email_native_preflight_runs
+                 WHERE profile_ref = ?1 AND domain = ?2 AND result = 'qualified'
+                   AND expires_at_ms > ?3",
+                rusqlite::params![profile_ref, domain, now_ms()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false);
+        let observations = super::preflight::collect_observations(
+            &journal,
+            &credentials,
+            &profile_ref,
+            &domain,
+            &requested_checks,
+        );
+        let run = PreflightRun::build(
+            &device_id,
+            &profile_ref,
+            &domain,
+            &observations,
+            previous_qualified,
+        );
         // Persist the run + checks (§10.1 tables).
         journal
             .connection()
@@ -543,26 +792,56 @@ async fn run_preflight_snapshot(
     .map_err(|error| format!("preflight join failed: {error}"));
     match result {
         Ok(Ok(wire)) => {
-            let _ = crate::cloud_mcp_send_remote_command_status_event(
+            // §10.2: the run is reported through the CONTRACT mutation, not
+            // a generic command status — the report is the completion.
+            // §8 mutation shape: `email_native_preflight_report {result: PreflightResult}`.
+            let payload = json!({
+                "contract": contract::EMAIL_CONTRACT,
+                "schema_version": contract::EMAIL_SCHEMA_VERSION,
+                "result": wire,
+                "client_request_id": uuid::Uuid::new_v4().to_string(),
+            });
+            if let Err(error) = crate::cloud_mcp_ws_request_with_timeout(
                 state,
-                event,
-                "completed",
-                "Email preflight snapshot recorded.",
-                Some(&json!({ "preflight": wire })),
+                "email_native_preflight_report",
+                &payload,
+                std::time::Duration::from_secs(20),
             )
-            .await;
+            .await
+            {
+                crate::log_cloud_sync_event(
+                    "email.preflight_report_error",
+                    json!({ "error": error }),
+                );
+            }
         }
         Ok(Err(error)) | Err(error) => {
-            let _ = crate::cloud_mcp_send_remote_command_status_event(
-                state,
-                event,
-                "failed",
-                "Email preflight run failed.",
-                Some(&json!({ "error": error })),
-            )
-            .await;
+            crate::log_terminal_status_event(
+                "backend.email.preflight_run_failed",
+                json!({ "error": error }),
+            );
         }
     }
+}
+
+/// Strictly parse a §9.3 settlement ack against the event we sent. FAIL
+/// CLOSED: the ack must name OUR `status_event_id`, carry a Boolean
+/// `applied`, and any `audit` slug must come from the closed registry.
+/// Anything else is an error and must NOT mark the event acked (the outbox
+/// retries; compaction stays gated).
+pub fn parse_send_event_ack(
+    sent_status_event_id: &str,
+    response: &Value,
+) -> Result<(bool, Option<String>), String> {
+    // The ack may ride the response root or a nested `data` object; the
+    // exact-typed §9.3 parser (contract + schema_version + matching
+    // status_event_id + Boolean applied + closed audit) does the rest.
+    let ack = response
+        .get("data")
+        .filter(|data| data.get("applied").is_some() || data.get("status_event_id").is_some())
+        .unwrap_or(response);
+    let parsed = contract::parse_settlement_ack(ack, sent_status_event_id)?;
+    Ok((parsed.applied, parsed.audit))
 }
 
 /// Record a §9.3 settlement ack routed back from the durable outbox
@@ -576,20 +855,13 @@ pub fn email_record_send_event_cloud_ack(payload: &Value, response: &Value) {
     else {
         return;
     };
-    // The ack may ride the response root or a nested `data` object.
-    let ack = response
-        .get("data")
-        .filter(|data| data.get("applied").is_some() || data.get("status_event_id").is_some())
-        .unwrap_or(response);
-    let applied = ack.get("applied").and_then(Value::as_bool).unwrap_or(true);
-    let audit = ack
-        .get("audit")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let result = (|| {
-        let mut journal = EmailJournal::open_default()?;
-        journal.record_cloud_ack(&status_event_id, applied, audit.as_deref())
-    })();
+    let result = match parse_send_event_ack(&status_event_id, response) {
+        Ok((applied, audit)) => (|| {
+            let mut journal = EmailJournal::open_default()?;
+            journal.record_cloud_ack(&status_event_id, applied, audit.as_deref())
+        })(),
+        Err(error) => Err(error),
+    };
     if let Err(error) = result {
         crate::log_terminal_status_event(
             "backend.email.send_event_ack_record_failed",
@@ -599,43 +871,45 @@ pub fn email_record_send_event_cloud_ack(payload: &Value, response: &Value) {
 }
 
 /// Startup journal recovery (plan §4.3: "journal recovery before cloud
-/// connect"): classify crashed jobs per the §6 device matrix. Settled
-/// events land in the journal pending queue; the resume flow hands them to
-/// the outbox once the account context exists.
+/// connect"): classify crashed jobs per the §6 device matrix. SYNCHRONOUS
+/// BY DESIGN — the caller must run this to completion BEFORE the remote
+/// command listener or the cloud connection starts, so a wake command can
+/// never race recovery into re-running a `data_started` generation. The
+/// work is local SQLite only (bounded, no network); settled events land in
+/// the journal pending queue and the resume flow hands them to the outbox
+/// once the account context exists.
 pub fn email_startup_journal_recovery() {
-    tauri::async_runtime::spawn_blocking(move || {
-        let device_id = crate::cloud_mcp_email_device_id();
-        let result = (|| {
-            let mut journal = EmailJournal::open_default()?;
-            journal.recover_after_restart(&device_id)
-        })();
-        match result {
-            Ok(settled) if !settled.is_empty() => {
-                crate::log_terminal_status_event(
-                    "backend.email.startup_recovery_settled",
-                    json!({
-                        "settled": settled
-                            .iter()
-                            .map(|(job, generation, outcome)| {
-                                json!({
-                                    "send_job_id": job,
-                                    "generation": generation,
-                                    "outcome": outcome,
-                                })
+    let device_id = crate::cloud_mcp_email_device_id();
+    let result = (|| {
+        let mut journal = EmailJournal::open_default()?;
+        journal.recover_after_restart(&device_id)
+    })();
+    match result {
+        Ok(settled) if !settled.is_empty() => {
+            crate::log_terminal_status_event(
+                "backend.email.startup_recovery_settled",
+                json!({
+                    "settled": settled
+                        .iter()
+                        .map(|(job, generation, outcome)| {
+                            json!({
+                                "send_job_id": job,
+                                "generation": generation,
+                                "outcome": outcome,
                             })
-                            .collect::<Vec<_>>(),
-                    }),
-                );
-            }
-            Ok(_) => {}
-            Err(error) => {
-                crate::log_terminal_status_event(
-                    "backend.email.startup_recovery_failed",
-                    json!({ "error": error }),
-                );
-            }
+                        })
+                        .collect::<Vec<_>>(),
+                }),
+            );
         }
-    });
+        Ok(_) => {}
+        Err(error) => {
+            crate::log_terminal_status_event(
+                "backend.email.startup_recovery_failed",
+                json!({ "error": error }),
+            );
+        }
+    }
 }
 
 /// Post-(re)connect resume flow: re-hand pending §9.2 events to the durable
@@ -677,7 +951,7 @@ pub async fn email_account_sync_resume_hook(state: &crate::CloudMcpState) {
             "contract": contract::EMAIL_CONTRACT,
             "schema_version": contract::EMAIL_SCHEMA_VERSION,
             "capability_version": contract::EMAIL_CAPABILITY_VERSION,
-            "modes": ["provider", "native"],
+            "modes": super::capability::supported_modes(),
             "profiles": profiles
                 .iter()
                 .map(super::profiles::SenderProfile::capability_entry)
@@ -755,7 +1029,13 @@ pub async fn email_account_sync_resume_hook(state: &crate::CloudMcpState) {
                         else {
                             continue;
                         };
-                        let Some(generation) = entry.get("generation").and_then(Value::as_u64)
+                        // Checked u32 conversion (§1: generation is a bounded
+                        // u32) — an out-of-range value is dropped, never
+                        // aliased onto another generation.
+                        let Some(generation) = entry
+                            .get("generation")
+                            .and_then(Value::as_u64)
+                            .and_then(|raw| u32::try_from(raw).ok())
                         else {
                             continue;
                         };
@@ -763,7 +1043,7 @@ pub async fn email_account_sync_resume_hook(state: &crate::CloudMcpState) {
                             "UPDATE email_send_jobs SET superseded = 1
                              WHERE send_job_id = ?1 AND generation = ?2
                                AND terminal_outcome IS NULL",
-                            rusqlite::params![send_job_id, generation as i64],
+                            rusqlite::params![send_job_id, generation],
                         );
                     }
                     Ok::<(), String>(())
@@ -821,7 +1101,8 @@ mod tests {
     fn journal_before_ack_accepts_then_dedupes() {
         let mut journal = temp_journal();
         let command = send_command();
-        let ack = journal_command_before_ack(&mut journal, &command, "live").unwrap();
+        let ack =
+            journal_command_before_ack(&mut journal, &command, "live", "device-test").unwrap();
         assert_eq!(ack.result, "accepted");
         assert!(ack.first_status_event_id.is_some());
         assert!(ack.should_execute());
@@ -831,7 +1112,8 @@ mod tests {
 
         // Redelivery of the identical command dedupes to `duplicate` and
         // replays the same first_status_event_id.
-        let replay = journal_command_before_ack(&mut journal, &command, "replay").unwrap();
+        let replay =
+            journal_command_before_ack(&mut journal, &command, "replay", "device-test").unwrap();
         assert_eq!(replay.result, "duplicate");
         assert_eq!(replay.first_status_event_id, ack.first_status_event_id);
         assert!(!replay.should_execute());
@@ -841,7 +1123,7 @@ mod tests {
     fn tampered_payload_is_security_rejected() {
         let mut journal = temp_journal();
         let command = send_command();
-        journal_command_before_ack(&mut journal, &command, "live").unwrap();
+        journal_command_before_ack(&mut journal, &command, "live", "device-test").unwrap();
         // Same command_id, different binding => different payload hash.
         let tampered = parse_email_command(
             EMAIL_COMMAND_SEND,
@@ -854,7 +1136,8 @@ mod tests {
             }),
         )
         .unwrap();
-        let ack = journal_command_before_ack(&mut journal, &tampered, "live").unwrap();
+        let ack =
+            journal_command_before_ack(&mut journal, &tampered, "live", "device-test").unwrap();
         assert_eq!(ack.result, "rejected");
         assert!(ack.security_rejected);
     }
@@ -874,27 +1157,48 @@ mod tests {
             }),
         )
         .unwrap();
-        journal_command_before_ack(&mut journal, &gen2, "live").unwrap();
+        journal_command_before_ack(&mut journal, &gen2, "live", "device-test").unwrap();
         // A late generation-1 command is rejected (fenced), not executed.
-        let ack = journal_command_before_ack(&mut journal, &send_command(), "live").unwrap();
+        let ack = journal_command_before_ack(&mut journal, &send_command(), "live", "device-test")
+            .unwrap();
         assert_eq!(ack.result, "rejected");
         assert!(!ack.security_rejected);
         assert!(!ack.should_execute());
     }
 
     #[test]
-    fn generation_retired_ack_parses() {
+    fn generation_retired_ack_parses_strictly() {
         let event = json!({
+            "contract": crate::email::contract::EMAIL_CONTRACT,
+            "schema_version": 1,
             "kind": "email_generation_retired",
             "send_job_id": "job-1",
             "generation": 1,
             "retired_at_ms": 1,
         });
         assert_eq!(
-            parse_generation_retired(&event),
-            Some(("job-1".to_string(), 1))
+            parse_generation_retired(&event).unwrap(),
+            ("job-1".to_string(), 1)
         );
-        assert!(parse_generation_retired(&json!({"kind": "other"})).is_none());
+        // Not the retirement kind at all.
+        assert!(parse_generation_retired(&json!({"kind": "other"})).is_err());
+        assert!(!is_generation_retired_event(&json!({"kind": "other"})));
+        // Envelope-less retirement events fail closed (review #10).
+        let mut missing_envelope = event.clone();
+        missing_envelope.as_object_mut().unwrap().remove("contract");
+        assert!(parse_generation_retired(&missing_envelope).is_err());
+        assert!(is_generation_retired_event(&missing_envelope));
+        // A u32-overflowing generation is an ERROR, never an alias.
+        let mut overflow = event.clone();
+        overflow["generation"] = json!(4_294_967_297u64);
+        assert!(parse_generation_retired(&overflow).is_err());
+        // §0.2 decimal-string generations are accepted with checked range.
+        let mut stringy = event.clone();
+        stringy["generation"] = json!("2");
+        assert_eq!(
+            parse_generation_retired(&stringy).unwrap(),
+            ("job-1".to_string(), 2)
+        );
     }
 
     #[test]

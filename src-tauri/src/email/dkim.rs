@@ -146,7 +146,8 @@ mod tests {
     fn sign_prepends_dkim_signature_header() {
         let key = generate_rsa_dkim_key().unwrap();
         let message = b"From: ops@acme.example\r\nTo: rcpt@partner.example\r\nSubject: hi\r\nDate: Mon, 20 Jul 2026 00:00:00 +0000\r\nMessage-ID: <1@acme.example>\r\n\r\nbody\r\n";
-        let signed = sign_message(&key.private_key_pem, "acme.example", "dfmail1", message).unwrap();
+        let signed =
+            sign_message(&key.private_key_pem, "acme.example", "dfmail1", message).unwrap();
         let text = String::from_utf8_lossy(&signed);
         assert!(text.starts_with("DKIM-Signature:"));
         assert!(text.contains("d=acme.example"));
@@ -170,8 +171,8 @@ mod tests {
         use mail_auth::common::verify::DomainKey;
         use mail_auth::hickory_resolver::config::{ResolverConfig, ResolverOpts};
         use mail_auth::{
-            AuthenticatedMessage, DkimResult, MessageAuthenticator, Parameters, ResolverCache,
-            Txt, MX,
+            AuthenticatedMessage, DkimResult, MessageAuthenticator, Parameters, ResolverCache, Txt,
+            MX,
         };
 
         struct SeededCache<K, V>(Mutex<HashMap<K, V>>);
@@ -197,11 +198,11 @@ mod tests {
 
         let key = generate_rsa_dkim_key().unwrap();
         let message = b"From: Acme Ops <ops@acme.example>\r\nTo: billing@partner.example\r\nSubject: round trip\r\nDate: Mon, 20 Jul 2026 00:00:00 +0000\r\nMessage-ID: <rt@acme.example>\r\n\r\nround trip body\r\n";
-        let signed = sign_message(&key.private_key_pem, "acme.example", "dfmail1", message).unwrap();
+        let signed =
+            sign_message(&key.private_key_pem, "acme.example", "dfmail1", message).unwrap();
 
         let authenticated = AuthenticatedMessage::parse(&signed).expect("message parses");
-        let domain_key =
-            DomainKey::parse(key.dns_txt_value.as_bytes()).expect("domain key parses");
+        let domain_key = DomainKey::parse(key.dns_txt_value.as_bytes()).expect("domain key parses");
         let txt_cache: SeededCache<String, Txt> = SeededCache(Mutex::new(HashMap::new()));
         let record = Txt::DomainKey(Arc::new(domain_key));
         // txt_lookup keys are lowercased FQDNs with a trailing dot; seed both
@@ -238,7 +239,10 @@ mod tests {
                 .iter()
                 .any(|output| matches!(output.result(), DkimResult::Pass)),
             "mail-auth verifier must pass the round trip: {:?}",
-            outputs.iter().map(|output| output.result()).collect::<Vec<_>>()
+            outputs
+                .iter()
+                .map(|output| output.result())
+                .collect::<Vec<_>>()
         );
 
         // Negative control: a tampered body must not verify.
@@ -267,7 +271,8 @@ mod tests {
         use mail_auth::dkim::Signature;
         let key = generate_rsa_dkim_key().unwrap();
         let message = b"From: ops@acme.example\r\nSubject: hi\r\nDate: Mon, 20 Jul 2026 00:00:00 +0000\r\n\r\nhello world\r\n";
-        let signed = sign_message(&key.private_key_pem, "acme.example", "dfmail1", message).unwrap();
+        let signed =
+            sign_message(&key.private_key_pem, "acme.example", "dfmail1", message).unwrap();
         let header_line: String = String::from_utf8_lossy(&signed)
             .lines()
             .take_while(|line| !line.is_empty())

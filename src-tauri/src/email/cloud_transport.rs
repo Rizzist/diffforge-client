@@ -48,7 +48,9 @@ pub enum PrepareOutcome {
     Leased(Box<PrepareGrant>),
     /// Closed-registry refusal slug (§0.4). Unknown slugs fail closed at
     /// parse time and never reach here.
-    Refused { slug: String },
+    Refused {
+        slug: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -352,12 +354,16 @@ impl EmailCloudTransport for WsCloudTransport {
         if send_job_id.is_empty() || status_event_id.is_empty() {
             return Err("send event payload missing identity".to_string());
         }
-        let idempotency_key = send_event_idempotency_key(&send_job_id, generation, &status_event_id);
+        let idempotency_key =
+            send_event_idempotency_key(&send_job_id, generation, &status_event_id);
         let mut outbox_payload = payload.clone();
         if let Some(object) = outbox_payload.as_object_mut() {
             // The outbox reads `idempotency_key` as its durable dedup key —
             // (send_job_id, generation, status_event_id) per §0.4.
-            object.insert("idempotency_key".to_string(), json!(idempotency_key.clone()));
+            object.insert(
+                "idempotency_key".to_string(),
+                json!(idempotency_key.clone()),
+            );
         }
         let state = self.state.clone();
         tauri::async_runtime::block_on(async move {
@@ -390,8 +396,7 @@ mod tests {
             return;
         };
         let leased: Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("prepare__email_send_prepare__leased.json"))
-                .unwrap(),
+            &std::fs::read_to_string(dir.join("prepare__email_send_prepare__leased.json")).unwrap(),
         )
         .unwrap();
         let data = &leased["payload"]["response"]["data"];
@@ -414,8 +419,7 @@ mod tests {
             ),
         ] {
             let value: Value =
-                serde_json::from_str(&std::fs::read_to_string(dir.join(fixture)).unwrap())
-                    .unwrap();
+                serde_json::from_str(&std::fs::read_to_string(dir.join(fixture)).unwrap()).unwrap();
             match parse_prepare_data(&value["payload"]["response"]["data"]).unwrap() {
                 PrepareOutcome::Refused { slug: parsed } => assert_eq!(parsed, slug),
                 other => panic!("expected refusal, got {other:?}"),

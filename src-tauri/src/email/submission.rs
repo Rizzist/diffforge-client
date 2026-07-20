@@ -27,9 +27,7 @@ use super::email_killpoint;
 use super::journal::{EmailJournal, PendingEventRow, RecipientRow, SendJobRow};
 use super::mime::verify_mime;
 use super::profiles::{binding_profile_ref, load_profile, SenderProfile};
-use super::smtp_session::{
-    SmtpCredentials, SmtpFailure, SmtpSecurity, SmtpSession, SmtpTarget,
-};
+use super::smtp_session::{SmtpCredentials, SmtpFailure, SmtpSecurity, SmtpSession, SmtpTarget};
 
 pub const DEFAULT_EHLO: &str = "device.diffforge.local";
 
@@ -41,6 +39,11 @@ pub struct SubmissionDeps<'a> {
     pub extra_root_cert_pem: Option<String>,
     /// Socket-level connect override (tests dial the sink; None in prod).
     pub connect_host_override: Option<String>,
+    /// MX resolver override for native delivery (tests inject the in-memory
+    /// fake; None = live Hickory resolution).
+    pub native_mx: Option<&'a dyn super::mx::MxResolver>,
+    /// Native SMTP port override (tests dial the loopback sink; None = 25).
+    pub native_port_override: Option<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +78,10 @@ pub fn send_event_payload(
 ) -> Value {
     let mut map = Map::new();
     map.insert("contract".into(), json!(contract::EMAIL_CONTRACT));
-    map.insert("schema_version".into(), json!(contract::EMAIL_SCHEMA_VERSION));
+    map.insert(
+        "schema_version".into(),
+        json!(contract::EMAIL_SCHEMA_VERSION),
+    );
     map.insert("status_event_id".into(), json!(status_event_id));
     map.insert("command_id".into(), json!(job.command_id));
     map.insert("send_job_id".into(), json!(job.send_job_id));
@@ -140,7 +146,13 @@ fn emit_phase_event(
         None,
         None,
     );
-    journal.insert_send_event(&job.send_job_id, job.generation, phase, &status_event_id, &payload)?;
+    journal.insert_send_event(
+        &job.send_job_id,
+        job.generation,
+        phase,
+        &status_event_id,
+        &payload,
+    )?;
     transport.emit_send_event(&payload)?;
     journal.mark_event_handed_off(&status_event_id)?;
     Ok(())
@@ -181,11 +193,36 @@ fn settle(
         generation: job.generation,
         payload: payload.clone(),
     };
-    journal.journal_terminal(&job.send_job_id, job.generation, outcome, &event)?;
+    let inserted = journal.journal_terminal(&job.send_job_id, job.generation, outcome, &event)?;
     email_killpoint("post_journal_pre_report");
-    transport.emit_send_event(&payload)?;
-    journal.mark_event_handed_off(&status_event_id)?;
-    Ok(SubmissionResult::Terminal(outcome.to_string()))
+    if inserted {
+        transport.emit_send_event(&payload)?;
+        journal.mark_event_handed_off(&status_event_id)?;
+        return Ok(SubmissionResult::Terminal(outcome.to_string()));
+    }
+    // Another worker already settled the pair: OUR payload was NOT journaled
+    // and must never be reported (review #7). Re-hand the ORIGINAL journaled
+    // settled event if the cloud has not acked it yet, and report the
+    // journaled outcome.
+    if let Some((original, outbox_state)) =
+        journal.load_settled_event(&job.send_job_id, job.generation)?
+    {
+        if outbox_state != "acked" && transport.emit_send_event(&original.payload).is_ok() {
+            journal.mark_event_handed_off(&original.status_event_id)?;
+        }
+    }
+    let journaled_outcome = journal
+        .load_job(&job.send_job_id, job.generation)?
+        .and_then(|row| row.terminal_outcome)
+        .or_else(|| {
+            journal
+                .tombstone(&job.send_job_id, job.generation)
+                .ok()
+                .flatten()
+                .map(|(outcome, _, _)| outcome)
+        })
+        .unwrap_or_else(|| outcome.to_string());
+    Ok(SubmissionResult::Terminal(journaled_outcome))
 }
 
 fn recipient_state_value(recipient: &RecipientRow) -> Value {
@@ -247,6 +284,28 @@ pub fn run_send_job(
     }
     if job.superseded {
         return Ok(SubmissionResult::NotRunnable("superseded".to_string()));
+    }
+    // §10.1 / review #1 (CRITICAL): a generation that already crossed the
+    // DATA boundary may NEVER re-enter SMTP. A duplicate wake / re-offer for
+    // such a pair terminalizes it (delivery_unknown, or submitted when the
+    // provider 2xx was persisted) BEFORE prepare — no path re-sends DATA.
+    if job.data_started {
+        if let Some((_, _, outcome)) =
+            journal.recover_incomplete_pair(send_job_id, generation, &deps.device_id)?
+        {
+            // The terminal was journaled; hand the settled event (and any
+            // other pending events for the pair) to the outbox.
+            for event in journal.pending_events_for(send_job_id, generation)? {
+                if deps.transport.emit_send_event(&event.payload).is_ok() {
+                    journal.mark_event_handed_off(&event.status_event_id)?;
+                }
+            }
+            return Ok(SubmissionResult::Terminal(outcome));
+        }
+        // Another path settled it first — the pair is terminal either way.
+        return Ok(SubmissionResult::NotRunnable(
+            "data_boundary_crossed".to_string(),
+        ));
     }
     if job.cancel_requested {
         let recipients = journal.load_recipients(send_job_id, generation)?;
@@ -335,25 +394,47 @@ fn run_leased_send(
     let mut job = journal
         .load_job(&send_job_id, generation)?
         .ok_or_else(|| "job vanished mid-run".to_string())?;
-    emit_phase_event(journal, deps.transport, &job, &deps.device_id, SendPhase::Prepared)?;
+    emit_phase_event(
+        journal,
+        deps.transport,
+        &job,
+        &deps.device_id,
+        SendPhase::Prepared,
+    )?;
     email_killpoint("post_lease_journaled");
 
     journal.advance_phase(&send_job_id, generation, SendPhase::LeaseHeld)?;
     job.phase = SendPhase::LeaseHeld.as_str().to_string();
     job.phase_rank = SendPhase::LeaseHeld.rank();
-    emit_phase_event(journal, deps.transport, &job, &deps.device_id, SendPhase::LeaseHeld)?;
+    emit_phase_event(
+        journal,
+        deps.transport,
+        &job,
+        &deps.device_id,
+        SendPhase::LeaseHeld,
+    )?;
 
     // ---- download ----
     journal.advance_phase(&send_job_id, generation, SendPhase::Downloading)?;
     job.phase = SendPhase::Downloading.as_str().to_string();
     job.phase_rank = SendPhase::Downloading.rank();
-    emit_phase_event(journal, deps.transport, &job, &deps.device_id, SendPhase::Downloading)?;
+    emit_phase_event(
+        journal,
+        deps.transport,
+        &job,
+        &deps.device_id,
+        SendPhase::Downloading,
+    )?;
     let mime_bytes = match deps
         .transport
         .download_mime(&grant.mime_path, &grant.mime_transfer_id)
     {
         Ok(bytes) => bytes,
-        Err(error) => return Ok(SubmissionResult::Abandoned(format!("download_failed:{error}"))),
+        Err(error) => {
+            return Ok(SubmissionResult::Abandoned(format!(
+                "download_failed:{error}"
+            )))
+        }
     };
     email_killpoint("post_download");
 
@@ -395,7 +476,13 @@ fn run_leased_send(
     let job = journal
         .load_job(&send_job_id, generation)?
         .ok_or_else(|| "job vanished mid-run".to_string())?;
-    emit_phase_event(journal, deps.transport, &job, &deps.device_id, SendPhase::Verified)?;
+    emit_phase_event(
+        journal,
+        deps.transport,
+        &job,
+        &deps.device_id,
+        SendPhase::Verified,
+    )?;
     email_killpoint("post_verified");
 
     // Journal envelope recipients (pending).
@@ -419,11 +506,534 @@ fn run_leased_send(
     journal.replace_recipients(&send_job_id, generation, &recipients)?;
 
     if grant.mode == "native" {
-        return Ok(SubmissionResult::Abandoned(
-            "native_mode_requires_native_delivery_worker".to_string(),
-        ));
+        return run_native_transaction(deps, journal, job, &grant, &mime_bytes);
     }
     run_provider_transaction(deps, journal, job, &grant, &mime_bytes)
+}
+
+/// Lease-aware, journaled native direct-to-MX delivery (review #11): drives
+/// a leased native job end-to-end through the same §6b.2 ladder the provider
+/// path uses. One recipient per SMTP transaction (native_delivery.rs); the
+/// DATA boundary is journaled through the SAME `mark_data_started` FULL
+/// write before any recipient's DATA, the §10.2 facts (lease, DKIM key,
+/// source IP, port-25) are re-checked before every DATA, and ambiguity
+/// at/after DATA settles delivery_unknown — never retransmitted.
+fn run_native_transaction(
+    deps: &SubmissionDeps<'_>,
+    journal: &mut EmailJournal,
+    job: SendJobRow,
+    grant: &PrepareGrant,
+    mime_bytes: &[u8],
+) -> Result<SubmissionResult, String> {
+    use super::native_delivery::{
+        apply_rate_outcome, deliver_recipient, NativeDeps, NativePreDataFacts,
+        NativeRecipientOutcome,
+    };
+    use rusqlite::OptionalExtension;
+    use std::cell::Cell;
+
+    let send_job_id = job.send_job_id.clone();
+    let generation = job.generation;
+    let Some(native) = grant.native.as_ref() else {
+        return Ok(SubmissionResult::Abandoned(
+            "native_grant_missing".to_string(),
+        ));
+    };
+
+    // ---- active DKIM key (journal-held, §10.1) — must match the grant ----
+    let key_row: Option<(String, String, String)> = journal
+        .connection()
+        .query_row(
+            "SELECT selector, pubkey_fingerprint_sha256, secret_locator FROM email_dkim_keys
+             WHERE domain = ?1 AND state = 'active'
+             ORDER BY created_at_ms DESC LIMIT 1",
+            [native.dkim_domain.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("native dkim key lookup failed: {error}"))?;
+    let Some((selector, fingerprint, locator)) = key_row else {
+        return Ok(SubmissionResult::Abandoned(
+            "dkim_key_unavailable".to_string(),
+        ));
+    };
+    if selector != native.dkim_selector
+        || !fingerprint.eq_ignore_ascii_case(&native.dkim_pubkey_fingerprint)
+    {
+        // Grant/journal disagreement about the signing key: never sign with
+        // the wrong key; re-qualification/preflight resolves it.
+        return Ok(SubmissionResult::Abandoned(
+            "dkim_key_unavailable".to_string(),
+        ));
+    }
+    let dkim_key_pem = match deps.secrets.resolve_locator(&locator) {
+        Ok(Some(secret)) => secret,
+        Ok(None) | Err(_) => {
+            return Ok(SubmissionResult::Abandoned(
+                "dkim_key_unavailable".to_string(),
+            ))
+        }
+    };
+
+    // ---- §10.2 recheck facts observed once per run (IP + port 25) ----
+    let last_egress: Option<(String, Option<bool>)> = journal
+        .connection()
+        .query_row(
+            "SELECT egress_ip, port25_open FROM email_egress_ip_observations
+             ORDER BY observed_at_ms DESC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?.map(|value| value != 0),
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("native egress observation lookup failed: {error}"))?;
+    let source_ip_authorized = native.authorized_ips.is_empty()
+        || last_egress
+            .as_ref()
+            .is_some_and(|(ip, _)| native.authorized_ips.iter().any(|allowed| allowed == ip));
+    let port25_reachable = last_egress
+        .as_ref()
+        .and_then(|(_, port25)| *port25)
+        .unwrap_or(true);
+
+    // ---- renew the lease before entering SMTP (fence check) ----
+    let lease_expires = Cell::new(grant.expires_at_ms);
+    match deps.transport.lease_renew(
+        &send_job_id,
+        generation,
+        &grant.lease_id,
+        grant.lease_epoch,
+        &grant.fence_token,
+        SendPhase::Connecting.as_str(),
+    ) {
+        Ok(RenewOutcome::Extended { expires_at_ms }) => {
+            journal.extend_lease(&send_job_id, generation, grant.lease_epoch, expires_at_ms)?;
+            lease_expires.set(expires_at_ms);
+        }
+        Ok(RenewOutcome::Refused { slug, .. }) => {
+            return match slug.as_str() {
+                "cancelled" => {
+                    let job = journal
+                        .load_job(&send_job_id, generation)?
+                        .ok_or_else(|| "job vanished mid-run".to_string())?;
+                    settle(
+                        journal,
+                        deps.transport,
+                        &job,
+                        &deps.device_id,
+                        "cancelled",
+                        vec![],
+                        None,
+                        None,
+                        "cancelled",
+                    )
+                }
+                other => Ok(SubmissionResult::Abandoned(format!("lease_{other}"))),
+            };
+        }
+        Err(error) => return Ok(SubmissionResult::Abandoned(format!("renew_failed:{error}"))),
+    }
+
+    journal.advance_phase(&send_job_id, generation, SendPhase::Connecting)?;
+    {
+        let job = journal
+            .load_job(&send_job_id, generation)?
+            .ok_or_else(|| "job vanished mid-run".to_string())?;
+        emit_phase_event(
+            journal,
+            deps.transport,
+            &job,
+            &deps.device_id,
+            SendPhase::Connecting,
+        )?;
+    }
+    email_killpoint("pre_connect");
+
+    let fallback_resolver = super::mx::HickoryMxResolver;
+    let resolver: &dyn super::mx::MxResolver = deps.native_mx.unwrap_or(&fallback_resolver);
+
+    // The hooks and the loop body share the journal sequentially (RefCell —
+    // deliver_recipient invokes the hook strictly inline).
+    let journal_cell = RefCell::new(journal);
+    let deps_transport = deps.transport;
+    // Hook-abort channel: before_data failures surface through the SMTP
+    // failure classifier as opaque errors, so the hook records WHY it
+    // aborted and the loop below acts on the recorded reason, never on the
+    // misclassified outcome.
+    let hook_abort: RefCell<Option<String>> = RefCell::new(None);
+
+    let mut outcomes: Vec<(String, NativeRecipientOutcome)> = Vec::new();
+    for recipient in &grant.envelope.recipients {
+        let attempt = {
+            let mut guard = journal_cell.borrow_mut();
+            guard.begin_attempt(&send_job_id, generation, Some(&recipient.domain))?
+        };
+        let recheck = |_host: &str| NativePreDataFacts {
+            source_ip_authorized,
+            lease_valid: now_ms() < lease_expires.get(),
+            dkim_fingerprint_matches: true, // verified against the grant above
+            port25_reachable,
+        };
+        let native_deps = NativeDeps {
+            mx: resolver,
+            dkim_key_pem: dkim_key_pem.clone(),
+            dkim_domain: native.dkim_domain.clone(),
+            dkim_selector: native.dkim_selector.clone(),
+            ehlo: native.ehlo.clone(),
+            extra_root_cert_pem: deps.extra_root_cert_pem.clone(),
+            connect_host_override: deps.connect_host_override.clone(),
+            connect_port_override: deps.native_port_override,
+            recheck_facts: &recheck,
+        };
+        let before_data = || -> Result<(), String> {
+            let mut guard = journal_cell.borrow_mut();
+            let journal: &mut EmailJournal = &mut *guard;
+            let job = journal
+                .load_job(&send_job_id, generation)
+                .map_err(|error| format!("native pre-DATA check failed: {error}"))?
+                .ok_or_else(|| "job vanished before DATA".to_string())?;
+            // Cancel honored strictly before the FIRST data_started.
+            if job.cancel_requested && !job.data_started {
+                *hook_abort.borrow_mut() = Some("cancel_requested".to_string());
+                return Err("cancel_requested".to_string());
+            }
+            if job.superseded {
+                *hook_abort.borrow_mut() = Some("superseded".to_string());
+                return Err("superseded".to_string());
+            }
+            let first_crossing = !job.data_started;
+            // Renew the fence one last time before this recipient's DATA.
+            match deps_transport.lease_renew(
+                &send_job_id,
+                generation,
+                &grant.lease_id,
+                grant.lease_epoch,
+                &grant.fence_token,
+                SendPhase::MailFromSent.as_str(),
+            ) {
+                Ok(RenewOutcome::Extended { expires_at_ms }) => {
+                    let _ = journal.extend_lease(
+                        &send_job_id,
+                        generation,
+                        grant.lease_epoch,
+                        expires_at_ms,
+                    );
+                    lease_expires.set(expires_at_ms);
+                }
+                Ok(RenewOutcome::Refused { slug, .. }) => {
+                    *hook_abort.borrow_mut() = Some(format!("lease_{slug}"));
+                    return Err(format!("lease_{slug}"));
+                }
+                Err(error) => {
+                    *hook_abort.borrow_mut() = Some(format!("renew_failed:{error}"));
+                    return Err(format!("renew_failed:{error}"));
+                }
+            }
+            journal
+                .mark_data_started(&send_job_id, generation)
+                .map_err(|error| format!("data_started journal failed: {error}"))?;
+            email_killpoint("post_data_started_journal");
+            if first_crossing {
+                if let Ok(Some(job)) = journal.load_job(&send_job_id, generation) {
+                    let _ = emit_phase_event(
+                        journal,
+                        deps_transport,
+                        &job,
+                        &deps.device_id,
+                        SendPhase::DataStarted,
+                    );
+                }
+            }
+            Ok(())
+        };
+        let delivered = deliver_recipient(
+            &native_deps,
+            &recipient.address,
+            &recipient.domain,
+            &grant.envelope.mail_from,
+            mime_bytes,
+            0,
+            before_data,
+        );
+        let abort_reason = hook_abort.borrow_mut().take();
+        let outcome = match delivered {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Infrastructure error (DKIM signing / MX transport): the
+                // recipient was never attempted on the wire — defer it.
+                let mut guard = journal_cell.borrow_mut();
+                guard.finish_attempt(
+                    &send_job_id,
+                    generation,
+                    attempt,
+                    SendPhase::Connecting.as_str(),
+                    "native_error",
+                )?;
+                crate::log_terminal_status_event(
+                    "backend.email.native_recipient_error",
+                    json!({
+                        "send_job_id": send_job_id,
+                        "generation": generation,
+                        "recipient_ref": recipient.recipient_ref,
+                        "error": error,
+                    }),
+                );
+                outcomes.push((
+                    recipient.recipient_ref.clone(),
+                    NativeRecipientOutcome::Deferred { retry_at_ms: None },
+                ));
+                continue;
+            }
+        };
+        // A hook abort (cancel/fence) misclassifies through the SMTP layer —
+        // the recorded reason wins over the reported outcome.
+        if let Some(reason) = abort_reason {
+            let journal = journal_cell.into_inner();
+            journal.finish_attempt(
+                &send_job_id,
+                generation,
+                attempt,
+                SendPhase::MailFromSent.as_str(),
+                if reason == "cancel_requested" {
+                    "cancelled"
+                } else {
+                    "fenced"
+                },
+            )?;
+            if reason == "cancel_requested" {
+                let job = journal
+                    .load_job(&send_job_id, generation)?
+                    .ok_or_else(|| "job vanished on cancel".to_string())?;
+                let rows = journal.load_recipients(&send_job_id, generation)?;
+                let per_recipient = rows.iter().map(recipient_state_value).collect();
+                return settle(
+                    journal,
+                    deps.transport,
+                    &job,
+                    &deps.device_id,
+                    "cancelled",
+                    per_recipient,
+                    None,
+                    None,
+                    "cancelled",
+                );
+            }
+            return Ok(SubmissionResult::Abandoned(reason));
+        }
+        {
+            let mut guard = journal_cell.borrow_mut();
+            let journal: &mut EmailJournal = &mut *guard;
+            match &outcome {
+                NativeRecipientOutcome::PreflightAborted { check } => {
+                    journal.finish_attempt(
+                        &send_job_id,
+                        generation,
+                        attempt,
+                        SendPhase::Connecting.as_str(),
+                        "preflight_recheck_failed",
+                    )?;
+                    drop(guard);
+                    // §10.2: a failed pre-DATA fact abort is not a wire
+                    // event; stop non-terminally for re-qualification.
+                    return Ok(SubmissionResult::Abandoned(format!(
+                        "native_preflight_recheck:{check}"
+                    )));
+                }
+                NativeRecipientOutcome::Submitted { smtp_code } => {
+                    journal.update_recipient_status(
+                        &send_job_id,
+                        generation,
+                        &recipient.recipient_ref,
+                        "submitted",
+                        Some(*smtp_code),
+                        None,
+                        Some("accepted"),
+                        None,
+                        None,
+                    )?;
+                    journal.finish_attempt(
+                        &send_job_id,
+                        generation,
+                        attempt,
+                        SendPhase::DataCompleted.as_str(),
+                        "submitted",
+                    )?;
+                    apply_rate_outcome(journal, &recipient.domain, &outcome)?;
+                }
+                NativeRecipientOutcome::Deferred { retry_at_ms } => {
+                    journal.update_recipient_status(
+                        &send_job_id,
+                        generation,
+                        &recipient.recipient_ref,
+                        "deferred",
+                        None,
+                        None,
+                        Some("deferred"),
+                        None,
+                        *retry_at_ms,
+                    )?;
+                    journal.finish_attempt(
+                        &send_job_id,
+                        generation,
+                        attempt,
+                        SendPhase::MailFromSent.as_str(),
+                        "deferred",
+                    )?;
+                    apply_rate_outcome(journal, &recipient.domain, &outcome)?;
+                }
+                NativeRecipientOutcome::Bounced { smtp_code } => {
+                    journal.update_recipient_status(
+                        &send_job_id,
+                        generation,
+                        &recipient.recipient_ref,
+                        "bounced",
+                        *smtp_code,
+                        None,
+                        Some("rejected_permanent"),
+                        None,
+                        None,
+                    )?;
+                    journal.finish_attempt(
+                        &send_job_id,
+                        generation,
+                        attempt,
+                        SendPhase::MailFromSent.as_str(),
+                        "bounced",
+                    )?;
+                }
+                NativeRecipientOutcome::DeliveryUnknown => {
+                    journal.update_recipient_status(
+                        &send_job_id,
+                        generation,
+                        &recipient.recipient_ref,
+                        "delivery_unknown",
+                        None,
+                        None,
+                        None,
+                        Some("native delivery ambiguous at/after DATA"),
+                        None,
+                    )?;
+                    journal.finish_attempt(
+                        &send_job_id,
+                        generation,
+                        attempt,
+                        SendPhase::DataStarted.as_str(),
+                        "delivery_unknown",
+                    )?;
+                }
+            }
+        }
+        outcomes.push((recipient.recipient_ref.clone(), outcome));
+    }
+    let journal = journal_cell.into_inner();
+
+    // ---- aggregate per §6b.1 ----
+    let any_unknown = outcomes
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, NativeRecipientOutcome::DeliveryUnknown));
+    let submitted_codes: Vec<u16> = outcomes
+        .iter()
+        .filter_map(|(_, outcome)| match outcome {
+            NativeRecipientOutcome::Submitted { smtp_code } => Some(*smtp_code),
+            _ => None,
+        })
+        .collect();
+    let all_bounced = !outcomes.is_empty()
+        && outcomes
+            .iter()
+            .all(|(_, outcome)| matches!(outcome, NativeRecipientOutcome::Bounced { .. }));
+
+    let job = journal
+        .load_job(&send_job_id, generation)?
+        .ok_or_else(|| "job vanished post-native-run".to_string())?;
+    let rows = journal.load_recipients(&send_job_id, generation)?;
+    let per_recipient: Vec<Value> = rows.iter().map(recipient_state_value).collect();
+
+    if any_unknown {
+        return settle(
+            journal,
+            deps.transport,
+            &job,
+            &deps.device_id,
+            "delivery_unknown",
+            per_recipient,
+            None,
+            None,
+            "delivery_unknown",
+        );
+    }
+    if let Some(best_code) = submitted_codes.first().copied() {
+        // Provider acceptance journaled BEFORE reported; recipient rows were
+        // flipped per-recipient already (pass None).
+        journal.mark_data_completed(&send_job_id, generation, Some(best_code), "accepted", None)?;
+        email_killpoint("post_data_completed_journal");
+        let job = journal
+            .load_job(&send_job_id, generation)?
+            .ok_or_else(|| "job vanished post-DATA".to_string())?;
+        let rows = journal.load_recipients(&send_job_id, generation)?;
+        let per_recipient: Vec<Value> = rows.iter().map(recipient_state_value).collect();
+        let all_submitted = submitted_codes.len() == outcomes.len();
+        let sanitized = contract::SanitizedResponse {
+            smtp_code: Some(best_code),
+            enhanced_code: None,
+            response_class: ResponseClass::Accepted,
+        };
+        return settle(
+            journal,
+            deps.transport,
+            &job,
+            &deps.device_id,
+            if all_submitted {
+                "submitted"
+            } else {
+                "partially_submitted"
+            },
+            per_recipient,
+            Some(&sanitized),
+            None,
+            "none",
+        );
+    }
+    if all_bounced {
+        return settle(
+            journal,
+            deps.transport,
+            &job,
+            &deps.device_id,
+            "provider_rejected",
+            per_recipient,
+            None,
+            None,
+            "policy",
+        );
+    }
+    // Only deferrals (greylisting / temporary refusals) — non-terminal when
+    // the DATA boundary was never crossed; once crossed, the pair may never
+    // re-enter SMTP (§10.1) and settles delivery_unknown.
+    if job.data_started {
+        return settle(
+            journal,
+            deps.transport,
+            &job,
+            &deps.device_id,
+            "delivery_unknown",
+            per_recipient,
+            None,
+            None,
+            "delivery_unknown",
+        );
+    }
+    Ok(SubmissionResult::Abandoned("native_deferred".to_string()))
 }
 
 fn run_provider_transaction(
@@ -443,9 +1053,38 @@ fn run_provider_transaction(
     let Some(profile) = load_profile(journal, &profile_ref)? else {
         return Ok(SubmissionResult::Abandoned("profile_missing".to_string()));
     };
-    let credentials = provider_credentials(&profile, deps.secrets)?;
+    let credentials = match provider_credentials(&profile, deps.secrets) {
+        ProviderCredentials::Unauthenticated => None,
+        ProviderCredentials::Available(credentials) => Some(credentials),
+        ProviderCredentials::Unavailable(reason) => {
+            // Configured-but-unavailable credentials stop the run BEFORE any
+            // SMTP traffic (review #13): never a silent no-AUTH session,
+            // never a fake provider rejection. Non-terminal — the cloud's
+            // credential_required → released → re-offer path re-executes it
+            // once credentials are restored (§6b.1).
+            crate::log_terminal_status_event(
+                "backend.email.credentials_unavailable",
+                json!({
+                    "send_job_id": send_job_id,
+                    "generation": generation,
+                    "reason": reason,
+                }),
+            );
+            let attempt = journal.begin_attempt(&send_job_id, generation, None)?;
+            journal.finish_attempt(
+                &send_job_id,
+                generation,
+                attempt,
+                SendPhase::Verified.as_str(),
+                "credential_failure",
+            )?;
+            return Ok(SubmissionResult::Abandoned("credential_failure".to_string()));
+        }
+    };
     let Some(smtp_host) = profile.smtp_host.clone() else {
-        return Ok(SubmissionResult::Abandoned("profile_incomplete".to_string()));
+        return Ok(SubmissionResult::Abandoned(
+            "profile_incomplete".to_string(),
+        ));
     };
     let port = profile.smtp_port.unwrap_or(587);
     let security = match profile.smtp_security.as_deref() {
@@ -497,7 +1136,13 @@ fn run_provider_transaction(
     let job = journal
         .load_job(&send_job_id, generation)?
         .ok_or_else(|| "job vanished mid-run".to_string())?;
-    emit_phase_event(journal, deps.transport, &job, &deps.device_id, SendPhase::Connecting)?;
+    emit_phase_event(
+        journal,
+        deps.transport,
+        &job,
+        &deps.device_id,
+        SendPhase::Connecting,
+    )?;
     email_killpoint("pre_connect");
 
     let target = SmtpTarget {
@@ -645,22 +1290,18 @@ fn run_provider_transaction(
         Ok((response, _rcpt_responses)) => {
             let code = super::smtp_session::response_code_u16(&response);
             let message = response.message().collect::<Vec<&str>>().join(" ");
-            // 2xx journaled BEFORE reported.
-            journal.mark_data_completed(&send_job_id, generation, Some(code), "accepted")?;
+            // 2xx journaled BEFORE reported — and the recipient rows flip to
+            // `submitted` in the SAME transaction (review #8): a crash can
+            // never leave a persisted provider acceptance alongside
+            // `pending` recipient rows.
+            journal.mark_data_completed(
+                &send_job_id,
+                generation,
+                Some(code),
+                "accepted",
+                Some(&message.chars().take(300).collect::<String>()),
+            )?;
             email_killpoint("post_data_completed_journal");
-            for recipient in &grant.envelope.recipients {
-                journal.update_recipient_status(
-                    &send_job_id,
-                    generation,
-                    &recipient.recipient_ref,
-                    "submitted",
-                    Some(code),
-                    None,
-                    Some("accepted"),
-                    Some(&message.chars().take(300).collect::<String>()),
-                    None,
-                )?;
-            }
             journal.finish_attempt(
                 &send_job_id,
                 generation,
@@ -671,7 +1312,13 @@ fn run_provider_transaction(
             let job = journal
                 .load_job(&send_job_id, generation)?
                 .ok_or_else(|| "job vanished post-DATA".to_string())?;
-            emit_phase_event(journal, deps.transport, &job, &deps.device_id, SendPhase::DataCompleted)?;
+            emit_phase_event(
+                journal,
+                deps.transport,
+                &job,
+                &deps.device_id,
+                SendPhase::DataCompleted,
+            )?;
             let rows = journal.load_recipients(&send_job_id, generation)?;
             let per_recipient = rows.iter().map(recipient_state_value).collect();
             let sanitized = contract::SanitizedResponse {
@@ -694,24 +1341,59 @@ fn run_provider_transaction(
             )
         }
         Err(failure) => handle_transaction_failure(
-            deps, journal, &send_job_id, generation, attempt, grant, failure,
+            deps,
+            journal,
+            &send_job_id,
+            generation,
+            attempt,
+            grant,
+            failure,
         ),
     }
+}
+
+/// Tri-state credential resolution (review #13): a profile that CONFIGURED
+/// credentials (username, locator, or the has_credentials flag) but cannot
+/// resolve them right now must STOP before SMTP — silently proceeding
+/// without AUTH would either attempt unauthenticated delivery or misreport a
+/// locked/deleted secret as a provider rejection. Only a profile with
+/// neither a username nor a locator (nor the flag) is explicitly
+/// unauthenticated.
+enum ProviderCredentials {
+    Unauthenticated,
+    Available(SmtpCredentials),
+    Unavailable(String),
 }
 
 fn provider_credentials(
     profile: &SenderProfile,
     secrets: &dyn SecretResolver,
-) -> Result<Option<SmtpCredentials>, String> {
-    let Some(username) = profile.username.clone() else {
-        return Ok(None);
-    };
-    let Some(locator) = profile.secret_locator.as_deref() else {
-        return Ok(None);
-    };
-    match secrets.resolve_locator(locator) {
-        Ok(Some(secret)) => Ok(Some(SmtpCredentials { username, secret })),
-        Ok(None) | Err(_) => Ok(None),
+) -> ProviderCredentials {
+    match (profile.username.clone(), profile.secret_locator.as_deref()) {
+        (None, None) => {
+            if profile.has_credentials {
+                ProviderCredentials::Unavailable(
+                    "profile marks has_credentials but stores no locator".to_string(),
+                )
+            } else {
+                ProviderCredentials::Unauthenticated
+            }
+        }
+        (Some(username), Some(locator)) => match secrets.resolve_locator(locator) {
+            Ok(Some(secret)) => ProviderCredentials::Available(SmtpCredentials { username, secret }),
+            Ok(None) => ProviderCredentials::Unavailable(
+                "configured credential missing from the store".to_string(),
+            ),
+            Err(error) => {
+                ProviderCredentials::Unavailable(format!("credential store error: {error}"))
+            }
+        },
+        (Some(_), None) => ProviderCredentials::Unavailable(
+            "username configured without a stored secret".to_string(),
+        ),
+        (None, Some(_)) => ProviderCredentials::Unavailable(
+            "stored secret configured without a username".to_string(),
+        ),
     }
 }
 
@@ -859,6 +1541,33 @@ fn handle_transaction_failure(
                 SendPhase::Connecting.as_str(),
                 class.as_str(),
             )?;
+            // Exception (review #1): once `data_started` is committed the
+            // pair may NEVER re-enter SMTP — a temporary refusal arriving
+            // after the boundary (e.g. a clean 4xx to the DATA command)
+            // settles delivery_unknown NOW instead of abandoning into a
+            // reoffer that could not run anyway.
+            let data_started = journal
+                .load_job(send_job_id, generation)?
+                .map(|row| row.data_started)
+                .unwrap_or(false);
+            if data_started {
+                let job = journal
+                    .load_job(send_job_id, generation)?
+                    .ok_or_else(|| "job vanished post-DATA".to_string())?;
+                let rows = journal.load_recipients(send_job_id, generation)?;
+                let per_recipient = rows.iter().map(recipient_state_value).collect();
+                return settle(
+                    journal,
+                    deps.transport,
+                    &job,
+                    &deps.device_id,
+                    "delivery_unknown",
+                    per_recipient,
+                    None,
+                    None,
+                    "delivery_unknown",
+                );
+            }
             Ok(SubmissionResult::Abandoned(format!(
                 "transient:{}",
                 class.as_str()

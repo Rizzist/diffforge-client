@@ -11,14 +11,8 @@ pub const MAX_CONNECTIONS_PER_DOMAIN: i64 = 2;
 
 /// Greylist backoff ladder in seconds: 5m, 15m, 30m, 1h, 2h, 4h. Stage index
 /// beyond the last repeats 4h; the whole schedule is bounded to 48h.
-pub const GREYLIST_LADDER_SECS: [i64; 6] = [
-    5 * 60,
-    15 * 60,
-    30 * 60,
-    60 * 60,
-    2 * 60 * 60,
-    4 * 60 * 60,
-];
+pub const GREYLIST_LADDER_SECS: [i64; 6] =
+    [5 * 60, 15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60];
 pub const GREYLIST_MAX_AGE_MS: i64 = 48 * 60 * 60 * 1000;
 
 fn now_ms() -> i64 {
@@ -44,11 +38,7 @@ fn jitter_millis(base_secs: i64, domain: &str, stage: u32) -> i64 {
 
 /// The next greylist retry time for `stage` (0-based), or None if the retry
 /// window would exceed the 48h cap from `first_deferral_at_ms`.
-pub fn greylist_next_retry_at(
-    domain: &str,
-    stage: u32,
-    first_deferral_at_ms: i64,
-) -> Option<i64> {
+pub fn greylist_next_retry_at(domain: &str, stage: u32, first_deferral_at_ms: i64) -> Option<i64> {
     let index = (stage as usize).min(GREYLIST_LADDER_SECS.len() - 1);
     let base = GREYLIST_LADDER_SECS[index];
     let delay = jitter_millis(base, domain, stage);

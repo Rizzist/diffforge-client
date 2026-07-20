@@ -341,8 +341,10 @@ impl CredentialStack {
         if self.vault.health() == CredentialStoreHealth::Healthy {
             return self.vault.set(name, value);
         }
-        Err("no usable credential store: OS store unavailable and vault locked or absent"
-            .to_string())
+        Err(
+            "no usable credential store: OS store unavailable and vault locked or absent"
+                .to_string(),
+        )
     }
 
     pub fn resolve(&self, locator: &str) -> Result<Option<SecretString>, String> {
@@ -392,10 +394,7 @@ pub fn cached_store_health() -> CredentialStoreHealth {
     static STATE: Mutex<Option<(Instant, CredentialStoreHealth)>> = Mutex::new(None);
     static PROBING: AtomicBool = AtomicBool::new(false);
 
-    let cached = STATE
-        .lock()
-        .ok()
-        .and_then(|guard| *guard);
+    let cached = STATE.lock().ok().and_then(|guard| *guard);
     let (stale, value) = match cached {
         Some((at, value)) => (at.elapsed() > TTL, value),
         None => (true, CredentialStoreHealth::Unavailable),

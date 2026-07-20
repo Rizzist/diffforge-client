@@ -27,6 +27,20 @@ use super::email_killpoint;
 pub const EMAIL_JOURNAL_FILE: &str = "email-send-journal.sqlite";
 const EMAIL_JOURNAL_BUSY_TIMEOUT_MS: u64 = 30_000;
 
+/// Lease epochs are full-range `u64` on the wire (§0.2) but SQLite INTEGER
+/// is signed. The journal stores them as fixed-width 20-digit decimal TEXT
+/// (`contract::u64_to_sortable`): lossless across the entire u64 range, and
+/// lexicographic order == numeric order, so the TEXT `<=`/`=` fences below
+/// never alias or corrupt epochs above `i64::MAX`. Every journal read/write
+/// goes through this pair.
+pub(crate) fn epoch_to_db(epoch: u64) -> String {
+    contract::u64_to_sortable(epoch)
+}
+
+pub(crate) fn epoch_from_db(text: &str) -> Result<u64, String> {
+    contract::u64_from_sortable(text)
+}
+
 /// Versioned migrations. Each entry is (version, name, idempotent DDL batch).
 /// NEVER edit a shipped entry — append a new version instead.
 const EMAIL_JOURNAL_MIGRATIONS: &[(i64, &str, &str)] = &[(
@@ -81,7 +95,11 @@ const EMAIL_JOURNAL_MIGRATIONS: &[(i64, &str, &str)] = &[(
         phase TEXT NOT NULL,
         phase_rank INTEGER NOT NULL,
         lease_id TEXT,
-        lease_epoch INTEGER NOT NULL DEFAULT 0,
+        -- Full-range u64 lease epochs ride the fixed-width 20-digit decimal
+        -- TEXT form (contract::u64_to_sortable): lossless, and lexicographic
+        -- order == numeric order, so the TEXT <=/= fences below never alias
+        -- or corrupt epochs above i64::MAX. The default is encoded zero.
+        lease_epoch TEXT NOT NULL DEFAULT '00000000000000000000',
         lease_expires_at_ms INTEGER,
         mime_sha256 TEXT,
         mime_size_bytes INTEGER,
@@ -220,7 +238,9 @@ pub enum CommandIntake {
     /// Receipt + job inserted in one txn. Ack `accepted`.
     Accepted { first_status_event_id: String },
     /// Same command_id + same payload hash already journaled. Ack `duplicate`.
-    Duplicate { first_status_event_id: Option<String> },
+    Duplicate {
+        first_status_event_id: Option<String>,
+    },
     /// Same command_id + DIFFERENT payload hash: security rejection (§10.1).
     SecurityRejected { journaled_sha256: String },
     /// The (job, generation) is tombstoned — tombstone dominates. Ack
@@ -294,13 +314,18 @@ impl EmailJournal {
     pub fn open_at(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
-                format!("unable to create email journal dir {}: {error}", parent.display())
+                format!(
+                    "unable to create email journal dir {}: {error}",
+                    parent.display()
+                )
             })?;
         }
         let connection = Connection::open(path)
             .map_err(|error| format!("unable to open email journal {}: {error}", path.display()))?;
         connection
-            .busy_timeout(std::time::Duration::from_millis(EMAIL_JOURNAL_BUSY_TIMEOUT_MS))
+            .busy_timeout(std::time::Duration::from_millis(
+                EMAIL_JOURNAL_BUSY_TIMEOUT_MS,
+            ))
             .map_err(|error| format!("unable to set email journal busy timeout: {error}"))?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
@@ -371,7 +396,9 @@ impl EmailJournal {
                      ON CONFLICT(k) DO UPDATE SET v = excluded.v",
                     params![version.to_string()],
                 )
-                .map_err(|error| format!("unable to stamp email journal schema version: {error}"))?;
+                .map_err(|error| {
+                    format!("unable to stamp email journal schema version: {error}")
+                })?;
         }
         Ok(())
     }
@@ -432,12 +459,38 @@ impl EmailJournal {
         binding_id: &str,
         payload_sha256: &str,
         source: &str,
+        build_received_event: impl FnOnce(&str) -> Value,
     ) -> Result<CommandIntake, String> {
         let now = now_ms();
         self.with_full_synchronous(|connection| {
             let txn = connection
                 .transaction()
                 .map_err(|error| format!("email intake txn begin failed: {error}"))?;
+
+            // Receipt dedup FIRST: a reused command_id with a different
+            // payload hash is a security rejection (§10.1) even when the
+            // generation is tombstoned — identity always wins over dominance.
+            if let Some((existing_hash, first_event)) = txn
+                .query_row(
+                    "SELECT payload_sha256, first_status_event_id
+                     FROM email_command_receipts WHERE command_id = ?1",
+                    [command_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map_err(|error| format!("email intake receipt check failed: {error}"))?
+            {
+                txn.commit()
+                    .map_err(|error| format!("email intake txn commit failed: {error}"))?;
+                if existing_hash == payload_sha256 {
+                    return Ok(CommandIntake::Duplicate {
+                        first_status_event_id: first_event,
+                    });
+                }
+                return Ok(CommandIntake::SecurityRejected {
+                    journaled_sha256: existing_hash,
+                });
+            }
 
             // Tombstone dominates — a tombstoned generation never re-executes.
             if let Some(outcome) = txn
@@ -465,39 +518,17 @@ impl EmailJournal {
                 });
             }
 
-            // Receipt dedup: same id + same hash = duplicate; different hash
-            // = security rejection (§10.1) — nothing executes.
-            if let Some((existing_hash, first_event)) = txn
-                .query_row(
-                    "SELECT payload_sha256, first_status_event_id
-                     FROM email_command_receipts WHERE command_id = ?1",
-                    [command_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|error| format!("email intake receipt check failed: {error}"))?
-            {
-                txn.commit()
-                    .map_err(|error| format!("email intake txn commit failed: {error}"))?;
-                if existing_hash == payload_sha256 {
-                    return Ok(CommandIntake::Duplicate {
-                        first_status_event_id: first_event,
-                    });
-                }
-                return Ok(CommandIntake::SecurityRejected {
-                    journaled_sha256: existing_hash,
-                });
-            }
-
-            // Higher generation fences lower (§10.1).
+            // Higher generation fences lower (§10.1). The high-water mark
+            // spans BOTH live jobs and tombstones — compaction deletes the
+            // job row but the tombstone survives forever, so a lower
+            // generation stays fenced after compaction.
             if let Some(current) = txn
                 .query_row(
-                    "SELECT MAX(generation) FROM email_send_jobs WHERE send_job_id = ?1",
+                    "SELECT MAX(generation) FROM (
+                         SELECT generation FROM email_send_jobs WHERE send_job_id = ?1
+                         UNION ALL
+                         SELECT generation FROM email_send_tombstones WHERE send_job_id = ?1
+                     )",
                     [send_job_id],
                     |row| row.get::<_, Option<i64>>(0),
                 )
@@ -520,23 +551,56 @@ impl EmailJournal {
             }
 
             let first_status_event_id = uuid::Uuid::new_v4().to_string();
-            // Receipt + job in ONE transaction (§10.1 law).
+            // Receipt + job + the phase-received event in ONE transaction
+            // (§10.1 law; the event row makes the ack's
+            // first_status_event_id durable — an ack must never reference an
+            // event the journal does not hold).
             txn.execute(
                 "INSERT INTO email_command_receipts
                  (command_id, payload_sha256, received_at_ms, ack_result,
                   first_status_event_id, source)
                  VALUES (?1, ?2, ?3, 'accepted', ?4, ?5)",
-                params![command_id, payload_sha256, now, first_status_event_id, source],
+                params![
+                    command_id,
+                    payload_sha256,
+                    now,
+                    first_status_event_id,
+                    source
+                ],
             )
             .map_err(|error| format!("email intake receipt insert failed: {error}"))?;
             txn.execute(
                 "INSERT INTO email_send_jobs
                  (send_job_id, generation, command_id, binding_id, phase, phase_rank,
-                  created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, 'received', 1, ?5, ?5)",
-                params![send_job_id, generation, command_id, binding_id, now],
+                  lease_epoch, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, 'received', 1, ?5, ?6, ?6)",
+                params![
+                    send_job_id,
+                    generation,
+                    command_id,
+                    binding_id,
+                    epoch_to_db(0),
+                    now
+                ],
             )
             .map_err(|error| format!("email intake job insert failed: {error}"))?;
+            let received_payload = build_received_event(&first_status_event_id);
+            txn.execute(
+                "INSERT OR IGNORE INTO email_send_events
+                 (status_event_id, send_job_id, generation, phase, phase_rank, payload_sha256,
+                  payload_json, outbox_state, created_at_ms)
+                 VALUES (?1, ?2, ?3, 'received', ?4, ?5, ?6, 'pending', ?7)",
+                params![
+                    first_status_event_id,
+                    send_job_id,
+                    generation,
+                    SendPhase::Received.rank(),
+                    contract::canonical_payload_sha256(&received_payload),
+                    received_payload.to_string(),
+                    now
+                ],
+            )
+            .map_err(|error| format!("email intake received event insert failed: {error}"))?;
             // New generation supersedes lower non-terminal generations.
             txn.execute(
                 "UPDATE email_send_jobs SET superseded = 1, updated_at_ms = ?3
@@ -571,12 +635,7 @@ impl EmailJournal {
                     "SELECT payload_sha256, first_status_event_id
                      FROM email_command_receipts WHERE command_id = ?1",
                     [command_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                        ))
-                    },
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
                 )
                 .optional()
                 .map_err(|error| format!("email companion receipt check failed: {error}"))?
@@ -611,7 +670,11 @@ impl EmailJournal {
     // Send-job lifecycle
     // ------------------------------------------------------------------
 
-    pub fn load_job(&self, send_job_id: &str, generation: u32) -> Result<Option<SendJobRow>, String> {
+    pub fn load_job(
+        &self,
+        send_job_id: &str,
+        generation: u32,
+    ) -> Result<Option<SendJobRow>, String> {
         self.connection
             .query_row(
                 "SELECT send_job_id, generation, command_id, binding_id, mode, phase, phase_rank,
@@ -630,7 +693,16 @@ impl EmailJournal {
                         phase: row.get(5)?,
                         phase_rank: row.get::<_, i64>(6)? as u32,
                         lease_id: row.get(7)?,
-                        lease_epoch: row.get::<_, i64>(8)? as u64,
+                        lease_epoch: {
+                            let text = row.get::<_, String>(8)?;
+                            epoch_from_db(&text).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    8,
+                                    rusqlite::types::Type::Text,
+                                    error.into(),
+                                )
+                            })?
+                        },
                         lease_expires_at_ms: row.get(9)?,
                         mime_sha256: row.get(10)?,
                         mime_size_bytes: row.get(11)?,
@@ -704,7 +776,7 @@ impl EmailJournal {
                     generation,
                     mode,
                     lease_id,
-                    lease_epoch as i64,
+                    epoch_to_db(lease_epoch),
                     lease_expires_at_ms,
                     mime_sha256,
                     mime_size_bytes,
@@ -732,7 +804,7 @@ impl EmailJournal {
                 params![
                     send_job_id,
                     generation,
-                    lease_epoch as i64,
+                    epoch_to_db(lease_epoch),
                     lease_expires_at_ms,
                     now_ms()
                 ],
@@ -899,7 +971,14 @@ impl EmailJournal {
                 "UPDATE email_send_attempts
                  SET ended_at_ms = ?4, phase_reached = ?5, outcome = ?6
                  WHERE send_job_id = ?1 AND generation = ?2 AND attempt = ?3",
-                params![send_job_id, generation, attempt, now_ms(), phase_reached, outcome],
+                params![
+                    send_job_id,
+                    generation,
+                    attempt,
+                    now_ms(),
+                    phase_reached,
+                    outcome
+                ],
             )
             .map(|_| ())
             .map_err(|error| format!("email attempt finish failed: {error}"))
@@ -933,7 +1012,10 @@ impl EmailJournal {
     }
 
     /// The DATA-boundary write (§6b.2 / §10.1): `data_started` committed with
-    /// `synchronous=FULL` BEFORE the DATA command goes on the wire.
+    /// `synchronous=FULL` BEFORE the DATA command goes on the wire. The
+    /// update is MONOTONIC — a job already at or past `data_completed` is
+    /// never regressed back to `data_started` (a duplicate worker attempting
+    /// it gets an error and must stop).
     pub fn mark_data_started(&mut self, send_job_id: &str, generation: u32) -> Result<(), String> {
         self.with_full_synchronous(|connection| {
             let txn = connection
@@ -944,17 +1026,21 @@ impl EmailJournal {
                     "UPDATE email_send_jobs
                      SET data_started = 1, phase = 'data_started', phase_rank = ?3,
                          updated_at_ms = ?4
-                     WHERE send_job_id = ?1 AND generation = ?2 AND terminal_outcome IS NULL",
+                     WHERE send_job_id = ?1 AND generation = ?2 AND terminal_outcome IS NULL
+                       AND phase_rank < ?5",
                     params![
                         send_job_id,
                         generation,
                         SendPhase::DataStarted.rank(),
-                        now_ms()
+                        now_ms(),
+                        SendPhase::DataCompleted.rank()
                     ],
                 )
                 .map_err(|error| format!("email data_started update failed: {error}"))?;
             if updated == 0 {
-                return Err("email data_started on unknown or terminal job".to_string());
+                return Err(
+                    "email data_started on unknown, terminal, or already-completed job".to_string(),
+                );
             }
             txn.commit()
                 .map_err(|error| format!("email data_started commit failed: {error}"))
@@ -962,13 +1048,19 @@ impl EmailJournal {
     }
 
     /// Journal the provider 2xx BEFORE reporting it (§10.1): phase
-    /// data_completed + the sanitized code, committed FULL.
+    /// data_completed + the sanitized code, committed FULL. Monotonic (only
+    /// a job that crossed `data_started` and is not settled can complete).
+    /// When `settle_pending_recipients` carries the sanitized provider line,
+    /// every still-pending recipient row flips to `submitted` in the SAME
+    /// transaction — a crash can never leave a persisted 2xx alongside
+    /// `pending` recipient rows.
     pub fn mark_data_completed(
         &mut self,
         send_job_id: &str,
         generation: u32,
         smtp_code: Option<u16>,
         response_class: &str,
+        settle_pending_recipients: Option<&str>,
     ) -> Result<(), String> {
         self.with_full_synchronous(|connection| {
             let txn = connection
@@ -979,19 +1071,40 @@ impl EmailJournal {
                     "UPDATE email_send_jobs
                      SET phase = 'data_completed', phase_rank = ?3, last_smtp_code = ?4,
                          last_response_class = ?5, updated_at_ms = ?6
-                     WHERE send_job_id = ?1 AND generation = ?2 AND terminal_outcome IS NULL",
+                     WHERE send_job_id = ?1 AND generation = ?2 AND terminal_outcome IS NULL
+                       AND data_started = 1 AND phase_rank < ?7",
                     params![
                         send_job_id,
                         generation,
                         SendPhase::DataCompleted.rank(),
                         smtp_code.map(i64::from),
                         response_class,
-                        now_ms()
+                        now_ms(),
+                        SendPhase::Settled.rank()
                     ],
                 )
                 .map_err(|error| format!("email data_completed update failed: {error}"))?;
             if updated == 0 {
-                return Err("email data_completed on unknown or terminal job".to_string());
+                return Err(
+                    "email data_completed on unknown, terminal, or pre-DATA job".to_string()
+                );
+            }
+            if let Some(sanitized) = settle_pending_recipients {
+                txn.execute(
+                    "UPDATE email_send_recipients
+                     SET status = 'submitted', smtp_code = ?3, response_class = ?4,
+                         response_sanitized = ?5, updated_at_ms = ?6
+                     WHERE send_job_id = ?1 AND generation = ?2 AND status = 'pending'",
+                    params![
+                        send_job_id,
+                        generation,
+                        smtp_code.map(i64::from),
+                        response_class,
+                        sanitized,
+                        now_ms()
+                    ],
+                )
+                .map_err(|error| format!("email data_completed recipients failed: {error}"))?;
             }
             txn.commit()
                 .map_err(|error| format!("email data_completed commit failed: {error}"))
@@ -1113,6 +1226,47 @@ impl EmailJournal {
             .map_err(|error| format!("email send event handoff failed: {error}"))
     }
 
+    /// Load the journaled `settled` event for a pair, if any — the ORIGINAL
+    /// terminal report. A duplicate settle attempt re-hands THIS event
+    /// (review #7): a terminal payload that lost the settle race must never
+    /// be reported, because it was never journaled.
+    pub fn load_settled_event(
+        &self,
+        send_job_id: &str,
+        generation: u32,
+    ) -> Result<Option<(PendingEventRow, String)>, String> {
+        self.connection
+            .query_row(
+                "SELECT status_event_id, payload_json, outbox_state FROM email_send_events
+                 WHERE send_job_id = ?1 AND generation = ?2 AND phase = 'settled'
+                 ORDER BY created_at_ms ASC LIMIT 1",
+                params![send_job_id, generation],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("email settled event load failed: {error}"))?
+            .map(|(status_event_id, payload_json, outbox_state)| {
+                let payload = serde_json::from_str::<Value>(&payload_json)
+                    .map_err(|error| format!("email settled event payload corrupt: {error}"))?;
+                Ok((
+                    PendingEventRow {
+                        status_event_id,
+                        send_job_id: send_job_id.to_string(),
+                        generation,
+                        payload,
+                    },
+                    outbox_state,
+                ))
+            })
+            .transpose()
+    }
+
     /// Record the §9.3 settlement ack. Stale-generation acks are SUCCESS with
     /// `applied: false, audit: "stale_generation"` — the event is cloud-acked
     /// either way.
@@ -1137,6 +1291,50 @@ impl EmailJournal {
             )
             .map(|_| ())
             .map_err(|error| format!("email send event ack record failed: {error}"))
+    }
+
+    /// Events not yet cloud-acked for ONE (send_job_id, generation), oldest
+    /// first — the worker flushes these before running so the ack's
+    /// `first_status_event_id` (journaled at intake) always reaches the
+    /// outbox, including on duplicate redelivery after an ack-side crash.
+    pub fn pending_events_for(
+        &self,
+        send_job_id: &str,
+        generation: u32,
+    ) -> Result<Vec<PendingEventRow>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT status_event_id, send_job_id, generation, payload_json
+                 FROM email_send_events
+                 WHERE outbox_state = 'pending' AND send_job_id = ?1 AND generation = ?2
+                 ORDER BY created_at_ms ASC",
+            )
+            .map_err(|error| format!("email pending events prepare failed: {error}"))?;
+        let rows = statement
+            .query_map(params![send_job_id, generation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| format!("email pending events query failed: {error}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (status_event_id, send_job_id, generation, payload_json) =
+                row.map_err(|error| format!("email pending events row failed: {error}"))?;
+            let payload = serde_json::from_str::<Value>(&payload_json)
+                .map_err(|error| format!("email pending event payload corrupt: {error}"))?;
+            out.push(PendingEventRow {
+                status_event_id,
+                send_job_id,
+                generation: generation as u32,
+                payload,
+            });
+        }
+        Ok(out)
     }
 
     /// Events not yet cloud-acked, oldest first — the resume path re-hands
@@ -1333,11 +1531,66 @@ impl EmailJournal {
         };
         let mut settled = Vec::new();
         for job in incomplete {
+            if let Some(entry) = self.classify_and_settle_incomplete(&job, device_id)? {
+                settled.push(entry);
+            }
+        }
+        Ok(settled)
+    }
+
+    /// Recover ONE incomplete (data_started, non-terminal) pair — the same
+    /// classification the startup sweep uses, callable from the send worker
+    /// when it encounters a job that already crossed DATA (§10.1: such a
+    /// generation may NEVER re-enter SMTP; a duplicate wake terminalizes it
+    /// instead of re-running it).
+    pub fn recover_incomplete_pair(
+        &mut self,
+        send_job_id: &str,
+        generation: u32,
+        device_id: &str,
+    ) -> Result<Option<(String, u32, String)>, String> {
+        let Some(job) = self.load_job(send_job_id, generation)? else {
+            return Ok(None);
+        };
+        if job.terminal_outcome.is_some() || !job.data_started {
+            return Ok(None);
+        }
+        self.classify_and_settle_incomplete(&job, device_id)
+    }
+
+    fn classify_and_settle_incomplete(
+        &mut self,
+        job: &SendJobRow,
+        device_id: &str,
+    ) -> Result<Option<(String, u32, String)>, String> {
+        {
+            let job = job.clone();
             let persisted_success = job.phase == SendPhase::DataCompleted.as_str()
                 && job
                     .last_response_class
                     .as_deref()
                     .is_some_and(|class| class == "accepted");
+            // Persisted provider success is authoritative for recipients that
+            // never got their row flip (pre-#8-fix journals): force them to
+            // `submitted` before building the terminal event so the report
+            // can never contradict the persisted 2xx.
+            if persisted_success {
+                self.connection
+                    .execute(
+                        "UPDATE email_send_recipients
+                         SET status = 'submitted', smtp_code = COALESCE(smtp_code, ?3),
+                             response_class = COALESCE(response_class, 'accepted'),
+                             updated_at_ms = ?4
+                         WHERE send_job_id = ?1 AND generation = ?2 AND status = 'pending'",
+                        params![
+                            job.send_job_id,
+                            job.generation,
+                            job.last_smtp_code.map(i64::from),
+                            now_ms()
+                        ],
+                    )
+                    .map_err(|error| format!("email recovery recipient force failed: {error}"))?;
+            }
             let (outcome, error_class, delivery_state, response_class) = if persisted_success {
                 ("submitted", "none", "submitted", "accepted")
             } else {
@@ -1423,10 +1676,14 @@ impl EmailJournal {
                 payload,
             };
             if self.journal_terminal(&job.send_job_id, job.generation, outcome, &event)? {
-                settled.push((job.send_job_id.clone(), job.generation, outcome.to_string()));
+                return Ok(Some((
+                    job.send_job_id.clone(),
+                    job.generation,
+                    outcome.to_string(),
+                )));
             }
+            Ok(None)
         }
-        Ok(settled)
     }
 
     /// Journal summaries for `email_send_resume` (§8): every non-terminal
@@ -1442,11 +1699,21 @@ impl EmailJournal {
             .map_err(|error| format!("email resume summaries prepare failed: {error}"))?;
         let rows = statement
             .query_map([], |row| {
+                let lease_epoch_text = row.get::<_, String>(3)?;
+                let lease_epoch = epoch_from_db(&lease_epoch_text).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        error.into(),
+                    )
+                })?;
                 Ok(json!({
                     "send_job_id": row.get::<_, String>(0)?,
                     "generation": row.get::<_, i64>(1)?,
                     "phase": row.get::<_, String>(2)?,
-                    "lease_epoch": row.get::<_, i64>(3)?.to_string(),
+                    // Decode the sortable-TEXT DB form back to the §0.2
+                    // unsigned decimal string (no zero padding on the wire).
+                    "lease_epoch": lease_epoch.to_string(),
                 }))
             })
             .map_err(|error| format!("email resume summaries query failed: {error}"))?;
