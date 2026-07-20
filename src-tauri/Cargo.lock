@@ -4410,7 +4410,7 @@ dependencies = [
 
 [[package]]
 name = "rust-diffforge"
-version = "0.9.24"
+version = "0.9.25"
 dependencies = [
  "arboard",
  "base64 0.22.1",
