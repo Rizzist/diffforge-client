@@ -3663,19 +3663,23 @@ async fn swarm_submit_task(
     Ok(SwarmSubmitTaskResult { run_id })
 }
 
-#[tauri::command(rename_all = "snake_case")]
-async fn swarm_cancel_run(
-    app: AppHandle,
-    state: State<'_, SwarmRuntimeState>,
-    workspace_id: String,
-    swarm_id: String,
-    run_id: String,
-) -> Result<SwarmState, String> {
-    let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+/// Cancels `run_id` if it is still the swarm's active run: flags the
+/// conductor's cancel token, interrupts member agents, and settles the run
+/// summary as cancelled. A no-op when the run already settled or another run
+/// took over. `reason` is threaded into the member interrupts for telemetry.
+pub(crate) async fn swarm_cancel_run_internal(
+    app: &AppHandle,
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    run_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
     let members = {
         let data = entry.lock().await;
         if data.active_run_id != run_id {
-            return Ok(swarm_state_from_data(&data));
+            return Ok(());
         }
         if let Some(cancel) = data.active_run_cancel.as_ref() {
             cancel.store(true, Ordering::SeqCst);
@@ -3688,21 +3692,42 @@ async fn swarm_cancel_run(
                 app.clone(),
                 member.pane_id.clone(),
                 Some(instance_id),
-                "swarm_cancel_run".to_string(),
+                reason.to_string(),
             )
             .await;
         }
     }
     let _ = swarm_mark_run_settled(
-        &app,
-        &state,
-        &workspace_id,
-        &swarm_id,
-        &run_id,
+        app,
+        state,
+        workspace_id,
+        swarm_id,
+        run_id,
         "cancelled",
         "Swarm run cancelled.",
     )
     .await?;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn swarm_cancel_run(
+    app: AppHandle,
+    state: State<'_, SwarmRuntimeState>,
+    workspace_id: String,
+    swarm_id: String,
+    run_id: String,
+) -> Result<SwarmState, String> {
+    swarm_cancel_run_internal(
+        &app,
+        state.inner(),
+        &workspace_id,
+        &swarm_id,
+        &run_id,
+        "swarm_cancel_run",
+    )
+    .await?;
+    let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
     let data = entry.lock().await;
     Ok(swarm_state_from_data(&data))
 }

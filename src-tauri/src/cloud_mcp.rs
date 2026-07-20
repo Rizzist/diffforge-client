@@ -369,6 +369,10 @@ struct CloudMcpAccountTodoDeltaApplyResult {
     highest_seq: u64,
     cursor: String,
     mirror_changed: bool,
+    /// True when the account epoch moved between the caller's frame fence
+    /// and the apply critical section: nothing was written, and the caller
+    /// must not broadcast, ack, or resume anything for this stale event.
+    dropped_stale_epoch: bool,
 }
 
 enum CloudMcpAccountTodoCacheWrite {
@@ -13884,7 +13888,11 @@ fn cloud_mcp_value_is_native_sessions(value: &Value) -> bool {
         )
 }
 
-async fn cloud_mcp_cache_account_device_live_state_snapshot(state: &CloudMcpState, event: &Value) {
+async fn cloud_mcp_cache_account_device_live_state_snapshot(
+    state: &CloudMcpState,
+    event: &Value,
+    expected_account_epoch: u64,
+) {
     let Some(snapshot) = cloud_mcp_account_device_live_state_snapshot_from_event(event) else {
         return;
     };
@@ -13892,9 +13900,11 @@ async fn cloud_mcp_cache_account_device_live_state_snapshot(state: &CloudMcpStat
     // handler bumps the epoch BEFORE clearing the snapshot under this lock,
     // so an event captured for the previous account context fails this
     // recheck instead of union-merging stale devices into the new account.
-    let account_epoch = state.account_epoch.load(Ordering::SeqCst);
+    // The expected epoch is the SOCKET's birth epoch (not re-read here): a
+    // fresh load would miss a switch that landed while the frame handler was
+    // awaiting upstream of this commit.
     let mut runtime = state.inner.lock().await;
-    if state.account_epoch.load(Ordering::SeqCst) != account_epoch {
+    if state.account_epoch.load(Ordering::SeqCst) != expected_account_epoch {
         return;
     }
     runtime.account_device_live_state_snapshot = Some(cloud_mcp_merge_account_live_state_snapshot(
@@ -13903,7 +13913,11 @@ async fn cloud_mcp_cache_account_device_live_state_snapshot(state: &CloudMcpStat
     ));
 }
 
-async fn cloud_mcp_cache_account_usage_snapshot(state: &CloudMcpState, event: &Value) {
+async fn cloud_mcp_cache_account_usage_snapshot(
+    state: &CloudMcpState,
+    event: &Value,
+    expected_account_epoch: u64,
+) {
     let Some(snapshot) = cloud_mcp_account_usage_snapshot_from_event(event) else {
         return;
     };
@@ -13913,7 +13927,12 @@ async fn cloud_mcp_cache_account_usage_snapshot(state: &CloudMcpState, event: &V
     // desktop_auth_apply_billing_status) re-ran the deep slim pass over the
     // fat payload — a measured recurring CPU spike.
     let snapshot = desktop_auth_slim_billing_status(snapshot);
+    // Check-to-commit fencing against the frame's socket epoch, mirroring
+    // the live-state cache above.
     let mut runtime = state.inner.lock().await;
+    if state.account_epoch.load(Ordering::SeqCst) != expected_account_epoch {
+        return;
+    }
     runtime.account_usage_snapshot = Some(snapshot);
 }
 
@@ -17487,12 +17506,30 @@ async fn cloud_mcp_apply_account_sync_resume_response(
     state: &CloudMcpState,
     response: &Value,
     reason: &str,
+    resume_account_epoch: u64,
 ) {
     if let Some(todos) =
         cloud_mcp_account_sync_resume_domain(response, &["todos", "todo", "account_todos"])
     {
-        match cloud_mcp_apply_account_todo_inbound_event(state, "todo.live_state", &todos).await {
+        match cloud_mcp_apply_account_todo_inbound_event(
+            state,
+            "todo.live_state",
+            &todos,
+            resume_account_epoch,
+        )
+        .await
+        {
             Ok(result) => {
+                if result.dropped_stale_epoch {
+                    // The account switched while the resume request was in
+                    // flight: the payload belongs to the previous account and
+                    // must not be reconciled or acked under the new context.
+                    log_cloud_sync_event(
+                        "account_sync_resume.todos_stale_epoch_dropped",
+                        json!({ "reason": reason }),
+                    );
+                    return;
+                }
                 let reconciliation_commits =
                     todo_store_account_resume_reconciliation_commits(&todos);
                 let mut reconciliation_items = 0usize;
@@ -17836,6 +17873,10 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
 fn cloud_mcp_spawn_account_sync_resume(state: &CloudMcpState, reason: &'static str) {
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
+        // Captured BEFORE the request is sent: a response that comes back
+        // after an account switch carries the previous account's state and
+        // must fail the apply-side epoch recheck instead of landing.
+        let resume_account_epoch = state.account_epoch.load(Ordering::SeqCst);
         let payload = cloud_mcp_account_sync_resume_payload(reason).await;
         match cloud_mcp_ws_request_with_timeout(
             &state,
@@ -17846,7 +17887,13 @@ fn cloud_mcp_spawn_account_sync_resume(state: &CloudMcpState, reason: &'static s
         .await
         {
             Ok(response) => {
-                cloud_mcp_apply_account_sync_resume_response(&state, &response, reason).await;
+                cloud_mcp_apply_account_sync_resume_response(
+                    &state,
+                    &response,
+                    reason,
+                    resume_account_epoch,
+                )
+                .await;
                 log_cloud_sync_event(
                     "account_sync_resume.ok",
                     json!({
@@ -18535,7 +18582,12 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
                     "reason": "global_ws_ready",
                     "payload": initial_account_usage,
                 });
-                cloud_mcp_cache_account_usage_snapshot(&state_for_initial, &event).await;
+                cloud_mcp_cache_account_usage_snapshot(
+                    &state_for_initial,
+                    &event,
+                    ready_account_epoch,
+                )
+                .await;
                 let _ = state_for_initial.global_ws_events.send(event);
             }
             if let Some(initial_native_sessions) = ready_message
@@ -18783,7 +18835,7 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
         return;
     }
     if cloud_mcp_value_is_account_usage(&message) {
-        cloud_mcp_cache_account_usage_snapshot(state, &message).await;
+        cloud_mcp_cache_account_usage_snapshot(state, &message, socket_account_epoch).await;
         let _ = state.global_ws_events.send(message);
         return;
     }
@@ -18836,7 +18888,12 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
         return;
     }
     if direct_kind == "account_device_live_state_snapshot" {
-        cloud_mcp_cache_account_device_live_state_snapshot(state, &message).await;
+        cloud_mcp_cache_account_device_live_state_snapshot(
+            state,
+            &message,
+            socket_account_epoch,
+        )
+        .await;
         let _ = state.global_ws_events.send(message);
         return;
     }
@@ -18970,8 +19027,21 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
                 "count": cloud_mcp_sync_payload_count(&event),
             }),
         );
-        match cloud_mcp_apply_account_todo_inbound_event(state, &event_kind, &event).await {
+        match cloud_mcp_apply_account_todo_inbound_event(
+            state,
+            &event_kind,
+            &event,
+            socket_account_epoch,
+        )
+        .await
+        {
             Ok(result) => {
+                if result.dropped_stale_epoch {
+                    // The account switched while this frame's handler was in
+                    // flight; nothing was applied and the stale event must
+                    // not be broadcast into the new account's runtime.
+                    return;
+                }
                 let suppress_local_echo = result.applied == 0
                     && result.deleted == 0
                     && result.skipped_local_echo > 0
@@ -18996,7 +19066,7 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
     if message.get("kind").and_then(Value::as_str) == Some("cloud_event") {
         // The graph/spec sync loops still own local cache materialization.
         // This global channel is the durable wake signal shared by every workspace.
-        let event = message
+        let mut event = message
             .get("event")
             .cloned()
             .unwrap_or_else(|| message.clone());
@@ -19006,6 +19076,20 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        if event_kind == "remote_command_requested" {
+            // Stamp the socket's birth epoch onto the command before it is
+            // broadcast: the remote-command listener consumes the broadcast
+            // asynchronously, so it can run AFTER an account switch even
+            // though this handler's frame fence passed. The stamp lets the
+            // listener drop the command instead of recording/executing an
+            // account-A command under account B's context.
+            if let Some(object) = event.as_object_mut() {
+                object.insert(
+                    "socket_account_epoch".to_string(),
+                    json!(socket_account_epoch),
+                );
+            }
+        }
         if cloud_mcp_handle_agent_session_observer_subscription(state, &event, &event_kind) {
             return;
         }
@@ -19013,10 +19097,15 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
             return;
         }
         if event_kind == "account_device_live_state_snapshot" {
-            cloud_mcp_cache_account_device_live_state_snapshot(state, &event).await;
+            cloud_mcp_cache_account_device_live_state_snapshot(
+                state,
+                &event,
+                socket_account_epoch,
+            )
+            .await;
         }
         if cloud_mcp_value_is_account_usage(&event) {
-            cloud_mcp_cache_account_usage_snapshot(state, &event).await;
+            cloud_mcp_cache_account_usage_snapshot(state, &event, socket_account_epoch).await;
         }
         if event_kind == CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT
             || cloud_mcp_tokenomics_strict_ingest_ack_response(&event)
@@ -19111,13 +19200,21 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
                     "count": inbound_count,
                 }),
             );
-            match cloud_mcp_apply_account_todo_inbound_event(state, &event_kind, &event).await {
+            match cloud_mcp_apply_account_todo_inbound_event(
+                state,
+                &event_kind,
+                &event,
+                socket_account_epoch,
+            )
+            .await
+            {
                 Ok(result) => {
-                    suppress_cloud_event = result.applied == 0
-                        && result.deleted == 0
-                        && result.skipped_local_echo > 0
-                        && result.skipped_stale == 0
-                        && result.ignored == 0;
+                    suppress_cloud_event = result.dropped_stale_epoch
+                        || (result.applied == 0
+                            && result.deleted == 0
+                            && result.skipped_local_echo > 0
+                            && result.skipped_stale == 0
+                            && result.ignored == 0);
                 }
                 Err(error) => {
                     log_cloud_sync_event(
@@ -19221,7 +19318,22 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
             }
         }
         if !suppress_cloud_event {
-            let _ = state.global_ws_events.send(event);
+            // Check-to-commit fence for the broadcast sink: the frame fence
+            // ran before this handler was awaited, so an account switch
+            // mid-handler would otherwise fan this old-account event out to
+            // every listener (remote-command intake, UI emits, ...) under
+            // the new account's context. Drop it if the epoch moved.
+            if state.account_epoch.load(Ordering::SeqCst) != socket_account_epoch {
+                log_cloud_sync_event(
+                    "ws.cloud_event_dropped_stale_account_epoch",
+                    json!({
+                        "event_kind": event_kind,
+                        "socket_account_epoch": socket_account_epoch,
+                    }),
+                );
+            } else {
+                let _ = state.global_ws_events.send(event);
+            }
         }
         cloud_mcp_clear_sync_activity_key(&inbound_activity_key);
     }
@@ -20763,6 +20875,30 @@ pub(crate) fn cloud_mcp_ensure_remote_command_listener(
             }
             if event_kind != "remote_command_requested" {
                 continue;
+            }
+            // Epoch fence at the RECORD/EXECUTE sink: the broadcast channel
+            // buffers, so a command captured on an account-A socket can reach
+            // this listener after an A→B switch even though every send-side
+            // fence passed. Commands stamped with their socket's birth epoch
+            // are dropped here when the epoch has moved — never recorded into
+            // the intake store or executed under account B's context.
+            if let Some(frame_account_epoch) = event
+                .get("socket_account_epoch")
+                .and_then(Value::as_u64)
+            {
+                let current_account_epoch =
+                    state_clone.account_epoch.load(Ordering::SeqCst);
+                if frame_account_epoch != current_account_epoch {
+                    log_cloud_sync_event(
+                        "remote_command.dropped_stale_account_epoch",
+                        json!({
+                            "command_kind": cloud_mcp_remote_command_kind(&event),
+                            "frame_account_epoch": frame_account_epoch,
+                            "current_account_epoch": current_account_epoch,
+                        }),
+                    );
+                    continue;
+                }
             }
             if !cloud_mcp_remote_command_matches_device(&event) {
                 continue;
@@ -57538,12 +57674,22 @@ fn cloud_mcp_todo_mirror_entry_key(
     base_url: Option<&str>,
     repo_id: Option<&str>,
     workspace_id: Option<&str>,
+    account_scope: &str,
 ) -> String {
+    // The mirror database is process-global and survives account switches,
+    // so row keys MUST embed the account scope of the payload that produced
+    // them: an account-A write racing an A→B switch then lands under A's
+    // scope instead of colliding with (and overwriting) account B's row for
+    // the same workspace. The scope comes from the EVENT/response payload
+    // (`account:{id}` when it names an account, `personal` otherwise), not
+    // from process-current auth, so a stale frame cannot borrow the new
+    // account's scope.
     let key_material = format!(
-        "{}::{}::{}",
+        "{}::{}::{}::{}",
         base_url.unwrap_or_default().trim(),
         repo_id.unwrap_or_default().trim(),
-        workspace_id.unwrap_or_default().trim()
+        workspace_id.unwrap_or_default().trim(),
+        account_scope.trim()
     );
     format!("todo-mirror-{}", cloud_mcp_short_hash(&key_material))
 }
@@ -58976,7 +59122,12 @@ fn cloud_mcp_apply_account_todo_delta_conn(
         }
     }
     if !mirror_rows.is_empty() || !removed_todo_ids.is_empty() {
+        // Carry the EVENT's account scope into the mirror write so row keys
+        // are scoped to the account that produced the delta — a stale frame
+        // racing an account switch lands under its own account's keys.
         let response = json!({
+            "account_id": result.account_id,
+            "scope_key": scope_key,
             "workspace_todos": {
                 "items": mirror_rows,
             },
@@ -59090,6 +59241,7 @@ async fn cloud_mcp_apply_account_todo_inbound_event(
     state: &CloudMcpState,
     event_kind: &str,
     event: &Value,
+    expected_account_epoch: u64,
 ) -> Result<CloudMcpAccountTodoDeltaApplyResult, String> {
     let base_url = {
         let runtime = state.inner.lock().await;
@@ -59109,6 +59261,27 @@ async fn cloud_mcp_apply_account_todo_inbound_event(
         cloud_mcp_sync_activity_size_class("applying", count, bytes, "todos"),
         &format!("todo.live_state:{event_kind}"),
     );
+    // Check-to-commit fencing (same pattern as the live-state snapshot
+    // commit): the caller's epoch fence ran BEFORE this handler was awaited,
+    // so an A→B account switch mid-handler would otherwise let account A's
+    // todo delta land in the mirror — and echo out over the local broadcast
+    // and cloud ack — under account B's context. Recheck here, immediately
+    // before the store write, and drop the stale event instead.
+    if state.account_epoch.load(Ordering::SeqCst) != expected_account_epoch {
+        cloud_mcp_clear_sync_activity_key(&activity_key);
+        log_cloud_sync_event(
+            "todo_sync.stale_epoch_dropped",
+            json!({
+                "event_kind": event_kind,
+                "expected_account_epoch": expected_account_epoch,
+                "current_account_epoch": state.account_epoch.load(Ordering::SeqCst),
+            }),
+        );
+        return Ok(CloudMcpAccountTodoDeltaApplyResult {
+            dropped_stale_epoch: true,
+            ..Default::default()
+        });
+    }
     let result = cloud_mcp_apply_account_todo_delta_conn(
         &conn,
         "todo.live_state",
@@ -59996,6 +60169,7 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
     base_url: Option<&str>,
     repo_id: Option<&str>,
     workspace_id: Option<&str>,
+    account_scope: &str,
     rows: &[Value],
     now_ms: u64,
 ) -> Result<(), String> {
@@ -60073,7 +60247,12 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
         }
         let key = format!(
             "{}::{}::{}",
-            cloud_mcp_todo_mirror_entry_key(Some(base_url), None, Some(&effective_workspace_id)),
+            cloud_mcp_todo_mirror_entry_key(
+                Some(base_url),
+                None,
+                Some(&effective_workspace_id),
+                account_scope,
+            ),
             row_kind,
             status_row_key
         );
@@ -60225,6 +60404,7 @@ fn cloud_mcp_todo_mirror_upsert_rows(
     base_url: Option<&str>,
     repo_id: Option<&str>,
     workspace_id: Option<&str>,
+    account_scope: &str,
     rows: &[Value],
     now_ms: u64,
 ) -> Result<(), String> {
@@ -60235,6 +60415,7 @@ fn cloud_mcp_todo_mirror_upsert_rows(
         base_url,
         repo_id,
         workspace_id,
+        account_scope,
         rows,
         now_ms,
     )
@@ -60426,7 +60607,11 @@ fn cloud_mcp_update_todo_mirror_conn(
         return Ok(false);
     }
     let now_ms = cloud_mcp_now_ms();
-    let key = cloud_mcp_todo_mirror_entry_key(base_url, repo_id, workspace_id);
+    // Account scope from the PAYLOAD (not process-current auth): keys written
+    // for one account's data must never collide with another account's rows
+    // in this shared mirror, even when the write races an account switch.
+    let (account_scope, _) = cloud_mcp_account_todo_scope_from_value(response);
+    let key = cloud_mcp_todo_mirror_entry_key(base_url, repo_id, workspace_id, &account_scope);
     if let Some(workspace_todos) = workspace_todos {
         let metadata = cloud_mcp_compact_workspace_todos_metadata(&workspace_todos);
         let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
@@ -60459,6 +60644,7 @@ fn cloud_mcp_update_todo_mirror_conn(
         base_url,
         repo_id,
         workspace_id,
+        &account_scope,
         &rows,
         now_ms,
     )?;
@@ -60474,6 +60660,7 @@ fn cloud_mcp_update_todo_mirror_conn(
         base_url,
         repo_id,
         workspace_id,
+        &account_scope,
         &history_rows,
         now_ms,
     )?;
@@ -66831,6 +67018,37 @@ mod cloud_mcp_tests {
         )
         .await;
         assert_eq!(disposition, CloudMcpWsFrameDisposition::Handled);
+
+        // Mid-handler-switch leg: the per-frame fence PASSED (the frame was
+        // accepted while its socket epoch was current), but an A→B switch
+        // bumps the epoch while the handler is awaiting downstream work. The
+        // check-to-commit recheck inside the todo apply critical section
+        // must drop the application before it touches the mirror, broadcasts
+        // locally, or acks to the cloud.
+        let handler_entry_epoch = state.account_epoch.load(Ordering::SeqCst);
+        state.account_epoch.fetch_add(1, Ordering::SeqCst);
+        let mut fence_events = state.global_ws_events.subscribe();
+        let stale_delta: Value =
+            serde_json::from_str(&todo_delta_frame).expect("todo delta frame parses");
+        let result = cloud_mcp_apply_account_todo_inbound_event(
+            &state,
+            "todo.live_state",
+            &stale_delta,
+            handler_entry_epoch,
+        )
+        .await
+        .expect("a stale-epoch apply must drop cleanly, not error");
+        assert!(
+            result.dropped_stale_epoch,
+            "an epoch bump between the frame fence and the apply critical \
+             section must drop the todo application"
+        );
+        assert_eq!(result.applied, 0, "a dropped stale apply must write nothing");
+        assert_eq!(result.deleted, 0, "a dropped stale apply must delete nothing");
+        assert!(
+            fence_events.try_recv().is_err(),
+            "a dropped stale apply must not broadcast into the new account's runtime"
+        );
     }
 
     fn workspace_consistency_catalog_path(data_root: &Path) -> PathBuf {
@@ -74467,7 +74685,8 @@ mod cloud_mcp_tests {
             cloud_mcp_todo_mirror_entry_key(
                 Some("https://cloud.example"),
                 None,
-                Some("workspace-row")
+                Some("workspace-row"),
+                &cloud_mcp_account_todo_scope_from_value(&response).0,
             )
         );
         assert!(key.starts_with(&expected_key_prefix));
@@ -74482,6 +74701,34 @@ mod cloud_mcp_tests {
         )
         .expect("workspace-scoped status");
         assert_eq!(status["count"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn todo_mirror_entry_keys_are_scoped_per_account() {
+        let personal = cloud_mcp_todo_mirror_entry_key(
+            Some("https://cloud.example"),
+            None,
+            Some("workspace-a"),
+            "personal",
+        );
+        let account_a = cloud_mcp_todo_mirror_entry_key(
+            Some("https://cloud.example"),
+            None,
+            Some("workspace-a"),
+            "account:acct-a",
+        );
+        let account_b = cloud_mcp_todo_mirror_entry_key(
+            Some("https://cloud.example"),
+            None,
+            Some("workspace-a"),
+            "account:acct-b",
+        );
+        assert_ne!(
+            account_a, account_b,
+            "two accounts' rows for the same workspace must never share a mirror key"
+        );
+        assert_ne!(personal, account_a);
+        assert_ne!(personal, account_b);
     }
 
     #[test]

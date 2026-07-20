@@ -14202,6 +14202,95 @@ mod todo_dispatch_backend_tests {
     use super::*;
 
     #[test]
+    fn swarm_submit_continuation_aborts_when_requeue_bumps_attempt_mid_staging() {
+        let workspace_id = format!("test-swarm-fence-{}", uuid::Uuid::new_v4());
+        // The row exactly as todo_dispatch_backend_try_claim_item leaves it:
+        // running at attempt 0 under the backend dispatch claim.
+        let claimed = json!({
+            "id": "todo-swarm-fence",
+            "todo_id": "todo-swarm-fence",
+            "remote_command": { "command_id": "command-swarm-fence" },
+            "status": "running",
+            "todo_status": "running",
+            "status_reason": "todo_queue_backend_dispatch_claim",
+            "todo_status_reason": "todo_queue_backend_dispatch_claim",
+            "target_kind": "swarm",
+            "target_swarm_id": "swarm-fence",
+            "text": "fenced swarm submit",
+            "workspace_id": workspace_id,
+        });
+
+        // The queue store re-resolves its data root from the environment on
+        // every call and concurrently running cloud_mcp tests scope that env
+        // to their own temp roots, so retry the whole leg — genuine fence
+        // breakage still fails every attempt.
+        let mut verified = false;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            todo_dispatch_queue_write(&workspace_id, &[claimed.clone()]);
+            // While the claim is intact, the continuation's fence passes.
+            if !todo_dispatch_backend_swarm_claim_still_current(&workspace_id, &claimed, 0) {
+                continue;
+            }
+
+            // Mid-staging Unqueue+Queue: the requeue flips the row back to
+            // queued, bumps it to attempt 1, and clears the run binding —
+            // the same writes todo_store_set_status performs.
+            let mut requeued = claimed.clone();
+            todo_store_set_item_status(&mut requeued, "queued", "todo_store_set_status");
+            todo_store_set_item_attempt_seq(&mut requeued, 1);
+            todo_store_clear_item_swarm_run_binding(&mut requeued);
+            todo_dispatch_queue_write(&workspace_id, &[requeued.clone()]);
+
+            // The stale continuation (claimed attempt 0) must now abort...
+            assert!(
+                !todo_dispatch_backend_swarm_claim_still_current(&workspace_id, &claimed, 0),
+                "a continuation claiming attempt 0 must abort after the row \
+                 was requeued to attempt 1"
+            );
+
+            // ...leaving the row exactly as the requeue left it: queued at
+            // attempt 1 with no run binding.
+            let path = todo_dispatch_data_path("queues", &workspace_id).expect("queue path");
+            let items = todo_dispatch_queue_read(&path)
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(items.len(), 1);
+            assert_eq!(todo_store_item_status(&items[0]), "queued");
+            assert_eq!(todo_dispatch_queue_item_attempt_seq(&items[0]), 1);
+            assert!(
+                items[0].get("swarm_run_id").is_none() && items[0].get("run_id").is_none(),
+                "the aborted continuation must not resurrect a run binding"
+            );
+
+            // A FRESH dispatch claims attempt 1 and its continuation's fence
+            // passes for that attempt.
+            let target = json!({
+                "target_kind": "swarm",
+                "target_swarm_id": "swarm-fence",
+            });
+            let fresh = todo_dispatch_backend_try_claim_item(&workspace_id, &requeued, &target)
+                .expect("fresh claim at attempt 1");
+            assert_eq!(todo_dispatch_queue_item_attempt_seq(&fresh), 1);
+            assert!(
+                todo_dispatch_backend_swarm_claim_still_current(&workspace_id, &fresh, 1),
+                "the fresh attempt-1 claim must pass the fence and dispatch"
+            );
+            verified = true;
+            break;
+        }
+        assert!(verified, "queue store never stabilized across retries");
+
+        if let Some(path) = todo_dispatch_data_path("queues", &workspace_id) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
     fn deferred_remote_commands_remain_until_exact_ui_handler_ack() {
         let pending = vec![
             json!({ "command_id": "activate-one", "command_kind": "workspace_activate" }),
@@ -15919,6 +16008,53 @@ async fn todo_dispatch_backend_swarm_can_start(
     }
 }
 
+/// True when `entry` is still the queue row this swarm-submit continuation
+/// claimed: same identity, still `running` under the backend dispatch claim,
+/// and still the exact claimed attempt. A cancel/requeue mid-submit flips the
+/// status back to `queued`, bumps `attempt_seq`, and clears the run binding —
+/// any of those makes the continuation stale.
+fn todo_dispatch_backend_swarm_claim_matches(
+    entry: &Value,
+    item: &Value,
+    claimed_attempt_seq: u64,
+) -> bool {
+    todo_store_items_share_identity(entry, item)
+        && todo_store_item_status(entry) == "running"
+        && todo_dispatch_text(entry, &["todo_status_reason", "status_reason"])
+            == "todo_queue_backend_dispatch_claim"
+        && todo_dispatch_queue_item_attempt_seq(entry) == claimed_attempt_seq
+}
+
+/// Re-verifies, under the queue store guard, that the claimed row is still
+/// exactly as `todo_dispatch_backend_try_claim_item` left it. The swarm
+/// submit path awaits between claiming and committing (attachment staging up
+/// to 30s, then the run submission itself); an Unqueue+Queue in that window
+/// bumps the row to attempt N+1 with a cleared binding, and the stale
+/// continuation must abort instead of resurrecting `running` plus its dead
+/// `swarm_run_id` onto the fresh attempt (which would wedge it: completion
+/// settlement is attempt-fenced, so the row could never settle).
+fn todo_dispatch_backend_swarm_claim_still_current(
+    workspace_id: &str,
+    item: &Value,
+    claimed_attempt_seq: u64,
+) -> bool {
+    let _store_guard = todo_dispatch_queue_store_guard();
+    let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
+        // No queue store to verify against — keep the legacy behavior of
+        // proceeding (the running restore is a no-op without a store too).
+        return true;
+    };
+    todo_dispatch_queue_read(&path)
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().any(|entry| {
+                todo_dispatch_backend_swarm_claim_matches(entry, item, claimed_attempt_seq)
+            })
+        })
+        .unwrap_or(false)
+}
+
 async fn todo_dispatch_backend_submit_swarm(
     app: &AppHandle,
     workspace_id: &str,
@@ -15926,6 +16062,10 @@ async fn todo_dispatch_backend_submit_swarm(
     target: &Value,
 ) -> bool {
     let swarm_id = todo_dispatch_text(target, &["target_swarm_id"]);
+    // The attempt this continuation claimed. Every commit below is fenced to
+    // it: a requeue during any await bumps the row past this attempt and the
+    // continuation must then abort without touching the row.
+    let claimed_attempt_seq = todo_dispatch_queue_item_attempt_seq(item);
     let prepared =
         todo_dispatch_backend_item_text_with_remote_attachments(item, workspace_id).await;
     // Swarm submission is not an interactive TUI input channel, so preserve
@@ -15933,6 +16073,24 @@ async fn todo_dispatch_backend_submit_swarm(
     // native composer attachments.
     let prompt = todo_dispatch_prepared_text_fallback(&prepared);
     if swarm_id.is_empty() || prompt.is_empty() {
+        return false;
+    }
+    // Fence after the staging await, BEFORE registering a swarm run: if the
+    // user unqueued/requeued while attachments staged, dispatching now would
+    // start a run for a superseded attempt. Returning false is safe — the
+    // caller's release-claim only touches rows still `running` under the
+    // dispatch claim, so a requeued row stays exactly as the requeue left it.
+    if !todo_dispatch_backend_swarm_claim_still_current(workspace_id, item, claimed_attempt_seq) {
+        log_terminal_status_event(
+            "backend.todo_dispatch.swarm_submit_fence_skip",
+            json!({
+                "claimed_attempt_seq": claimed_attempt_seq,
+                "item_id": todo_store_item_sync_id(item),
+                "stage": "post_attachment_staging",
+                "swarm_id": swarm_id,
+                "workspace_id": workspace_id,
+            }),
+        );
         return false;
     }
     let swarm_state = app.state::<SwarmRuntimeState>();
@@ -15950,7 +16108,7 @@ async fn todo_dispatch_backend_submit_swarm(
         // exact attempt, so a cancel-then-requeue (which bumps the attempt
         // and clears the row's run binding) can never be settled by THIS
         // run's completion.
-        Some(todo_dispatch_queue_item_attempt_seq(item)),
+        Some(claimed_attempt_seq),
     )
     .await
     {
@@ -15987,6 +16145,106 @@ async fn todo_dispatch_backend_submit_swarm(
     let pane_id = todo_dispatch_text(target, &["pane_id", "target_terminal_id"]);
     let origin_device_id = todo_dispatch_text(item, &["origin_device_id"]);
 
+    // Commit the running restore FIRST, fenced under the queue store guard,
+    // and only record the receipt/journal once it lands: recording a running
+    // receipt for a superseded attempt would resurrect the old outcome the
+    // requeue explicitly cleared.
+    let mut running_item = None;
+    let mut stale_claim = false;
+    if let Some(path) = todo_dispatch_data_path("queues", workspace_id) {
+        let _store_guard = todo_dispatch_queue_store_guard();
+        let snapshot = todo_dispatch_queue_read(&path);
+        if let Some(items) = snapshot.get("items").and_then(Value::as_array) {
+            // Re-verify UNDER THE STORE GUARD, immediately before restoring
+            // running + the run binding: the run submission awaited above, so
+            // an Unqueue+Queue may have bumped the row to attempt N+1 and
+            // cleared its binding. Restoring would rewrite the fresh attempt
+            // to `running` with a run id that can never settle it (completion
+            // is fenced to the CLAIMED attempt) — wedging it forever.
+            let claim_current = items.iter().any(|entry| {
+                todo_dispatch_backend_swarm_claim_matches(entry, item, claimed_attempt_seq)
+            });
+            if !claim_current {
+                stale_claim = true;
+            } else {
+                let next_items = items
+                    .iter()
+                    .cloned()
+                    .map(|mut entry| {
+                        if todo_store_items_share_identity(&entry, item) {
+                            todo_store_set_item_status(
+                                &mut entry,
+                                "running",
+                                "todo_queue_swarm_run_started",
+                            );
+                            if let Some(object) = entry.as_object_mut() {
+                                object.insert("command_id".to_string(), json!(command_id.clone()));
+                                object
+                                    .insert("dispatch_id".to_string(), json!(dispatch_id.clone()));
+                                object.insert(
+                                    "last_dispatch_id".to_string(),
+                                    json!(dispatch_id.clone()),
+                                );
+                                object.insert("todo_id".to_string(), json!(todo_id.clone()));
+                                object.insert("target_kind".to_string(), json!("swarm"));
+                                object
+                                    .insert("target_swarm_id".to_string(), json!(swarm_id.clone()));
+                                object.insert("swarm_run_id".to_string(), json!(run_id.clone()));
+                                if !pane_id.is_empty() {
+                                    object.insert(
+                                        "target_terminal_id".to_string(),
+                                        json!(pane_id.clone()),
+                                    );
+                                    object.insert("pane_id".to_string(), json!(pane_id.clone()));
+                                }
+                                if let Some(terminal_index) =
+                                    target.get("target_terminal_index").cloned()
+                                {
+                                    object.insert(
+                                        "target_terminal_index".to_string(),
+                                        terminal_index,
+                                    );
+                                }
+                            }
+                            running_item = Some(entry.clone());
+                        }
+                        entry
+                    })
+                    .collect::<Vec<_>>();
+                todo_dispatch_queue_write(workspace_id, &next_items);
+                todo_store_orphan_sweep_trigger("todo_queue_swarm_run_started");
+            }
+        }
+    }
+    if stale_claim {
+        log_terminal_status_event(
+            "backend.todo_dispatch.swarm_submit_fence_skip",
+            json!({
+                "claimed_attempt_seq": claimed_attempt_seq,
+                "item_id": item_id,
+                "stage": "post_swarm_submit",
+                "swarm_id": swarm_id,
+                "swarm_run_id": run_id,
+                "workspace_id": workspace_id,
+            }),
+        );
+        // Release the registration this continuation just created: the run
+        // belongs to a superseded attempt, so cancel it instead of leaving
+        // it executing with no row that could ever settle from it. The row
+        // itself is left exactly as the requeue left it (queued at the new
+        // attempt, binding clear).
+        let _ = swarm_cancel_run_internal(
+            app,
+            swarm_state.inner(),
+            workspace_id,
+            &swarm_id,
+            &run_id,
+            "todo_queue_swarm_stale_claim_cancel",
+        )
+        .await;
+        return false;
+    }
+
     let mut receipt = json!({
         "command_id": command_id,
         "item_id": item_id,
@@ -16000,7 +16258,7 @@ async fn todo_dispatch_backend_submit_swarm(
         // rows: an attempt-less running write cannot clear the previous
         // attempt's superseded markers, so completion would observe the OLD
         // attempt, fail the row fence, and strand the row running forever.
-        "attempt_seq": todo_dispatch_queue_item_attempt_seq(item),
+        "attempt_seq": claimed_attempt_seq,
         "text": prompt.chars().take(180).collect::<String>(),
         "workspace_id": workspace_id,
         "workspace_name": workspace_name,
@@ -16039,53 +16297,6 @@ async fn todo_dispatch_backend_submit_swarm(
             "workspace_id": workspace_id,
         }),
     );
-
-    let mut running_item = None;
-    if let Some(path) = todo_dispatch_data_path("queues", workspace_id) {
-        let _store_guard = todo_dispatch_queue_store_guard();
-        let snapshot = todo_dispatch_queue_read(&path);
-        if let Some(items) = snapshot.get("items").and_then(Value::as_array) {
-            let next_items = items
-                .iter()
-                .cloned()
-                .map(|mut entry| {
-                    if todo_store_items_share_identity(&entry, item) {
-                        todo_store_set_item_status(
-                            &mut entry,
-                            "running",
-                            "todo_queue_swarm_run_started",
-                        );
-                        if let Some(object) = entry.as_object_mut() {
-                            object.insert("command_id".to_string(), json!(command_id.clone()));
-                            object.insert("dispatch_id".to_string(), json!(dispatch_id.clone()));
-                            object
-                                .insert("last_dispatch_id".to_string(), json!(dispatch_id.clone()));
-                            object.insert("todo_id".to_string(), json!(todo_id.clone()));
-                            object.insert("target_kind".to_string(), json!("swarm"));
-                            object.insert("target_swarm_id".to_string(), json!(swarm_id.clone()));
-                            object.insert("swarm_run_id".to_string(), json!(run_id.clone()));
-                            if !pane_id.is_empty() {
-                                object.insert(
-                                    "target_terminal_id".to_string(),
-                                    json!(pane_id.clone()),
-                                );
-                                object.insert("pane_id".to_string(), json!(pane_id.clone()));
-                            }
-                            if let Some(terminal_index) =
-                                target.get("target_terminal_index").cloned()
-                            {
-                                object.insert("target_terminal_index".to_string(), terminal_index);
-                            }
-                        }
-                        running_item = Some(entry.clone());
-                    }
-                    entry
-                })
-                .collect::<Vec<_>>();
-            todo_dispatch_queue_write(workspace_id, &next_items);
-            todo_store_orphan_sweep_trigger("todo_queue_swarm_run_started");
-        }
-    }
     if let Some(running_item) = running_item {
         todo_store_push_corrections(
             app,
