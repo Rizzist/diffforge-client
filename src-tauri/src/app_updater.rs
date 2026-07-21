@@ -14,6 +14,7 @@ const APP_UPDATE_AVAILABLE_EVENT: &str = "forge-app-update-available";
 const APP_UPDATE_PROGRESS_EVENT: &str = "forge-app-update-progress";
 const APP_UPDATE_STATE_EVENT: &str = "forge-app-update-state";
 const APP_UPDATE_RECHECK_INTERVAL_SECS: u64 = 4 * 60 * 60;
+const APP_UPDATE_CHECK_RETRY_LADDER_SECS: [u64; 3] = [30, 2 * 60, 10 * 60];
 const APP_UPDATE_PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 // While an update is pending and auto-restart is enabled, poll terminal
 // idleness on this cadence, and require it to hold across a confirmation
@@ -31,6 +32,11 @@ const APP_UPDATE_STATE_RESTARTING: u8 = 4;
 const APP_UPDATE_STATE_FAILED: u8 = 5;
 
 static APP_UPDATE_INSTALLING: AtomicBool = AtomicBool::new(false);
+// Consecutive network-class check failures. Shared (not loop-local) so a
+// SUCCESSFUL check from ANY path — including a manual retry while the
+// background loop sleeps in its retry ladder — resets the quiet-first-failure
+// accounting.
+static APP_UPDATE_CHECK_NETWORK_FAILURES: AtomicUsize = AtomicUsize::new(0);
 // GUI mode is opt-in. Daemons default to on unless DIFFFORGE_DAEMON_AUTO_UPDATE=0.
 static APP_UPDATE_AUTO_WHEN_IDLE: AtomicBool = AtomicBool::new(false);
 static APP_UPDATE_AUTH_TRANSPORT_RESTART_DEFERRED: AtomicBool = AtomicBool::new(false);
@@ -135,6 +141,24 @@ enum AppUpdateDownloadFinish {
     Finished,
     RestartPending(u64),
     Stale,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AppUpdateCheckRetryState {
+    consecutive_network_failures: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppUpdateCheckFailureReporting {
+    StoreAndPublish,
+    ReturnOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AppUpdateCheckFailureDecision {
+    next_state: AppUpdateCheckRetryState,
+    retry_after_secs: u64,
+    publish_failed_state: bool,
 }
 
 impl AppUpdateRemoteOperation {
@@ -648,6 +672,75 @@ fn app_update_last_error() -> Option<String> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
+}
+
+fn app_update_check_error_is_network_class(error: &str) -> bool {
+    // Classify on prose only: URL host/path text inside the error (e.g. a
+    // signature failure quoting an endpoint whose path contains
+    // "connection") must not read as a transport failure.
+    let error = app_update_check_error_without_urls(error).to_ascii_lowercase();
+    [
+        "error sending request",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "connect error",
+        "dns error",
+        "name resolution",
+        "failed to lookup",
+        "timed out",
+        "operation timed out",
+        "network is unreachable",
+        "network unreachable",
+        "no route to host",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+/// Strips every URL-looking token (scheme://… through the next whitespace)
+/// so classification sees only the error prose.
+fn app_update_check_error_without_urls(error: &str) -> String {
+    let mut output = String::with_capacity(error.len());
+    for token in error.split_whitespace() {
+        if token.contains("://") {
+            continue;
+        }
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(token);
+    }
+    output
+}
+
+fn app_update_check_retry_after_secs(consecutive_network_failures: usize) -> u64 {
+    consecutive_network_failures
+        .checked_sub(1)
+        .and_then(|index| APP_UPDATE_CHECK_RETRY_LADDER_SECS.get(index).copied())
+        .unwrap_or(APP_UPDATE_RECHECK_INTERVAL_SECS)
+}
+
+fn app_update_check_failure_decision(
+    state: AppUpdateCheckRetryState,
+    error: &str,
+) -> AppUpdateCheckFailureDecision {
+    if !app_update_check_error_is_network_class(error) {
+        return AppUpdateCheckFailureDecision {
+            next_state: AppUpdateCheckRetryState::default(),
+            retry_after_secs: APP_UPDATE_RECHECK_INTERVAL_SECS,
+            publish_failed_state: true,
+        };
+    }
+
+    let consecutive_network_failures = state.consecutive_network_failures.saturating_add(1);
+    AppUpdateCheckFailureDecision {
+        next_state: AppUpdateCheckRetryState {
+            consecutive_network_failures,
+        },
+        retry_after_secs: app_update_check_retry_after_secs(consecutive_network_failures),
+        publish_failed_state: consecutive_network_failures > 1,
+    }
 }
 
 /// Removes credentials and request parameters from URL-looking text before an
@@ -1282,14 +1375,36 @@ fn app_update_remote_restart_gate_response(
 }
 
 async fn app_updater_run_check(app: &AppHandle) -> Result<Option<AppUpdateInfo>, String> {
-    app_update_store_state(APP_UPDATE_STATE_CHECKING);
-    app_update_publish_device_state(app, "app_update_checking");
+    app_updater_run_check_with_failure_reporting(
+        app,
+        AppUpdateCheckFailureReporting::StoreAndPublish,
+    )
+    .await
+}
+
+async fn app_updater_run_background_check(
+    app: &AppHandle,
+) -> Result<Option<AppUpdateInfo>, String> {
+    app_updater_run_check_with_failure_reporting(app, AppUpdateCheckFailureReporting::ReturnOnly)
+        .await
+}
+
+async fn app_updater_run_check_with_failure_reporting(
+    app: &AppHandle,
+    failure_reporting: AppUpdateCheckFailureReporting,
+) -> Result<Option<AppUpdateInfo>, String> {
+    if failure_reporting == AppUpdateCheckFailureReporting::StoreAndPublish {
+        app_update_store_state(APP_UPDATE_STATE_CHECKING);
+        app_update_publish_device_state(app, "app_update_checking");
+    }
     let updater = match app_updater_instance(app) {
         Ok(updater) => updater,
         Err(error) => {
             let error = app_update_scrub_external_text(&error);
-            app_update_store_failed_state(&error);
-            app_update_publish_device_state(app, "app_update_failed");
+            if failure_reporting == AppUpdateCheckFailureReporting::StoreAndPublish {
+                app_update_store_failed_state(&error);
+                app_update_publish_device_state(app, "app_update_failed");
+            }
             return Err(error);
         }
     };
@@ -1297,11 +1412,16 @@ async fn app_updater_run_check(app: &AppHandle) -> Result<Option<AppUpdateInfo>,
         Ok(update) => update,
         Err(error) => {
             let error = app_update_scrub_external_text(&format!("Update check failed: {error}"));
-            app_update_store_failed_state(&error);
-            app_update_publish_device_state(app, "app_update_failed");
+            if failure_reporting == AppUpdateCheckFailureReporting::StoreAndPublish {
+                app_update_store_failed_state(&error);
+                app_update_publish_device_state(app, "app_update_failed");
+            }
             return Err(error);
         }
     };
+    // Any successful check — background or manual — resets the
+    // quiet-first-failure ladder accounting.
+    APP_UPDATE_CHECK_NETWORK_FAILURES.store(0, Ordering::Release);
     let Some(update) = update else {
         app_update_store_available(None);
         if app_update_staged_info().is_none() {
@@ -1345,7 +1465,7 @@ pub(crate) fn app_updater_start(app: &AppHandle) {
         // on mount and also listens for the available event). Subsequent
         // checks fall on the recheck interval at the bottom of the loop.
         loop {
-            let pending = match app_updater_run_check(&app).await {
+            let pending = match app_updater_run_background_check(&app).await {
                 Ok(Some(info)) => {
                     log_terminal_status_event(
                         "backend.app_update.available",
@@ -1359,7 +1479,26 @@ pub(crate) fn app_updater_start(app: &AppHandle) {
                         "backend.app_update.check_failed",
                         json!({ "error": error }),
                     );
-                    false
+                    // The counter is shared so a successful MANUAL check
+                    // during our retry sleep resets the accounting before
+                    // this failure path runs again.
+                    let decision = app_update_check_failure_decision(
+                        AppUpdateCheckRetryState {
+                            consecutive_network_failures: APP_UPDATE_CHECK_NETWORK_FAILURES
+                                .load(Ordering::Acquire),
+                        },
+                        &error,
+                    );
+                    APP_UPDATE_CHECK_NETWORK_FAILURES.store(
+                        decision.next_state.consecutive_network_failures,
+                        Ordering::Release,
+                    );
+                    if decision.publish_failed_state {
+                        app_update_store_failed_state(&error);
+                        app_update_publish_device_state(&app, "app_update_failed");
+                    }
+                    sleep(Duration::from_secs(decision.retry_after_secs)).await;
+                    continue;
                 }
             };
 
@@ -2665,6 +2804,80 @@ mod app_update_tests {
             ),
             "https://safe.example/x;mirror=https://host/y"
         );
+    }
+
+    #[test]
+    fn check_error_classifies_network_failures_by_reqwest_text() {
+        for error in [
+            "Update check failed: error sending request for url (https://updates.example/latest.json)",
+            "Update check failed: connection refused",
+            "Update check failed: dns error",
+            "Update check failed: operation timed out",
+            "Update check failed: failed to lookup address information",
+        ] {
+            assert!(
+                app_update_check_error_is_network_class(error),
+                "expected network-class error: {error}"
+            );
+        }
+
+        for error in [
+            "Update check failed: signature verification failed",
+            "Update check failed: could not parse manifest JSON",
+            "Could not build updater: invalid endpoint",
+            // URL text must not drive classification: a signature failure
+            // quoting an endpoint whose path contains network-y words stays
+            // non-network.
+            "Update check failed: signature verification failed for https://cdn.example/connection-timeout/updater.json",
+        ] {
+            assert!(
+                !app_update_check_error_is_network_class(error),
+                "expected reportable error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_retry_ladder_progresses_then_returns_to_recheck_interval() {
+        assert_eq!(app_update_check_retry_after_secs(1), 30);
+        assert_eq!(app_update_check_retry_after_secs(2), 2 * 60);
+        assert_eq!(app_update_check_retry_after_secs(3), 10 * 60);
+        assert_eq!(
+            app_update_check_retry_after_secs(4),
+            APP_UPDATE_RECHECK_INTERVAL_SECS
+        );
+        assert_eq!(
+            app_update_check_retry_after_secs(99),
+            APP_UPDATE_RECHECK_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn check_failure_decision_keeps_first_network_failure_quiet() {
+        let first = app_update_check_failure_decision(
+            AppUpdateCheckRetryState::default(),
+            "Update check failed: error sending request for url (https://updates.example/latest.json)",
+        );
+        assert!(!first.publish_failed_state);
+        assert_eq!(first.retry_after_secs, 30);
+        assert_eq!(first.next_state.consecutive_network_failures, 1);
+
+        let second =
+            app_update_check_failure_decision(first.next_state, "Update check failed: dns error");
+        assert!(second.publish_failed_state);
+        assert_eq!(second.retry_after_secs, 2 * 60);
+        assert_eq!(second.next_state.consecutive_network_failures, 2);
+
+        let reportable = app_update_check_failure_decision(
+            second.next_state,
+            "Update check failed: signature verification failed",
+        );
+        assert!(reportable.publish_failed_state);
+        assert_eq!(
+            reportable.retry_after_secs,
+            APP_UPDATE_RECHECK_INTERVAL_SECS
+        );
+        assert_eq!(reportable.next_state, AppUpdateCheckRetryState::default());
     }
 
     fn test_remote_context(token: u64) -> AppUpdateRemoteCommandContext {
