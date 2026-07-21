@@ -44,6 +44,8 @@ const TERMINAL_RESTART_INTENT_DEFAULT_DEADLINE_MS: u64 = 120_000;
 const TERMINAL_RESTART_INTENT_MIN_DEADLINE_MS: u64 = 5_000;
 const TERMINAL_RESTART_INTENT_MAX_DEADLINE_MS: u64 = 15 * 60_000;
 const TERMINAL_RESTART_INTENT_EVENT: &str = "forge-terminal-restart-intent";
+const TERMINAL_DAEMON_RESPAWN_WINDOW_MS: u64 = 5 * 60_000;
+const TERMINAL_DAEMON_RESPAWN_MAX_PER_WINDOW: usize = 3;
 // A resume binding is captured before a busy restart is queued. Keep it past
 // the longest admission deadline so the ready event can still reopen against
 // the pane's frozen account instead of falling back to the mutable active one.
@@ -75,6 +77,8 @@ static TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_GENERATION: AtomicU64 = AtomicU64::ne
 static TERMINAL_CODEX_HOOK_TRUST_DISCOVERY_STATES: OnceLock<
     StdMutex<HashMap<(String, u64), TerminalCodexHookTrustDiscoveryEntry>>,
 > = OnceLock::new();
+static TERMINAL_DAEMON_RESPAWN_HISTORY: OnceLock<StdMutex<HashMap<String, VecDeque<u64>>>> =
+    OnceLock::new();
 
 fn terminal_codex_hook_trust_discovery_states(
 ) -> &'static StdMutex<HashMap<(String, u64), TerminalCodexHookTrustDiscoveryEntry>> {
@@ -8391,6 +8395,31 @@ fn spawn_terminal_reader(
             )
             .await
             {
+                let respawn_candidate = terminal_daemon_reader_exit_respawn_candidate(
+                    &instance.metadata,
+                    crate::daemon_mode_active(),
+                    terminal_instance_is_generic_shell(&instance),
+                );
+                let respawn_candidate = respawn_candidate.and_then(|candidate| {
+                    if terminal_daemon_reader_exit_respawn_allowed_at(
+                        &candidate.slot_key,
+                        terminal_now_ms(),
+                    ) {
+                        Some(candidate)
+                    } else {
+                        log_terminal_crash_forensics_event(
+                            "backend.terminal_reader_exit.respawn_suppressed",
+                            json!({
+                                "instance_id": instance.id,
+                                "pane_id": clean_terminal_diagnostic_log_text(&cleanup_pane_id),
+                                "reason": "respawn_rate_limit",
+                                "slot_key": candidate.slot_key,
+                                "workspace_id": candidate.workspace_id,
+                            }),
+                        );
+                        None
+                    }
+                });
                 // EOF normally follows process exit, but allow a short reap
                 // window so managed-login completion receives the PTY's real
                 // status instead of an unconditional/unknown success.
@@ -8407,37 +8436,61 @@ fn spawn_terminal_reader(
                     }
                     sleep(Duration::from_millis(10)).await;
                 }
+                let notify_context = TerminalCloudMcpCloseContext::from_instance(&instance);
                 terminal_record_workspace_agent_session_history(
                     Some(cleanup_app.clone()),
                     &instance,
                     None,
                     None,
                     "detached",
-                    "reader_exit:terminal_detached",
+                    if respawn_candidate.is_some() {
+                        "reader_exit:terminal_respawn"
+                    } else {
+                        "reader_exit:terminal_detached"
+                    },
                     None,
                 );
-                terminal_runtime_mark_closing(&instance, "reader_exit");
-                let notify_state = cleanup_state.clone();
-                let notify_pane_id = cleanup_pane_id.clone();
-                let notify_context = TerminalCloudMcpCloseContext::from_instance(&instance);
-                let notify_task = tauri::async_runtime::spawn(async move {
-                    cloud_mcp_mark_terminal_closed(
-                        &notify_state,
-                        &notify_pane_id,
-                        instance_id,
-                        &notify_context,
-                        "reader_exit",
+                terminal_runtime_mark_closing(
+                    &instance,
+                    if respawn_candidate.is_some() {
+                        "reader_exit_respawn"
+                    } else {
+                        "reader_exit"
+                    },
+                );
+                if let Some(respawn_candidate) = respawn_candidate {
+                    let _ = terminal_daemon_reader_exit_respawn(
+                        cleanup_app.clone(),
+                        cleanup_state.clone(),
+                        cleanup_tracker,
+                        instance,
+                        notify_context,
+                        respawn_candidate,
                     )
                     .await;
-                });
-                let _ = tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
-                cleanup_terminal_instance_async(
-                    instance,
-                    false,
-                    "reader_exit",
-                    false,
-                    Some(cleanup_tracker),
-                );
+                } else {
+                    let notify_state = cleanup_state.clone();
+                    let notify_pane_id = cleanup_pane_id.clone();
+                    let notify_task = tauri::async_runtime::spawn(async move {
+                        cloud_mcp_mark_terminal_closed(
+                            &notify_state,
+                            &notify_pane_id,
+                            instance_id,
+                            &notify_context,
+                            "reader_exit",
+                        )
+                        .await;
+                    });
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
+                    cleanup_terminal_instance_async(
+                        instance,
+                        false,
+                        "reader_exit",
+                        false,
+                        Some(cleanup_tracker),
+                    );
+                }
                 todo_store_orphan_sweep_trigger("terminal_reader_exit");
             }
 
@@ -8548,6 +8601,161 @@ fn terminal_restart_session_binding(
 
 fn terminal_instance_is_generic_shell(instance: &TerminalInstance) -> bool {
     terminal_restart_role(None, instance).as_deref() == Some("generic")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalDaemonRespawnCandidate {
+    pane_id: String,
+    workspace_id: String,
+    terminal_index: usize,
+    slot_key: String,
+}
+
+fn terminal_daemon_respawn_history() -> &'static StdMutex<HashMap<String, VecDeque<u64>>> {
+    TERMINAL_DAEMON_RESPAWN_HISTORY.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn terminal_daemon_reader_exit_respawn_candidate(
+    metadata: &TerminalInstanceMetadata,
+    daemon_mode: bool,
+    generic_shell: bool,
+) -> Option<TerminalDaemonRespawnCandidate> {
+    if !daemon_mode || !generic_shell {
+        return None;
+    }
+    let workspace_id = cloud_mcp_workspace_id_match_key(&metadata.workspace_id);
+    if workspace_id.is_empty() {
+        return None;
+    }
+    let terminal_index = metadata.terminal_index.map(usize::from)?;
+    let slot_key = format!("{workspace_id}:{terminal_index}:generic");
+    Some(TerminalDaemonRespawnCandidate {
+        pane_id: metadata.pane_id.clone(),
+        workspace_id,
+        terminal_index,
+        slot_key,
+    })
+}
+
+fn terminal_daemon_reader_exit_respawn_allowed_at(slot_key: &str, now_ms: u64) -> bool {
+    let Ok(mut history) = terminal_daemon_respawn_history().lock() else {
+        return false;
+    };
+    let entries = history.entry(slot_key.to_string()).or_default();
+    entries.retain(|observed_ms| {
+        now_ms.saturating_sub(*observed_ms) < TERMINAL_DAEMON_RESPAWN_WINDOW_MS
+    });
+    if entries.len() >= TERMINAL_DAEMON_RESPAWN_MAX_PER_WINDOW {
+        return false;
+    }
+    entries.push_back(now_ms);
+    true
+}
+
+#[cfg(test)]
+fn terminal_daemon_reader_exit_respawn_history_clear() {
+    if let Ok(mut history) = terminal_daemon_respawn_history().lock() {
+        history.clear();
+    }
+}
+
+async fn terminal_daemon_reader_exit_respawn(
+    app: AppHandle,
+    cloud_mcp_state: CloudMcpState,
+    cleanup_tracker: Arc<TerminalCleanupTracker>,
+    instance: TerminalInstance,
+    close_context: TerminalCloudMcpCloseContext,
+    candidate: TerminalDaemonRespawnCandidate,
+) -> bool {
+    let pane_id = candidate.pane_id.clone();
+    let instance_id = instance.id;
+    let cleanup_tracker_for_task = Arc::clone(&cleanup_tracker);
+    let cleanup_task = tauri::async_runtime::spawn_blocking(move || {
+        let _cleanup_guard =
+            cleanup_tracker_for_task.begin("reader_exit_respawn", Some(instance_id));
+        cleanup_terminal_instance_with_context(
+            instance,
+            false,
+            "reader_exit_respawn",
+            TerminalCoordinationCleanupMode::Preserve,
+        );
+    });
+    let cleanup_wait_result =
+        tokio::time::timeout(Duration::from_millis(TERMINAL_CLOSE_COMMAND_WAIT_MS), cleanup_task)
+            .await;
+    match cleanup_wait_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log_terminal_crash_forensics_event(
+            "backend.terminal_reader_exit.respawn_cleanup_join_error",
+            json!({
+                "error": clean_terminal_telemetry_text(&error.to_string()),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            }),
+        ),
+        Err(_) => log_terminal_crash_forensics_event(
+            "backend.terminal_reader_exit.respawn_cleanup_timeout",
+            json!({
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            }),
+        ),
+    }
+
+    let _ = cloud_mcp_clear_terminal_remote_presence_for_terminal(
+        &cloud_mcp_state,
+        &candidate.workspace_id,
+        &pane_id,
+        instance_id,
+        "terminal_respawn",
+    );
+    match cloud_mcp_remote_workspace_spawn_configured_terminal(
+        &app,
+        &candidate.workspace_id,
+        candidate.terminal_index,
+    )
+    .await
+    {
+        Ok(result) => {
+            {
+                let terminal_key = cloud_mcp_terminal_key(&pane_id, instance_id);
+                let mut runtime = cloud_mcp_state.inner.lock().await;
+                runtime.terminal_contexts.remove(&terminal_key);
+            }
+            log_terminal_crash_forensics_event(
+                "backend.terminal_reader_exit.respawned",
+                json!({
+                    "old_instance_id": instance_id,
+                    "old_pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "result": result,
+                    "slot_key": candidate.slot_key,
+                    "workspace_id": candidate.workspace_id,
+                }),
+            );
+            true
+        }
+        Err(error) => {
+            log_terminal_crash_forensics_event(
+                "backend.terminal_reader_exit.respawn_failed",
+                json!({
+                    "error": clean_terminal_telemetry_text(&error),
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "slot_key": candidate.slot_key,
+                    "workspace_id": candidate.workspace_id,
+                }),
+            );
+            cloud_mcp_mark_terminal_closed(
+                &cloud_mcp_state,
+                &pane_id,
+                instance_id,
+                &close_context,
+                "reader_exit_respawn_failed",
+            )
+            .await;
+            false
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -19403,6 +19611,35 @@ fn terminal_activity_watchdog_starting_action(
     None
 }
 
+fn terminal_activity_watchdog_pty_recovery_action(
+    metadata: &TerminalInstanceMetadata,
+    runtime: &TerminalRuntimeSnapshot,
+    starting_age_ms: u64,
+    live_process: bool,
+    prompt_marker_visible: bool,
+    mcp_startup_visible: bool,
+    output_quiet: bool,
+    output_flowing: bool,
+    stale_age_ms: u64,
+) -> Option<TerminalActivityWatchdogAction> {
+    if let Some(action) = terminal_activity_watchdog_starting_action(
+        runtime,
+        starting_age_ms,
+        live_process,
+        prompt_marker_visible,
+        mcp_startup_visible,
+        output_quiet,
+        output_flowing,
+    ) {
+        return Some(action);
+    }
+    if terminal_activity_provider_allows_pty_lifecycle_recovery(metadata) {
+        terminal_activity_watchdog_stale_hot_action(runtime, stale_age_ms)
+    } else {
+        None
+    }
+}
+
 fn terminal_activity_watchdog_mcp_startup_action(
     runtime: &TerminalRuntimeSnapshot,
     mcp_startup_visible: bool,
@@ -21715,29 +21952,24 @@ fn spawn_terminal_activity_hook_watcher(
                 mcp_startup_age_ms,
             )
             .or_else(|| {
-                (!terminal_codex_hook_trust_discovery_blocks_idle(&pane_id, instance_id)
-                    && terminal_activity_provider_allows_pty_lifecycle_recovery(&instance.metadata))
-                .then(|| {
-                    terminal_activity_watchdog_starting_action(
-                        &runtime,
-                        starting_age_ms,
-                        live_process,
-                        prompt_marker_visible,
-                        mcp_startup_visible,
-                        output_quiet,
-                        output_flowing,
-                    )
-                    .or_else(|| {
-                        terminal_activity_watchdog_stale_hot_action(
+                (!terminal_codex_hook_trust_discovery_blocks_idle(&pane_id, instance_id))
+                    .then(|| {
+                        terminal_activity_watchdog_pty_recovery_action(
+                            &instance.metadata,
                             &runtime,
+                            starting_age_ms,
+                            live_process,
+                            prompt_marker_visible,
+                            mcp_startup_visible,
+                            output_quiet,
+                            output_flowing,
                             now_ms.saturating_sub(last_hook_or_output_activity_ms),
                         )
                     })
-                })
-                .flatten()
+                    .flatten()
             })
             // OUTSIDE the pty-lifecycle-recovery gate: WAITING is Claude-only
-            // and that gate rejects Claude — the release must run for it.
+            // and Claude still rejects non-startup PTY recovery.
             .or_else(|| {
                 terminal_activity_watchdog_waiting_release_action(
                     &runtime,
@@ -31655,6 +31887,48 @@ mod terminal_tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn daemon_reader_exit_respawn_candidate_requires_persistent_generic_workspace_slot() {
+        let metadata = TerminalInstanceMetadata {
+            pane_id: "workspace-terminal-workspace-a-2-generic".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            terminal_index: Some(2),
+            agent_id: "generic".to_string(),
+            agent_kind: "generic".to_string(),
+            ..TerminalInstanceMetadata::default()
+        };
+        let candidate =
+            terminal_daemon_reader_exit_respawn_candidate(&metadata, true, true)
+                .expect("daemon generic workspace slot respawns");
+        assert_eq!(candidate.workspace_id, "workspace-a");
+        assert_eq!(candidate.terminal_index, 2);
+        assert_eq!(candidate.slot_key, "workspace-a:2:generic");
+
+        assert!(terminal_daemon_reader_exit_respawn_candidate(&metadata, false, true).is_none());
+        assert!(terminal_daemon_reader_exit_respawn_candidate(&metadata, true, false).is_none());
+        let mut no_workspace = metadata.clone();
+        no_workspace.workspace_id.clear();
+        assert!(terminal_daemon_reader_exit_respawn_candidate(&no_workspace, true, true).is_none());
+        let mut no_index = metadata;
+        no_index.terminal_index = None;
+        assert!(terminal_daemon_reader_exit_respawn_candidate(&no_index, true, true).is_none());
+    }
+
+    #[test]
+    fn daemon_reader_exit_respawn_rate_limit_allows_three_per_window() {
+        terminal_daemon_reader_exit_respawn_history_clear();
+        let key = "workspace-a:2:generic";
+        assert!(terminal_daemon_reader_exit_respawn_allowed_at(key, 1_000));
+        assert!(terminal_daemon_reader_exit_respawn_allowed_at(key, 2_000));
+        assert!(terminal_daemon_reader_exit_respawn_allowed_at(key, 3_000));
+        assert!(!terminal_daemon_reader_exit_respawn_allowed_at(key, 4_000));
+        assert!(terminal_daemon_reader_exit_respawn_allowed_at(
+            key,
+            1_000 + TERMINAL_DAEMON_RESPAWN_WINDOW_MS
+        ));
+        terminal_daemon_reader_exit_respawn_history_clear();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn generic_shell_restart_waits_for_foreground_process_to_return_to_prompt() {
@@ -38821,6 +39095,74 @@ notifications = true
         assert!(terminal_activity_provider_allows_pty_lifecycle_recovery(
             &opencode_metadata
         ));
+    }
+
+    #[test]
+    fn claude_pty_watchdog_recovery_is_startup_only() {
+        let mut claude_metadata = terminal_projection_test_metadata();
+        claude_metadata.agent_id = "claude".to_string();
+        claude_metadata.agent_kind = "claude".to_string();
+        let starting = TerminalRuntimeSnapshot::opened_starting(None, "terminal-open");
+
+        assert_eq!(
+            terminal_activity_watchdog_pty_recovery_action(
+                &claude_metadata,
+                &starting,
+                TERMINAL_STARTING_WATCHDOG_MS,
+                true,
+                true,
+                false,
+                false,
+                false,
+                TERMINAL_HOT_STALE_WATCHDOG_MS,
+            ),
+            Some(TerminalActivityWatchdogAction::StartupStop)
+        );
+        assert_eq!(
+            terminal_activity_watchdog_pty_recovery_action(
+                &claude_metadata,
+                &starting,
+                TERMINAL_STARTING_WATCHDOG_MS,
+                true,
+                false,
+                false,
+                true,
+                false,
+                TERMINAL_HOT_STALE_WATCHDOG_MS,
+            ),
+            Some(TerminalActivityWatchdogAction::StartupStop)
+        );
+
+        let busy = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            provider_turn_id: Some("turn-claude".to_string()),
+            turn_id: Some("turn-claude".to_string()),
+            turn_active: true,
+            canonical_state: "thinking".to_string(),
+            canonical_badge_label: "thinking".to_string(),
+            canonical_state_seq: 2,
+            turn_generation: 1,
+            updated_at_ms: 1,
+            ..TerminalRuntimeSnapshot::opened_idle(None)
+        };
+        assert_eq!(
+            terminal_activity_watchdog_pty_recovery_action(
+                &claude_metadata,
+                &busy,
+                TERMINAL_STARTING_WATCHDOG_MS,
+                true,
+                true,
+                false,
+                true,
+                false,
+                TERMINAL_HOT_STALE_WATCHDOG_MS,
+            ),
+            None,
+            "Claude prompt glyphs during a busy turn must not synthesize ready"
+        );
     }
 
     #[test]

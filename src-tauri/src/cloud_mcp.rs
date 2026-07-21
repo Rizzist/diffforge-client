@@ -709,6 +709,7 @@ struct CloudMcpTerminalContextState {
     prompt_event_submitted_at: Option<String>,
     terminal_index: Option<u16>,
     thread_id: Option<String>,
+    launch_epoch: Option<String>,
     workspace_id: String,
     workspace_name: String,
     session_mode: String,
@@ -20101,12 +20102,7 @@ fn cloud_mcp_daemon_gui_block_message(command_kind: &str) -> Option<&'static str
         | "terminal_window_close" => {
             Some("Remote panel and window controls are unavailable in daemon mode.")
         }
-        "terminal_open"
-        | "open_terminal"
-        | "open_terminals"
-        | "terminal_spawn"
-        | "spawn_terminals"
-        | "agent_chat_session_open"
+        "agent_chat_session_open"
         | "open_agent_chat_session"
         | "session_open"
         | "open_session"
@@ -22283,6 +22279,15 @@ fn cloud_mcp_remote_workspace_configured_role(value: &Value) -> String {
     .to_string()
 }
 
+fn cloud_mcp_remote_workspace_agent_label(role: &str) -> &'static str {
+    match role {
+        "claude" => "Claude Code",
+        "opencode" => "OpenCode",
+        "generic" => "Terminal",
+        _ => "Codex",
+    }
+}
+
 fn cloud_mcp_remote_workspace_configured_pane_kind(value: &Value) -> Option<String> {
     let raw = match value {
         Value::String(text) => Some(text.trim().to_ascii_lowercase()),
@@ -22446,12 +22451,7 @@ fn cloud_mcp_remote_workspace_configured_terminal_snapshot(
     role: &str,
 ) -> Value {
     let pane_id = cloud_mcp_remote_workspace_configured_pane_id(workspace_id, terminal_index, role);
-    let agent_label = match role {
-        "claude" => "Claude Code",
-        "opencode" => "OpenCode",
-        "generic" => "Terminal",
-        _ => "Codex",
-    };
+    let agent_label = cloud_mcp_remote_workspace_agent_label(role);
     json!({
         "agent_id": role,
         "agent_kind": role,
@@ -22574,6 +22574,29 @@ fn cloud_mcp_remote_workspace_catalog_with_configured_layout(
             settings,
             &["terminalCount", "terminal_count"],
         );
+        let documents_count = cloud_mcp_remote_workspace_configured_count(
+            settings,
+            &["documentsCount", "documents_count"],
+        );
+        let panel_layout_configured = !pane_kinds.is_empty()
+            || cloud_mcp_remote_workspace_setting_value(
+                settings,
+                &["paneKinds", "pane_kinds", "panelKinds", "panel_kinds"],
+            )
+            .is_some()
+            || settings.get("panes").is_some()
+            || settings.get("workspacePanes").is_some()
+            || settings.get("workspace_panes").is_some()
+            || documents_count.is_some()
+            || cloud_mcp_remote_workspace_configured_count(settings, &["pcbCount", "pcb_count"])
+                .is_some()
+            || cloud_mcp_remote_workspace_configured_count(settings, &["vmCount", "vm_count"])
+                .is_some()
+            || cloud_mcp_remote_workspace_configured_count(
+                settings,
+                &["videoCount", "video_count"],
+            )
+            .is_some();
         let inferred_count = terminal_count
             .unwrap_or_default()
             .max(roles.len())
@@ -22657,13 +22680,7 @@ fn cloud_mcp_remote_workspace_catalog_with_configured_layout(
                 .and_then(Value::as_u64)
                 .unwrap_or(u64::MAX)
         });
-        if cloud_mcp_remote_workspace_configured_count(
-            settings,
-            &["documentsCount", "documents_count"],
-        )
-        .unwrap_or_default()
-            > 0
-        {
+        if documents_count.unwrap_or_default() > 0 {
             panels.push(cloud_mcp_remote_workspace_configured_panel_snapshot(
                 &workspace_id,
                 &workspace_name,
@@ -22675,10 +22692,39 @@ fn cloud_mcp_remote_workspace_catalog_with_configured_layout(
         }
         if let Some(object) = workspace.as_object_mut() {
             if has_terminal_layout {
+                let terminal_list_empty = terminals.is_empty();
                 object.insert("terminals".to_string(), Value::Array(terminals));
+                object.insert("terminal_list_authoritative".to_string(), json!(true));
+                object.insert(
+                    "terminal_list_empty_authoritative".to_string(),
+                    json!(terminal_list_empty),
+                );
+                object.insert(
+                    "terminal_clear_reason".to_string(),
+                    if terminal_list_empty {
+                        json!("all_terminals_closed")
+                    } else {
+                        json!("")
+                    },
+                );
             }
-            if !panels.is_empty() {
+            if panel_layout_configured || !panels.is_empty() {
+                let panel_list_empty = panels.is_empty();
                 object.insert("panels".to_string(), Value::Array(panels));
+                object.insert("panel_list_authoritative".to_string(), json!(true));
+                object.insert(
+                    "panel_list_empty_authoritative".to_string(),
+                    json!(panel_list_empty),
+                );
+                if panel_list_empty {
+                    object.insert("panel_layout_explicitly_empty".to_string(), json!(true));
+                    object.insert(
+                        "panel_clear_reason".to_string(),
+                        json!("no_workspace_panels"),
+                    );
+                } else {
+                    object.insert("panel_clear_reason".to_string(), json!(""));
+                }
             }
         }
     }
@@ -22725,6 +22771,2509 @@ fn cloud_mcp_remote_workspace_mark_explicit_panel_clear(
             "panel_clear_reason".to_string(),
             json!("all_panels_removed"),
         );
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CloudMcpRemoteWorkspaceLayout {
+    documents_count: usize,
+    terminal_roles: Vec<String>,
+    pane_kinds: serde_json::Map<String, Value>,
+    logical_terminal_indexes: Vec<usize>,
+    display_rows: Vec<Vec<usize>>,
+    minimized_pane_indexes: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CloudMcpRemoteWorkspaceSettingsLayoutPatch {
+    layout: CloudMcpRemoteWorkspaceLayout,
+    panel_counts: Value,
+    terminal_only_count: usize,
+    terminal_only_roles: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CloudMcpRemoteWorkspaceTerminalSlotMutation {
+    layout: CloudMcpRemoteWorkspaceLayout,
+    terminal_index: usize,
+    terminal_role: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CloudMcpRemoteWorkspaceRuntimeTeardown {
+    removed_terminal_indexes: Vec<usize>,
+    role_changed_terminal_indexes: Vec<usize>,
+    root_or_policy_changed: bool,
+}
+
+fn cloud_mcp_remote_workspace_panel_kind_value(kind: &str) -> Option<&'static str> {
+    match kind
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_'], "-")
+        .as_str()
+    {
+        "web" | "browser" | "web-tab" => Some("web"),
+        "pcb" | "pcb-design" | "circuit" => Some("pcb"),
+        "vm" | "vm-sandbox" | "sandbox" => Some("vm"),
+        "video" | "video-editor" => Some("video"),
+        "swarm" | "swarm-panel" => Some("swarm"),
+        _ => None,
+    }
+}
+
+fn cloud_mcp_remote_workspace_normalized_slot_indexes(value: Option<&Value>) -> Vec<usize> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    items
+        .iter()
+        .filter_map(cloud_mcp_remote_workspace_configured_index)
+        .filter(|index| *index < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT)
+        .filter(|index| seen.insert(*index))
+        .collect()
+}
+
+fn cloud_mcp_remote_workspace_setting_bool(
+    settings: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<bool> {
+    cloud_mcp_remote_workspace_setting_value(settings, keys).and_then(|value| match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(number) => number.as_i64().map(|value| value != 0),
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+fn cloud_mcp_remote_workspace_setting_text(
+    settings: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    cloud_mcp_remote_workspace_setting_value(settings, keys)
+        .and_then(|value| match value {
+            Value::String(text) => Some(text.trim().to_string()),
+            Value::Number(number) => Some(number.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn cloud_mcp_remote_workspace_layout_panel_counts(layout: &CloudMcpRemoteWorkspaceLayout) -> Value {
+    json!({
+        "document": layout.documents_count,
+        "web": layout
+            .pane_kinds
+            .values()
+            .filter_map(Value::as_str)
+            .filter(|kind| *kind == "web")
+            .count(),
+        "pcb-design": layout
+            .pane_kinds
+            .values()
+            .filter_map(Value::as_str)
+            .filter(|kind| *kind == "pcb")
+            .count(),
+        "vm-sandbox": layout
+            .pane_kinds
+            .values()
+            .filter_map(Value::as_str)
+            .filter(|kind| *kind == "vm")
+            .count(),
+        "video-editor": layout
+            .pane_kinds
+            .values()
+            .filter_map(Value::as_str)
+            .filter(|kind| *kind == "video")
+            .count(),
+    })
+}
+
+fn cloud_mcp_remote_workspace_panel_index_set(
+    pane_kinds: &serde_json::Map<String, Value>,
+) -> HashSet<usize> {
+    pane_kinds
+        .keys()
+        .filter_map(|key| key.parse::<usize>().ok())
+        .filter(|index| *index < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT)
+        .collect()
+}
+
+fn cloud_mcp_remote_workspace_sorted_panel_indexes(
+    pane_kinds: &serde_json::Map<String, Value>,
+) -> Vec<usize> {
+    let mut indexes = cloud_mcp_remote_workspace_panel_index_set(pane_kinds)
+        .into_iter()
+        .collect::<Vec<_>>();
+    indexes.sort_unstable();
+    indexes
+}
+
+fn cloud_mcp_remote_workspace_terminal_only_indexes(
+    layout: &CloudMcpRemoteWorkspaceLayout,
+) -> Vec<usize> {
+    let panel_indexes = cloud_mcp_remote_workspace_panel_index_set(&layout.pane_kinds);
+    layout
+        .logical_terminal_indexes
+        .iter()
+        .copied()
+        .filter(|index| !panel_indexes.contains(index))
+        .collect()
+}
+
+fn cloud_mcp_remote_workspace_terminal_only_roles(
+    layout: &CloudMcpRemoteWorkspaceLayout,
+) -> Vec<String> {
+    let panel_indexes = cloud_mcp_remote_workspace_panel_index_set(&layout.pane_kinds);
+    layout
+        .logical_terminal_indexes
+        .iter()
+        .enumerate()
+        .filter(|(_, index)| !panel_indexes.contains(index))
+        .map(|(position, _)| {
+            layout
+                .terminal_roles
+                .get(position)
+                .map(String::as_str)
+                .unwrap_or("codex")
+                .to_string()
+        })
+        .collect()
+}
+
+fn cloud_mcp_remote_workspace_visible_indexes(
+    logical_indexes: &[usize],
+    minimized_indexes: &[usize],
+) -> Vec<usize> {
+    let minimized = minimized_indexes.iter().copied().collect::<HashSet<_>>();
+    logical_indexes
+        .iter()
+        .copied()
+        .filter(|index| !minimized.contains(index))
+        .collect()
+}
+
+fn cloud_mcp_remote_workspace_normalized_display_rows(
+    value: Option<&Value>,
+    visible_indexes: &[usize],
+) -> Vec<Vec<usize>> {
+    if visible_indexes.is_empty() {
+        return Vec::new();
+    }
+    let visible = visible_indexes.iter().copied().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut rows = Vec::<Vec<usize>>::new();
+    if let Some(Value::Array(input_rows)) = value {
+        for row in input_rows {
+            let row_indexes = match row {
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(cloud_mcp_remote_workspace_configured_index)
+                    .collect::<Vec<_>>(),
+                Value::Object(_) => row
+                    .get("terminal_indexes")
+                    .or_else(|| row.get("terminalIndexes"))
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(cloud_mcp_remote_workspace_configured_index)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let normalized = row_indexes
+                .into_iter()
+                .filter(|index| visible.contains(index))
+                .filter(|index| seen.insert(*index))
+                .collect::<Vec<_>>();
+            if !normalized.is_empty() {
+                rows.push(normalized);
+            }
+        }
+    }
+    let missing = visible_indexes
+        .iter()
+        .copied()
+        .filter(|index| !seen.contains(index))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        if rows.is_empty() {
+            rows = cloud_mcp_remote_workspace_display_rows(visible_indexes);
+        } else {
+            for index in missing {
+                if rows.last().is_some_and(|row| row.len() < 3) {
+                    rows.last_mut().unwrap().push(index);
+                } else {
+                    rows.push(vec![index]);
+                }
+            }
+        }
+    }
+    if rows.iter().any(|row| row.len() > 3) {
+        return cloud_mcp_remote_workspace_display_rows(visible_indexes);
+    }
+    rows
+}
+
+fn cloud_mcp_remote_workspace_current_layout(
+    settings: &serde_json::Map<String, Value>,
+) -> CloudMcpRemoteWorkspaceLayout {
+    let pane_kinds = cloud_mcp_remote_workspace_configured_panel_indexes(settings)
+        .into_iter()
+        .filter(|(index, _)| *index < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT)
+        .filter_map(|(index, kind)| {
+            cloud_mcp_remote_workspace_panel_kind_value(&kind)
+                .map(|kind| (index.to_string(), json!(kind)))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let terminal_count =
+        cloud_mcp_remote_workspace_configured_count(settings, &["terminalCount", "terminal_count"]);
+    let roles =
+        cloud_mcp_remote_workspace_setting_value(settings, &["terminalRoles", "terminal_roles"])
+            .and_then(Value::as_array)
+            .map(|roles| {
+                roles
+                    .iter()
+                    .map(cloud_mcp_remote_workspace_configured_role)
+                    .take(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    let mut logical_indexes = cloud_mcp_remote_workspace_normalized_slot_indexes(
+        cloud_mcp_remote_workspace_setting_value(
+            settings,
+            &["logicalTerminalIndexes", "logical_terminal_indexes"],
+        ),
+    );
+    if logical_indexes.is_empty() {
+        let pane_records = cloud_mcp_remote_workspace_configured_pane_records(settings);
+        let mut configured = pane_records
+            .keys()
+            .copied()
+            .filter(|index| *index < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT)
+            .collect::<Vec<_>>();
+        configured.extend(cloud_mcp_remote_workspace_sorted_panel_indexes(&pane_kinds));
+        configured.sort_unstable();
+        configured.dedup();
+        logical_indexes = configured;
+    }
+    if logical_indexes.is_empty() {
+        let count = terminal_count
+            .unwrap_or_default()
+            .max(roles.len())
+            .min(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT);
+        logical_indexes = (0..count).collect();
+    }
+    if logical_indexes.len() < roles.len() {
+        let used = logical_indexes.iter().copied().collect::<HashSet<_>>();
+        for index in 0..CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT {
+            if logical_indexes.len() >= roles.len() {
+                break;
+            }
+            if !used.contains(&index) {
+                logical_indexes.push(index);
+            }
+        }
+    }
+    let target_len = terminal_count
+        .unwrap_or_default()
+        .max(logical_indexes.len())
+        .max(roles.len())
+        .min(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT);
+    let mut used = logical_indexes.iter().copied().collect::<HashSet<_>>();
+    let mut next_index = 0usize;
+    while logical_indexes.len() < target_len
+        && next_index < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT
+    {
+        if used.insert(next_index) {
+            logical_indexes.push(next_index);
+        }
+        next_index += 1;
+    }
+    let mut terminal_roles = roles;
+    terminal_roles.truncate(logical_indexes.len());
+    while terminal_roles.len() < logical_indexes.len() {
+        terminal_roles.push("codex".to_string());
+    }
+    let minimized_pane_indexes = cloud_mcp_remote_workspace_normalized_slot_indexes(
+        settings
+            .get("minimizedPaneIndexes")
+            .or_else(|| settings.get("minimized_pane_indexes")),
+    )
+    .into_iter()
+    .filter(|index| logical_indexes.contains(index))
+    .collect::<Vec<_>>();
+    let visible_indexes =
+        cloud_mcp_remote_workspace_visible_indexes(&logical_indexes, &minimized_pane_indexes);
+    let display_rows = cloud_mcp_remote_workspace_normalized_display_rows(
+        settings
+            .get("displayRows")
+            .or_else(|| settings.get("display_rows")),
+        &visible_indexes,
+    );
+    CloudMcpRemoteWorkspaceLayout {
+        documents_count: cloud_mcp_remote_workspace_configured_count(
+            settings,
+            &["documentsCount", "documents_count"],
+        )
+        .unwrap_or_default()
+        .min(1),
+        terminal_roles,
+        pane_kinds,
+        logical_terminal_indexes: logical_indexes,
+        display_rows,
+        minimized_pane_indexes,
+    }
+}
+
+fn cloud_mcp_remote_workspace_settings_insert_layout(
+    settings: &mut serde_json::Map<String, Value>,
+    layout: &CloudMcpRemoteWorkspaceLayout,
+) {
+    let counts = cloud_mcp_remote_workspace_layout_panel_counts(layout);
+    cloud_mcp_remote_workspace_insert_persisted_setting(
+        settings,
+        "terminalCount",
+        "terminal_count",
+        json!(layout.logical_terminal_indexes.len()),
+    );
+    cloud_mcp_remote_workspace_insert_persisted_setting(
+        settings,
+        "terminalRoles",
+        "terminal_roles",
+        json!(layout.terminal_roles.clone()),
+    );
+    cloud_mcp_remote_workspace_insert_persisted_setting(
+        settings,
+        "logicalTerminalIndexes",
+        "logical_terminal_indexes",
+        json!(layout.logical_terminal_indexes.clone()),
+    );
+    settings.insert(
+        "displayRows".to_string(),
+        json!(layout.display_rows.clone()),
+    );
+    settings.remove("display_rows");
+    if layout.minimized_pane_indexes.is_empty() {
+        settings.remove("minimizedPaneIndexes");
+        settings.remove("minimized_pane_indexes");
+    } else {
+        settings.insert(
+            "minimizedPaneIndexes".to_string(),
+            json!(layout.minimized_pane_indexes.clone()),
+        );
+        settings.remove("minimized_pane_indexes");
+    }
+    cloud_mcp_remote_workspace_insert_persisted_setting(
+        settings,
+        "documentsCount",
+        "documents_count",
+        json!(layout.documents_count),
+    );
+    cloud_mcp_remote_workspace_insert_persisted_setting(
+        settings,
+        "pcbCount",
+        "pcb_count",
+        counts["pcb-design"].clone(),
+    );
+    cloud_mcp_remote_workspace_insert_persisted_setting(
+        settings,
+        "vmCount",
+        "vm_count",
+        counts["vm-sandbox"].clone(),
+    );
+    cloud_mcp_remote_workspace_insert_persisted_setting(
+        settings,
+        "videoCount",
+        "video_count",
+        counts["video-editor"].clone(),
+    );
+    for key in [
+        "panes",
+        "workspacePanes",
+        "workspace_panes",
+        "panelKinds",
+        "panel_kinds",
+    ] {
+        settings.remove(key);
+    }
+    if layout.pane_kinds.is_empty() {
+        settings.remove("paneKinds");
+        settings.remove("pane_kinds");
+    } else {
+        cloud_mcp_remote_workspace_insert_persisted_setting(
+            settings,
+            "paneKinds",
+            "pane_kinds",
+            Value::Object(layout.pane_kinds.clone()),
+        );
+    }
+}
+
+fn cloud_mcp_remote_workspace_fill_panel_kind(
+    pane_kinds: &mut serde_json::Map<String, Value>,
+    used: &mut HashSet<usize>,
+    kind: &str,
+    target_count: usize,
+) {
+    let mut current = pane_kinds
+        .values()
+        .filter_map(Value::as_str)
+        .filter(|value| *value == kind)
+        .count();
+    let mut next_slot = 0usize;
+    while current < target_count && next_slot < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT {
+        if used.insert(next_slot) {
+            pane_kinds.insert(next_slot.to_string(), json!(kind));
+            current += 1;
+        }
+        next_slot += 1;
+    }
+}
+
+fn cloud_mcp_remote_workspace_kept_panel_kinds(
+    current: &serde_json::Map<String, Value>,
+    desired_web: usize,
+    desired_pcb: usize,
+    desired_vm: usize,
+    desired_video: usize,
+) -> serde_json::Map<String, Value> {
+    let mut next = serde_json::Map::new();
+    for (kind, desired) in [
+        ("web", desired_web),
+        ("pcb", desired_pcb),
+        ("vm", desired_vm),
+        ("video", desired_video),
+        ("swarm", usize::MAX),
+    ] {
+        let mut indexes = current
+            .iter()
+            .filter_map(|(index, value)| {
+                (value.as_str() == Some(kind))
+                    .then(|| index.parse::<usize>().ok())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        indexes.sort_unstable();
+        for index in indexes.into_iter().take(desired) {
+            if index < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT {
+                next.insert(index.to_string(), json!(kind));
+            }
+        }
+    }
+    next
+}
+
+fn cloud_mcp_remote_workspace_reconcile_indexes_excluding(
+    indexes: &[usize],
+    count: usize,
+    exclude_indexes: &HashSet<usize>,
+) -> Vec<usize> {
+    let target_count = count.min(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT);
+    let mut used = HashSet::new();
+    let mut next = indexes
+        .iter()
+        .copied()
+        .filter(|index| *index < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT)
+        .filter(|index| !exclude_indexes.contains(index))
+        .filter(|index| used.insert(*index))
+        .take(target_count)
+        .collect::<Vec<_>>();
+    let mut next_index = 0usize;
+    while next.len() < target_count && next_index < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT {
+        if !exclude_indexes.contains(&next_index) && used.insert(next_index) {
+            next.push(next_index);
+        }
+        next_index += 1;
+    }
+    next
+}
+
+fn cloud_mcp_remote_workspace_build_settings_layout_patch(
+    settings: &serde_json::Map<String, Value>,
+    requested_terminal_count: Option<usize>,
+    requested_terminal_roles: Option<&[String]>,
+    requested_panel_counts: Option<&CloudMcpRemoteWorkspacePanelCounts>,
+    root_changed: bool,
+) -> CloudMcpRemoteWorkspaceSettingsLayoutPatch {
+    let current = cloud_mcp_remote_workspace_current_layout(settings);
+    let current_terminal_only_indexes = cloud_mcp_remote_workspace_terminal_only_indexes(&current);
+    let current_terminal_only_roles = cloud_mcp_remote_workspace_terminal_only_roles(&current);
+    let terminal_roles_provided = requested_terminal_roles.is_some();
+    let requested_next_terminal_count = requested_terminal_roles
+        .map(|roles| {
+            roles
+                .len()
+                .min(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT)
+        })
+        .or(requested_terminal_count)
+        .unwrap_or(current_terminal_only_roles.len())
+        .min(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT);
+    let current_counts = cloud_mcp_remote_workspace_layout_panel_counts(&current);
+    let next_document_count = requested_panel_counts
+        .map(|counts| counts.document)
+        .unwrap_or_else(|| current_counts["document"].as_u64().unwrap_or_default() as usize)
+        .min(1);
+    let requested_grid = requested_panel_counts.map(|counts| {
+        (
+            counts.web.min(8),
+            counts.pcb.min(4),
+            counts.vm.min(4),
+            counts.video.min(3),
+        )
+    });
+    let (mut desired_web, mut desired_pcb, mut desired_vm, mut desired_video) = requested_grid
+        .unwrap_or_else(|| {
+            (
+                current_counts["web"].as_u64().unwrap_or_default() as usize,
+                current_counts["pcb-design"].as_u64().unwrap_or_default() as usize,
+                current_counts["vm-sandbox"].as_u64().unwrap_or_default() as usize,
+                current_counts["video-editor"].as_u64().unwrap_or_default() as usize,
+            )
+        });
+    let preserved_panel_count = desired_web
+        .saturating_add(desired_pcb)
+        .saturating_add(desired_vm)
+        .saturating_add(desired_video)
+        .min(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT);
+    let next_terminal_count = if requested_panel_counts.is_none() {
+        requested_next_terminal_count.min(
+            CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT.saturating_sub(preserved_panel_count),
+        )
+    } else {
+        requested_next_terminal_count
+    };
+    let mut next_terminal_only_roles = if let Some(roles) = requested_terminal_roles {
+        roles
+            .iter()
+            .map(|role| cloud_mcp_remote_workspace_configured_role(&json!(role)))
+            .take(next_terminal_count)
+            .collect::<Vec<_>>()
+    } else {
+        current_terminal_only_roles
+            .iter()
+            .cloned()
+            .take(next_terminal_count)
+            .collect::<Vec<_>>()
+    };
+    let fallback_role = if terminal_roles_provided {
+        "codex".to_string()
+    } else {
+        next_terminal_only_roles
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "codex".to_string())
+    };
+    while next_terminal_only_roles.len() < next_terminal_count {
+        next_terminal_only_roles.push(fallback_role.clone());
+    }
+
+    let panel_slot_capacity =
+        CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT.saturating_sub(next_terminal_count);
+    desired_web = desired_web.min(panel_slot_capacity);
+    desired_pcb = desired_pcb.min(panel_slot_capacity.saturating_sub(desired_web));
+    desired_vm = desired_vm.min(panel_slot_capacity.saturating_sub(desired_web + desired_pcb));
+    desired_video = desired_video
+        .min(panel_slot_capacity.saturating_sub(desired_web + desired_pcb + desired_vm));
+
+    let mut next_pane_kinds = cloud_mcp_remote_workspace_kept_panel_kinds(
+        &current.pane_kinds,
+        desired_web,
+        desired_pcb,
+        desired_vm,
+        desired_video,
+    );
+    let kept_panel_indexes = cloud_mcp_remote_workspace_panel_index_set(&next_pane_kinds);
+    let base_terminal_indexes = if root_changed {
+        (0..next_terminal_count).collect::<Vec<_>>()
+    } else {
+        current_terminal_only_indexes
+    };
+    let terminal_next_indexes = cloud_mcp_remote_workspace_reconcile_indexes_excluding(
+        &base_terminal_indexes,
+        next_terminal_count,
+        &kept_panel_indexes,
+    );
+    let terminal_role_by_index = terminal_next_indexes
+        .iter()
+        .copied()
+        .zip(next_terminal_only_roles.iter().cloned())
+        .collect::<HashMap<_, _>>();
+    let mut used_slots = terminal_next_indexes
+        .iter()
+        .copied()
+        .chain(kept_panel_indexes.iter().copied())
+        .collect::<HashSet<_>>();
+    cloud_mcp_remote_workspace_fill_panel_kind(
+        &mut next_pane_kinds,
+        &mut used_slots,
+        "web",
+        desired_web,
+    );
+    cloud_mcp_remote_workspace_fill_panel_kind(
+        &mut next_pane_kinds,
+        &mut used_slots,
+        "pcb",
+        desired_pcb,
+    );
+    cloud_mcp_remote_workspace_fill_panel_kind(
+        &mut next_pane_kinds,
+        &mut used_slots,
+        "vm",
+        desired_vm,
+    );
+    cloud_mcp_remote_workspace_fill_panel_kind(
+        &mut next_pane_kinds,
+        &mut used_slots,
+        "video",
+        desired_video,
+    );
+    let panel_indexes = cloud_mcp_remote_workspace_sorted_panel_indexes(&next_pane_kinds);
+    let panel_index_set = panel_indexes.iter().copied().collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let logical_terminal_indexes = terminal_next_indexes
+        .iter()
+        .copied()
+        .chain(panel_indexes.iter().copied())
+        .filter(|index| *index < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT)
+        .filter(|index| seen.insert(*index))
+        .collect::<Vec<_>>();
+    let terminal_roles = logical_terminal_indexes
+        .iter()
+        .map(|index| {
+            if panel_index_set.contains(index) {
+                fallback_role.clone()
+            } else {
+                terminal_role_by_index
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| fallback_role.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+    let minimized_pane_indexes = current
+        .minimized_pane_indexes
+        .iter()
+        .copied()
+        .filter(|index| logical_terminal_indexes.contains(index))
+        .collect::<Vec<_>>();
+    let visible_indexes = cloud_mcp_remote_workspace_visible_indexes(
+        &logical_terminal_indexes,
+        &minimized_pane_indexes,
+    );
+    let layout_pane_count_changed =
+        logical_terminal_indexes.len() != current.logical_terminal_indexes.len();
+    let display_rows = if layout_pane_count_changed {
+        cloud_mcp_remote_workspace_display_rows(&visible_indexes)
+    } else {
+        cloud_mcp_remote_workspace_normalized_display_rows(
+            Some(&json!(current.display_rows)),
+            &visible_indexes,
+        )
+    };
+    let layout = CloudMcpRemoteWorkspaceLayout {
+        documents_count: next_document_count,
+        terminal_roles,
+        pane_kinds: next_pane_kinds,
+        logical_terminal_indexes,
+        display_rows,
+        minimized_pane_indexes,
+    };
+    let panel_counts = cloud_mcp_remote_workspace_layout_panel_counts(&layout);
+    CloudMcpRemoteWorkspaceSettingsLayoutPatch {
+        layout,
+        panel_counts,
+        terminal_only_count: next_terminal_count,
+        terminal_only_roles: next_terminal_only_roles,
+    }
+}
+
+fn cloud_mcp_remote_workspace_add_terminal_layout(
+    settings: &serde_json::Map<String, Value>,
+    role: &str,
+) -> Option<CloudMcpRemoteWorkspaceTerminalSlotMutation> {
+    let current = cloud_mcp_remote_workspace_current_layout(settings);
+    if current.logical_terminal_indexes.len() >= CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT {
+        return None;
+    }
+    let used = current
+        .logical_terminal_indexes
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let next_terminal_index =
+        (0..CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT).find(|index| !used.contains(index))?;
+    let terminal_role = cloud_mcp_remote_workspace_configured_role(&json!(role));
+    let role_by_index = current
+        .logical_terminal_indexes
+        .iter()
+        .enumerate()
+        .map(|(position, index)| {
+            (
+                *index,
+                current
+                    .terminal_roles
+                    .get(position)
+                    .cloned()
+                    .unwrap_or_else(|| "codex".to_string()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut next_indexes = current.logical_terminal_indexes.clone();
+    next_indexes.push(next_terminal_index);
+    let mut seen = HashSet::new();
+    next_indexes.retain(|index| {
+        *index < CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT && seen.insert(*index)
+    });
+    let next_terminal_roles = next_indexes
+        .iter()
+        .map(|index| {
+            if *index == next_terminal_index {
+                terminal_role.clone()
+            } else {
+                role_by_index
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| "codex".to_string())
+            }
+        })
+        .collect::<Vec<_>>();
+    let next_minimized = current
+        .minimized_pane_indexes
+        .iter()
+        .copied()
+        .filter(|index| next_indexes.contains(index))
+        .collect::<Vec<_>>();
+    let next_visible = cloud_mcp_remote_workspace_visible_indexes(&next_indexes, &next_minimized);
+    let old_visible = cloud_mcp_remote_workspace_visible_indexes(
+        &current.logical_terminal_indexes,
+        &current.minimized_pane_indexes,
+    );
+    let mut display_rows = cloud_mcp_remote_workspace_normalized_display_rows(
+        Some(&json!(current.display_rows)),
+        &old_visible,
+    );
+    if display_rows.is_empty() {
+        display_rows = cloud_mcp_remote_workspace_display_rows(&next_visible);
+    } else if display_rows.last().is_some_and(|row| row.len() < 3) {
+        display_rows.last_mut().unwrap().push(next_terminal_index);
+    } else {
+        display_rows.push(vec![next_terminal_index]);
+    }
+    display_rows = cloud_mcp_remote_workspace_normalized_display_rows(
+        Some(&json!(display_rows)),
+        &next_visible,
+    );
+    let mut pane_kinds = current.pane_kinds.clone();
+    pane_kinds.remove(&next_terminal_index.to_string());
+    Some(CloudMcpRemoteWorkspaceTerminalSlotMutation {
+        layout: CloudMcpRemoteWorkspaceLayout {
+            documents_count: current.documents_count,
+            terminal_roles: next_terminal_roles,
+            pane_kinds,
+            logical_terminal_indexes: next_indexes,
+            display_rows,
+            minimized_pane_indexes: next_minimized,
+        },
+        terminal_index: next_terminal_index,
+        terminal_role,
+    })
+}
+
+fn cloud_mcp_remote_workspace_remove_slot_layout(
+    settings: &serde_json::Map<String, Value>,
+    terminal_index: usize,
+) -> Option<CloudMcpRemoteWorkspaceTerminalSlotMutation> {
+    let current = cloud_mcp_remote_workspace_current_layout(settings);
+    if !current.logical_terminal_indexes.contains(&terminal_index) {
+        return None;
+    }
+    if cloud_mcp_remote_workspace_panel_index_set(&current.pane_kinds).contains(&terminal_index) {
+        return None;
+    }
+    let role_by_index = current
+        .logical_terminal_indexes
+        .iter()
+        .enumerate()
+        .map(|(position, index)| {
+            (
+                *index,
+                current
+                    .terminal_roles
+                    .get(position)
+                    .cloned()
+                    .unwrap_or_else(|| "codex".to_string()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut next_indexes = current
+        .logical_terminal_indexes
+        .iter()
+        .copied()
+        .filter(|index| *index != terminal_index)
+        .collect::<Vec<_>>();
+    next_indexes.truncate(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT);
+    let terminal_role = role_by_index
+        .get(&terminal_index)
+        .cloned()
+        .unwrap_or_else(|| "codex".to_string());
+    let terminal_roles = next_indexes
+        .iter()
+        .map(|index| {
+            role_by_index
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| "codex".to_string())
+        })
+        .collect::<Vec<_>>();
+    let mut pane_kinds = current.pane_kinds.clone();
+    pane_kinds.remove(&terminal_index.to_string());
+    let minimized_pane_indexes = current
+        .minimized_pane_indexes
+        .into_iter()
+        .filter(|index| *index != terminal_index && next_indexes.contains(index))
+        .collect::<Vec<_>>();
+    let visible_indexes =
+        cloud_mcp_remote_workspace_visible_indexes(&next_indexes, &minimized_pane_indexes);
+    let display_rows = cloud_mcp_remote_workspace_normalized_display_rows(
+        Some(&json!(current.display_rows)),
+        &visible_indexes,
+    );
+    Some(CloudMcpRemoteWorkspaceTerminalSlotMutation {
+        layout: CloudMcpRemoteWorkspaceLayout {
+            documents_count: current.documents_count,
+            terminal_roles,
+            pane_kinds,
+            logical_terminal_indexes: next_indexes,
+            display_rows,
+            minimized_pane_indexes,
+        },
+        terminal_index,
+        terminal_role,
+    })
+}
+
+fn cloud_mcp_remote_workspace_settings_input(
+    event: &Value,
+) -> Option<serde_json::Map<String, Value>> {
+    for source in [
+        event.get("settings"),
+        event.get("payload").and_then(|value| value.get("settings")),
+        event.get("request").and_then(|value| value.get("settings")),
+        event
+            .get("payload")
+            .and_then(|value| value.get("request"))
+            .and_then(|value| value.get("settings")),
+    ] {
+        if let Some(object) = source.and_then(Value::as_object) {
+            return Some(object.clone());
+        }
+    }
+    let mut legacy = serde_json::Map::new();
+    for (target, keys) in [
+        ("workspace_name", &["workspace_name", "name"][..]),
+        (
+            "workspace_root",
+            &["workspace_root", "root_directory", "root"][..],
+        ),
+        ("terminal_count", &["terminal_count"][..]),
+        ("terminal_roles", &["terminal_roles"][..]),
+        ("safety_mode", &["safety_mode"][..]),
+        ("panel_counts", &["panel_counts"][..]),
+        ("archived", &["archived"][..]),
+        ("is_default", &["is_default"][..]),
+    ] {
+        for key in keys {
+            if let Some(value) = cloud_mcp_remote_command_field_value(event, key) {
+                legacy.insert(target.to_string(), value.clone());
+                break;
+            }
+        }
+    }
+    (!legacy.is_empty()).then_some(legacy)
+}
+
+fn cloud_mcp_remote_workspace_settings_has(
+    settings: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> bool {
+    keys.iter().any(|key| settings.contains_key(*key))
+}
+
+fn cloud_mcp_remote_workspace_settings_input_value<'a>(
+    settings: &'a serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a Value> {
+    keys.iter().find_map(|key| settings.get(*key))
+}
+
+fn cloud_mcp_remote_workspace_settings_event(settings: &serde_json::Map<String, Value>) -> Value {
+    Value::Object(settings.clone())
+}
+
+fn cloud_mcp_remote_workspace_boolean(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(number) => number.as_i64().map(|value| value != 0),
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn cloud_mcp_remote_workspace_role_counts_for_ack(roles: &[String]) -> Value {
+    json!({
+        "claude": roles.iter().filter(|role| role.as_str() == "claude").count(),
+        "codex": roles.iter().filter(|role| role.as_str() == "codex").count(),
+        "opencode": roles.iter().filter(|role| role.as_str() == "opencode").count(),
+        "terminal": roles.iter().filter(|role| role.as_str() == "generic").count(),
+    })
+}
+
+fn cloud_mcp_remote_workspace_duplicate_except(
+    catalog: &[Value],
+    workspace_settings: &Value,
+    root_identity: &str,
+    workspace_id: &str,
+) -> Option<(String, String)> {
+    for workspace in catalog {
+        let candidate_id = local_workspace_catalog_entry_id(workspace).unwrap_or_default();
+        if candidate_id == workspace_id {
+            continue;
+        }
+        let Some((candidate_identity, _)) =
+            local_workspace_catalog_root_identity(workspace, workspace_settings)
+        else {
+            continue;
+        };
+        if candidate_identity != root_identity {
+            continue;
+        }
+        let name =
+            local_workspace_catalog_text(workspace, &["name", "workspace_name", "workspaceName"])
+                .unwrap_or_else(|| "another workspace".to_string());
+        return Some((candidate_id, name));
+    }
+    None
+}
+
+fn cloud_mcp_remote_workspace_find_catalog_index(
+    catalog: &[Value],
+    workspace_id: &str,
+) -> Option<usize> {
+    catalog.iter().position(|workspace| {
+        local_workspace_catalog_entry_id(workspace).as_deref() == Some(workspace_id)
+    })
+}
+
+fn cloud_mcp_remote_workspace_lifecycle_values(app: &AppHandle) -> (String, Vec<String>) {
+    let lifecycle = app_local_state_read(app, "workspace-lifecycle");
+    let default_workspace_id = lifecycle
+        .get("defaultWorkspaceId")
+        .or_else(|| lifecycle.get("default_workspace_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let enabled_workspace_ids = lifecycle
+        .get("enabledWorkspaceIds")
+        .or_else(|| lifecycle.get("enabled_workspace_ids"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            let mut seen = HashSet::new();
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .filter(|value| seen.insert((*value).to_string()))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    (default_workspace_id, enabled_workspace_ids)
+}
+
+fn cloud_mcp_remote_workspace_write_lifecycle(
+    app: &AppHandle,
+    default_workspace_id: String,
+    enabled_workspace_ids: Vec<String>,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    let enabled = enabled_workspace_ids
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .filter(|value| seen.insert(value.clone()))
+        .collect::<Vec<_>>();
+    app_local_state_write(
+        app,
+        "workspace-lifecycle",
+        &json!({
+            "defaultWorkspaceId": default_workspace_id,
+            "enabledWorkspaceIds": enabled,
+        }),
+    )
+}
+
+fn cloud_mcp_remote_workspace_set_default_lifecycle(
+    app: &AppHandle,
+    workspace_id: &str,
+    is_default: bool,
+    catalog: &[Value],
+) -> Result<(), String> {
+    let (current_default, mut enabled) = cloud_mcp_remote_workspace_lifecycle_values(app);
+    let next_default = if is_default {
+        if cloud_mcp_remote_workspace_find_catalog_index(catalog, workspace_id).is_some() {
+            workspace_id.to_string()
+        } else {
+            String::new()
+        }
+    } else if current_default == workspace_id {
+        String::new()
+    } else {
+        current_default
+    };
+    if is_default && !enabled.iter().any(|value| value == workspace_id) {
+        enabled.push(workspace_id.to_string());
+    }
+    cloud_mcp_remote_workspace_write_lifecycle(app, next_default, enabled)
+}
+
+fn cloud_mcp_remote_workspace_remove_from_lifecycle(
+    app: &AppHandle,
+    workspace_id: &str,
+) -> Result<(), String> {
+    let (current_default, enabled) = cloud_mcp_remote_workspace_lifecycle_values(app);
+    let next_enabled = enabled
+        .into_iter()
+        .filter(|enabled_id| enabled_id != workspace_id)
+        .collect::<Vec<_>>();
+    let next_default = if current_default == workspace_id {
+        String::new()
+    } else {
+        current_default
+    };
+    cloud_mcp_remote_workspace_write_lifecycle(app, next_default, next_enabled)
+}
+
+async fn cloud_mcp_remote_workspace_publish_catalog_snapshot(
+    state: &CloudMcpState,
+    catalog: Vec<Value>,
+    workspace_settings: &Value,
+    reason: &str,
+) -> Result<Value, String> {
+    let published =
+        cloud_mcp_remote_workspace_catalog_with_configured_layout(catalog, workspace_settings);
+    cloud_mcp_sync_device_workspaces_snapshot_internal(
+        state,
+        Value::Array(published),
+        None,
+        Some(reason.to_string()),
+    )
+    .await
+}
+
+async fn cloud_mcp_remote_workspace_runtime_active(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    workspace_id: &str,
+) -> bool {
+    let terminal_state = app.state::<TerminalState>();
+    {
+        let guard = terminal_state.terminals.read().await;
+        if guard
+            .values()
+            .any(|instance| instance.metadata.workspace_id.trim() == workspace_id)
+        {
+            return true;
+        }
+    }
+    let runtime = state.inner.lock().await;
+    runtime
+        .registered_workspaces
+        .values()
+        .any(|workspace| workspace.workspace_id.trim() == workspace_id)
+}
+
+fn cloud_mcp_remote_workspace_build_runtime_teardown(
+    current_settings: &serde_json::Map<String, Value>,
+    next_settings: &serde_json::Map<String, Value>,
+    root_or_policy_changed: bool,
+) -> CloudMcpRemoteWorkspaceRuntimeTeardown {
+    let current = cloud_mcp_remote_workspace_current_layout(current_settings);
+    let next = cloud_mcp_remote_workspace_current_layout(next_settings);
+    let current_terminal_only_indexes = cloud_mcp_remote_workspace_terminal_only_indexes(&current);
+    let current_roles = current
+        .logical_terminal_indexes
+        .iter()
+        .enumerate()
+        .map(|(position, index)| {
+            (
+                *index,
+                current
+                    .terminal_roles
+                    .get(position)
+                    .cloned()
+                    .unwrap_or_else(|| "codex".to_string()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let next_index_set = cloud_mcp_remote_workspace_terminal_only_indexes(&next)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let next_roles = next
+        .logical_terminal_indexes
+        .iter()
+        .enumerate()
+        .map(|(position, index)| {
+            (
+                *index,
+                next.terminal_roles
+                    .get(position)
+                    .cloned()
+                    .unwrap_or_else(|| "codex".to_string()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let removed_terminal_indexes = current_terminal_only_indexes
+        .iter()
+        .copied()
+        .filter(|index| !next_index_set.contains(index))
+        .collect::<Vec<_>>();
+    let role_changed_terminal_indexes = current_terminal_only_indexes
+        .into_iter()
+        .filter(|index| next_index_set.contains(index))
+        .filter(|index| current_roles.get(index) != next_roles.get(index))
+        .collect::<Vec<_>>();
+    CloudMcpRemoteWorkspaceRuntimeTeardown {
+        removed_terminal_indexes,
+        role_changed_terminal_indexes,
+        root_or_policy_changed,
+    }
+}
+
+async fn cloud_mcp_remote_workspace_close_runtime_indexes(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    workspace_id: &str,
+    teardown: &CloudMcpRemoteWorkspaceRuntimeTeardown,
+) {
+    let close_all = teardown.root_or_policy_changed;
+    let close_indexes = teardown
+        .removed_terminal_indexes
+        .iter()
+        .copied()
+        .chain(teardown.role_changed_terminal_indexes.iter().copied())
+        .collect::<HashSet<_>>();
+    if !close_all && close_indexes.is_empty() {
+        return;
+    }
+    let terminal_state = app.state::<TerminalState>();
+    let targets = {
+        let guard = terminal_state.terminals.read().await;
+        guard
+            .iter()
+            .filter_map(|(pane_id, instance)| {
+                if instance.metadata.workspace_id.trim() != workspace_id {
+                    return None;
+                }
+                let index = instance.metadata.terminal_index.map(usize::from);
+                if close_all || index.is_some_and(|index| close_indexes.contains(&index)) {
+                    Some((pane_id.clone(), instance.id))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    for (pane_id, instance_id) in targets {
+        let _ = close_terminal_session(
+            Some(app.clone()),
+            terminal_state.inner(),
+            Some(state),
+            &pane_id,
+            Some(instance_id),
+            false,
+            false,
+            None,
+        )
+        .await;
+    }
+}
+
+async fn cloud_mcp_remote_workspace_reconcile_active_runtime(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    workspace_id: &str,
+    teardown: CloudMcpRemoteWorkspaceRuntimeTeardown,
+) -> Result<Value, String> {
+    if todo_dispatch_webview_dispatcher_active() {
+        return Ok(json!({"skipped": true, "reason": "webview_dispatcher_active"}));
+    }
+    if !cloud_mcp_remote_workspace_runtime_active(app, state, workspace_id).await {
+        return Ok(json!({"active": false, "skipped": true}));
+    }
+    cloud_mcp_remote_workspace_close_runtime_indexes(app, state, workspace_id, &teardown).await;
+    workspace_activate_runtime_internal(app, workspace_id, "remote_workspace_settings_update").await
+}
+
+async fn cloud_mcp_remote_workspace_spawn_configured_terminal(
+    app: &AppHandle,
+    workspace_id: &str,
+    terminal_index: usize,
+) -> Result<Value, String> {
+    if todo_dispatch_webview_dispatcher_active() {
+        return Err("webview dispatcher became active before terminal spawn".to_string());
+    }
+    let workspace_settings = app_local_state_read(app, "workspace-settings");
+    let workspace = workspace_activation_resolve_workspace(app, workspace_id, &workspace_settings)?;
+    let settings = workspace_activation_settings_for_workspace(&workspace_settings, &workspace.id);
+    let threads_state = workspace_activation_threads_state(&workspace.id, &workspace.root).await?;
+    let descriptor =
+        workspace_activation_terminal_descriptors_from_values(&workspace, settings, &threads_state)
+            .into_iter()
+            .find(|descriptor| descriptor.terminal_index as usize == terminal_index)
+            .ok_or_else(|| {
+                format!("No configured terminal descriptor exists for slot {terminal_index}.")
+            })?;
+    let output_channel = Channel::new(|_body: InvokeResponseBody| Ok(()));
+    let terminal_state = app.state::<TerminalState>();
+    let cloud_mcp_state = app.state::<CloudMcpState>();
+    let app_control_mcp_state = app.state::<AppControlMcpState>();
+    let request = workspace_activation_terminal_request(&workspace, &descriptor);
+    let open_result = terminal_open(
+        app.clone(),
+        terminal_state,
+        cloud_mcp_state,
+        app_control_mcp_state,
+        request,
+        output_channel,
+    )
+    .await?;
+    Ok(json!({
+        "pane_id": open_result.pane_id,
+        "terminal_instance_id": open_result.instance_id,
+        "terminal_index": terminal_index,
+        "workspace_id": workspace.id,
+    }))
+}
+
+fn cloud_mcp_remote_workspace_target_terminal_index(event: &Value) -> Option<usize> {
+    cloud_mcp_remote_command_field_value(event, "target_terminal_index")
+        .or_else(|| cloud_mcp_remote_command_field_value(event, "terminal_index"))
+        .or_else(|| cloud_mcp_remote_command_field_value(event, "index"))
+        .and_then(cloud_mcp_remote_workspace_integer)
+        .filter(|value| *value >= 0)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+async fn cloud_mcp_remote_workspace_live_terminal_target(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    workspace_id: &str,
+    target_terminal_id: &str,
+    target_terminal_index: Option<usize>,
+) -> Option<(String, Option<u64>, Option<usize>)> {
+    let terminal_state = app.state::<TerminalState>();
+    {
+        let guard = terminal_state.terminals.read().await;
+        for (pane_id, instance) in guard.iter() {
+            if instance.metadata.workspace_id.trim() != workspace_id {
+                continue;
+            }
+            let index = instance.metadata.terminal_index.map(usize::from);
+            let id_match = !target_terminal_id.trim().is_empty()
+                && (pane_id == target_terminal_id
+                    || instance.metadata.pane_id == target_terminal_id
+                    || cloud_mcp_remote_workspace_configured_pane_id(
+                        workspace_id,
+                        index.unwrap_or_default(),
+                        &instance.metadata.agent_id,
+                    ) == target_terminal_id);
+            let index_match = target_terminal_index.is_some() && target_terminal_index == index;
+            if id_match || index_match {
+                return Some((pane_id.clone(), Some(instance.id), index));
+            }
+        }
+    }
+    let snapshot = {
+        let snapshots = state.runtime_snapshots.lock().await;
+        snapshots.workspace_terminals.clone()
+    };
+    snapshot
+        .as_ref()
+        .and_then(|payload| payload.get("workspaces"))
+        .and_then(Value::as_array)
+        .and_then(|workspaces| {
+            workspaces
+                .iter()
+                .filter(|workspace| {
+                    cloud_mcp_payload_text(workspace, &["workspace_id"])
+                        .map(|value| cloud_mcp_workspace_id_match_key(&value))
+                        .as_deref()
+                        == Some(workspace_id)
+                })
+                .flat_map(|workspace| {
+                    workspace
+                        .get("terminals")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .find(|terminal| {
+                    (!target_terminal_id.trim().is_empty()
+                        && cloud_mcp_terminal_matches_target_id(
+                            workspace_id,
+                            terminal,
+                            target_terminal_id,
+                        ))
+                        || target_terminal_index.is_some_and(|index| {
+                            cloud_mcp_payload_i64(terminal, &["terminal_index", "index"])
+                                .is_some_and(|candidate| candidate == index as i64)
+                        })
+                })
+        })
+        .and_then(|terminal| {
+            let pane_id = cloud_mcp_payload_text(&terminal, &["pane_id", "terminal_id"])?;
+            let instance_id =
+                cloud_mcp_payload_i64(&terminal, &["terminal_instance_id", "instance_id"])
+                    .and_then(|value| u64::try_from(value).ok())
+                    .filter(|value| *value > 0);
+            let index = cloud_mcp_payload_i64(&terminal, &["terminal_index", "index"])
+                .filter(|value| *value >= 0)
+                .and_then(|value| usize::try_from(value).ok());
+            Some((pane_id, instance_id, index))
+        })
+}
+
+fn cloud_mcp_remote_workspace_terminal_open_role(event: &Value) -> String {
+    cloud_mcp_remote_workspace_string_field(
+        event,
+        &[
+            "agent_id",
+            "agent_kind",
+            "agent_type",
+            "agent",
+            "provider",
+            "role",
+        ],
+    )
+    .map(|role| {
+        let role = cloud_mcp_remote_workspace_configured_role(&json!(role));
+        if role == "generic"
+            && cloud_mcp_remote_workspace_string_field(event, &["agent_type"])
+                .is_some_and(|value| value.eq_ignore_ascii_case("any"))
+        {
+            "codex".to_string()
+        } else {
+            role
+        }
+    })
+    .unwrap_or_else(|| "codex".to_string())
+}
+
+async fn cloud_mcp_execute_remote_workspace_settings_update(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) -> CloudMcpRemoteWorkspaceCommandOutcome {
+    let requested_workspace_id =
+        cloud_mcp_remote_workspace_string_field(event, &["workspace_id"]).unwrap_or_default();
+    let workspace_id = cloud_mcp_resolve_local_workspace_id(&requested_workspace_id)
+        .unwrap_or(requested_workspace_id)
+        .trim()
+        .to_string();
+    if workspace_id.is_empty() {
+        return cloud_mcp_remote_workspace_failed_outcome(
+            event,
+            "Workspace settings update requires a workspace id.",
+            None,
+        );
+    }
+    let Some(settings_input) = cloud_mcp_remote_workspace_settings_input(event) else {
+        return cloud_mcp_remote_workspace_failed_outcome(
+            event,
+            "Workspace settings update did not include any supported settings.",
+            None,
+        );
+    };
+    let requested_name = cloud_mcp_remote_workspace_settings_input_value(
+        &settings_input,
+        &["workspace_name", "name"],
+    )
+    .and_then(|value| match value {
+        Value::String(text) => Some(text.trim().to_string()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    })
+    .unwrap_or_default();
+    let requested_root = cloud_mcp_remote_workspace_settings_input_value(
+        &settings_input,
+        &["workspace_root", "root_directory", "root"],
+    )
+    .and_then(|value| match value {
+        Value::String(text) => Some(text.trim().to_string()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    })
+    .unwrap_or_default();
+    let wants_terminal_count =
+        cloud_mcp_remote_workspace_settings_has(&settings_input, &["terminal_count"]);
+    let wants_terminal_roles =
+        cloud_mcp_remote_workspace_settings_has(&settings_input, &["terminal_roles"]);
+    let wants_panel_counts =
+        cloud_mcp_remote_workspace_settings_has(&settings_input, &["panel_counts"]);
+    let wants_archived = cloud_mcp_remote_workspace_settings_has(&settings_input, &["archived"]);
+    let wants_default = cloud_mcp_remote_workspace_settings_has(&settings_input, &["is_default"]);
+    let requested_safety_event = cloud_mcp_remote_workspace_settings_event(&settings_input);
+    let requested_safety_mode = cloud_mcp_remote_workspace_safety_mode(&requested_safety_event);
+    if requested_name.is_empty()
+        && requested_root.is_empty()
+        && !wants_terminal_count
+        && !wants_terminal_roles
+        && !requested_safety_mode.provided
+        && !wants_panel_counts
+        && !wants_archived
+        && !wants_default
+    {
+        return cloud_mcp_remote_workspace_failed_outcome(
+            event,
+            "Workspace settings update supports workspace_name, workspace_root, terminal_count, terminal_roles, safety_mode, panel_counts, archived, and is_default; none were provided.",
+            None,
+        );
+    }
+    if requested_name.chars().count() > 80 {
+        return cloud_mcp_remote_workspace_failed_outcome(
+            event,
+            "Workspace name must be 80 characters or fewer.",
+            None,
+        );
+    }
+
+    let mut applied_fields = Vec::<Value>::new();
+    let mut rejected_fields = Vec::<Value>::new();
+    let mut applied_settings = serde_json::Map::<String, Value>::new();
+    let mut runtime_teardown = CloudMcpRemoteWorkspaceRuntimeTeardown::default();
+    let update_result: Result<(Vec<Value>, Value), String> = async {
+        let scope_key = cloud_mcp_process_account_scope_key();
+        let _catalog_mutation_guard = state.workspace_catalog_mutation_lock.lock().await;
+        let loaded = local_workspaces_load(app.clone(), scope_key.clone()).await?;
+        let mut catalog = loaded
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let Some(workspace_index) =
+            cloud_mcp_remote_workspace_find_catalog_index(&catalog, &workspace_id)
+        else {
+            return Err(format!("Unknown workspace: {workspace_id}"));
+        };
+        let mut workspace_settings = app_local_state_read(app, "workspace-settings");
+        let mut all_settings_object = workspace_settings
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let current_workspace_settings = all_settings_object
+            .get(&workspace_id)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut next_workspace_settings = current_workspace_settings.clone();
+        let current_agent_session_mode = cloud_mcp_remote_workspace_setting_text(
+            &current_workspace_settings,
+            &["agentSessionMode", "agent_session_mode"],
+        )
+        .unwrap_or_else(|| "direct_coordination".to_string());
+        let mut effective_root_directory = local_workspace_catalog_root_text(
+            &catalog[workspace_index],
+            &Value::Object(all_settings_object.clone()),
+        )
+        .or_else(|| {
+            cloud_mcp_remote_workspace_setting_text(
+                &current_workspace_settings,
+                &["rootDirectory", "root_directory"],
+            )
+        })
+        .unwrap_or_default();
+        let initial_root_directory = effective_root_directory.clone();
+        let mut effective_root_git_repository_known =
+            current_workspace_settings.contains_key("rootGitRepository");
+        let mut effective_root_git_repository = cloud_mcp_remote_workspace_setting_bool(
+            &current_workspace_settings,
+            &["rootGitRepository"],
+        )
+        .unwrap_or(false);
+        let mut root_changed = false;
+        let mut next_catalog_changed = false;
+        if !requested_root.is_empty() {
+            let normalized_root = validate_workspace_root_directory(requested_root.clone()).await?;
+            let root_directory = normalized_root.working_directory.trim().to_string();
+            if root_directory.is_empty() {
+                return Err("Workspace root directory was not returned by validation.".to_string());
+            }
+            let root_identity = normalized_root.root_identity.clone();
+            let old_identity = local_workspace_catalog_root_identity(
+                &catalog[workspace_index],
+                &Value::Object(all_settings_object.clone()),
+            )
+            .map(|(identity, _)| identity)
+            .or_else(|| {
+                (!initial_root_directory.is_empty())
+                    .then(|| normalized_literal_path_key(&initial_root_directory))
+            })
+            .unwrap_or_default();
+            root_changed = root_identity != old_identity;
+            if root_changed {
+                if let Some((duplicate_id, _duplicate_name)) =
+                    cloud_mcp_remote_workspace_duplicate_except(
+                        &catalog,
+                        &Value::Object(all_settings_object.clone()),
+                        &root_identity,
+                        &workspace_id,
+                    )
+                {
+                    rejected_fields.push(json!({
+                        "field": "workspace_root",
+                        "reason": "duplicate_workspace_root",
+                        "duplicateWorkspaceId": duplicate_id,
+                    }));
+                    return Ok((catalog, workspace_settings));
+                }
+                if let Some(object) = catalog[workspace_index].as_object_mut() {
+                    object.insert("root_directory".to_string(), json!(root_directory));
+                    object.insert("root_identity".to_string(), json!(root_identity));
+                    object.insert(
+                        "updated_at".to_string(),
+                        json!(cloud_mcp_remote_workspace_iso8601_now()),
+                    );
+                    next_catalog_changed = true;
+                }
+            }
+            effective_root_directory = root_directory.clone();
+            effective_root_git_repository_known = true;
+            effective_root_git_repository = normalized_root.git_repository;
+            cloud_mcp_remote_workspace_insert_persisted_setting(
+                &mut next_workspace_settings,
+                "rootDirectory",
+                "root_directory",
+                json!(root_directory.clone()),
+            );
+            next_workspace_settings.insert(
+                "rootWasEmptyAtSelection".to_string(),
+                json!(normalized_root.empty_directory),
+            );
+            next_workspace_settings.insert(
+                "rootGitRepository".to_string(),
+                json!(normalized_root.git_repository),
+            );
+            applied_settings.insert("workspace_root".to_string(), json!(root_directory));
+            applied_fields.push(json!("workspace_root"));
+        }
+
+        let requested_terminal_count_value =
+            cloud_mcp_remote_workspace_settings_input_value(&settings_input, &["terminal_count"]);
+        let requested_terminal_count = if wants_terminal_count {
+            let parsed = requested_terminal_count_value
+                .and_then(cloud_mcp_remote_workspace_integer)
+                .filter(|count| *count >= 0)
+                .and_then(|count| usize::try_from(count).ok())
+                .map(|count| count.min(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT));
+            if parsed.is_none() {
+                rejected_fields.push(json!({
+                    "field": "terminal_count",
+                    "reason": "invalid_value",
+                    "value": requested_terminal_count_value.cloned().unwrap_or(Value::Null),
+                }));
+            }
+            parsed
+        } else {
+            None
+        };
+        let requested_terminal_roles = cloud_mcp_remote_workspace_terminal_roles(&requested_safety_event);
+        rejected_fields.extend(requested_terminal_roles.rejected_fields.clone());
+        if wants_terminal_roles && !requested_terminal_roles.has_valid_role_count {
+            if requested_terminal_roles.rejected_fields.is_empty() {
+                rejected_fields.push(json!({
+                    "field": "terminal_roles",
+                    "reason": "invalid_value",
+                }));
+            }
+        }
+        let requested_panel_counts = cloud_mcp_remote_workspace_panel_counts(&requested_safety_event);
+        rejected_fields.extend(requested_panel_counts.rejected_fields.clone());
+
+        let terminal_count_can_apply = wants_terminal_count
+            && !wants_terminal_roles
+            && requested_terminal_count.is_some()
+            && !rejected_fields
+                .iter()
+                .any(|field| field.get("field").and_then(Value::as_str) == Some("terminal_count"));
+        let terminal_roles_can_apply =
+            wants_terminal_roles && requested_terminal_roles.has_valid_role_count;
+        let mut panel_counts_can_apply = wants_panel_counts && requested_panel_counts.has_supported_keys;
+        if panel_counts_can_apply {
+            let current_layout =
+                cloud_mcp_remote_workspace_current_layout(&current_workspace_settings);
+            let current_terminal_only_count =
+                cloud_mcp_remote_workspace_terminal_only_indexes(&current_layout).len();
+            let requested_terminal_only_count = if terminal_roles_can_apply {
+                requested_terminal_roles.roles.len()
+            } else if terminal_count_can_apply {
+                requested_terminal_count.unwrap_or_default()
+            } else {
+                current_terminal_only_count
+            };
+            let requested_grid_panels = requested_panel_counts
+                .web
+                .saturating_add(requested_panel_counts.pcb)
+                .saturating_add(requested_panel_counts.vm)
+                .saturating_add(requested_panel_counts.video);
+            let capacity = CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT
+                .saturating_sub(requested_terminal_only_count);
+            if requested_grid_panels > capacity {
+                rejected_fields.push(json!({
+                    "field": "panel_counts",
+                    "reason": "capacity_exceeded",
+                    "capacity": capacity,
+                    "requested": requested_grid_panels,
+                    "terminal_count": requested_terminal_only_count,
+                }));
+                panel_counts_can_apply = false;
+            }
+        }
+        if terminal_count_can_apply || terminal_roles_can_apply || panel_counts_can_apply {
+            let layout_patch = cloud_mcp_remote_workspace_build_settings_layout_patch(
+                &current_workspace_settings,
+                terminal_count_can_apply.then(|| requested_terminal_count.unwrap_or_default()),
+                terminal_roles_can_apply.then_some(requested_terminal_roles.roles.as_slice()),
+                panel_counts_can_apply.then_some(&requested_panel_counts),
+                root_changed,
+            );
+            cloud_mcp_remote_workspace_settings_insert_layout(
+                &mut next_workspace_settings,
+                &layout_patch.layout,
+            );
+            runtime_teardown = cloud_mcp_remote_workspace_build_runtime_teardown(
+                &current_workspace_settings,
+                &next_workspace_settings,
+                false,
+            );
+            if terminal_roles_can_apply {
+                applied_settings.insert(
+                    "terminal_count".to_string(),
+                    json!(layout_patch.terminal_only_count),
+                );
+                applied_settings.insert(
+                    "terminal_roles".to_string(),
+                    cloud_mcp_remote_workspace_role_counts_for_ack(&layout_patch.terminal_only_roles),
+                );
+                applied_fields.push(json!("terminal_roles"));
+            } else if terminal_count_can_apply {
+                applied_settings.insert(
+                    "terminal_count".to_string(),
+                    json!(layout_patch.terminal_only_count),
+                );
+                applied_fields.push(json!("terminal_count"));
+            }
+            if panel_counts_can_apply {
+                applied_settings.insert("panel_counts".to_string(), layout_patch.panel_counts);
+                applied_fields.push(json!("panel_counts"));
+            }
+        }
+
+        let mut next_agent_session_mode = current_agent_session_mode.clone();
+        if requested_safety_mode.provided {
+            if !requested_safety_mode.valid {
+                rejected_fields.push(json!({
+                    "field": "safety_mode",
+                    "reason": "unsupported_value",
+                    "value": requested_safety_mode.safety_mode,
+                }));
+            } else if requested_safety_mode.agent_session_mode == "worktree_coordination"
+                && effective_root_git_repository_known
+                && !effective_root_git_repository
+            {
+                rejected_fields.push(json!({
+                    "field": "safety_mode",
+                    "reason": "safe_requires_git",
+                }));
+            } else {
+                next_agent_session_mode = requested_safety_mode.agent_session_mode.clone();
+                cloud_mcp_remote_workspace_insert_persisted_setting(
+                    &mut next_workspace_settings,
+                    "agentSessionMode",
+                    "agent_session_mode",
+                    json!(next_agent_session_mode.clone()),
+                );
+                next_workspace_settings.insert(
+                    "gitWorktreesEnabled".to_string(),
+                    json!(next_agent_session_mode == "worktree_coordination"),
+                );
+                applied_settings.insert(
+                    "safety_mode".to_string(),
+                    json!(requested_safety_mode.safety_mode.clone()),
+                );
+                applied_fields.push(json!("safety_mode"));
+            }
+        }
+        runtime_teardown.root_or_policy_changed |= root_changed || next_agent_session_mode != current_agent_session_mode;
+        if !requested_name.is_empty() {
+            if let Some(object) = catalog[workspace_index].as_object_mut() {
+                object.insert("name".to_string(), json!(requested_name.clone()));
+                object.insert(
+                    "updated_at".to_string(),
+                    json!(cloud_mcp_remote_workspace_iso8601_now()),
+                );
+                next_catalog_changed = true;
+            }
+            applied_settings.insert("workspace_name".to_string(), json!(requested_name));
+            applied_fields.push(json!("workspace_name"));
+        }
+        if next_workspace_settings != current_workspace_settings {
+            all_settings_object.insert(
+                workspace_id.clone(),
+                Value::Object(next_workspace_settings.clone()),
+            );
+            workspace_settings = app_local_state_merge(
+                app,
+                "workspace-settings",
+                &json!({workspace_id.clone(): Value::Object(next_workspace_settings.clone())}),
+            )?;
+        }
+        if next_catalog_changed {
+            local_workspaces_store(app.clone(), scope_key.clone(), Value::Array(catalog.clone())).await?;
+        }
+        if root_changed {
+            let _ = coordination::tauri_commands::coordination_bootstrap_workspace(
+                Some(effective_root_directory.clone()),
+                None,
+                Some(next_agent_session_mode.clone()),
+            );
+        } else if !effective_root_directory.is_empty()
+            && next_agent_session_mode != current_agent_session_mode
+        {
+            let _ = coordination::tauri_commands::coordination_update_repo_policy(
+                Some(effective_root_directory.clone()),
+                None,
+                json!({"agent_session_mode": next_agent_session_mode}),
+            );
+        }
+        if wants_default {
+            let parsed = cloud_mcp_remote_workspace_settings_input_value(&settings_input, &["is_default"])
+                .and_then(cloud_mcp_remote_workspace_boolean);
+            if let Some(is_default) = parsed {
+                cloud_mcp_remote_workspace_set_default_lifecycle(
+                    app,
+                    &workspace_id,
+                    is_default,
+                    &catalog,
+                )?;
+                applied_settings.insert("is_default".to_string(), json!(is_default));
+                applied_fields.push(json!("is_default"));
+            } else {
+                rejected_fields.push(json!({
+                    "field": "is_default",
+                    "reason": "invalid_value",
+                }));
+            }
+        }
+        if wants_archived {
+            let parsed = cloud_mcp_remote_workspace_settings_input_value(&settings_input, &["archived"])
+                .and_then(cloud_mcp_remote_workspace_boolean);
+            match parsed {
+                None => rejected_fields.push(json!({
+                    "field": "archived",
+                    "reason": "invalid_value",
+                })),
+                Some(true) => {
+                    if let Some(object) = catalog[workspace_index].as_object_mut() {
+                        object.insert("local_archived".to_string(), json!(true));
+                        object.insert("locally_archived".to_string(), json!(true));
+                        object.insert(
+                            "local_archived_at".to_string(),
+                            json!(cloud_mcp_remote_workspace_iso8601_now()),
+                        );
+                        object.insert(
+                            "updated_at".to_string(),
+                            json!(cloud_mcp_remote_workspace_iso8601_now()),
+                        );
+                    }
+                    cloud_mcp_remote_workspace_remove_from_lifecycle(app, &workspace_id)?;
+                    local_workspaces_store(
+                        app.clone(),
+                        scope_key.clone(),
+                        Value::Array(catalog.clone()),
+                    )
+                    .await?;
+                    applied_settings.insert("archived".to_string(), json!(true));
+                    applied_fields.push(json!("archived"));
+                }
+                Some(false) => {
+                    let archived = catalog[workspace_index]
+                        .get("local_archived")
+                        .or_else(|| catalog[workspace_index].get("locally_archived"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !archived {
+                        rejected_fields.push(json!({
+                            "field": "archived",
+                            "reason": "already_unarchived",
+                        }));
+                    } else if effective_root_directory.trim().is_empty() {
+                        rejected_fields.push(json!({
+                            "field": "archived",
+                            "reason": "unarchive_unsupported",
+                        }));
+                    } else {
+                        let normalized_root =
+                            validate_workspace_root_directory(effective_root_directory.clone()).await?;
+                        let root_directory = normalized_root.working_directory.trim().to_string();
+                        let root_identity = normalized_root.root_identity.clone();
+                        if let Some((duplicate_id, _)) = cloud_mcp_remote_workspace_duplicate_except(
+                            &catalog,
+                            &workspace_settings,
+                            &root_identity,
+                            &workspace_id,
+                        ) {
+                            rejected_fields.push(json!({
+                                "field": "archived",
+                                "reason": "duplicate_workspace_root",
+                                "duplicateWorkspaceId": duplicate_id,
+                            }));
+                        } else {
+                            if let Some(object) = catalog[workspace_index].as_object_mut() {
+                                object.insert("root_directory".to_string(), json!(root_directory.clone()));
+                                object.insert("root_identity".to_string(), json!(root_identity));
+                                object.insert("local_archived".to_string(), json!(false));
+                                object.insert("locally_archived".to_string(), json!(false));
+                                object.insert("local_archived_at".to_string(), json!(""));
+                                object.insert("locally_archived_at".to_string(), json!(""));
+                                object.insert(
+                                    "updated_at".to_string(),
+                                    json!(cloud_mcp_remote_workspace_iso8601_now()),
+                                );
+                            }
+                            cloud_mcp_remote_workspace_insert_persisted_setting(
+                                &mut next_workspace_settings,
+                                "rootDirectory",
+                                "root_directory",
+                                json!(root_directory),
+                            );
+                            next_workspace_settings.insert(
+                                "rootWasEmptyAtSelection".to_string(),
+                                json!(normalized_root.empty_directory),
+                            );
+                            next_workspace_settings.insert(
+                                "rootGitRepository".to_string(),
+                                json!(normalized_root.git_repository),
+                            );
+                            workspace_settings = app_local_state_merge(
+                                app,
+                                "workspace-settings",
+                                &json!({workspace_id.clone(): Value::Object(next_workspace_settings.clone())}),
+                            )?;
+                            local_workspaces_store(
+                                app.clone(),
+                                scope_key.clone(),
+                                Value::Array(catalog.clone()),
+                            )
+                            .await?;
+                            applied_settings.insert("archived".to_string(), json!(false));
+                            applied_fields.push(json!("archived"));
+                        }
+                    }
+                }
+            }
+        }
+        cloud_mcp_remote_workspace_publish_catalog_snapshot(
+            state,
+            catalog.clone(),
+            &workspace_settings,
+            "remote_workspace_settings_update",
+        )
+        .await?;
+        Ok((catalog, workspace_settings))
+    }
+    .await;
+
+    let (catalog, workspace_settings) = match update_result {
+        Ok(values) => values,
+        Err(error) => return cloud_mcp_remote_workspace_failed_outcome(event, error, None),
+    };
+    let runtime_result = cloud_mcp_remote_workspace_reconcile_active_runtime(
+        app,
+        state,
+        &workspace_id,
+        runtime_teardown,
+    )
+    .await
+    .unwrap_or_else(|error| json!({"error": clean_terminal_telemetry_text(&error)}));
+    let rejected_blocked = rejected_fields.iter().any(|field| {
+        field
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                matches!(
+                    reason,
+                    "archive_failed"
+                        | "already_unarchived"
+                        | "capacity_exceeded"
+                        | "duplicate_workspace_root"
+                        | "safe_requires_git"
+                        | "unarchive_unsupported"
+                )
+            })
+    });
+    let status = if rejected_blocked {
+        "blocked"
+    } else if !applied_fields.is_empty() {
+        "completed"
+    } else {
+        "failed"
+    };
+    let message = if !applied_fields.is_empty() {
+        if rejected_fields.is_empty() {
+            "Workspace settings updated on this desktop."
+        } else {
+            "Workspace settings partially updated on this desktop."
+        }
+    } else {
+        "No requested workspace settings were applied."
+    };
+    let details = json!({
+        "appliedFields": applied_fields,
+        "appliedSettings": Value::Object(applied_settings),
+        "catalog_count": catalog.len(),
+        "command_id": cloud_mcp_remote_command_id(event),
+        "command_kind": cloud_mcp_remote_command_kind(event),
+        "rejectedFields": rejected_fields,
+        "runtime_reconcile": runtime_result,
+        "settings_workspace_present": workspace_settings.get(&workspace_id).is_some(),
+        "workspace_id": workspace_id,
+    });
+    CloudMcpRemoteWorkspaceCommandOutcome {
+        status,
+        message: message.to_string(),
+        details,
+    }
+}
+
+async fn cloud_mcp_execute_remote_terminal_open(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) -> CloudMcpRemoteWorkspaceCommandOutcome {
+    let requested_workspace_id =
+        cloud_mcp_remote_workspace_string_field(event, &["workspace_id"]).unwrap_or_default();
+    let workspace_id = cloud_mcp_resolve_local_workspace_id(&requested_workspace_id)
+        .unwrap_or(requested_workspace_id)
+        .trim()
+        .to_string();
+    if workspace_id.is_empty() {
+        return cloud_mcp_remote_workspace_failed_outcome(
+            event,
+            "Terminal open requires a workspace id.",
+            None,
+        );
+    }
+    let count = cloud_mcp_remote_command_field_i64(event, &["count"])
+        .filter(|value| *value > 0)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(1)
+        .min(12);
+    let open_mode = cloud_mcp_remote_workspace_string_field(event, &["open_mode", "mode"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let spawn_count = open_mode == "spawn_count";
+    let role = cloud_mcp_remote_workspace_terminal_open_role(event);
+    let transaction: Result<(Vec<Value>, Value, usize, usize, Vec<usize>, Vec<Value>), String> =
+        async {
+            let scope_key = cloud_mcp_process_account_scope_key();
+            let _catalog_mutation_guard = state.workspace_catalog_mutation_lock.lock().await;
+            let loaded = local_workspaces_load(app.clone(), scope_key.clone()).await?;
+            let catalog = loaded
+                .get("workspaces")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if cloud_mcp_remote_workspace_find_catalog_index(&catalog, &workspace_id).is_none() {
+                return Err(format!("Unknown workspace: {workspace_id}"));
+            }
+            let mut workspace_settings = app_local_state_read(app, "workspace-settings");
+            let mut settings_map = workspace_settings
+                .get(&workspace_id)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let current_layout = cloud_mcp_remote_workspace_current_layout(&settings_map);
+            let existing_role_count =
+                cloud_mcp_remote_workspace_terminal_only_roles(&current_layout)
+                    .iter()
+                    .filter(|candidate| candidate.as_str() == role.as_str())
+                    .count();
+            let target_add_count = if spawn_count {
+                count
+            } else {
+                count.saturating_sub(existing_role_count)
+            };
+            let mut added_indexes = Vec::new();
+            let mut added_layouts = Vec::new();
+            for _ in 0..target_add_count {
+                let Some(mutation) =
+                    cloud_mcp_remote_workspace_add_terminal_layout(&settings_map, &role)
+                else {
+                    break;
+                };
+                cloud_mcp_remote_workspace_settings_insert_layout(
+                    &mut settings_map,
+                    &mutation.layout,
+                );
+                added_indexes.push(mutation.terminal_index);
+                added_layouts.push(json!({
+                    "terminal_index": mutation.terminal_index,
+                    "terminal_role": mutation.terminal_role,
+                }));
+            }
+            if !added_indexes.is_empty() {
+                workspace_settings = app_local_state_merge(
+                    app,
+                    "workspace-settings",
+                    &json!({workspace_id.clone(): Value::Object(settings_map)}),
+                )?;
+            }
+            cloud_mcp_remote_workspace_publish_catalog_snapshot(
+                state,
+                catalog.clone(),
+                &workspace_settings,
+                "remote_terminal_open",
+            )
+            .await?;
+            Ok((
+                catalog,
+                workspace_settings,
+                existing_role_count,
+                target_add_count,
+                added_indexes,
+                added_layouts,
+            ))
+        }
+        .await;
+    let (
+        catalog,
+        _workspace_settings,
+        existing_role_count,
+        target_add_count,
+        added_indexes,
+        added_layouts,
+    ) = match transaction {
+        Ok(values) => values,
+        Err(error) => return cloud_mcp_remote_workspace_failed_outcome(event, error, None),
+    };
+    let mut spawn_results = Vec::new();
+    for index in &added_indexes {
+        match cloud_mcp_remote_workspace_spawn_configured_terminal(app, &workspace_id, *index).await
+        {
+            Ok(result) => spawn_results.push(result),
+            Err(error) => spawn_results.push(json!({
+                "error": clean_terminal_telemetry_text(&error),
+                "terminal_index": index,
+            })),
+        }
+    }
+    if added_indexes.is_empty() && target_add_count == 0 {
+        return CloudMcpRemoteWorkspaceCommandOutcome {
+            status: "completed",
+            message: format!(
+                "{} already has {} terminal{} open.",
+                cloud_mcp_remote_workspace_agent_label(&role),
+                existing_role_count,
+                if existing_role_count == 1 { "" } else { "s" }
+            ),
+            details: json!({
+                "added": added_layouts,
+                "agent_id": role,
+                "catalog_count": catalog.len(),
+                "command_id": cloud_mcp_remote_command_id(event),
+                "command_kind": cloud_mcp_remote_command_kind(event),
+                "existing_count": existing_role_count,
+                "requested_count": count,
+                "target_add_count": target_add_count,
+                "workspace_id": workspace_id,
+            }),
+        };
+    }
+    if added_indexes.is_empty() {
+        return CloudMcpRemoteWorkspaceCommandOutcome {
+            status: "blocked",
+            message: format!(
+                "Terminal limit reached. Diff Forge supports up to {} workspace terminals.",
+                CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT
+            ),
+            details: json!({
+                "catalog_count": catalog.len(),
+                "command_id": cloud_mcp_remote_command_id(event),
+                "command_kind": cloud_mcp_remote_command_kind(event),
+                "existing_count": existing_role_count,
+                "requested_count": count,
+                "target_add_count": target_add_count,
+                "workspace_id": workspace_id,
+            }),
+        };
+    }
+    let all_spawns_failed = !spawn_results.is_empty()
+        && spawn_results
+            .iter()
+            .all(|result| result.get("error").is_some());
+    CloudMcpRemoteWorkspaceCommandOutcome {
+        status: if all_spawns_failed {
+            "failed"
+        } else {
+            "completed"
+        },
+        message: if all_spawns_failed {
+            "Coding-agent terminal slots were allocated, but the native PTYs could not be opened."
+                .to_string()
+        } else {
+            "Coding-agent terminals updated headless.".to_string()
+        },
+        details: json!({
+            "added": added_layouts,
+            "agent_id": role,
+            "catalog_count": catalog.len(),
+            "command_id": cloud_mcp_remote_command_id(event),
+            "command_kind": cloud_mcp_remote_command_kind(event),
+            "existing_count": existing_role_count,
+            "requested_count": count,
+            "spawn_results": spawn_results,
+            "target_add_count": target_add_count,
+            "workspace_id": workspace_id,
+        }),
+    }
+}
+
+async fn cloud_mcp_execute_remote_terminal_close(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) -> CloudMcpRemoteWorkspaceCommandOutcome {
+    let requested_workspace_id =
+        cloud_mcp_remote_workspace_string_field(event, &["workspace_id"]).unwrap_or_default();
+    let workspace_id = cloud_mcp_resolve_local_workspace_id(&requested_workspace_id)
+        .unwrap_or(requested_workspace_id)
+        .trim()
+        .to_string();
+    if workspace_id.is_empty() {
+        return cloud_mcp_remote_workspace_failed_outcome(
+            event,
+            "Terminal close requires a workspace id.",
+            None,
+        );
+    }
+    let target_terminal_id = cloud_mcp_remote_workspace_string_field(
+        event,
+        &[
+            "target_terminal_id",
+            "terminal_id",
+            "pane_id",
+            "target_pane_id",
+        ],
+    )
+    .unwrap_or_default();
+    let target_terminal_index = cloud_mcp_remote_workspace_target_terminal_index(event);
+    let live_target = cloud_mcp_remote_workspace_live_terminal_target(
+        app,
+        state,
+        &workspace_id,
+        &target_terminal_id,
+        target_terminal_index,
+    )
+    .await;
+    let terminal_index = live_target
+        .as_ref()
+        .and_then(|(_, _, index)| *index)
+        .or(target_terminal_index);
+    if live_target.is_none() && terminal_index.is_none() {
+        return cloud_mcp_remote_workspace_failed_outcome(
+            event,
+            "Target terminal was not found on this desktop.",
+            Some(json!({
+                "target_terminal_id": target_terminal_id,
+            })),
+        );
+    }
+    let mut close_result = Value::Null;
+    if let Some((pane_id, instance_id, _)) = live_target {
+        let terminal_state = app.state::<TerminalState>();
+        match close_terminal_session(
+            Some(app.clone()),
+            terminal_state.inner(),
+            Some(state),
+            &pane_id,
+            instance_id,
+            false,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(closed) => {
+                close_result = json!({
+                    "closed": closed,
+                    "pane_id": pane_id,
+                    "terminal_instance_id": instance_id,
+                });
+            }
+            Err(error) => {
+                return cloud_mcp_remote_workspace_failed_outcome(
+                    event,
+                    "Terminal could not be closed.",
+                    Some(json!({"error": clean_terminal_telemetry_text(&error)})),
+                );
+            }
+        }
+    }
+    let terminal_index = terminal_index.unwrap_or_default();
+    let transaction: Result<(Vec<Value>, Value, Option<Value>), String> = async {
+        let scope_key = cloud_mcp_process_account_scope_key();
+        let _catalog_mutation_guard = state.workspace_catalog_mutation_lock.lock().await;
+        let loaded = local_workspaces_load(app.clone(), scope_key.clone()).await?;
+        let catalog = loaded
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if cloud_mcp_remote_workspace_find_catalog_index(&catalog, &workspace_id).is_none() {
+            return Err(format!("Unknown workspace: {workspace_id}"));
+        }
+        let mut workspace_settings = app_local_state_read(app, "workspace-settings");
+        let mut settings_map = workspace_settings
+            .get(&workspace_id)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mutation = cloud_mcp_remote_workspace_remove_slot_layout(&settings_map, terminal_index);
+        if let Some(mutation) = mutation.as_ref() {
+            cloud_mcp_remote_workspace_settings_insert_layout(&mut settings_map, &mutation.layout);
+            workspace_settings = app_local_state_merge(
+                app,
+                "workspace-settings",
+                &json!({workspace_id.clone(): Value::Object(settings_map)}),
+            )?;
+        }
+        cloud_mcp_remote_workspace_publish_catalog_snapshot(
+            state,
+            catalog.clone(),
+            &workspace_settings,
+            "remote_terminal_close",
+        )
+        .await?;
+        Ok((
+            catalog,
+            workspace_settings,
+            mutation.map(|mutation| {
+                json!({
+                    "terminal_index": mutation.terminal_index,
+                    "terminal_role": mutation.terminal_role,
+                })
+            }),
+        ))
+    }
+    .await;
+    let (catalog, _, removed) = match transaction {
+        Ok(values) => values,
+        Err(error) => return cloud_mcp_remote_workspace_failed_outcome(event, error, None),
+    };
+    CloudMcpRemoteWorkspaceCommandOutcome {
+        status: "completed",
+        message: if removed.is_some() {
+            "Terminal force-closed headless; its workspace slot was removed.".to_string()
+        } else {
+            "Terminal process closed headless; no configured workspace slot was removed."
+                .to_string()
+        },
+        details: json!({
+            "catalog_count": catalog.len(),
+            "close_result": close_result,
+            "command_id": cloud_mcp_remote_command_id(event),
+            "command_kind": cloud_mcp_remote_command_kind(event),
+            "removed": removed,
+            "terminal_index": terminal_index,
+            "workspace_id": workspace_id,
+        }),
+    }
+}
+
+async fn cloud_mcp_remote_workspace_delete_blockers(
+    state: &CloudMcpState,
+    workspace_id: &str,
+) -> Vec<Value> {
+    let mut blockers = Vec::new();
+    if todo_dispatch_workspace_has_busy_terminals(workspace_id) {
+        blockers.push(json!({
+            "reason": "todo_dispatch_runtime_busy",
+        }));
+    }
+    let snapshot = {
+        let snapshots = state.runtime_snapshots.lock().await;
+        snapshots.workspace_terminals.clone()
+    };
+    if let Some(workspaces) = snapshot
+        .as_ref()
+        .and_then(|payload| payload.get("workspaces"))
+        .and_then(Value::as_array)
+    {
+        for terminal in workspaces
+            .iter()
+            .filter(|workspace| {
+                cloud_mcp_payload_text(workspace, &["workspace_id"])
+                    .as_deref()
+                    .map(cloud_mcp_workspace_id_match_key)
+                    .as_deref()
+                    == Some(workspace_id)
+            })
+            .flat_map(|workspace| {
+                workspace
+                    .get("terminals")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+        {
+            if cloud_mcp_presence_terminal_is_idle(terminal) {
+                continue;
+            }
+            blockers.push(json!({
+                "pane_id": cloud_mcp_payload_text(terminal, &["pane_id", "terminal_id"]),
+                "reason": "terminal_busy",
+                "terminal_index": cloud_mcp_payload_i64(terminal, &["terminal_index", "index"]),
+            }));
+        }
+    }
+    blockers
+}
+
+async fn cloud_mcp_execute_remote_workspace_delete(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) -> CloudMcpRemoteWorkspaceCommandOutcome {
+    let requested_workspace_id =
+        cloud_mcp_remote_workspace_string_field(event, &["workspace_id"]).unwrap_or_default();
+    let workspace_id = cloud_mcp_resolve_local_workspace_id(&requested_workspace_id)
+        .unwrap_or(requested_workspace_id)
+        .trim()
+        .to_string();
+    if workspace_id.is_empty() {
+        return cloud_mcp_remote_workspace_failed_outcome(
+            event,
+            "Workspace delete requires a workspace id.",
+            None,
+        );
+    }
+    let blockers = cloud_mcp_remote_workspace_delete_blockers(state, &workspace_id).await;
+    if !blockers.is_empty() {
+        return CloudMcpRemoteWorkspaceCommandOutcome {
+            status: "blocked",
+            message: "Workspace still has non-idle terminals, so it was not deleted.".to_string(),
+            details: json!({
+                "blockers": blockers,
+                "command_id": cloud_mcp_remote_command_id(event),
+                "command_kind": cloud_mcp_remote_command_kind(event),
+                "workspace_id": workspace_id,
+            }),
+        };
+    }
+    let delete_result: Result<(String, String, Vec<Value>, Value, Value), String> = async {
+        let scope_key = cloud_mcp_process_account_scope_key();
+        let _catalog_mutation_guard = state.workspace_catalog_mutation_lock.lock().await;
+        let loaded = local_workspaces_load(app.clone(), scope_key.clone()).await?;
+        let mut catalog = loaded
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let Some(workspace_index) =
+            cloud_mcp_remote_workspace_find_catalog_index(&catalog, &workspace_id)
+        else {
+            return Err(format!("Unknown workspace: {workspace_id}"));
+        };
+        let workspace_settings = app_local_state_read(app, "workspace-settings");
+        let workspace = catalog.remove(workspace_index);
+        let workspace_name =
+            local_workspace_catalog_text(&workspace, &["name", "workspace_name", "workspaceName"])
+                .unwrap_or_else(|| workspace_id.clone());
+        let repo_path = local_workspace_catalog_root_text(&workspace, &workspace_settings)
+            .ok_or_else(|| "Workspace delete could not resolve the project root.".to_string())?;
+        local_workspaces_store(app.clone(), scope_key, Value::Array(catalog.clone())).await?;
+        let next_workspace_settings = app_local_state_merge(
+            app,
+            "workspace-settings",
+            &json!({workspace_id.clone(): Value::Null}),
+        )?;
+        cloud_mcp_remote_workspace_remove_from_lifecycle(app, &workspace_id)?;
+        let _ = deactivate_workspace_runtime(
+            app.clone(),
+            Some(repo_path.clone()),
+            Some("workspace_delete".to_string()),
+            Some(workspace_id.clone()),
+            Some(false),
+        )
+        .await;
+        let cloud_delete = cloud_mcp_delete_workspace_internal(
+            state,
+            repo_path.clone(),
+            workspace_id.clone(),
+            Some(workspace_name.clone()),
+            Some(false),
+        )
+        .await?;
+        cloud_mcp_remote_workspace_publish_catalog_snapshot(
+            state,
+            catalog.clone(),
+            &next_workspace_settings,
+            "remote_workspace_delete",
+        )
+        .await?;
+        Ok((
+            repo_path,
+            workspace_name,
+            catalog,
+            next_workspace_settings,
+            cloud_delete,
+        ))
+    }
+    .await;
+    match delete_result {
+        Ok((repo_path, workspace_name, catalog, workspace_settings, cloud_delete)) => {
+            CloudMcpRemoteWorkspaceCommandOutcome {
+                status: "completed",
+                message: format!(
+                    "Workspace \"{workspace_name}\" deleted from Diff Forge; project files stay on disk."
+                ),
+                details: json!({
+                    "catalog_count": catalog.len(),
+                    "cloud_delete": cloud_delete,
+                    "command_id": cloud_mcp_remote_command_id(event),
+                    "command_kind": cloud_mcp_remote_command_kind(event),
+                    "repo_path": repo_path,
+                    "settings_workspace_present": workspace_settings.get(&workspace_id).is_some(),
+                    "workspace_id": workspace_id,
+                }),
+            }
+        }
+        Err(error) => cloud_mcp_remote_workspace_failed_outcome(event, error, None),
     }
 }
 
@@ -23051,6 +25600,22 @@ fn cloud_mcp_remote_workspace_management_command(command_kind: &str) -> bool {
             | "workspace_root_browse"
             | "workspace_create"
             | "create_workspace"
+            | "workspace_settings_update"
+            | "workspace_settings"
+            | "update_workspace_settings"
+            | "terminal_open"
+            | "open_terminal"
+            | "open_terminals"
+            | "terminal_spawn"
+            | "spawn_terminals"
+            | "terminal_close"
+            | "close_terminal"
+            | "terminal_force_close"
+            | "force_close_terminal"
+            | "terminal_remove"
+            | "remove_terminal"
+            | "workspace_delete"
+            | "delete_workspace"
     )
 }
 
@@ -23072,17 +25637,45 @@ fn cloud_mcp_apply_remote_workspace_management_lever_for_dispatcher(
     if !cloud_mcp_remote_workspace_management_lever_handles(event, webview_dispatcher_active) {
         return false;
     }
-    if matches!(
+    let requires_app = !matches!(
         command_kind.as_str(),
-        "workspace_create" | "create_workspace"
-    ) && app.is_none()
-    {
+        "workspace_directory_browse" | "browse_workspace_directory" | "workspace_root_browse"
+    );
+    if requires_app && app.is_none() {
         return false;
     }
     let app = app.cloned();
     let state = state.clone();
     let event = event.clone();
     tauri::async_runtime::spawn(async move {
+        if matches!(
+            command_kind.as_str(),
+            "workspace_settings_update"
+                | "workspace_settings"
+                | "update_workspace_settings"
+                | "terminal_open"
+                | "open_terminal"
+                | "open_terminals"
+                | "terminal_spawn"
+                | "spawn_terminals"
+                | "terminal_close"
+                | "close_terminal"
+                | "terminal_force_close"
+                | "force_close_terminal"
+                | "terminal_remove"
+                | "remove_terminal"
+                | "workspace_delete"
+                | "delete_workspace"
+        ) {
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state,
+                &event,
+                "running",
+                "Remote workspace management command is running headless.",
+                Some(&cloud_mcp_remote_workspace_command_details(&event)),
+            )
+            .await;
+        }
         let outcome = match command_kind.as_str() {
             "workspace_directory_browse"
             | "browse_workspace_directory"
@@ -23094,6 +25687,36 @@ fn cloud_mcp_apply_remote_workspace_management_lever_for_dispatcher(
                     return;
                 };
                 cloud_mcp_execute_remote_workspace_create(app, &state, &event).await
+            }
+            "workspace_settings_update" | "workspace_settings" | "update_workspace_settings" => {
+                let Some(app) = app.as_ref() else {
+                    return;
+                };
+                cloud_mcp_execute_remote_workspace_settings_update(app, &state, &event).await
+            }
+            "terminal_open" | "open_terminal" | "open_terminals" | "terminal_spawn"
+            | "spawn_terminals" => {
+                let Some(app) = app.as_ref() else {
+                    return;
+                };
+                cloud_mcp_execute_remote_terminal_open(app, &state, &event).await
+            }
+            "terminal_close"
+            | "close_terminal"
+            | "terminal_force_close"
+            | "force_close_terminal"
+            | "terminal_remove"
+            | "remove_terminal" => {
+                let Some(app) = app.as_ref() else {
+                    return;
+                };
+                cloud_mcp_execute_remote_terminal_close(app, &state, &event).await
+            }
+            "workspace_delete" | "delete_workspace" => {
+                let Some(app) = app.as_ref() else {
+                    return;
+                };
+                cloud_mcp_execute_remote_workspace_delete(app, &state, &event).await
             }
             _ => return,
         };
@@ -27514,10 +30137,10 @@ fn cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
     if cloud_mcp_remote_loopspace_command(&command_kind) {
         return !webview_dispatcher_active;
     }
-    if webview_dispatcher_active
-        && (cloud_mcp_remote_command_is_agent_prompt_answer(&command_kind)
-            || cloud_mcp_remote_workspace_management_command(&command_kind))
-    {
+    if cloud_mcp_remote_workspace_management_command(&command_kind) {
+        return !webview_dispatcher_active;
+    }
+    if webview_dispatcher_active && cloud_mcp_remote_command_is_agent_prompt_answer(&command_kind) {
         return false;
     }
     matches!(
@@ -34213,6 +36836,32 @@ fn cloud_mcp_terminal_io_target(stream_key: &str) -> Result<CloudMcpTerminalIoTa
     })
 }
 
+fn cloud_mcp_terminal_io_target_with_instance(
+    target: &CloudMcpTerminalIoTarget,
+    instance_id: u64,
+) -> CloudMcpTerminalIoTarget {
+    CloudMcpTerminalIoTarget {
+        stream_key: cloud_mcp_terminal_output_stream_key(
+            &target.device_id,
+            &target.workspace_id,
+            &target.pane_id,
+            instance_id,
+        ),
+        device_id: target.device_id.clone(),
+        workspace_id: target.workspace_id.clone(),
+        pane_id: target.pane_id.clone(),
+        instance_id,
+    }
+}
+
+fn cloud_mcp_terminal_io_retarget_newer_instance(
+    target: &CloudMcpTerminalIoTarget,
+    current_instance_id: u64,
+) -> Option<CloudMcpTerminalIoTarget> {
+    (current_instance_id > target.instance_id)
+        .then(|| cloud_mcp_terminal_io_target_with_instance(target, current_instance_id))
+}
+
 fn cloud_mcp_terminal_io_origin(message: &Value) -> String {
     cloud_mcp_payload_text(message, &["origin_connection_id"])
         .unwrap_or_else(|| "unknown".to_string())
@@ -34831,6 +37480,19 @@ fn cloud_mcp_terminal_io_target_matches_terminal(
     })
 }
 
+fn cloud_mcp_terminal_io_target_matches_logical_terminal(
+    target: &CloudMcpTerminalIoTarget,
+    workspace_match_key: Option<&str>,
+    pane_id: &str,
+) -> bool {
+    if target.pane_id.trim() != pane_id.trim() {
+        return false;
+    }
+    workspace_match_key.is_none_or(|workspace_match_key| {
+        cloud_mcp_workspace_id_match_key(&target.workspace_id) == workspace_match_key
+    })
+}
+
 fn cloud_mcp_terminal_remote_presence_stream_matches_terminal(
     stream_key: &str,
     workspace_match_key: Option<&str>,
@@ -34845,6 +37507,22 @@ fn cloud_mcp_terminal_remote_presence_stream_matches_terminal(
         workspace_match_key,
         pane_id,
         instance_id,
+    )
+}
+
+fn cloud_mcp_terminal_io_stream_key_matches_logical_terminal(
+    stream_key: &str,
+    target: &CloudMcpTerminalIoTarget,
+) -> bool {
+    let workspace_match_key = cloud_mcp_workspace_id_match_key(&target.workspace_id);
+    let workspace_match_key = (!workspace_match_key.is_empty()).then_some(workspace_match_key);
+    let Ok(candidate) = cloud_mcp_terminal_io_target(stream_key) else {
+        return false;
+    };
+    cloud_mcp_terminal_io_target_matches_logical_terminal(
+        &candidate,
+        workspace_match_key.as_deref(),
+        &target.pane_id,
     )
 }
 
@@ -35396,7 +38074,7 @@ fn cloud_mcp_terminal_io_attach_origin_to_stream(
     if let Ok(mut subscriptions) = state.terminal_io_stream_subscriptions.lock() {
         for (stream_key, origins) in subscriptions.iter_mut() {
             if stream_key != &target.stream_key
-                && cloud_mcp_terminal_io_stream_key_matches_target_terminal(stream_key, target)
+                && cloud_mcp_terminal_io_stream_key_matches_logical_terminal(stream_key, target)
                 && origins.remove(origin).is_some()
             {
                 removed_stream_keys.push(stream_key.clone());
@@ -35411,6 +38089,26 @@ fn cloud_mcp_terminal_io_attach_origin_to_stream(
     for stream_key in removed_stream_keys {
         cloud_mcp_terminal_io_forget_acked_origin(state, &stream_key, origin);
     }
+}
+
+async fn cloud_mcp_terminal_io_current_attach_target(
+    terminal_state: &TerminalState,
+    target: &CloudMcpTerminalIoTarget,
+) -> Option<(TerminalInstance, CloudMcpTerminalIoTarget)> {
+    let current = {
+        let terminals = terminal_state.terminals.read().await;
+        terminals.get(&target.pane_id).cloned()
+    }?;
+    if cloud_mcp_workspace_id_match_key(&current.metadata.workspace_id)
+        != cloud_mcp_workspace_id_match_key(&target.workspace_id)
+    {
+        return None;
+    }
+    if current.id == target.instance_id {
+        return Some((current, target.clone()));
+    }
+    let current_target = cloud_mcp_terminal_io_retarget_newer_instance(target, current.id)?;
+    Some((current, current_target))
 }
 
 fn cloud_mcp_terminal_io_heartbeat_ack_payload(
@@ -35531,7 +38229,7 @@ async fn cloud_mcp_handle_terminal_io_message(
         return true;
     };
     let terminal_state = app.state::<TerminalState>();
-    let instance = match get_terminal_instance_if_current(
+    let (instance, target) = match get_terminal_instance_if_current(
         terminal_state.inner(),
         &target.pane_id,
         Some(target.instance_id),
@@ -35542,7 +38240,30 @@ async fn cloud_mcp_handle_terminal_io_message(
             if cloud_mcp_workspace_id_match_key(&instance.metadata.workspace_id)
                 == cloud_mcp_workspace_id_match_key(&target.workspace_id) =>
         {
-            instance
+            (instance, target)
+        }
+        _ if kind == "termio.attach" => {
+            match cloud_mcp_terminal_io_current_attach_target(terminal_state.inner(), &target).await
+            {
+                Some((instance, resolved_target)) => (instance, resolved_target),
+                None => {
+                    let id = cloud_mcp_payload_text(message, &["id"])
+                        .unwrap_or_else(|| format!("termio-ended-{}", cloud_mcp_now_ms()));
+                    let _ = cloud_mcp_send_terminal_io_message(
+                        state,
+                        Some(message),
+                        &target,
+                        "termio.ended",
+                        id,
+                        json!({
+                            "reason": "stale_or_missing_instance",
+                            "request_kind": kind,
+                        }),
+                    )
+                    .await;
+                    return true;
+                }
+            }
         }
         _ => {
             let id = cloud_mcp_payload_text(message, &["id"])
@@ -37519,6 +40240,9 @@ fn cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
             requested,
         );
     }
+    if cloud_mcp_workspace_terminal_empty_clear_is_explicit(workspace, snapshot_reason, requested) {
+        return true;
+    }
     let workspace_clear_reason =
         cloud_mcp_payload_text(workspace, &["workspace_clear_reason"]).unwrap_or_default();
     let workspace_event_reason =
@@ -37573,6 +40297,11 @@ fn cloud_mcp_workspace_panel_empty_clear_is_explicit(
         return true;
     }
     if !workspace_active {
+        if cloud_mcp_panel_empty_clear_reason_is_explicit(requested_panel_clear_reason)
+            || cloud_mcp_panel_empty_clear_reason_is_explicit(snapshot_reason)
+        {
+            return true;
+        }
         let workspace_clear_reason =
             cloud_mcp_payload_text(workspace, &["workspace_clear_reason"]).unwrap_or_default();
         let workspace_event_reason =
@@ -39277,6 +42006,31 @@ fn cloud_mcp_presence_terminal_matches_instance_for_close(
         ),
         Some(value) if value == instance_id
     )
+}
+
+fn cloud_mcp_terminal_snapshot_launch_epoch(
+    snapshot: &Value,
+    pane_id: &str,
+    instance_id: u64,
+) -> Option<String> {
+    let workspaces = snapshot.get("workspaces").and_then(Value::as_array)?;
+    for workspace in workspaces {
+        for terminal in cloud_mcp_workspace_terminal_items(workspace) {
+            if !cloud_mcp_presence_terminal_matches_instance_for_close(
+                &terminal,
+                pane_id,
+                instance_id,
+            ) {
+                continue;
+            }
+            if let Some(launch_epoch) =
+                cloud_mcp_payload_text(&terminal, &["launch_epoch", "terminal_launch_epoch"])
+            {
+                return Some(launch_epoch);
+            }
+        }
+    }
+    None
 }
 
 fn cloud_mcp_terminal_state_removes_from_live_snapshot(terminal: &Value) -> bool {
@@ -41222,6 +43976,9 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 prompt_event_submitted_at: prompt_metadata.prompt_event_submitted_at.clone(),
                 terminal_index: prompt_metadata.terminal_index,
                 thread_id: prompt_metadata.thread_id.clone(),
+                launch_epoch: coordination
+                    .as_ref()
+                    .and_then(|coordination| coordination.terminal_launch_epoch.clone()),
                 workspace_id: prompt_workspace_id,
                 workspace_name: prompt_metadata.workspace_name.clone(),
                 session_mode: session_mode.as_str().to_string(),
@@ -43201,6 +45958,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
             "workspace_runtime_seq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
             "workspace_order": workspace_order,
+            "terminal_count": terminals.len(),
             "terminal_clear_reason": terminal_clear_reason,
             "terminal_list_empty_authoritative": terminal_list_empty_authoritative,
             "terminal_list_authoritative": terminal_list_authoritative,
@@ -45994,6 +48752,35 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     } else {
         payload.thread_id.clone()
     };
+    let snapshot_launch_epoch = if context_entry
+        .as_ref()
+        .and_then(|entry| entry.launch_epoch.as_deref())
+        .is_some()
+    {
+        None
+    } else {
+        let snapshots = state.runtime_snapshots.lock().await;
+        snapshots
+            .workspace_terminals
+            .as_ref()
+            .and_then(|snapshot| {
+                cloud_mcp_terminal_snapshot_launch_epoch(
+                    snapshot,
+                    terminal_id,
+                    payload.instance_id,
+                )
+            })
+    };
+    let launch_epoch = context_entry
+        .as_ref()
+        .and_then(|entry| entry.launch_epoch.clone())
+        .or(snapshot_launch_epoch)
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}:{}",
+                payload.terminal_process_epoch, terminal_id, payload.instance_id
+            )
+        });
     let device_terminal_orchestrator = cloud_mcp_is_app_control_workspace_id(&payload.workspace_id)
         || cloud_mcp_is_app_control_pane_id(terminal_id);
     let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(payload.observed_at_ms));
@@ -46057,6 +48844,7 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "terminal_process_epoch": payload.terminal_process_epoch.as_str(),
         "terminal_index": payload.terminal_index,
         "terminal_epoch": format!("{}:{}", terminal_id, payload.instance_id),
+        "launch_epoch": launch_epoch,
         "terminal_name": payload.terminal_name.as_str(),
         "terminal_nickname": payload.terminal_nickname.as_str(),
         "thread_id": thread_id.as_str(),
@@ -63693,8 +66481,28 @@ mod cloud_mcp_tests {
             "workspace_root_browse",
             "workspace_create",
             "create_workspace",
+            "workspace_settings_update",
+            "workspace_settings",
+            "update_workspace_settings",
+            "terminal_open",
+            "open_terminal",
+            "open_terminals",
+            "terminal_spawn",
+            "spawn_terminals",
+            "terminal_close",
+            "close_terminal",
+            "terminal_force_close",
+            "force_close_terminal",
+            "terminal_remove",
+            "remove_terminal",
+            "workspace_delete",
+            "delete_workspace",
         ] {
             let event = json!({"command_kind": command_kind});
+            assert!(
+                cloud_mcp_daemon_gui_block_message(command_kind).is_none(),
+                "{command_kind} must reach the Rust-owned headless lever"
+            );
             assert!(cloud_mcp_remote_workspace_management_lever_handles(
                 &event, false
             ));
@@ -64421,6 +67229,283 @@ mod cloud_mcp_tests {
         );
         assert_eq!(terminals.first().unwrap()["terminal_index"], json!(30));
         assert_eq!(terminals.last().unwrap()["terminal_index"], json!(53));
+    }
+
+    #[test]
+    fn remote_workspace_settings_layout_clamps_without_wiping_rejected_panel_counts() {
+        let retained = json!({
+            "terminalCount": 3,
+            "terminalRoles": ["claude", "codex", "generic"],
+            "logicalTerminalIndexes": [0, 1, 2],
+            "paneKinds": {"1": "web"},
+            "displayRows": [[0, 1, 2]],
+            "minimizedPaneIndexes": [],
+        });
+        let current_settings = retained.as_object().cloned().unwrap();
+        let event = json!({
+            "command_kind": "workspace_settings_update",
+            "settings": {
+                "terminal_count": 99,
+                "panel_counts": {"web": "oops"},
+            },
+        });
+        let settings_input =
+            cloud_mcp_remote_workspace_settings_input(&event).expect("settings input");
+        let count =
+            cloud_mcp_remote_workspace_settings_input_value(&settings_input, &["terminal_count"])
+                .and_then(cloud_mcp_remote_workspace_integer)
+                .and_then(|count| usize::try_from(count).ok())
+                .map(|count| count.min(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT));
+        let panel_counts = cloud_mcp_remote_workspace_panel_counts(
+            &cloud_mcp_remote_workspace_settings_event(&settings_input),
+        );
+
+        assert_eq!(count, Some(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT));
+        assert!(!panel_counts.has_supported_keys);
+        assert_eq!(
+            panel_counts.rejected_fields,
+            vec![json!({
+                "field": "panel_counts.web",
+                "reason": "invalid_value",
+                "value": "oops",
+            })]
+        );
+
+        let patch = cloud_mcp_remote_workspace_build_settings_layout_patch(
+            &current_settings,
+            count,
+            None,
+            None,
+            false,
+        );
+        let mut next_settings = current_settings.clone();
+        cloud_mcp_remote_workspace_settings_insert_layout(&mut next_settings, &patch.layout);
+
+        assert_eq!(patch.terminal_only_count, 23);
+        assert_eq!(next_settings["terminalCount"], json!(24));
+        assert_eq!(
+            next_settings["paneKinds"]["1"],
+            json!("web"),
+            "rejected panel_counts must not wipe retained layout"
+        );
+        assert_eq!(
+            next_settings["logicalTerminalIndexes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT
+        );
+        assert_eq!(
+            cloud_mcp_remote_workspace_terminal_only_indexes(&patch.layout).len(),
+            23
+        );
+        assert_eq!(patch.panel_counts["web"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn remote_terminal_open_allocates_slot_and_publishes_snapshot() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-remote-terminal-open-data");
+        let cache_root = test_cloud_root("diffforge-remote-terminal-open-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let catalog = vec![json!({
+            "id": "terminal-open-workspace",
+            "name": "Terminal Open Workspace",
+            "root_directory": "/tmp/terminal-open-workspace",
+        })];
+        workspace_consistency_write_catalog(&data_root, Value::Array(catalog.clone()));
+        let mut settings = json!({
+            "terminalCount": 3,
+            "terminalRoles": ["claude", "generic", "codex"],
+            "logicalTerminalIndexes": [0, 1, 2],
+            "paneKinds": {"1": "web"},
+            "displayRows": [[0, 1, 2]],
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+
+        let current_layout = cloud_mcp_remote_workspace_current_layout(&settings);
+        assert_eq!(
+            cloud_mcp_remote_workspace_terminal_only_roles(&current_layout)
+                .iter()
+                .filter(|role| role.as_str() == "opencode")
+                .count(),
+            0
+        );
+        let mutation =
+            cloud_mcp_remote_workspace_add_terminal_layout(&settings, "opencode").expect("slot");
+        assert_eq!(mutation.terminal_index, 3);
+        assert_eq!(mutation.terminal_role, "opencode");
+        cloud_mcp_remote_workspace_settings_insert_layout(&mut settings, &mutation.layout);
+        assert_eq!(settings["logicalTerminalIndexes"], json!([0, 1, 2, 3]));
+        assert_eq!(
+            settings["terminalRoles"],
+            json!(["claude", "generic", "codex", "opencode"])
+        );
+        assert!(settings["paneKinds"].get("3").is_none());
+
+        let configured = cloud_mcp_remote_workspace_catalog_with_configured_layout(
+            catalog,
+            &json!({"terminal-open-workspace": Value::Object(settings)}),
+        );
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        let publish_state = state.clone();
+        let publish = tokio::spawn(async move {
+            cloud_mcp_sync_device_workspaces_snapshot_internal(
+                &publish_state,
+                Value::Array(configured),
+                None,
+                Some("remote_terminal_open".to_string()),
+            )
+            .await
+        });
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        let published = &envelope["request"]["payload"]["workspaces"][0];
+        let terminals = published["terminals"].as_array().unwrap();
+        assert_eq!(published["terminal_count"], json!(3));
+        assert_eq!(terminals.len(), 3);
+        assert!(terminals.iter().any(|terminal| {
+            terminal["terminal_index"] == json!(3) && terminal["agent_kind"] == json!("opencode")
+        }));
+        assert_eq!(publish.await.unwrap().unwrap()["sent"], json!(true));
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn remote_terminal_close_frees_slot_and_publishes_snapshot() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-remote-terminal-close-data");
+        let cache_root = test_cloud_root("diffforge-remote-terminal-close-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let catalog = vec![json!({
+            "id": "terminal-close-workspace",
+            "name": "Terminal Close Workspace",
+            "root_directory": "/tmp/terminal-close-workspace",
+        })];
+        workspace_consistency_write_catalog(&data_root, Value::Array(catalog.clone()));
+        let mut settings = json!({
+            "terminalCount": 4,
+            "terminalRoles": ["claude", "generic", "codex", "opencode"],
+            "logicalTerminalIndexes": [0, 1, 2, 3],
+            "paneKinds": {"1": "web"},
+            "displayRows": [[0, 1, 2], [3]],
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+
+        assert!(
+            cloud_mcp_remote_workspace_remove_slot_layout(&settings, 1).is_none(),
+            "terminal close/remove must not delete workspace panel slots"
+        );
+        let mutation =
+            cloud_mcp_remote_workspace_remove_slot_layout(&settings, 2).expect("slot removed");
+        assert_eq!(mutation.terminal_index, 2);
+        cloud_mcp_remote_workspace_settings_insert_layout(&mut settings, &mutation.layout);
+        assert_eq!(settings["logicalTerminalIndexes"], json!([0, 1, 3]));
+        assert_eq!(
+            settings["terminalRoles"],
+            json!(["claude", "generic", "opencode"])
+        );
+
+        let configured = cloud_mcp_remote_workspace_catalog_with_configured_layout(
+            catalog,
+            &json!({"terminal-close-workspace": Value::Object(settings)}),
+        );
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        let publish_state = state.clone();
+        let publish = tokio::spawn(async move {
+            cloud_mcp_sync_device_workspaces_snapshot_internal(
+                &publish_state,
+                Value::Array(configured),
+                None,
+                Some("remote_terminal_close".to_string()),
+            )
+            .await
+        });
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        let published = &envelope["request"]["payload"]["workspaces"][0];
+        let terminals = published["terminals"].as_array().unwrap();
+        assert_eq!(published["terminal_count"], json!(2));
+        assert!(terminals
+            .iter()
+            .all(|terminal| terminal["terminal_index"] != json!(2)));
+        assert!(terminals
+            .iter()
+            .any(|terminal| terminal["terminal_index"] == json!(3)));
+        assert_eq!(publish.await.unwrap().unwrap()["sent"], json!(true));
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_delete_publish_removes_catalog_row() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let data_root = test_cloud_root("diffforge-remote-workspace-delete-data");
+        let cache_root = test_cloud_root("diffforge-remote-workspace-delete-cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let remaining_catalog = vec![json!({
+            "id": "workspace-keep",
+            "name": "Workspace Keep",
+            "root_directory": "/tmp/workspace-keep",
+        })];
+        workspace_consistency_write_catalog(&data_root, Value::Array(remaining_catalog.clone()));
+        let configured = cloud_mcp_remote_workspace_catalog_with_configured_layout(
+            remaining_catalog,
+            &json!({
+                "workspace-keep": {
+                    "terminalCount": 1,
+                    "terminalRoles": ["codex"],
+                    "logicalTerminalIndexes": [0],
+                },
+                "workspace-delete": {
+                    "terminalCount": 1,
+                    "terminalRoles": ["claude"],
+                    "logicalTerminalIndexes": [0],
+                },
+            }),
+        );
+
+        let (state, mut rx) = workspace_consistency_connected_state().await;
+        let publish_state = state.clone();
+        let publish = tokio::spawn(async move {
+            cloud_mcp_sync_device_workspaces_snapshot_internal(
+                &publish_state,
+                Value::Array(configured),
+                None,
+                Some("remote_workspace_delete".to_string()),
+            )
+            .await
+        });
+        let envelope = workspace_consistency_capture_and_ack(&state, &mut rx).await;
+        let workspaces = envelope["request"]["payload"]["workspaces"]
+            .as_array()
+            .unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0]["workspace_id"], json!("workspace-keep"));
+        assert!(workspaces
+            .iter()
+            .all(|workspace| workspace["workspace_id"] != json!("workspace-delete")));
+        assert_eq!(publish.await.unwrap().unwrap()["sent"], json!(true));
+
+        let _ = fs::remove_dir_all(data_root);
+        let _ = fs::remove_dir_all(cache_root);
     }
 
     #[tokio::test]
@@ -65191,8 +68276,12 @@ mod cloud_mcp_tests {
         let instance_id = 80;
         let profile_stream_key =
             cloud_mcp_terminal_output_stream_key(&device_id, workspace_id, pane_id, instance_id);
-        let alias_stream_key =
-            cloud_mcp_terminal_output_stream_key("web-card-device", workspace_id, pane_id, instance_id);
+        let alias_stream_key = cloud_mcp_terminal_output_stream_key(
+            "web-card-device",
+            workspace_id,
+            pane_id,
+            instance_id,
+        );
         let alias_target =
             cloud_mcp_terminal_io_target(&alias_stream_key).expect("alias target parses");
         termio_test_subscribe(&state, &profile_stream_key, "viewer-dupe");
@@ -65230,6 +68319,184 @@ mod cloud_mcp_tests {
         assert_eq!(frame["kind"], json!("termio.output"));
         assert_eq!(frame["sk"], json!(alias_stream_key));
         assert!(termio_test_try_recv(&mut rx).is_err());
+    }
+
+    #[test]
+    fn termio_attach_retargets_stale_stream_key_to_newer_instance() {
+        let stale_stream_key =
+            cloud_mcp_terminal_output_stream_key("viewer-device", "workspace-rebind", "pane-rebind", 81);
+        let target = cloud_mcp_terminal_io_target(&stale_stream_key).expect("target parses");
+
+        let rebound = cloud_mcp_terminal_io_retarget_newer_instance(&target, 82)
+            .expect("newer instance retargets");
+        assert_eq!(rebound.instance_id, 82);
+        assert_eq!(
+            rebound.stream_key,
+            cloud_mcp_terminal_output_stream_key(
+                "viewer-device",
+                "workspace-rebind",
+                "pane-rebind",
+                82,
+            )
+        );
+        assert!(cloud_mcp_terminal_io_retarget_newer_instance(&target, 81).is_none());
+        assert!(cloud_mcp_terminal_io_retarget_newer_instance(&target, 80).is_none());
+    }
+
+    #[test]
+    fn termio_attach_dedupes_origin_across_rebound_instance_stream_keys() {
+        let state = CloudMcpState::new();
+        let workspace_id = "workspace-rebound-origin";
+        let pane_id = "pane-rebound-origin";
+        let old_stream_key =
+            cloud_mcp_terminal_output_stream_key("viewer-device", workspace_id, pane_id, 90);
+        let new_stream_key =
+            cloud_mcp_terminal_output_stream_key("viewer-device", workspace_id, pane_id, 91);
+        let new_target = cloud_mcp_terminal_io_target(&new_stream_key).expect("new target parses");
+        termio_test_subscribe(&state, &old_stream_key, "viewer-rebound");
+
+        cloud_mcp_terminal_io_attach_origin_to_stream(
+            &state,
+            &new_target,
+            "viewer-rebound",
+            termio_test_subscription("attach-rebound", cloud_mcp_now_ms()),
+        );
+
+        assert!(!cloud_mcp_terminal_io_origin_is_subscribed(
+            &state,
+            &old_stream_key,
+            "viewer-rebound",
+        ));
+        assert!(cloud_mcp_terminal_io_origin_is_subscribed(
+            &state,
+            &new_stream_key,
+            "viewer-rebound",
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn termio_attach_current_target_resolves_newer_live_instance_and_dead_none() {
+        let (terminal_state, removed, root) = tauri::async_runtime::block_on(async {
+            let root = env::temp_dir().join(format!(
+                "termio-attach-current-target-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let size = PtySize {
+                rows: 12,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            };
+            let warm = create_warm_shell_pty_in_directory(size, &root).unwrap();
+            let metadata = TerminalInstanceMetadata {
+                pane_id: "pane-current-target".to_string(),
+                workspace_id: "workspace-current-target".to_string(),
+                agent_id: "generic".to_string(),
+                agent_kind: "generic".to_string(),
+                terminal_process_epoch: "test-process-epoch".to_string(),
+                ..TerminalInstanceMetadata::default()
+            };
+            let (instance, _reader) = TerminalInstance::from_warm_shell(
+                82,
+                warm,
+                root.clone(),
+                false,
+                None,
+                TerminalSessionMode::General,
+                metadata,
+                TerminalLaunchRuntimeMetadata::default(),
+                None,
+                false,
+            );
+            let terminals = Arc::new(RwLock::new(HashMap::from([(
+                "pane-current-target".to_string(),
+                instance.clone(),
+            )])));
+            let terminal_state = TerminalState {
+                terminals: Arc::clone(&terminals),
+                pending_restart_intents: Arc::new(StdMutex::new(HashMap::new())),
+                next_restart_intent_seq: AtomicU64::new(1),
+                terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
+                terminal_input_transport: Arc::new(StdMutex::new(None)),
+                terminal_output_transport: Arc::new(StdMutex::new(None)),
+                terminal_activity_transport: Arc::new(StdMutex::new(None)),
+                terminal_activity_transport_tokens: Arc::new(StdMutex::new(HashMap::new())),
+                terminal_structured_interactions: Arc::new(StdMutex::new(HashMap::new())),
+                terminal_structured_interaction_waiters: Arc::new(StdMutex::new(HashMap::new())),
+                terminal_output_transport_subscribers: Arc::new(StdMutex::new(HashMap::new())),
+                parked_prompts: Arc::new(RwLock::new(HashMap::new())),
+                active_audio_input_target: Arc::new(StdMutex::new(None)),
+                audio_route_gate: Arc::new(StdMutex::new(TerminalAudioRouteGate::default())),
+                lifecycle_lock: Arc::new(Mutex::new(())),
+                pty_pool: Arc::new(PtyPool::new()),
+                cleanup_tracker: Arc::new(TerminalCleanupTracker::new()),
+                workspace_topology_cache: Arc::new(RwLock::new(HashMap::new())),
+                terminal_process_epoch: "test-process-epoch".to_string(),
+                next_terminal_instance_id: AtomicU64::new(83),
+                next_terminal_input_queue_id: AtomicU64::new(1),
+                next_terminal_output_subscriber_id: AtomicU64::new(1),
+            };
+            let stale_stream_key = cloud_mcp_terminal_output_stream_key(
+                "viewer-device",
+                "workspace-current-target",
+                "pane-current-target",
+                81,
+            );
+            let stale_target =
+                cloud_mcp_terminal_io_target(&stale_stream_key).expect("stale target parses");
+            let (resolved_instance, resolved_target) =
+                cloud_mcp_terminal_io_current_attach_target(&terminal_state, &stale_target)
+                    .await
+                    .expect("newer live instance retargets stale attach");
+            assert_eq!(resolved_instance.id, 82);
+            assert_eq!(resolved_target.instance_id, 82);
+            assert_eq!(
+                resolved_target.stream_key,
+                cloud_mcp_terminal_output_stream_key(
+                    "viewer-device",
+                    "workspace-current-target",
+                    "pane-current-target",
+                    82,
+                )
+            );
+
+            let removed = terminals.write().await.remove("pane-current-target").unwrap();
+            assert!(
+                cloud_mcp_terminal_io_current_attach_target(&terminal_state, &stale_target)
+                    .await
+                    .is_none(),
+                "truly dead logical terminal must stay on the ended path"
+            );
+            (terminal_state, removed, root)
+        });
+        cleanup_terminal_instance_with_context(
+            removed,
+            true,
+            "test_termio_attach_current_target",
+            TerminalCoordinationCleanupMode::Preserve,
+        );
+        std::mem::forget(terminal_state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_snapshot_launch_epoch_lookup_matches_exact_instance() {
+        let snapshot = json!({
+            "workspaces": [{
+                "terminals": [
+                    {"pane_id": "pane-launch", "terminal_instance_id": 1, "launch_epoch": "old"},
+                    {"pane_id": "pane-launch", "terminal_instance_id": 2, "launch_epoch": "pane-launch:2"}
+                ]
+            }]
+        });
+
+        assert_eq!(
+            cloud_mcp_terminal_snapshot_launch_epoch(&snapshot, "pane-launch", 2).as_deref(),
+            Some("pane-launch:2")
+        );
+        assert!(cloud_mcp_terminal_snapshot_launch_epoch(&snapshot, "pane-launch", 3).is_none());
     }
 
     fn termio_test_subscription(
@@ -65484,9 +68751,12 @@ mod cloud_mcp_tests {
         // route through this same gated helper — pinned structurally since
         // the attach handler needs a live Tauri app to drive.
         let source = include_str!("cloud_mcp.rs");
+        // last(): the attach re-resolution guard arm (`_ if kind ==
+        // "termio.attach"`) contains the same substring and precedes the
+        // real match arm — the final occurrence is the handler body.
         let attach_arm = source
             .split("\"termio.attach\" => {")
-            .nth(1)
+            .last()
             .and_then(|rest| rest.split("\"termio.detach\" => {").next())
             .expect("attach arm precedes detach arm");
         assert_eq!(
@@ -66320,9 +69590,11 @@ mod cloud_mcp_tests {
         // not the whole arm — the attached payload also carries the id and
         // must not satisfy this check on the snapshot's behalf.)
         let source = include_str!("cloud_mcp.rs");
+        // last(): the attach re-resolution guard arm contains the same
+        // substring — the final occurrence is the handler body.
         let attach_arm = source
             .split("\"termio.attach\" => {")
-            .nth(1)
+            .last()
             .and_then(|rest| rest.split("\"termio.detach\" => {").next())
             .expect("attach arm precedes detach arm");
         let attach_snapshot_payload = attach_arm
@@ -66888,10 +70160,18 @@ mod cloud_mcp_tests {
         let workspace_id = "workspace-control-conflict";
         let pane_id = "pane-control-conflict";
         let instance_id = 81;
-        let profile_stream_key =
-            cloud_mcp_terminal_output_stream_key("native-device", workspace_id, pane_id, instance_id);
-        let alias_stream_key =
-            cloud_mcp_terminal_output_stream_key("alias-device", workspace_id, pane_id, instance_id);
+        let profile_stream_key = cloud_mcp_terminal_output_stream_key(
+            "native-device",
+            workspace_id,
+            pane_id,
+            instance_id,
+        );
+        let alias_stream_key = cloud_mcp_terminal_output_stream_key(
+            "alias-device",
+            workspace_id,
+            pane_id,
+            instance_id,
+        );
         let alias_target =
             cloud_mcp_terminal_io_target(&alias_stream_key).expect("alias target parses");
 
@@ -66918,7 +70198,9 @@ mod cloud_mcp_tests {
             );
             assert_eq!(owners.len(), 1);
             assert_eq!(
-                owners.get(&alias_stream_key).map(|owner| owner.origin.as_str()),
+                owners
+                    .get(&alias_stream_key)
+                    .map(|owner| owner.origin.as_str()),
                 Some("viewer-new")
             );
             assert!(!owners.contains_key(&profile_stream_key));
@@ -71691,6 +74973,7 @@ mod cloud_mcp_tests {
             prompt_event_submitted_at: None,
             terminal_index: Some(0),
             thread_id: Some("thread-a".to_string()),
+            launch_epoch: Some("pane-a:7".to_string()),
             workspace_id: "workspace-a".to_string(),
             workspace_name: "Workspace A".to_string(),
             session_mode: String::new(),
