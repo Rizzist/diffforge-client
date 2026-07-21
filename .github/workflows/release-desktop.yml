@@ -373,6 +373,8 @@ jobs:
           (cd out && sha256sum * > SHA256SUMS)
           ls -la out
       - name: Generate latest.json
+        env:
+          WILL_PUBLISH: ${{ github.ref_type == 'tag' || inputs.publish == true }}
         run: |
           node - <<'EOF'
           const fs = require('fs');
@@ -406,8 +408,24 @@ jobs:
           };
           fs.writeFileSync('out/latest.json', JSON.stringify(manifest, null, 2) + '\n');
           console.log(fs.readFileSync('out/latest.json', 'utf8'));
+          // Every shipping platform must land in the feed (darwin-x86_64 is
+          // out of the build matrix, so it is not expected). The builds stay
+          // continue-on-error on purpose; the guard lives here instead so a
+          // flaky build cannot silently publish an incomplete feed.
+          const expectedKeys = ['darwin-aarch64', 'windows-x86_64', 'linux-x86_64'];
+          const missing = expectedKeys.filter((key) => !platforms[key]);
+          if (missing.length) {
+            const detail = `latest.json is missing expected platforms: ${missing.join(', ')}`;
+            if (process.env.WILL_PUBLISH === 'true') {
+              console.error(`::error::${detail} — refusing to publish a release with incomplete platform artifacts.`);
+              process.exit(1);
+            }
+            console.log(`::warning::${detail} (build-only run; a publishing run would fail here).`);
+          }
           EOF
       - name: Generate updater.json
+        env:
+          WILL_PUBLISH: ${{ github.ref_type == 'tag' || inputs.publish == true }}
         run: |
           node - <<'EOF'
           // Tauri-updater feed: same platform keys as latest.json, but the
@@ -436,6 +454,21 @@ jobs:
           };
           fs.writeFileSync('out/updater.json', JSON.stringify(manifest, null, 2) + '\n');
           console.log(`updater.json platforms: ${Object.keys(platforms).join(', ') || 'none'}`);
+          // Every entry above is an expected OTA platform: a device on a
+          // missing platform would silently never see the update. The builds
+          // stay continue-on-error on purpose; the guard lives here instead
+          // so a flaky build cannot silently publish broken OTA metadata.
+          const missing = entries
+            .filter(([, key]) => !platforms[key])
+            .map(([file, key]) => `${key} (${file} + .sig)`);
+          if (missing.length) {
+            const detail = `updater.json is missing expected OTA platforms: ${missing.join(', ')}`;
+            if (process.env.WILL_PUBLISH === 'true') {
+              console.error(`::error::${detail} — refusing to publish a release with broken OTA metadata.`);
+              process.exit(1);
+            }
+            console.log(`::warning::${detail} (build-only run; a publishing run would fail here).`);
+          }
           EOF
       - uses: actions/upload-artifact@v4
         with:

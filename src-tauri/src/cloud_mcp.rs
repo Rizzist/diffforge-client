@@ -165,6 +165,7 @@ const CLOUD_MCP_BACKGROUND_SYNC_IDLE_WAKE_MS: u64 = 60_000;
 const CLOUD_MCP_BACKGROUND_SYNC_EMPTY_IDLE_WAKE_MS: u64 = 5 * 60_000;
 const CLOUD_MCP_OUTBOX_STALE_IN_FLIGHT_MS: u64 = (CLOUD_MCP_SYNC_TIMEOUT_SECS + 15) * 1000;
 const CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS: u64 = 10_000;
+const CLOUD_MCP_APP_UPDATE_TERMINAL_ACK_TIMEOUT_MS: u64 = 1_200;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH: u8 = 0;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM: u8 = 1;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW: u8 = 2;
@@ -562,9 +563,7 @@ struct CloudMcpRemoteCommandReceipt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloudMcpRemoteCommandReceiptClaim {
     Claimed,
-    Duplicate {
-        first_delivery_rust_owned: bool,
-    },
+    Duplicate { first_delivery_rust_owned: bool },
 }
 
 #[derive(Clone)]
@@ -4733,25 +4732,20 @@ fn cloud_mcp_outbox_idempotency_key(
         normalized_kind.as_str(),
         "remote_command_ack" | "remote_command_result"
     ) {
-        let command_id =
-            cloud_mcp_payload_text(payload, &["command_id"]).unwrap_or_default();
+        let command_id = cloud_mcp_payload_text(payload, &["command_id"]).unwrap_or_default();
         let status = cloud_mcp_payload_text(payload, &["status", "run_status"])
             .unwrap_or_else(|| "unknown".to_string())
             .to_ascii_lowercase();
-        let status_event_id = cloud_mcp_payload_text(
-            payload,
-            &["status_event_id", "idempotency_key", "pid"],
-        )
-        .unwrap_or_default();
+        let status_event_id =
+            cloud_mcp_payload_text(payload, &["status_event_id", "idempotency_key", "pid"])
+                .unwrap_or_default();
         if !command_id.is_empty() {
             // Remote-command statuses are an ordered event stream, not a
             // replaceable command snapshot. Keep each lifecycle status in its
             // own durable row while preserving per-status idempotency. A
             // producer-provided status_event_id further distinguishes repeated
             // events of the same status when that is intentional.
-            return format!(
-                "remote-command-status:{command_id}:{status}:{status_event_id}"
-            );
+            return format!("remote-command-status:{command_id}:{status}:{status_event_id}");
         }
     }
     if let Some(key) = cloud_mcp_payload_text(payload, &["pid", "idempotency_key"]) {
@@ -7789,6 +7783,43 @@ async fn cloud_mcp_send_event_over_app_ws_once(
     payload: &Value,
     request_prefix: &str,
 ) -> Result<Value, String> {
+    cloud_mcp_send_event_over_app_ws_once_inner(
+        state,
+        event_kind,
+        payload,
+        request_prefix,
+        true,
+        Duration::from_millis(CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS),
+    )
+    .await
+}
+
+async fn cloud_mcp_send_event_over_live_app_ws_once(
+    state: &CloudMcpState,
+    event_kind: &str,
+    payload: &Value,
+    request_prefix: &str,
+    ack_timeout: Duration,
+) -> Result<Value, String> {
+    cloud_mcp_send_event_over_app_ws_once_inner(
+        state,
+        event_kind,
+        payload,
+        request_prefix,
+        false,
+        ack_timeout,
+    )
+    .await
+}
+
+async fn cloud_mcp_send_event_over_app_ws_once_inner(
+    state: &CloudMcpState,
+    event_kind: &str,
+    payload: &Value,
+    request_prefix: &str,
+    wait_for_connection: bool,
+    ack_timeout: Duration,
+) -> Result<Value, String> {
     if let Err(reason) =
         cloud_mcp_validate_authoritative_workspace_snapshot_payload(event_kind, payload)
     {
@@ -7799,8 +7830,21 @@ async fn cloud_mcp_send_event_over_app_ws_once(
             "{CLOUD_MCP_AUTHORITATIVE_WORKSPACE_SNAPSHOT_REBUILD_PREFIX}{reason}"
         ));
     }
-    cloud_mcp_start_global_ws(state).await;
-    let tx = cloud_mcp_wait_for_ws_sender(state).await?;
+    let tx = if wait_for_connection {
+        cloud_mcp_start_global_ws(state).await;
+        cloud_mcp_wait_for_ws_sender(state).await?
+    } else {
+        if !CLOUD_MCP_GLOBAL_WS_LIVE.load(Ordering::Acquire) {
+            return Err("Cloud MCP app websocket is not connected.".to_string());
+        }
+        state
+            .global_ws_tx
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Cloud MCP app websocket is not connected.".to_string())?
+    };
     let auth = cloud_mcp_ws_auth_object(state).await?;
     if tx.is_closed() {
         return Err("Cloud MCP app websocket sender is closed.".to_string());
@@ -7861,12 +7905,7 @@ async fn cloud_mcp_send_event_over_app_ws_once(
         return Err("Cloud MCP app websocket is not accepting messages.".to_string());
     }
 
-    let response = match timeout(
-        Duration::from_millis(CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS),
-        response_rx,
-    )
-    .await
-    {
+    let response = match timeout(ack_timeout, response_rx).await {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => {
             state.global_ws_pending.lock().await.remove(&request_id);
@@ -11830,8 +11869,11 @@ fn cloud_mcp_process_authorization_bearer() -> Option<String> {
             // writes the JWT while the minting token is still current; a
             // stale mint is dropped entirely (not returned either — it would
             // authenticate the caller as the old account).
-            if cloud_mcp_commit_minted_jwt_to_process_cache(&desktop_session_token, &jwt, expires_ms)
-            {
+            if cloud_mcp_commit_minted_jwt_to_process_cache(
+                &desktop_session_token,
+                &jwt,
+                expires_ms,
+            ) {
                 return Some(jwt);
             }
             log_cloud_sync_event(
@@ -17843,30 +17885,31 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
             continue;
         }
         let remote_command_account_key = state.auth.lock().await.account_key.clone();
-        let remote_lever_handled = cloud_mcp_apply_remote_workspace_lever_for_dispatcher(
-            &app,
-            state,
-            &event,
-            webview_dispatcher_active,
-        ) || cloud_mcp_apply_remote_loopspace_lever_for_dispatcher(
-            &app,
-            state,
-            &event,
-            webview_dispatcher_active,
-            &remote_command_account_key,
-        ) || orchestrator_pool_apply_remote_send_lever(&app, state, &event)
-            || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, state, &event)
-            || cloud_mcp_apply_remote_terminal_lever(&app, state, &event)
-            || cloud_mcp_apply_remote_agent_lever(&app, state, &event)
-            || cloud_mcp_apply_remote_agent_prompt_lever(
+        let remote_lever_handled =
+            cloud_mcp_apply_remote_workspace_lever_for_dispatcher(
                 &app,
                 state,
                 &event,
                 webview_dispatcher_active,
-            )
-            || cloud_mcp_apply_remote_asset_lever(&app, state, &event)
-            || cloud_mcp_apply_remote_local_script_lever(&app, state, &event)
-            || cloud_mcp_apply_remote_device_lever(&app, state, &event);
+            ) || cloud_mcp_apply_remote_loopspace_lever_for_dispatcher(
+                &app,
+                state,
+                &event,
+                webview_dispatcher_active,
+                &remote_command_account_key,
+            ) || orchestrator_pool_apply_remote_send_lever(&app, state, &event)
+                || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, state, &event)
+                || cloud_mcp_apply_remote_terminal_lever(&app, state, &event)
+                || cloud_mcp_apply_remote_agent_lever(&app, state, &event)
+                || cloud_mcp_apply_remote_agent_prompt_lever(
+                    &app,
+                    state,
+                    &event,
+                    webview_dispatcher_active,
+                )
+                || cloud_mcp_apply_remote_asset_lever(&app, state, &event)
+                || cloud_mcp_apply_remote_local_script_lever(&app, state, &event)
+                || cloud_mcp_apply_remote_device_lever(&app, state, &event);
         if !remote_lever_handled
             && !cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
                 &event,
@@ -18922,12 +18965,8 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
         return;
     }
     if direct_kind == "account_device_live_state_snapshot" {
-        cloud_mcp_cache_account_device_live_state_snapshot(
-            state,
-            &message,
-            socket_account_epoch,
-        )
-        .await;
+        cloud_mcp_cache_account_device_live_state_snapshot(state, &message, socket_account_epoch)
+            .await;
         let _ = state.global_ws_events.send(message);
         return;
     }
@@ -19131,12 +19170,8 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
             return;
         }
         if event_kind == "account_device_live_state_snapshot" {
-            cloud_mcp_cache_account_device_live_state_snapshot(
-                state,
-                &event,
-                socket_account_epoch,
-            )
-            .await;
+            cloud_mcp_cache_account_device_live_state_snapshot(state, &event, socket_account_epoch)
+                .await;
         }
         if cloud_mcp_value_is_account_usage(&event) {
             cloud_mcp_cache_account_usage_snapshot(state, &event, socket_account_epoch).await;
@@ -19788,6 +19823,14 @@ fn cloud_mcp_remote_command_field_bool(event: &Value, keys: &[&str]) -> Option<b
 }
 
 fn cloud_mcp_remote_workspace_requires_foreground(event: &Value) -> bool {
+    // Daemon mode has no windows and no AppShell: a foreground-defaulted
+    // activation would be journaled into the UI-handoff queue and wait forever
+    // for a webview that never mounts (the dashboard omits show_window, and
+    // omission historically meant foreground). Headless devices always take
+    // the Rust-owned execution path.
+    if crate::daemon_mode_active() {
+        return false;
+    }
     cloud_mcp_remote_command_field_bool(event, &["show_window"]).unwrap_or(true)
 }
 
@@ -20115,10 +20158,7 @@ fn cloud_mcp_duplicate_remote_command_is_ui_retry_for(
     webview_dispatcher_active
         && !daemon_mode_active
         && !first_delivery_rust_owned
-        && !cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
-            event,
-            webview_dispatcher_active,
-        )
+        && !cloud_mcp_remote_command_is_rust_owned_for_dispatcher(event, webview_dispatcher_active)
 }
 
 async fn cloud_mcp_ack_duplicate_remote_command(
@@ -20294,6 +20334,129 @@ async fn cloud_mcp_send_remote_command_status_event(
     message: &str,
     details: Option<&Value>,
 ) -> Result<Value, String> {
+    cloud_mcp_send_remote_command_status_event_inner(
+        state, event, status, message, details, false, true,
+    )
+    .await
+}
+
+pub(crate) async fn cloud_mcp_send_app_update_remote_command_status_event(
+    state: &CloudMcpState,
+    event: &Value,
+    status: &str,
+    message: &str,
+    details: Option<&Value>,
+) -> Result<Value, String> {
+    cloud_mcp_send_remote_command_status_event_inner(
+        state, event, status, message, details, true, true,
+    )
+    .await
+}
+
+pub(crate) async fn cloud_mcp_send_app_update_remote_command_nonterminal_status_event(
+    state: &CloudMcpState,
+    event: &Value,
+    status: &str,
+    message: &str,
+    details: Option<&Value>,
+) -> Result<Value, String> {
+    // OTA queued is advisory. A durable retry could arrive after the command's
+    // durable terminal and regress the dashboard, so await this live send but
+    // reserve the outbox contract for the terminal outcome.
+    cloud_mcp_send_remote_command_status_event_inner(
+        state, event, status, message, details, true, false,
+    )
+    .await
+}
+
+async fn cloud_mcp_persist_app_update_remote_command_status(
+    state: &CloudMcpState,
+    key: String,
+    event_kind: &str,
+    payload: &Value,
+    priority: u8,
+) -> Result<(), String> {
+    cloud_mcp_background_sync_ensure_started(state);
+    let reason = "remote_command_status";
+    let persisted_event_kind = event_kind.to_string();
+    let persisted_payload = payload.clone();
+    let persistence = tauri::async_runtime::spawn_blocking(move || {
+        cloud_mcp_outbox_enqueue_event(&persisted_event_kind, &persisted_payload, priority, reason)
+    })
+    .await
+    .map_err(|error| format!("App update outbox persistence task failed: {error}"))?;
+    match persistence {
+        Ok(row) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.outbox.queued",
+                json!({
+                    "event_kind": event_kind,
+                    "key": key,
+                    "reason": reason,
+                    "outbox_id": row.outbox_id,
+                    "idempotency_key": row.idempotency_key,
+                }),
+            );
+            state.background_sync.notify.notify_one();
+            if cloud_mcp_outbox_event_is_expedited(event_kind) {
+                cloud_mcp_spawn_expedited_agent_chat_drain(state);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // Keep the ordinary in-memory fallback for a process that stays
+            // alive, but report that it is not durable so OTA restart gating
+            // cannot mistake this job for persistence across process exit.
+            let job = CloudMcpBackgroundSyncJob {
+                enqueued_ms: cloud_mcp_now_ms(),
+                event_kind: event_kind.to_string(),
+                key: key.clone(),
+                payload: payload.clone(),
+                priority,
+                reason: reason.to_string(),
+            };
+            state
+                .background_sync
+                .pending
+                .lock()
+                .await
+                .insert(key.clone(), job);
+            let domain = cloud_mcp_sync_activity_domain(event_kind);
+            let bytes = cloud_mcp_sync_payload_bytes(payload);
+            let count = cloud_mcp_sync_payload_count(payload);
+            cloud_mcp_record_sync_activity(
+                domain,
+                "up",
+                "queued",
+                count,
+                bytes,
+                false,
+                cloud_mcp_sync_activity_size_class("queued", count, bytes, domain),
+                &format!("background:{event_kind}:{key}"),
+            );
+            log_terminal_status_event(
+                "backend.cloud_mcp.outbox.queue_error",
+                json!({
+                    "error": clean_terminal_telemetry_text(&error),
+                    "event_kind": event_kind,
+                    "key": key,
+                }),
+            );
+            state.background_sync.notify.notify_one();
+            Err(error)
+        }
+    }
+}
+
+async fn cloud_mcp_send_remote_command_status_event_inner(
+    state: &CloudMcpState,
+    event: &Value,
+    status: &str,
+    message: &str,
+    details: Option<&Value>,
+    await_live_send: bool,
+    durable_delivery: bool,
+) -> Result<Value, String> {
     let now = cloud_mcp_now_ms();
     let device_profile = cloud_mcp_desktop_device_profile();
     let target_terminal_nickname = cloud_mcp_terminal_nickname_text(
@@ -20455,37 +20618,117 @@ async fn cloud_mcp_send_remote_command_status_event(
             "workspace_id": cloud_mcp_remote_command_field_text(event, &["workspace_id"]),
         }),
     );
-    let direct_state = state.clone();
-    let direct_payload = payload.clone();
-    let direct_status_kind = status_kind.to_string();
-    tauri::async_runtime::spawn(async move {
-        let result = cloud_mcp_send_event_over_app_ws_once(
-            &direct_state,
-            &direct_status_kind,
-            &direct_payload,
-            "remote-command-status-live",
+    let ota_terminal_delivery = await_live_send && durable_delivery;
+    let durable_status_id =
+        cloud_mcp_payload_text(&payload, &["status_event_id"]).unwrap_or_else(|| now.to_string());
+    let durable_key = format!("remote-command-status:{command_id}:{status}:{durable_status_id}");
+    let durable_result = if ota_terminal_delivery {
+        // Persist first. If the websocket is already down, this lets restart
+        // proceed immediately on durable confirmation instead of waiting for
+        // a connection attempt that cannot beat process exit.
+        Some(
+            cloud_mcp_persist_app_update_remote_command_status(
+                state,
+                durable_key.clone(),
+                status_kind,
+                &payload,
+                cloud_mcp_outbox_priority_for_event(status_kind),
+            )
+            .await,
         )
-        .await;
+    } else {
+        None
+    };
+    let live_result = if ota_terminal_delivery {
+        let result = if CLOUD_MCP_GLOBAL_WS_LIVE.load(Ordering::Acquire) {
+            cloud_mcp_send_event_over_live_app_ws_once(
+                state,
+                status_kind,
+                &payload,
+                "app-update-terminal-status-live",
+                Duration::from_millis(CLOUD_MCP_APP_UPDATE_TERMINAL_ACK_TIMEOUT_MS),
+            )
+            .await
+        } else {
+            Err("Cloud MCP app websocket is not connected.".to_string())
+        };
         log_cloud_sync_event(
             "remote_command.status_live_sent",
             json!({
-                "event_kind": direct_status_kind,
+                "event_kind": status_kind,
                 "ok": result.is_ok(),
-                "error": result.err().map(|error| clean_terminal_telemetry_text(&error)),
+                "error": result
+                    .as_ref()
+                    .err()
+                    .map(|error| clean_terminal_telemetry_text(error)),
             }),
         );
-    });
-    let durable_status_id = cloud_mcp_payload_text(&payload, &["status_event_id"])
-        .unwrap_or_else(|| now.to_string());
-    cloud_mcp_enqueue_background_sync(
-        state,
-        format!("remote-command-status:{command_id}:{status}:{durable_status_id}"),
-        status_kind,
-        payload.clone(),
-        cloud_mcp_outbox_priority_for_event(status_kind),
-        "remote_command_status",
-    )
-    .await;
+        Some(result)
+    } else {
+        if await_live_send {
+            // OTA queued is advisory and only useful on the existing socket.
+            // Do not hold shutdown/restart ordering open while reconnecting.
+            let result = if CLOUD_MCP_GLOBAL_WS_LIVE.load(Ordering::Acquire) {
+                cloud_mcp_send_event_over_live_app_ws_once(
+                    state,
+                    status_kind,
+                    &payload,
+                    "app-update-nonterminal-status-live",
+                    Duration::from_millis(CLOUD_MCP_APP_UPDATE_TERMINAL_ACK_TIMEOUT_MS),
+                )
+                .await
+            } else {
+                Err("Cloud MCP app websocket is not connected.".to_string())
+            };
+            log_cloud_sync_event(
+                "remote_command.status_live_sent",
+                json!({
+                    "event_kind": status_kind,
+                    "ok": result.is_ok(),
+                    "error": result
+                        .as_ref()
+                        .err()
+                        .map(|error| clean_terminal_telemetry_text(error)),
+                }),
+            );
+        } else {
+            let direct_state = state.clone();
+            let direct_payload = payload.clone();
+            let direct_status_kind = status_kind.to_string();
+            tauri::async_runtime::spawn(async move {
+                let result = cloud_mcp_send_event_over_app_ws_once(
+                    &direct_state,
+                    &direct_status_kind,
+                    &direct_payload,
+                    "remote-command-status-live",
+                )
+                .await;
+                log_cloud_sync_event(
+                    "remote_command.status_live_sent",
+                    json!({
+                        "event_kind": direct_status_kind,
+                        "ok": result.is_ok(),
+                        "error": result
+                            .as_ref()
+                            .err()
+                            .map(|error| clean_terminal_telemetry_text(error)),
+                    }),
+                );
+            });
+        }
+        None
+    };
+    if durable_delivery && !ota_terminal_delivery {
+        cloud_mcp_enqueue_background_sync(
+            state,
+            durable_key,
+            status_kind,
+            payload.clone(),
+            cloud_mcp_outbox_priority_for_event(status_kind),
+            "remote_command_status",
+        )
+        .await;
+    }
     if cloud_mcp_payload_text(&payload, &["todo_dispatch_id"]).is_some() {
         let _ = cloud_mcp_apply_local_workspace_todo_event(
             state,
@@ -20495,10 +20738,34 @@ async fn cloud_mcp_send_remote_command_status_event(
         )
         .await;
     }
+    let live_confirmed = live_result.as_ref().is_some_and(Result::is_ok);
+    let durable_confirmed = durable_result.as_ref().is_some_and(Result::is_ok);
+    if ota_terminal_delivery && !live_confirmed && !durable_confirmed {
+        let live_error = live_result
+            .and_then(Result::err)
+            .unwrap_or_else(|| "live delivery was not attempted".to_string());
+        let durable_error = durable_result
+            .and_then(Result::err)
+            .unwrap_or_else(|| "durable persistence was not attempted".to_string());
+        return Err(format!(
+            "App update terminal delivery was not confirmed (live: {}; durable: {}).",
+            clean_terminal_telemetry_text(&live_error),
+            clean_terminal_telemetry_text(&durable_error),
+        ));
+    }
     Ok(json!({
         "ok": true,
-        "queued": true,
-        "durable": true,
+        "queued": if ota_terminal_delivery {
+            durable_confirmed
+        } else {
+            durable_delivery
+        },
+        "live_confirmed": live_confirmed,
+        "durable": if ota_terminal_delivery {
+            durable_confirmed
+        } else {
+            durable_delivery
+        },
         "status": status,
     }))
 }
@@ -20922,12 +21189,10 @@ pub(crate) fn cloud_mcp_ensure_remote_command_listener(
             // fence passed. Commands stamped with their socket's birth epoch
             // are dropped here when the epoch has moved — never recorded into
             // the intake store or executed under account B's context.
-            if let Some(frame_account_epoch) = event
-                .get("socket_account_epoch")
-                .and_then(Value::as_u64)
+            if let Some(frame_account_epoch) =
+                event.get("socket_account_epoch").and_then(Value::as_u64)
             {
-                let current_account_epoch =
-                    state_clone.account_epoch.load(Ordering::SeqCst);
+                let current_account_epoch = state_clone.account_epoch.load(Ordering::SeqCst);
                 if frame_account_epoch != current_account_epoch {
                     log_cloud_sync_event(
                         "remote_command.dropped_stale_account_epoch",
@@ -21036,32 +21301,32 @@ pub(crate) fn cloud_mcp_ensure_remote_command_listener(
             if cloud_mcp_apply_daemon_remote_command_guard(&state_clone, &event).await {
                 continue;
             }
-            let remote_command_account_key =
-                state_clone.auth.lock().await.account_key.clone();
-            let remote_lever_handled = cloud_mcp_apply_remote_workspace_lever_for_dispatcher(
-                &app,
-                &state_clone,
-                &event,
-                webview_dispatcher_active,
-            ) || cloud_mcp_apply_remote_loopspace_lever_for_dispatcher(
-                &app,
-                &state_clone,
-                &event,
-                webview_dispatcher_active,
-                &remote_command_account_key,
-            ) || orchestrator_pool_apply_remote_send_lever(&app, &state_clone, &event)
-                || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, &state_clone, &event)
-                || cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event)
-                || cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event)
-                || cloud_mcp_apply_remote_agent_prompt_lever(
+            let remote_command_account_key = state_clone.auth.lock().await.account_key.clone();
+            let remote_lever_handled =
+                cloud_mcp_apply_remote_workspace_lever_for_dispatcher(
                     &app,
                     &state_clone,
                     &event,
                     webview_dispatcher_active,
-                )
-                || cloud_mcp_apply_remote_asset_lever(&app, &state_clone, &event)
-                || cloud_mcp_apply_remote_local_script_lever(&app, &state_clone, &event)
-                || cloud_mcp_apply_remote_device_lever(&app, &state_clone, &event);
+                ) || cloud_mcp_apply_remote_loopspace_lever_for_dispatcher(
+                    &app,
+                    &state_clone,
+                    &event,
+                    webview_dispatcher_active,
+                    &remote_command_account_key,
+                ) || orchestrator_pool_apply_remote_send_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_agent_prompt_lever(
+                        &app,
+                        &state_clone,
+                        &event,
+                        webview_dispatcher_active,
+                    )
+                    || cloud_mcp_apply_remote_asset_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_local_script_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_device_lever(&app, &state_clone, &event);
             if remote_lever_handled
                 || cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
                     &event,
@@ -21182,7 +21447,10 @@ fn cloud_mcp_remote_workspace_failed_outcome(
     extra_details: Option<Value>,
 ) -> CloudMcpRemoteWorkspaceCommandOutcome {
     let mut details = cloud_mcp_remote_workspace_command_details(event);
-    if let (Some(target), Some(extra)) = (details.as_object_mut(), extra_details.as_ref().and_then(Value::as_object)) {
+    if let (Some(target), Some(extra)) = (
+        details.as_object_mut(),
+        extra_details.as_ref().and_then(Value::as_object),
+    ) {
         for (key, value) in extra {
             target.insert(key.clone(), value.clone());
         }
@@ -21197,10 +21465,11 @@ fn cloud_mcp_remote_workspace_failed_outcome(
 fn cloud_mcp_remote_workspace_name_and_root(
     event: &Value,
 ) -> Result<(String, String), CloudMcpRemoteWorkspaceCommandOutcome> {
-    let requested_name = cloud_mcp_remote_workspace_string_field(event, &["workspace_name", "name"])
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let requested_name =
+        cloud_mcp_remote_workspace_string_field(event, &["workspace_name", "name"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
     if requested_name.is_empty() || requested_name.chars().count() > 80 {
         return Err(cloud_mcp_remote_workspace_failed_outcome(
             event,
@@ -21340,9 +21609,7 @@ fn cloud_mcp_remote_workspace_safety_mode(event: &Value) -> CloudMcpRemoteWorksp
         "coordinated" | "coordination" | "direct_coordination" => {
             ("coordinated", "direct_coordination")
         }
-        "full" | "direct" | "direct_unmanaged" | "unmanaged" => {
-            ("full", "direct_unmanaged")
-        }
+        "full" | "direct" | "direct_unmanaged" | "unmanaged" => ("full", "direct_unmanaged"),
         _ => {
             return CloudMcpRemoteWorkspaceSafetyMode {
                 provided: true,
@@ -21392,8 +21659,7 @@ fn cloud_mcp_remote_workspace_integer(value: &Value) -> Option<i64> {
 fn cloud_mcp_remote_workspace_terminal_roles(
     event: &Value,
 ) -> CloudMcpRemoteWorkspaceTerminalRoles {
-    let Some(object) = cloud_mcp_remote_workspace_object_field(event, "terminal_roles")
-    else {
+    let Some(object) = cloud_mcp_remote_workspace_object_field(event, "terminal_roles") else {
         return CloudMcpRemoteWorkspaceTerminalRoles {
             has_valid_role_count: false,
             provided: false,
@@ -21490,11 +21756,8 @@ fn cloud_mcp_remote_workspace_panel_count(value: &Value, max: usize) -> Option<u
         .map(|count| count.min(max as i64) as usize)
 }
 
-fn cloud_mcp_remote_workspace_panel_counts(
-    event: &Value,
-) -> CloudMcpRemoteWorkspacePanelCounts {
-    let Some(object) = cloud_mcp_remote_workspace_object_field(event, "panel_counts")
-    else {
+fn cloud_mcp_remote_workspace_panel_counts(event: &Value) -> CloudMcpRemoteWorkspacePanelCounts {
+    let Some(object) = cloud_mcp_remote_workspace_object_field(event, "panel_counts") else {
         return CloudMcpRemoteWorkspacePanelCounts {
             has_supported_keys: false,
             has_only_valid_integer_values: false,
@@ -21512,15 +21775,12 @@ fn cloud_mcp_remote_workspace_panel_counts(
     let mut has_non_integer_supported_value = false;
     for (key, value) in object {
         let canonical = match key.as_str() {
-            "doc" | "docs" | "document" | "document_count" | "documents"
-            | "documents_count" => Some("document"),
+            "doc" | "docs" | "document" | "document_count" | "documents" | "documents_count" => {
+                Some("document")
+            }
             "browser" | "browsers" | "web" | "web_count" => Some("web"),
-            "pcb" | "pcbDesign" | "pcb-design" | "pcb_count" | "pcbs" => {
-                Some("pcb-design")
-            }
-            "vm" | "vmSandbox" | "vm-sandbox" | "vm_count" | "vms" => {
-                Some("vm-sandbox")
-            }
+            "pcb" | "pcbDesign" | "pcb-design" | "pcb_count" | "pcbs" => Some("pcb-design"),
+            "vm" | "vmSandbox" | "vm-sandbox" | "vm_count" | "vms" => Some("vm-sandbox"),
             "video" | "videoEditor" | "video-editor" | "video_count" | "videos" => {
                 Some("video-editor")
             }
@@ -21533,8 +21793,7 @@ fn cloud_mcp_remote_workspace_panel_counts(
                 "video-editor" => 3,
                 _ => 4,
             };
-            let valid = (canonical == "document"
-                && matches!(value, Value::Bool(_) | Value::Null))
+            let valid = (canonical == "document" && matches!(value, Value::Bool(_) | Value::Null))
                 || cloud_mcp_remote_workspace_panel_count(value, max).is_some();
             if valid {
                 has_non_integer_supported_value |=
@@ -21556,9 +21815,8 @@ fn cloud_mcp_remote_workspace_panel_counts(
             }));
         }
     }
-    let mut has_only_valid_integer_values = !supported.is_empty()
-        && !has_invalid_supported_value
-        && !has_non_integer_supported_value;
+    let mut has_only_valid_integer_values =
+        !supported.is_empty() && !has_invalid_supported_value && !has_non_integer_supported_value;
     let mut parse_count = |canonical: &str, max: usize| {
         let Some((key, value)) = supported.get(canonical) else {
             return 0;
@@ -21675,7 +21933,10 @@ fn cloud_mcp_build_remote_workspace_initial_layout_settings(
         seeded_web_count = kinds.values().filter(|kind| **kind == json!("web")).count();
         seeded_pcb_count = kinds.values().filter(|kind| **kind == json!("pcb")).count();
         seeded_vm_count = kinds.values().filter(|kind| **kind == json!("vm")).count();
-        seeded_video_count = kinds.values().filter(|kind| **kind == json!("video")).count();
+        seeded_video_count = kinds
+            .values()
+            .filter(|kind| **kind == json!("video"))
+            .count();
         seeded_terminal_roles = Some(roles);
         pane_kinds = Some(kinds);
     }
@@ -21709,9 +21970,8 @@ fn cloud_mcp_remote_workspace_iso8601_now() -> String {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let day_of_era = z - era * 146_097;
-    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
-        - day_of_era / 146_096)
-        / 365;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let mut year = year_of_era + era * 400;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
@@ -21734,9 +21994,9 @@ fn cloud_mcp_remote_workspace_duplicate(
 ) -> Result<Option<(String, String)>, String> {
     let path = local_workspace_store_path(app, scope_key)?;
     let workspace_settings = app_local_state_read(app, "workspace-settings");
-    for workspace in local_workspace_catalog_visible_items(
-        local_workspace_catalog_read_items_from_path(&path)?,
-    ) {
+    for workspace in
+        local_workspace_catalog_visible_items(local_workspace_catalog_read_items_from_path(&path)?)
+    {
         let candidate_identity =
             local_workspace_catalog_root_identity(&workspace, &workspace_settings)
                 .map(|(identity, _)| identity)
@@ -21744,7 +22004,9 @@ fn cloud_mcp_remote_workspace_duplicate(
                     default_working_directory().ok().map(|root| {
                         root.canonicalize()
                             .map(|canonical| normalized_path_key(&canonical))
-                            .unwrap_or_else(|_| normalized_literal_path_key(&root.to_string_lossy()))
+                            .unwrap_or_else(|_| {
+                                normalized_literal_path_key(&root.to_string_lossy())
+                            })
                     })
                 })
                 .unwrap_or_default();
@@ -21752,11 +22014,9 @@ fn cloud_mcp_remote_workspace_duplicate(
             continue;
         }
         let workspace_id = local_workspace_catalog_entry_id(&workspace).unwrap_or_default();
-        let workspace_name = local_workspace_catalog_text(
-            &workspace,
-            &["name", "workspace_name", "workspaceName"],
-        )
-        .unwrap_or_else(|| "another workspace".to_string());
+        let workspace_name =
+            local_workspace_catalog_text(&workspace, &["name", "workspace_name", "workspaceName"])
+                .unwrap_or_else(|| "another workspace".to_string());
         return Ok(Some((workspace_id, workspace_name)));
     }
     Ok(None)
@@ -21768,9 +22028,8 @@ fn cloud_mcp_remote_workspace_catalog_with_row(
     workspace: Value,
 ) -> Result<Vec<Value>, String> {
     let path = local_workspace_store_path(app, scope_key)?;
-    let mut catalog = local_workspace_catalog_visible_items(
-        local_workspace_catalog_read_items_from_path(&path)?,
-    );
+    let mut catalog =
+        local_workspace_catalog_visible_items(local_workspace_catalog_read_items_from_path(&path)?);
     let workspace_id = local_workspace_catalog_entry_id(&workspace).unwrap_or_default();
     if let Some(index) = catalog.iter().position(|candidate| {
         local_workspace_catalog_entry_id(candidate).as_deref() == Some(workspace_id.as_str())
@@ -21826,10 +22085,7 @@ fn cloud_mcp_remote_workspace_merge_created_settings(
         json!(root_directory),
     );
     settings.insert("rootWasEmptyAtSelection".to_string(), json!(root_was_empty));
-    settings.insert(
-        "rootGitRepository".to_string(),
-        json!(root_git_repository),
-    );
+    settings.insert("rootGitRepository".to_string(), json!(root_git_repository));
     cloud_mcp_remote_workspace_insert_persisted_setting(
         &mut settings,
         "agentSessionMode",
@@ -22083,11 +22339,7 @@ fn cloud_mcp_remote_workspace_configured_terminal_snapshot(
     terminal_index: usize,
     role: &str,
 ) -> Value {
-    let pane_id = cloud_mcp_remote_workspace_configured_pane_id(
-        workspace_id,
-        terminal_index,
-        role,
-    );
+    let pane_id = cloud_mcp_remote_workspace_configured_pane_id(workspace_id, terminal_index, role);
     let agent_label = match role {
         "claude" => "Claude Code",
         "opencode" => "OpenCode",
@@ -22149,11 +22401,7 @@ fn cloud_mcp_remote_workspace_configured_panel_snapshot(
         .unwrap_or_else(|| {
             terminal_index
                 .map(|index| {
-                    cloud_mcp_remote_workspace_configured_pane_id(
-                        workspace_id,
-                        index,
-                        role,
-                    )
+                    cloud_mcp_remote_workspace_configured_pane_id(workspace_id, index, role)
                 })
                 .unwrap_or_else(|| "workspace-document-panel".to_string())
         });
@@ -22194,11 +22442,9 @@ fn cloud_mcp_remote_workspace_catalog_with_configured_layout(
         let Some(workspace_id) = local_workspace_catalog_entry_id(workspace) else {
             continue;
         };
-        let workspace_name = local_workspace_catalog_text(
-            workspace,
-            &["name", "workspace_name", "workspaceName"],
-        )
-        .unwrap_or_else(|| workspace_id.clone());
+        let workspace_name =
+            local_workspace_catalog_text(workspace, &["name", "workspace_name", "workspaceName"])
+                .unwrap_or_else(|| workspace_id.clone());
         let Some(settings) = workspace_settings
             .get(&workspace_id)
             .and_then(Value::as_object)
@@ -22265,10 +22511,7 @@ fn cloud_mcp_remote_workspace_catalog_with_configured_layout(
                 .filter(|(_, index)| !pane_kinds.contains_key(index))
                 .take(CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT)
                 .map(|(position, terminal_index)| {
-                    let role = roles
-                        .get(position)
-                        .map(String::as_str)
-                        .unwrap_or("codex");
+                    let role = roles.get(position).map(String::as_str).unwrap_or("codex");
                     cloud_mcp_remote_workspace_configured_terminal_snapshot(
                         &workspace_id,
                         &workspace_name,
@@ -22284,7 +22527,12 @@ fn cloud_mcp_remote_workspace_catalog_with_configured_layout(
             .iter()
             .map(|(terminal_index, kind)| {
                 let role = roles
-                    .get(logical_positions.get(terminal_index).copied().unwrap_or(usize::MAX))
+                    .get(
+                        logical_positions
+                            .get(terminal_index)
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                    )
                     .map(String::as_str)
                     .unwrap_or("generic");
                 cloud_mcp_remote_workspace_configured_panel_snapshot(
@@ -22456,11 +22704,10 @@ async fn cloud_mcp_execute_remote_workspace_create(
         );
     }
     let requested_panel_counts = cloud_mcp_remote_workspace_panel_counts(event);
-    let (requested_name, requested_root) =
-        match cloud_mcp_remote_workspace_name_and_root(event) {
-            Ok(values) => values,
-            Err(outcome) => return outcome,
-        };
+    let (requested_name, requested_root) = match cloud_mcp_remote_workspace_name_and_root(event) {
+        Ok(values) => values,
+        Err(outcome) => return outcome,
+    };
 
     let create_result: Result<(String, Value), String> = async {
         let normalized_root = validate_workspace_root_directory(requested_root.clone()).await?;
@@ -22495,14 +22742,13 @@ async fn cloud_mcp_execute_remote_workspace_create(
             workspace_initialize_git(root_directory.clone()).await?;
             root_git_repository = true;
         }
-        let agent_session_mode = if initial_agent_session_mode == "worktree_coordination"
-            && !root_git_repository
-        {
-            "direct_coordination"
-        } else {
-            initial_agent_session_mode
-        }
-        .to_string();
+        let agent_session_mode =
+            if initial_agent_session_mode == "worktree_coordination" && !root_git_repository {
+                "direct_coordination"
+            } else {
+                initial_agent_session_mode
+            }
+            .to_string();
         let revived_workspace_id = local_workspace_reusable_id_for_root(
             app.clone(),
             scope_key.clone(),
@@ -22563,12 +22809,7 @@ async fn cloud_mcp_execute_remote_workspace_create(
             "workspace-settings",
             &json!({workspace_id.clone(): workspace_settings}),
         )?;
-        local_workspaces_store(
-            app.clone(),
-            scope_key,
-            Value::Array(next_catalog.clone()),
-        )
-        .await?;
+        local_workspaces_store(app.clone(), scope_key, Value::Array(next_catalog.clone())).await?;
         let _ = coordination::tauri_commands::coordination_bootstrap_workspace(
             Some(root_directory.clone()),
             None,
@@ -22634,7 +22875,11 @@ async fn cloud_mcp_execute_remote_workspace_create(
             } else if wants_terminal_count {
                 object.insert(
                     "terminal_count".to_string(),
-                    json!(layout.terminal_roles.as_ref().map(Vec::len).unwrap_or_default()),
+                    json!(layout
+                        .terminal_roles
+                        .as_ref()
+                        .map(Vec::len)
+                        .unwrap_or_default()),
                 );
             }
             if requested_panel_counts.has_supported_keys {
@@ -22721,8 +22966,10 @@ fn cloud_mcp_apply_remote_workspace_management_lever_for_dispatcher(
     if !cloud_mcp_remote_workspace_management_lever_handles(event, webview_dispatcher_active) {
         return false;
     }
-    if matches!(command_kind.as_str(), "workspace_create" | "create_workspace")
-        && app.is_none()
+    if matches!(
+        command_kind.as_str(),
+        "workspace_create" | "create_workspace"
+    ) && app.is_none()
     {
         return false;
     }
@@ -23016,10 +23263,7 @@ fn cloud_mcp_remote_loopspace_lever_handles(
         && cloud_mcp_remote_loopspace_command(&cloud_mcp_remote_command_kind(event))
 }
 
-fn cloud_mcp_remote_loopspace_state_patch(
-    loopspace_id: Option<&str>,
-    updated_at_ms: u64,
-) -> Value {
+fn cloud_mcp_remote_loopspace_state_patch(loopspace_id: Option<&str>, updated_at_ms: u64) -> Value {
     let mut patch = json!({
         "spaceMode": "loopspaces",
         "spaceSelectionReason": "remote_control_headless",
@@ -23076,13 +23320,11 @@ fn cloud_mcp_apply_remote_loopspace_lever_for_dispatcher(
             );
             return;
         };
-        let loopspace_id = cloud_mcp_remote_command_field_text(
-            &event,
-            &["loopspace_id", "loopspaceId"],
-        )
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+        let loopspace_id =
+            cloud_mcp_remote_command_field_text(&event, &["loopspace_id", "loopspaceId"])
+                .unwrap_or_default()
+                .trim()
+                .to_string();
 
         if account_key.trim().is_empty() {
             let details = json!({
@@ -23121,17 +23363,12 @@ fn cloud_mcp_apply_remote_loopspace_lever_for_dispatcher(
             }
         }
 
-        let selected_loopspace_id = (action == CloudMcpRemoteLoopspaceAction::Select)
-            .then_some(loopspace_id.as_str());
-        let patch = cloud_mcp_remote_loopspace_state_patch(
-            selected_loopspace_id,
-            cloud_mcp_now_ms(),
-        );
-        if let Err(error) = app_local_state_merge(
-            &app,
-            CLOUD_MCP_REMOTE_INTENTS_STATE_KEY,
-            &patch,
-        ) {
+        let selected_loopspace_id =
+            (action == CloudMcpRemoteLoopspaceAction::Select).then_some(loopspace_id.as_str());
+        let patch =
+            cloud_mcp_remote_loopspace_state_patch(selected_loopspace_id, cloud_mcp_now_ms());
+        if let Err(error) = app_local_state_merge(&app, CLOUD_MCP_REMOTE_INTENTS_STATE_KEY, &patch)
+        {
             let details = json!({
                 "reason": "local_state_write_failed",
                 "error": clean_terminal_telemetry_text(&error),
@@ -23160,9 +23397,7 @@ fn cloud_mcp_apply_remote_loopspace_lever_for_dispatcher(
             CloudMcpRemoteLoopspaceAction::View => {
                 "Loopspaces view recorded headless on this device."
             }
-            CloudMcpRemoteLoopspaceAction::Select => {
-                "Loopspace selected headless on this device."
-            }
+            CloudMcpRemoteLoopspaceAction::Select => "Loopspace selected headless on this device.",
         };
         let _ = cloud_mcp_send_remote_command_status_event(
             &state,
@@ -23521,10 +23756,7 @@ fn cloud_mcp_agent_update_progresses(app: &AppHandle) -> HashMap<String, AgentUp
         .unwrap_or_default()
 }
 
-fn cloud_mcp_agent_update_progress(
-    app: &AppHandle,
-    provider: &str,
-) -> Option<AgentUpdateProgress> {
+fn cloud_mcp_agent_update_progress(app: &AppHandle, provider: &str) -> Option<AgentUpdateProgress> {
     let _guard = CLOUD_MCP_AGENT_UPDATE_PROGRESS_FILE_LOCK
         .get_or_init(|| StdMutex::new(()))
         .lock()
@@ -23663,10 +23895,7 @@ fn cloud_mcp_latest_agent_model_catalog_value(agent_kind: &str) -> Option<Value>
         .and_then(|catalog| serde_json::to_value(catalog).ok())
 }
 
-async fn cloud_mcp_agent_update_status_payload(
-    app: &AppHandle,
-    state: &CloudMcpState,
-) -> Value {
+async fn cloud_mcp_agent_update_status_payload(app: &AppHandle, state: &CloudMcpState) -> Value {
     let cached = {
         let snapshots = state.runtime_snapshots.lock().await;
         snapshots
@@ -23711,10 +23940,7 @@ async fn cloud_mcp_publish_agent_update_progress(
             ),
             "complete" => (
                 "completed",
-                format!(
-                    "{} updated to {}.",
-                    progress.provider, progress.to_version
-                ),
+                format!("{} updated to {}.", progress.provider, progress.to_version),
             ),
             "failed" => (
                 "failed",
@@ -23787,13 +24013,10 @@ async fn cloud_mcp_enrich_agent_statuses_with_update_progress(
             if !update_available {
                 return None;
             }
-            let provider = cloud_mcp_payload_text(status, &["id", "agent_id"])?
-                .to_ascii_lowercase();
-            let from_version = cloud_mcp_payload_text(
-                status,
-                &["npm_package_version", "version"],
-            )
-            .unwrap_or_else(|| "unknown".to_string());
+            let provider =
+                cloud_mcp_payload_text(status, &["id", "agent_id"])?.to_ascii_lowercase();
+            let from_version = cloud_mcp_payload_text(status, &["npm_package_version", "version"])
+                .unwrap_or_else(|| "unknown".to_string());
             let to_version = cloud_mcp_payload_text(status, &["npm_latest_version"])?;
             Some((provider, from_version, to_version))
         })
@@ -23809,18 +24032,12 @@ async fn cloud_mcp_enrich_agent_statuses_with_update_progress(
         let should_begin = !active
             && current.is_none_or(|progress| {
                 progress.to_version != to_version
-                    || !matches!(
-                        progress.stage.as_str(),
-                        "available" | "complete" | "failed"
-                    )
+                    || !matches!(progress.stage.as_str(), "available" | "complete" | "failed")
             });
         if should_begin {
-            if let Ok(progress) = cloud_mcp_begin_agent_update_progress(
-                app,
-                &provider,
-                &from_version,
-                &to_version,
-            ) {
+            if let Ok(progress) =
+                cloud_mcp_begin_agent_update_progress(app, &provider, &from_version, &to_version)
+            {
                 cloud_mcp_emit_agent_update_progress(app, &progress);
                 progresses.insert(provider, progress);
             }
@@ -25062,8 +25279,9 @@ async fn cloud_mcp_execute_agent_update(
     let use_interactive_elevation =
         agent_update_should_use_interactive_elevation(execution, event.is_some());
     if execution == AgentUpdateExecution::ManualElevated && !use_interactive_elevation {
-        return Err("Interactive administrator approval is not allowed for remote updates."
-            .to_string());
+        return Err(
+            "Interactive administrator approval is not allowed for remote updates.".to_string(),
+        );
     }
     let definition = agent_definition(provider);
     let Some(_run_guard) = cloud_mcp_try_begin_agent_update(definition.id) else {
@@ -25131,8 +25349,8 @@ async fn cloud_mcp_execute_agent_update(
         )
     });
     let versions = tauri::async_runtime::spawn_blocking(move || {
-        let from_version = npm_global_package_version(definition)
-            .unwrap_or_else(|| "unknown".to_string());
+        let from_version =
+            npm_global_package_version(definition).unwrap_or_else(|| "unknown".to_string());
         let to_version = target_hint
             .filter(|value| !value.trim().is_empty())
             .or_else(|| npm_latest_package_version(definition))
@@ -25140,21 +25358,16 @@ async fn cloud_mcp_execute_agent_update(
         (from_version, to_version)
     })
     .await
-    .map_err(|error| format!("Unable to probe {} update versions: {error}", definition.label))?;
-    let progress = cloud_mcp_begin_agent_update_progress(
-        app,
-        definition.id,
-        &versions.0,
-        &versions.1,
-    )?;
-    cloud_mcp_publish_agent_update_progress(
-        app,
-        state,
-        event,
-        &progress,
-        "agent_update_available",
-    )
-    .await;
+    .map_err(|error| {
+        format!(
+            "Unable to probe {} update versions: {error}",
+            definition.label
+        )
+    })?;
+    let progress =
+        cloud_mcp_begin_agent_update_progress(app, definition.id, &versions.0, &versions.1)?;
+    cloud_mcp_publish_agent_update_progress(app, state, event, &progress, "agent_update_available")
+        .await;
 
     let lifecycle_lock = app.state::<TerminalState>().lifecycle_lock.clone();
     let mut queued = false;
@@ -25175,7 +25388,9 @@ async fn cloud_mcp_execute_agent_update(
                 "agent_update_cancelled",
             )
             .await;
-            return Err("Agent update was cancelled because Diff Forge is shutting down.".to_string());
+            return Err(
+                "Agent update was cancelled because Diff Forge is shutting down.".to_string(),
+            );
         }
         if cloud_mcp_agent_update_cancel_requested(definition.id) {
             let reason = format!(
@@ -25222,8 +25437,7 @@ async fn cloud_mcp_execute_agent_update(
             cloud_mcp_active_provider_terminal_labels(app, definition.id).await;
         if active_terminals.is_empty() {
             let guard = lifecycle_lock.clone().lock_owned().await;
-            active_terminals =
-                cloud_mcp_active_provider_terminal_labels(app, definition.id).await;
+            active_terminals = cloud_mcp_active_provider_terminal_labels(app, definition.id).await;
             if active_terminals.is_empty() {
                 if cloud_mcp_agent_update_cancel_requested(definition.id) {
                     drop(guard);
@@ -25424,13 +25638,8 @@ mod agent_update_progress_tests {
         .into_iter()
         .enumerate()
         {
-            progress = agent_update_progress_transition(
-                &progress,
-                stage,
-                101 + index as u64,
-                None,
-                None,
-            );
+            progress =
+                agent_update_progress_transition(&progress, stage, 101 + index as u64, None, None);
             emitted.push(progress.clone());
         }
         assert_eq!(
@@ -25455,13 +25664,8 @@ mod agent_update_progress_tests {
     #[test]
     fn failed_install_is_terminal_with_stage_and_reason() {
         let available = agent_update_progress_begin(None, "claude", "1.0.0", "1.1.0", 100);
-        let installing = agent_update_progress_transition(
-            &available,
-            "installing",
-            101,
-            None,
-            None,
-        );
+        let installing =
+            agent_update_progress_transition(&available, "installing", 101, None, None);
         let failed = agent_update_progress_transition(
             &installing,
             "failed",
@@ -25534,8 +25738,7 @@ mod agent_update_progress_tests {
         let complete = agent_update_reconcile_progress(&stuck, Some("1.1.0"), None, 120);
         assert_eq!(complete.stage, "complete");
         assert_eq!(complete.stage_seq, 10);
-        let failed =
-            agent_update_reconcile_progress(&stuck, Some("1.0.0"), None, 121);
+        let failed = agent_update_reconcile_progress(&stuck, Some("1.0.0"), None, 121);
         assert_eq!(failed.stage, "failed");
         assert_eq!(failed.failed_stage.as_deref(), Some("installing"));
         assert_eq!(failed.stage_seq, 10);
@@ -25666,11 +25869,7 @@ fn cloud_mcp_apply_remote_agent_lever(
                 Ok(provider) => provider,
                 Err(error) => {
                     let _ = cloud_mcp_send_remote_command_status_event(
-                        &state,
-                        &event,
-                        "failed",
-                        &error,
-                        None,
+                        &state, &event, "failed", &error, None,
                     )
                     .await;
                     return;
@@ -26794,6 +26993,12 @@ fn cloud_mcp_apply_remote_device_lever(
     let Some(action) = cloud_mcp_remote_device_lever_action(&command_kind) else {
         return false;
     };
+    // OTA admission is synchronous: once this function accepts the command,
+    // its context already belongs to an operation generation before the
+    // independently spawned handler can race an owner restart.
+    let app_update_binding = (action == "app_update_now")
+        .then(|| app_update_bind_remote_command_context(state, event))
+        .flatten();
     let app = app.clone();
     let state = state.clone();
     let event = event.clone();
@@ -27065,35 +27270,107 @@ fn cloud_mcp_apply_remote_device_lever(
                 cloud_mcp_report_terminal_output_status(&app, &state, &event).await;
             }
             "app_update_now" => {
-                let result = app_update_remote_now(app.clone()).await;
+                let Some(command_binding) = app_update_binding else {
+                    let _ = cloud_mcp_send_app_update_remote_command_status_event(
+                        &state,
+                        &event,
+                        "failed",
+                        "Desktop app is shutting down before the update completed.",
+                        None,
+                    )
+                    .await;
+                    return;
+                };
+                let result = app_update_remote_now(app.clone(), command_binding).await;
                 let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
                 let queued = result
                     .get("queued")
                     .or_else(|| result.get("restart_when_idle"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let message = if ok && queued {
-                    "App update accepted; daemon will restart when terminals are idle."
+                let already_running = result
+                    .get("already_running")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let committed_terminal = result
+                    .get("terminal_committed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let committed_status = result
+                    .get("terminal_status")
+                    .and_then(Value::as_str)
+                    .filter(|status| matches!(*status, "completed" | "failed"));
+                let failure_error = result
+                    .get("error")
+                    .or_else(|| result.get("message"))
+                    .and_then(Value::as_str)
+                    .map(app_update_scrub_external_text)
+                    .map(|error| error.chars().take(300).collect::<String>())
+                    .filter(|error| !error.is_empty());
+                let message = if committed_terminal {
+                    result
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(app_update_scrub_external_text)
+                        .unwrap_or_else(|| {
+                            "App update operation finished on this desktop.".to_string()
+                        })
+                } else if already_running {
+                    "An update is already in progress on this desktop; this command will be answered when it finishes."
+                        .to_string()
+                } else if ok && queued {
+                    "App update accepted; daemon will restart when terminals are idle.".to_string()
+                } else if queued {
+                    failure_error
+                        .as_deref()
+                        .map(|error| format!("App update is queued; restart is waiting: {error}"))
+                        .unwrap_or_else(|| {
+                            "App update is queued; restart is waiting for its safety gate."
+                                .to_string()
+                        })
                 } else if ok {
-                    "App update command completed on this desktop."
+                    "App update command completed on this desktop.".to_string()
+                } else if let Some(error) = failure_error {
+                    format!("App update failed on this desktop: {error}")
                 } else {
-                    "App update command failed on this desktop."
+                    "App update command failed on this desktop.".to_string()
                 };
-                let status = if ok && queued {
+                let status = if committed_terminal {
+                    committed_status.unwrap_or(if ok { "completed" } else { "failed" })
+                } else if already_running || queued {
                     "queued"
                 } else if ok {
                     "completed"
                 } else {
                     "failed"
                 };
-                let _ = cloud_mcp_send_remote_command_status_event(
-                    &state,
-                    &event,
-                    status,
-                    message,
-                    Some(&result),
-                )
-                .await;
+                if committed_terminal {
+                    // The generation owner already sent the terminal to every
+                    // attached command before returning this handshake.
+                } else if status == "queued" {
+                    // This helper reserves the nonterminal under the same
+                    // generation mutex. A concurrent terminal either
+                    // suppresses queued or waits for it, so terminal remains
+                    // the final reply for this command.
+                    let _ = app_update_send_remote_command_nonterminal(
+                        command_binding,
+                        status,
+                        &message,
+                        Some(&result),
+                    )
+                    .await;
+                } else if app_update_release_remote_command_context(command_binding) {
+                    // Fallback for an immediate arm-owned terminal: remove
+                    // only this command from the generation it joined.
+                    let _ = cloud_mcp_send_app_update_remote_command_status_event(
+                        &state,
+                        &event,
+                        status,
+                        &message,
+                        Some(&result),
+                    )
+                    .await;
+                }
                 cloud_mcp_emit_sync_status(None);
             }
             "plan_release" => {
@@ -32651,13 +32928,10 @@ pub(crate) async fn cloud_mcp_mint_device_binding_token(
         Duration::from_secs(2),
     )
     .await?;
-    cloud_mcp_payload_text(
-        &response,
-        &["data", "device_bind"],
-    )
-    .or_else(|| cloud_mcp_payload_text(&response, &["device_bind"]))
-    .filter(|value| value.starts_with("dbt1.") && value.len() <= 4_096)
-    .ok_or_else(|| "Cloud did not return a valid device binding token.".to_string())
+    cloud_mcp_payload_text(&response, &["data", "device_bind"])
+        .or_else(|| cloud_mcp_payload_text(&response, &["device_bind"]))
+        .filter(|value| value.starts_with("dbt1.") && value.len() <= 4_096)
+        .ok_or_else(|| "Cloud did not return a valid device binding token.".to_string())
 }
 
 async fn cloud_mcp_ws_request_with_timeout(
@@ -38531,17 +38805,16 @@ pub(crate) async fn cloud_mcp_sync_terminal_restart_intent_delta(
     let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(now_ms));
     let workspace_runtime_seq = cloud_mcp_next_workspace_runtime_seq(state, Some(now_ms));
     let workspace_runtime_epoch = cloud_mcp_workspace_runtime_epoch(state);
-    let agent_id = cloud_mcp_terminal_agent_id(
-        &metadata.pane_id,
-        instance.id,
-        coordination,
-    );
+    let agent_id = cloud_mcp_terminal_agent_id(&metadata.pane_id, instance.id, coordination);
     let agent_kind = coordination
         .map(|coordination| coordination.agent_kind.as_str())
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| (!metadata.agent_kind.trim().is_empty()).then_some(metadata.agent_kind.as_str()))
+        .or_else(|| {
+            (!metadata.agent_kind.trim().is_empty()).then_some(metadata.agent_kind.as_str())
+        })
         .unwrap_or("terminal");
-    let force_action = (intent_state == "blocked").then(|| terminal_restart_intent_force_action(intent));
+    let force_action =
+        (intent_state == "blocked").then(|| terminal_restart_intent_force_action(intent));
     let payload = json!({
         "source": "rust-diffforge-terminal-restart-intent",
         "event_kind": "terminal_state_update",
@@ -38894,7 +39167,10 @@ fn cloud_mcp_terminals_share_exact_instance(left: &Value, right: &Value) -> bool
         )
 }
 
-fn cloud_mcp_terminal_instance_order(existing: &Value, incoming: &Value) -> Option<std::cmp::Ordering> {
+fn cloud_mcp_terminal_instance_order(
+    existing: &Value,
+    incoming: &Value,
+) -> Option<std::cmp::Ordering> {
     let existing = cloud_mcp_payload_u64(existing, &["terminal_instance_id", "instance_id"])?;
     let incoming = cloud_mcp_payload_u64(incoming, &["terminal_instance_id", "instance_id"])?;
     (existing > 0 && incoming > 0).then(|| incoming.cmp(&existing))
@@ -38929,9 +39205,7 @@ fn cloud_mcp_merge_terminal_state_cohort_aware(target: &mut Value, incoming: Val
     let same_instance = cloud_mcp_terminals_share_exact_instance(target, &incoming);
     let numeric_instance_order = cloud_mcp_terminal_instance_order(target, &incoming);
     if !same_instance && numeric_instance_order.is_some() {
-        if cloud_mcp_terminal_instance_order(target, &incoming)
-            == Some(std::cmp::Ordering::Less)
-        {
+        if cloud_mcp_terminal_instance_order(target, &incoming) == Some(std::cmp::Ordering::Less) {
             // The pane has already advanced past this retired instance.
             return;
         }
@@ -38958,18 +39232,14 @@ fn cloud_mcp_merge_terminal_state_cohort_aware(target: &mut Value, incoming: Val
         (None, Some(_)) => true,
         _ => false,
     };
-    let previous_restart_intent_seq =
-        cloud_mcp_payload_u64(&previous, &["restart_intent_seq"]);
-    let incoming_restart_intent_seq =
-        cloud_mcp_payload_u64(&incoming, &["restart_intent_seq"]);
-    let incoming_restart_intent_wins = match (
-        previous_restart_intent_seq,
-        incoming_restart_intent_seq,
-    ) {
-        (Some(previous), Some(incoming)) => incoming > previous,
-        (None, Some(_)) => true,
-        _ => false,
-    };
+    let previous_restart_intent_seq = cloud_mcp_payload_u64(&previous, &["restart_intent_seq"]);
+    let incoming_restart_intent_seq = cloud_mcp_payload_u64(&incoming, &["restart_intent_seq"]);
+    let incoming_restart_intent_wins =
+        match (previous_restart_intent_seq, incoming_restart_intent_seq) {
+            (Some(previous), Some(incoming)) => incoming > previous,
+            (None, Some(_)) => true,
+            _ => false,
+        };
 
     cloud_mcp_live_state_merge_object(target, incoming.clone());
     if previous_canonical_seq.is_some() && !incoming_canonical_wins {
@@ -43340,8 +43610,7 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
                 // A genuinely newer pane epoch retires all prior rows before
                 // its per-instance sequences restart from their low values.
                 terminals.retain(|terminal| {
-                    cloud_mcp_terminal_pane_id(terminal).as_deref()
-                        != Some(terminal_id.as_str())
+                    cloud_mcp_terminal_pane_id(terminal).as_deref() != Some(terminal_id.as_str())
                 });
             }
             let existing_index = terminals.iter().position(|terminal| {
@@ -44764,8 +45033,7 @@ fn cloud_mcp_agent_chat_status_sync_try_arm(
     status: &str,
     fingerprint: &str,
 ) -> Option<u64> {
-    let memo =
-        CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO.get_or_init(|| StdMutex::new(HashMap::new()));
+    let memo = CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO.get_or_init(|| StdMutex::new(HashMap::new()));
     let Ok(mut map) = memo.lock() else {
         // Poisoned memo: fail open (sync anyway) with a token that never
         // matches an armed marker, so the settle is a no-op.
@@ -44800,8 +45068,7 @@ fn cloud_mcp_agent_chat_status_sync_memo_settle(
     token: u64,
     synced: bool,
 ) {
-    let memo =
-        CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO.get_or_init(|| StdMutex::new(HashMap::new()));
+    let memo = CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO.get_or_init(|| StdMutex::new(HashMap::new()));
     let Ok(mut map) = memo.lock() else {
         return;
     };
@@ -44899,24 +45166,90 @@ mod cloud_mcp_agent_chat_status_sync_memo_tests {
         let arm = cloud_mcp_agent_chat_status_sync_try_arm;
         let session = format!("ses-{}", uuid::Uuid::new_v4());
         // First waiting sync for a session always lands.
-        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo").is_some());
+        assert!(arm(
+            "opencode",
+            &session,
+            "waiting",
+            "ws-1|thread-1|pane-1|7|native|/repo"
+        )
+        .is_some());
         // Every further identical passive waiting frame is coalesced.
-        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo").is_none());
-        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|7|native|/repo").is_none());
+        assert!(arm(
+            "opencode",
+            &session,
+            "waiting",
+            "ws-1|thread-1|pane-1|7|native|/repo"
+        )
+        .is_none());
+        assert!(arm(
+            "opencode",
+            &session,
+            "waiting",
+            "ws-1|thread-1|pane-1|7|native|/repo"
+        )
+        .is_none());
         // A changed fingerprint (something else about the request changed)
         // syncs again — then coalesces again.
-        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
-        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo").is_none());
+        assert!(arm(
+            "opencode",
+            &session,
+            "waiting",
+            "ws-1|thread-1|pane-1|8|native|/repo"
+        )
+        .is_some());
+        assert!(arm(
+            "opencode",
+            &session,
+            "waiting",
+            "ws-1|thread-1|pane-1|8|native|/repo"
+        )
+        .is_none());
         // A status TRANSITION always syncs, and re-arms the waiting memo.
-        assert!(arm("opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
-        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
-        assert!(arm("opencode", &session, "waiting", "ws-1|thread-1|pane-1|8|native|/repo").is_none());
+        assert!(arm(
+            "opencode",
+            &session,
+            "running",
+            "ws-1|thread-1|pane-1|8|native|/repo"
+        )
+        .is_some());
+        assert!(arm(
+            "opencode",
+            &session,
+            "waiting",
+            "ws-1|thread-1|pane-1|8|native|/repo"
+        )
+        .is_some());
+        assert!(arm(
+            "opencode",
+            &session,
+            "waiting",
+            "ws-1|thread-1|pane-1|8|native|/repo"
+        )
+        .is_none());
         // Non-waiting statuses are never coalesced by this memo.
-        assert!(arm("opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
-        assert!(arm("opencode", &session, "running", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
+        assert!(arm(
+            "opencode",
+            &session,
+            "running",
+            "ws-1|thread-1|pane-1|8|native|/repo"
+        )
+        .is_some());
+        assert!(arm(
+            "opencode",
+            &session,
+            "running",
+            "ws-1|thread-1|pane-1|8|native|/repo"
+        )
+        .is_some());
         // Sessions are independent.
         let other = format!("ses-{}", uuid::Uuid::new_v4());
-        assert!(arm("opencode", &other, "waiting", "ws-1|thread-1|pane-1|8|native|/repo").is_some());
+        assert!(arm(
+            "opencode",
+            &other,
+            "waiting",
+            "ws-1|thread-1|pane-1|8|native|/repo"
+        )
+        .is_some());
 
         // The memo only records SUCCESS after the spawned sync settles: an
         // armed in-flight marker coalesces concurrent identical frames, a
@@ -44940,8 +45273,7 @@ mod cloud_mcp_agent_chat_status_sync_memo_tests {
         // ABA guard: waiting → running → identical waiting re-arms with a NEW
         // token; a LATE settle from the superseded first waiting attempt must
         // neither promote nor clear the newer attempt's marker.
-        let running_attempt =
-            arm("opencode", &flaky, "running", fingerprint).expect("running arm");
+        let running_attempt = arm("opencode", &flaky, "running", fingerprint).expect("running arm");
         let waiting_again =
             arm("opencode", &flaky, "waiting", fingerprint).expect("re-armed waiting");
         assert_ne!(waiting_again, retry_attempt);
@@ -63073,7 +63405,10 @@ mod cloud_mcp_tests {
         let gui_wrapper = cloud_source
             .split("async fn cloud_mcp_start_remote_command_listener")
             .nth(1)
-            .and_then(|rest| rest.split("const CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT").next())
+            .and_then(|rest| {
+                rest.split("const CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT")
+                    .next()
+            })
             .expect("GUI listener wrapper");
         let gui_listener_index = gui_wrapper
             .find("cloud_mcp_ensure_remote_command_listener")
@@ -63151,10 +63486,8 @@ mod cloud_mcp_tests {
         assert_eq!(view_patch["spaceSelectionUpdatedAtMs"], json!(41));
         assert!(view_patch.get("selectedLoopspaceId").is_none());
 
-        let select_patch = cloud_mcp_remote_loopspace_state_patch(
-            Some(" stale-or-unknown-loopspace-intent "),
-            42,
-        );
+        let select_patch =
+            cloud_mcp_remote_loopspace_state_patch(Some(" stale-or-unknown-loopspace-intent "), 42);
         assert_eq!(select_patch["spaceMode"], json!("loopspaces"));
         assert_eq!(
             select_patch["selectedLoopspaceId"],
@@ -63514,13 +63847,17 @@ mod cloud_mcp_tests {
         let roles = cloud_mcp_remote_workspace_terminal_roles(&seeded_event);
         assert_eq!(roles.roles, vec!["codex", "codex", "claude", "generic"]);
         let panels = cloud_mcp_remote_workspace_panel_counts(&seeded_event);
-        let layout = cloud_mcp_build_remote_workspace_initial_layout_settings(
-            Some(roles.roles),
-            &panels,
-        );
+        let layout =
+            cloud_mcp_build_remote_workspace_initial_layout_settings(Some(roles.roles), &panels);
         assert_eq!(layout.terminal_roles.as_ref().map(Vec::len), Some(6));
-        assert_eq!(layout.logical_terminal_indexes, Some(vec![0, 1, 2, 3, 4, 5]));
-        assert_eq!(layout.display_rows, Some(vec![vec![0, 1, 2], vec![3, 4, 5]]));
+        assert_eq!(
+            layout.logical_terminal_indexes,
+            Some(vec![0, 1, 2, 3, 4, 5])
+        );
+        assert_eq!(
+            layout.display_rows,
+            Some(vec![vec![0, 1, 2], vec![3, 4, 5]])
+        );
         assert_eq!(layout.pane_kinds.as_ref().unwrap()["4"], json!("web"));
         assert_eq!(layout.pane_kinds.as_ref().unwrap()["5"], json!("pcb"));
         assert_eq!(panels.rejected_fields.len(), 1);
@@ -63559,9 +63896,8 @@ mod cloud_mcp_tests {
                 "terminal_count": huge_positive,
             });
             let no_roles = cloud_mcp_remote_workspace_terminal_roles(&event);
-            let (_, terminal_count) =
-                cloud_mcp_remote_workspace_terminal_count(&event, &no_roles)
-                    .expect("huge positive count clamps instead of failing");
+            let (_, terminal_count) = cloud_mcp_remote_workspace_terminal_count(&event, &no_roles)
+                .expect("huge positive count clamps instead of failing");
             assert_eq!(terminal_count, Some(24));
         }
     }
@@ -63579,8 +63915,7 @@ mod cloud_mcp_tests {
             "agentPermissions": {"0": "acceptEdits", "1": "plan"},
         });
         let panel_counts = cloud_mcp_remote_workspace_panel_counts(&json!({}));
-        let layout =
-            cloud_mcp_build_remote_workspace_initial_layout_settings(None, &panel_counts);
+        let layout = cloud_mcp_build_remote_workspace_initial_layout_settings(None, &panel_counts);
         let merged = cloud_mcp_remote_workspace_merge_created_settings(
             Some(&retained),
             true,
@@ -63730,7 +64065,10 @@ mod cloud_mcp_tests {
             }),
         );
         let terminals = capped[0]["terminals"].as_array().unwrap();
-        assert_eq!(terminals.len(), CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT);
+        assert_eq!(
+            terminals.len(),
+            CLOUD_MCP_REMOTE_MAX_WORKSPACE_TERMINAL_COUNT
+        );
         assert_eq!(terminals.first().unwrap()["terminal_index"], json!(30));
         assert_eq!(terminals.last().unwrap()["terminal_index"], json!(53));
     }
@@ -63879,8 +64217,7 @@ mod cloud_mcp_tests {
         assert!(merged.get("panes").is_none());
         assert_eq!(merged["terminalRoles"], retained["terminalRoles"]);
 
-        let completion_panel_counts =
-            cloud_mcp_remote_workspace_applied_panel_counts(&layout);
+        let completion_panel_counts = cloud_mcp_remote_workspace_applied_panel_counts(&layout);
         assert_eq!(
             completion_panel_counts,
             json!({
@@ -64029,11 +64366,9 @@ mod cloud_mcp_tests {
         );
         assert_eq!(state.global_ws_events.receiver_count(), 1);
 
-        let target_device_id = cloud_mcp_payload_text(
-            &cloud_mcp_desktop_device_profile(),
-            &["device_id"],
-        )
-        .expect("desktop device id");
+        let target_device_id =
+            cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
+                .expect("desktop device id");
         let event = json!({
             "event_kind": "remote_command_requested",
             "command_id": "browse-completed-test",
@@ -67120,8 +67455,14 @@ mod cloud_mcp_tests {
             "an epoch bump between the frame fence and the apply critical \
              section must drop the todo application"
         );
-        assert_eq!(result.applied, 0, "a dropped stale apply must write nothing");
-        assert_eq!(result.deleted, 0, "a dropped stale apply must delete nothing");
+        assert_eq!(
+            result.applied, 0,
+            "a dropped stale apply must write nothing"
+        );
+        assert_eq!(
+            result.deleted, 0,
+            "a dropped stale apply must delete nothing"
+        );
         assert!(
             fence_events.try_recv().is_err(),
             "a dropped stale apply must not broadcast into the new account's runtime"
@@ -77981,12 +78322,8 @@ mod cloud_mcp_tests {
             "event_kind": "remote_command_requested",
         });
         assert_eq!(
-            cloud_mcp_claim_remote_command_receipt_for_dispatcher(
-                &state,
-                &other_workspace,
-                false,
-            )
-            .await,
+            cloud_mcp_claim_remote_command_receipt_for_dispatcher(&state, &other_workspace, false,)
+                .await,
             CloudMcpRemoteCommandReceiptClaim::Claimed,
         );
     }
@@ -78032,8 +78369,7 @@ mod cloud_mcp_tests {
             receipts.insert(
                 receipt_key.clone(),
                 CloudMcpRemoteCommandReceipt {
-                    received_ms: now
-                        .saturating_sub(CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS / 2),
+                    received_ms: now.saturating_sub(CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS / 2),
                     rust_owned: true,
                 },
             );

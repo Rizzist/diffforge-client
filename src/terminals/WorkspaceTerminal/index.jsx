@@ -1910,8 +1910,40 @@ function terminalSubagentStatusColor(status) {
   return "rgba(96, 165, 250, 0.97)"; // blue — running/active
 }
 
+// A finished subagent keeps its green dot visible for the linger window,
+// then fades out and leaves the overlay instead of staying forever.
+const TERMINAL_SUBAGENT_DONE_LINGER_MS = 5000;
+const TERMINAL_SUBAGENT_DONE_FADE_MS = 420;
+
+function terminalSubagentIsDone(status) {
+  const value = String(status || "").toLowerCase();
+  return value === "done" || value === "completed";
+}
+
+function terminalSubagentRowId(sub, index) {
+  return String(sub?.id || `${sub?.label || sub?.agent_type || "subagent"}-${index}`);
+}
+
+function terminalSubagentClockLabel(ms) {
+  if (!ms) {
+    return "";
+  }
+  try {
+    return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
 function TerminalSubagentOverlay({ pane_id: paneId, agent_kind: agentKind }) {
   const [subagents, setSubagents] = useState([]);
+  // Tick state bumped at linger/fade boundaries so finished rows leave on
+  // their own schedule instead of waiting for the next poll.
+  const [, setFadeTickMs] = useState(0);
+  const doneAtMsRef = useRef(new Map());
+  // Row id whose detail popover is open; null when closed. Auto-closes when
+  // the row leaves the visible set (fade-out or snapshot drop).
+  const [openSubagentId, setOpenSubagentId] = useState(null);
 
   useEffect(() => {
     const kind = String(agentKind || "").toLowerCase();
@@ -1939,9 +1971,75 @@ function TerminalSubagentOverlay({ pane_id: paneId, agent_kind: agentKind }) {
     };
   }, [agentKind, paneId]);
 
-  if (!subagents.length) {
+  // Stamp when each subagent is first seen done, prune stamps for rows that
+  // resumed or disappeared, and schedule a re-render at the next linger/fade
+  // boundary among the stamped rows.
+  useEffect(() => {
+    const stamps = doneAtMsRef.current;
+    const seen = new Set();
+    const now = Date.now();
+    subagents.forEach((sub, index) => {
+      const id = terminalSubagentRowId(sub, index);
+      seen.add(id);
+      if (terminalSubagentIsDone(sub.status)) {
+        if (!stamps.has(id)) {
+          stamps.set(id, now);
+        }
+      } else {
+        stamps.delete(id);
+      }
+    });
+    Array.from(stamps.keys()).forEach((id) => {
+      if (!seen.has(id)) {
+        stamps.delete(id);
+      }
+    });
+    let nextBoundaryDelay = Infinity;
+    stamps.forEach((doneAtMs) => {
+      const fadeAt = doneAtMs + TERMINAL_SUBAGENT_DONE_LINGER_MS;
+      const removeAt = fadeAt + TERMINAL_SUBAGENT_DONE_FADE_MS;
+      const boundary = fadeAt > now ? fadeAt : removeAt > now ? removeAt : 0;
+      if (boundary) {
+        nextBoundaryDelay = Math.min(nextBoundaryDelay, boundary - now);
+      }
+    });
+    if (!Number.isFinite(nextBoundaryDelay)) {
+      return undefined;
+    }
+    const timeoutId = window.setTimeout(() => {
+      setFadeTickMs(Date.now());
+    }, Math.max(30, nextBoundaryDelay));
+    return () => window.clearTimeout(timeoutId);
+  });
+
+  const nowMs = Date.now();
+  const visibleSubagents = [];
+  subagents.forEach((sub, index) => {
+    const id = terminalSubagentRowId(sub, index);
+    const doneAtMs = doneAtMsRef.current.get(id) || 0;
+    const doneForMs = doneAtMs ? nowMs - doneAtMs : 0;
+    if (doneAtMs && doneForMs >= TERMINAL_SUBAGENT_DONE_LINGER_MS + TERMINAL_SUBAGENT_DONE_FADE_MS) {
+      return;
+    }
+    visibleSubagents.push({
+      fading: Boolean(doneAtMs) && doneForMs >= TERMINAL_SUBAGENT_DONE_LINGER_MS,
+      id,
+      sub,
+    });
+  });
+
+  if (!visibleSubagents.length) {
+    if (openSubagentId !== null) {
+      setOpenSubagentId(null);
+    }
     return null;
   }
+  if (openSubagentId && !visibleSubagents.some(({ id }) => id === openSubagentId)) {
+    setOpenSubagentId(null);
+  }
+  const openEntry = openSubagentId
+    ? visibleSubagents.find(({ id }) => id === openSubagentId) || null
+    : null;
 
   return (
     <div
@@ -1959,15 +2057,25 @@ function TerminalSubagentOverlay({ pane_id: paneId, agent_kind: agentKind }) {
         pointerEvents: "none",
       }}
     >
-      {subagents.slice(0, 8).map((sub, index) => {
+      {visibleSubagents.slice(0, 8).map(({ fading, id, sub }) => {
         const label =
           String(sub.label || sub.agent_type || sub.description || "subagent").trim() || "subagent";
         const status = String(sub.status || "").toLowerCase();
-        const running = !(status === "done" || status === "completed" || status === "failed");
+        const done = terminalSubagentIsDone(status);
+        const running = !done && status !== "failed";
         const color = terminalSubagentStatusColor(status);
         return (
-          <div
-            key={sub.id || `${label}-${index}`}
+          <button
+            key={id}
+            type="button"
+            data-terminal-control="true"
+            aria-expanded={openSubagentId === id}
+            onClick={(event) => {
+              // Rows are the interactive exception inside a click-through
+              // overlay: keep the click from focusing/steering the tile.
+              event.stopPropagation();
+              setOpenSubagentId((current) => (current === id ? null : id));
+            }}
             title={`${label}${sub.description ? ` — ${sub.description}` : ""} · ${status || "running"}`}
             style={{
               display: "flex",
@@ -1978,14 +2086,20 @@ function TerminalSubagentOverlay({ pane_id: paneId, agent_kind: agentKind }) {
               borderRadius: 999,
               fontSize: 10,
               fontWeight: 650,
-              lineHeight: 1,
               color: "rgba(226, 232, 240, 0.94)",
-              background: "rgba(15, 23, 42, 0.74)",
-              border: "1px solid rgba(148, 163, 184, 0.24)",
+              background: openSubagentId === id ? "rgba(30, 41, 59, 0.92)" : "rgba(15, 23, 42, 0.74)",
+              border: openSubagentId === id
+                ? "1px solid rgba(148, 163, 184, 0.48)"
+                : "1px solid rgba(148, 163, 184, 0.24)",
               backdropFilter: "blur(6px)",
               WebkitBackdropFilter: "blur(6px)",
               whiteSpace: "nowrap",
-              opacity: running ? 1 : 0.62,
+              opacity: fading ? 0 : running || done ? 1 : 0.62,
+              transition: `opacity ${TERMINAL_SUBAGENT_DONE_FADE_MS}ms ease`,
+              pointerEvents: "auto",
+              cursor: "pointer",
+              font: "inherit",
+              textAlign: "left",
             }}
           >
             <span
@@ -1999,10 +2113,140 @@ function TerminalSubagentOverlay({ pane_id: paneId, agent_kind: agentKind }) {
                 boxShadow: running ? `0 0 5px ${color}` : "none",
               }}
             />
-            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
-          </div>
+            {/* line-height above 1 keeps glyph descenders (g/p/y) inside the
+                clipped ellipsis box — line-height:1 visibly chopped them. */}
+            <span
+              style={{
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                lineHeight: 1.35,
+              }}
+            >
+              {label}
+            </span>
+          </button>
         );
       })}
+      {openEntry ? (
+        <div
+          data-terminal-control="true"
+          role="dialog"
+          aria-label="Subagent details"
+          onClick={(event) => event.stopPropagation()}
+          style={{
+            marginTop: 4,
+            width: 280,
+            maxWidth: "68vw",
+            padding: "10px 12px",
+            borderRadius: 10,
+            fontSize: 11,
+            lineHeight: 1.45,
+            color: "rgba(226, 232, 240, 0.96)",
+            background: "rgba(10, 16, 28, 0.94)",
+            border: "1px solid rgba(148, 163, 184, 0.32)",
+            boxShadow: "0 10px 28px rgba(0, 0, 0, 0.45)",
+            backdropFilter: "blur(10px)",
+            WebkitBackdropFilter: "blur(10px)",
+            pointerEvents: "auto",
+            cursor: "default",
+            userSelect: "text",
+            WebkitUserSelect: "text",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+            <span
+              aria-hidden="true"
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: 999,
+                flex: "0 0 auto",
+                background: terminalSubagentStatusColor(String(openEntry.sub.status || "").toLowerCase()),
+              }}
+            />
+            <span style={{ fontWeight: 700, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {String(openEntry.sub.label || openEntry.sub.agent_type || "subagent").trim() || "subagent"}
+            </span>
+            <span style={{ marginLeft: "auto", opacity: 0.75, flex: "0 0 auto" }}>
+              {String(openEntry.sub.status || "running").toLowerCase()}
+            </span>
+            <button
+              type="button"
+              data-terminal-control="true"
+              aria-label="Close subagent details"
+              onClick={(event) => {
+                event.stopPropagation();
+                setOpenSubagentId(null);
+              }}
+              style={{
+                flex: "0 0 auto",
+                border: "none",
+                background: "transparent",
+                color: "rgba(148, 163, 184, 0.9)",
+                cursor: "pointer",
+                fontSize: 13,
+                lineHeight: 1,
+                padding: "0 2px",
+              }}
+            >
+              ×
+            </button>
+          </div>
+          {openEntry.sub.agent_type ? (
+            <div style={{ opacity: 0.85, marginBottom: 4 }}>type: {String(openEntry.sub.agent_type)}</div>
+          ) : null}
+          {openEntry.sub.description ? (
+            <div style={{ marginBottom: 4, wordBreak: "break-word" }}>{String(openEntry.sub.description)}</div>
+          ) : null}
+          {openEntry.sub.last_message ? (
+            <div
+              style={{
+                marginBottom: 4,
+                opacity: 0.85,
+                wordBreak: "break-word",
+                display: "-webkit-box",
+                WebkitLineClamp: 4,
+                WebkitBoxOrient: "vertical",
+                overflow: "hidden",
+              }}
+            >
+              {String(openEntry.sub.last_message)}
+            </div>
+          ) : null}
+          <div style={{ opacity: 0.7, marginBottom: openEntry.sub.transcript_path || openEntry.sub.agent_transcript_path ? 4 : 0 }}>
+            {[
+              openEntry.sub.started_at_ms ? `started ${terminalSubagentClockLabel(openEntry.sub.started_at_ms)}` : "",
+              openEntry.sub.finished_at_ms ? `finished ${terminalSubagentClockLabel(openEntry.sub.finished_at_ms)}` : "",
+              openEntry.sub.updated_at_ms ? `updated ${terminalSubagentClockLabel(openEntry.sub.updated_at_ms)}` : "",
+            ]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
+          {[
+            ["transcript", openEntry.sub.agent_transcript_path],
+            ["caller transcript", openEntry.sub.transcript_path],
+          ]
+            .filter(([, path]) => String(path || "").trim())
+            .map(([kind, path]) => (
+              <div
+                key={kind}
+                title={String(path)}
+                style={{
+                  opacity: 0.65,
+                  fontSize: 10,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  direction: "rtl",
+                  textAlign: "left",
+                }}
+              >
+                {kind}: {String(path)}
+              </div>
+            ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -7532,8 +7776,20 @@ function WorkspaceTerminal({
     }));
 
     let windowsTerminalLastScrollLogAt = 0;
+    let scrollHotLastStampAt = 0;
     disposables.push(terminal.onScroll((viewportY) => {
       const now = performance.now();
+      // Scrolling is interactivity: stamp the same hot window typing uses so
+      // background panes' output flushes and inspection refreshes yield to
+      // scroll frames while wheel momentum is active. Re-stamped at most
+      // every 250ms — onScroll fires per viewport line during momentum.
+      if (typeof window !== "undefined" && now - scrollHotLastStampAt >= 250) {
+        scrollHotLastStampAt = now;
+        window.__diffforgeTerminalInputHotUntil = Math.max(
+          Number(window.__diffforgeTerminalInputHotUntil || 0),
+          Date.now() + 1200,
+        );
+      }
       if (windowsTerminalDiagnosticsEnabled && now - windowsTerminalLastScrollLogAt >= 250) {
         windowsTerminalLastScrollLogAt = now;
         logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.scroll", {

@@ -2295,6 +2295,11 @@ fn video_tier1_emit_export_completion(
     duration_ms: u64,
     warnings: &[String],
 ) {
+    // The webview turns this path into an asset URL (draftSrc) — it must be a
+    // plain path, not a Windows \\?\ verbatim one, or the draft view is black.
+    let repo_path = workspace_path_display(std::path::Path::new(repo_path));
+    let output_path = workspace_path_display(std::path::Path::new(output_path));
+    let output_path = output_path.as_str();
     let result = serde_json::json!({
         "path": output_path,
         "width": width,

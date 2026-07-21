@@ -227,6 +227,10 @@ const TimelineScroller = styled.div`
   min-height: 0;
   overflow: auto;
   position: relative;
+  /* Touch on empty timeline space pans natively; interactive children
+     (clips, handles, ruler, label rail) opt out with touch-action: none so
+     their pointer drags aren't hijacked into a scroll. */
+  touch-action: pan-x pan-y;
 `;
 
 const TimelineCanvas = styled.div`
@@ -274,6 +278,8 @@ const RulerTrack = styled.div`
   position: relative;
   flex: 1 1 auto;
   cursor: ew-resize;
+  /* Touch scrubs the playhead instead of panning the scroller. */
+  touch-action: none;
 `;
 
 const RulerTick = styled.div`
@@ -325,6 +331,8 @@ const TrackLabelRail = styled.div`
   border-radius: 0 4px 4px 0;
   border-left: 2px solid ${(props) => TRACK_TINTS[props.$kind] || "transparent"};
   cursor: grab;
+  /* Touch reorders the track instead of panning the scroller. */
+  touch-action: none;
 
   html[data-forge-theme="light"] & {
     background: #ffffff;
@@ -413,6 +421,8 @@ const ClipBlock = styled.div`
   overflow: hidden;
   cursor: grab;
   user-select: none;
+  /* Touch moves the clip instead of panning the scroller. */
+  touch-action: none;
   background: ${(props) =>
     props.$kind === "audio"
       ? "linear-gradient(180deg, rgba(13, 74, 60, 0.8), rgba(6, 44, 36, 0.88))"
@@ -546,6 +556,7 @@ const TrimHandle = styled.div`
   bottom: 0;
   width: 7px;
   cursor: ew-resize;
+  touch-action: none;
   /* Above the junction TransitionHotspot (3) so the lower half of a clip edge
      stays trimmable at exact junctions; the marker (5) is top-half only. */
   z-index: 4;
@@ -1083,17 +1094,36 @@ export default function Timeline({
     return playback.subscribe(updatePlayhead);
   }, [playback, playheadMs, pxPerMs]);
 
-  // Option/Alt-scroll and pinch zoom, anchored at the cursor.
+  // Wheel map: plain wheel pans the timeline horizontally (editor
+  // convention — mouse wheels only emit deltaY), shift-wheel scrolls the
+  // track stack vertically, and Option/Alt or Ctrl (pinch) zooms at the
+  // cursor.
   const handleWheel = useCallback(
     (event) => {
-      if (!event.altKey && !event.ctrlKey) {
-        return;
-      }
-      event.preventDefault();
       const scroller = scrollerRef.current;
       if (!scroller) {
         return;
       }
+      if (!event.altKey && !event.ctrlKey) {
+        // deltaMode 1 = lines (Windows wheel setting); scale to pixels.
+        const scale = event.deltaMode === 1 ? 16 : 1;
+        const deltaX = event.deltaX * scale;
+        const deltaY = event.deltaY * scale;
+        // Trackpads emit real deltaX — honor the dominant axis so horizontal
+        // swipes don't fight the deltaY fold.
+        const delta = Math.abs(deltaX) > Math.abs(deltaY) ? deltaX : deltaY;
+        if (!delta) {
+          return;
+        }
+        event.preventDefault();
+        if (event.shiftKey) {
+          scroller.scrollTop += delta;
+        } else {
+          scroller.scrollLeft += delta;
+        }
+        return;
+      }
+      event.preventDefault();
       const rect = scroller.getBoundingClientRect();
       const cursorX = event.clientX - rect.left + scroller.scrollLeft - LABEL_RAIL_WIDTH;
       const cursorMs = Math.max(0, cursorX / pxPerMs);

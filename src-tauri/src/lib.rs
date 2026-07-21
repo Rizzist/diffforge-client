@@ -5608,6 +5608,10 @@ mod workspace_activation_tests {
 
 async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: String) {
     let _ = cloud_mcp_signal_desktop_closing(&app_for_shutdown, "app_shutdown").await;
+    // Close OTA admission and resolve every command generation while the
+    // Cloud transport is still available. Staged artifacts intentionally
+    // remain staged for the next launch.
+    app_update_shutdown().await;
 
     // In-flight todos cannot survive the process: label them interrupted
     // (resume-pending) now so they are never orphaned as "running".
