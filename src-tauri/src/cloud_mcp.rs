@@ -45473,7 +45473,19 @@ async fn cloud_mcp_daemon_startup_reopen_workspace_terminals(
     workspaces: &[Value],
 ) {
     for workspace in workspaces {
-        if !cloud_mcp_workspace_explicit_active_state(workspace).unwrap_or(false) {
+        // A headless device has no dashboard to (re)activate a workspace, and
+        // the local catalog carries no runtime active flag, so gating on an
+        // explicit-active flag never fired — the daemon came up with every
+        // pane dead. Reopen every configured workspace UNLESS it is archived
+        // or was explicitly deactivated; a BYOC box is meant to bring its
+        // agents online on boot. Redundant opens are safe (terminal_open
+        // adopts a live instance in daemon mode).
+        let archived = workspace
+            .get("local_archived")
+            .or_else(|| workspace.get("archived"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if archived || cloud_mcp_workspace_explicit_active_state(workspace) == Some(false) {
             continue;
         }
         let Some(workspace_id) = cloud_mcp_payload_text(workspace, &["workspace_id", "id"])
