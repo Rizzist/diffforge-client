@@ -105,7 +105,7 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           EMAIL_V1_FIXTURES_DIR: ${{ github.workspace }}/src-tauri/tests/contracts/email-v1
           EMAIL_V1_REQUIRE_FIXTURES: "1"
-        run: cargo test --manifest-path src-tauri/Cargo.toml email::
+        run: "cargo test --manifest-path src-tauri/Cargo.toml email::"
       - name: Run frontend email contract tests
         run: |
           npm ci
