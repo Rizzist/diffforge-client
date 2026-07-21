@@ -9,13 +9,13 @@
     "job_key": "df/email-queue/edge-iad-1/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/job-acct_mfrggzdfmztwq2lknnwg23tpob.json",
     "raw": {
       "bucket": "df-prod-content",
-      "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/ingress/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/raw/9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08-48123",
+      "key": "df/accounts-v2/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/ingress/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/raw/9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08-48123",
       "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
       "size_bytes": 48123
     },
     "edge_manifest": {
       "bucket": "df-prod-content",
-      "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/ingress/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/edge-manifest/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824-2048",
+      "key": "df/accounts-v2/acct_mfrggzdfmztwq2lknnwg23tpob/content/email/ingress/01J2ZK7Q8R9S6T5V4W3X2Y1Z0A/edge-manifest/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824-2048",
       "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
       "size_bytes": 2048
     },
