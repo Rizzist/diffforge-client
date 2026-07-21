@@ -8467,6 +8467,31 @@ fn spawn_terminal_reader(
                         "will_respawn": respawn_candidate.is_some(),
                     }),
                 );
+                // Diagnostic: on a daemon agent pane, dump the tail of the
+                // terminal's last rendered output so an unexplained agent exit
+                // (BYOC claude exit-1 with no visible error) reveals its final
+                // screen/message in journald. Agent panes only; capped tail.
+                if crate::daemon_mode_active()
+                    && !terminal_instance_is_generic_shell(&instance)
+                {
+                    let tail_text = {
+                        let buffer = instance.headless_output.lock();
+                        buffer
+                            .map(|buffer| {
+                                let raw: Vec<u8> = buffer.tail.iter().copied().collect();
+                                terminal_daemon_output_tail_for_forensics(&raw)
+                            })
+                            .unwrap_or_default()
+                    };
+                    crate::daemon_terminal_lifecycle_println(
+                        "reader_exit.output_tail",
+                        &json!({
+                            "instance_id": instance.id,
+                            "pane_id": clean_terminal_diagnostic_log_text(&cleanup_pane_id),
+                            "tail": tail_text,
+                        }),
+                    );
+                }
                 if let Some(respawn_candidate) = respawn_candidate {
                     let _ = terminal_daemon_reader_exit_respawn(
                         cleanup_app.clone(),
@@ -8622,6 +8647,53 @@ struct TerminalDaemonRespawnCandidate {
 
 fn terminal_daemon_respawn_history() -> &'static StdMutex<HashMap<String, VecDeque<u64>>> {
     TERMINAL_DAEMON_RESPAWN_HISTORY.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Reduce a terminal's raw output tail to a compact, single-line, printable
+/// summary for daemon forensics logging: strip ANSI/OSC escapes and control
+/// bytes, collapse whitespace, keep the last ~700 chars (the final screen).
+fn terminal_daemon_output_tail_for_forensics(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            // Skip a CSI (ESC [ ... final) or OSC (ESC ] ... BEL/ST) sequence.
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if c == '\u{7}' {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        if ch == '\n' || ch == '\t' || ch == '\r' {
+            out.push(' ');
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = collapsed.chars().collect();
+    let start = chars.len().saturating_sub(700);
+    chars[start..].iter().collect()
 }
 
 fn terminal_daemon_reader_exit_respawn_candidate(
