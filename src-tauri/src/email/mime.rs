@@ -70,28 +70,12 @@ fn decode_rfc2047_q(payload: &str) -> Vec<u8> {
 /// header value, converting the declared charset to UTF-8. Undecodable
 /// words stay literal — the guard then still sees their raw bytes.
 fn decode_rfc2047(input: &str) -> String {
-    use base64::engine::general_purpose::STANDARD as BASE64;
-    use base64::Engine as _;
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find("=?") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
-        let decoded = after.split_once('?').and_then(|(charset, tail)| {
-            let (encoding, tail) = tail.split_once('?')?;
-            let end = tail.find("?=")?;
-            let payload = &tail[..end];
-            let bytes = match encoding {
-                "b" | "B" => BASE64.decode(payload.as_bytes()).ok()?,
-                "q" | "Q" => decode_rfc2047_q(payload),
-                _ => return None,
-            };
-            let text = mail_parser::decoders::charsets::map::charset_decoder(charset.as_bytes())
-                .map(|decoder| decoder(&bytes))
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            Some((text, &tail[end + 2..]))
-        });
-        match decoded {
+        match decode_rfc2047_word(after) {
             Some((text, remainder)) => {
                 out.push_str(&text);
                 rest = remainder;
@@ -104,6 +88,26 @@ fn decode_rfc2047(input: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+fn decode_rfc2047_word(after_marker: &str) -> Option<(String, &str)> {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+
+    after_marker.split_once('?').and_then(|(charset, tail)| {
+        let (encoding, tail) = tail.split_once('?')?;
+        let end = tail.find("?=")?;
+        let payload = &tail[..end];
+        let bytes = match encoding {
+            "b" | "B" => BASE64.decode(payload.as_bytes()).ok()?,
+            "q" | "Q" => decode_rfc2047_q(payload),
+            _ => return None,
+        };
+        let text = mail_parser::decoders::charsets::map::charset_decoder(charset.as_bytes())
+            .map(|decoder| decoder(&bytes))
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+        Some((text, &tail[end + 2..]))
+    })
 }
 
 /// The ORIGINAL header value bytes (never the parser's reconstruction):
@@ -275,8 +279,8 @@ fn mark_bare_display_name_prefix_ineligible(
     }
 }
 
-/// Locate literal decoded occurrences of addr-specs that the structured
-/// parser extracted. A caller must intersect this mask with
+/// Locate literal occurrences of addr-specs that the structured parser
+/// extracted. A caller must intersect this mask with
 /// `addr_spec_eligible_bytes` before granting any raw-belt carve-out.
 fn extracted_addr_spec_ranges(value: &str, extracted: &[String]) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
@@ -300,6 +304,111 @@ fn extracted_addr_spec_ranges(value: &str, extracted: &[String]) -> Vec<Range<us
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
     ranges.dedup();
     ranges
+}
+
+fn extracted_addr_spec_mask(value: &str, extracted: &[String]) -> Vec<bool> {
+    let mut mask = vec![false; value.len()];
+    for range in extracted_addr_spec_ranges(value, extracted) {
+        mask[range].fill(true);
+    }
+    mask
+}
+
+fn advance_lowercase_index(input: &str, index: &mut usize) {
+    for ch in input.chars() {
+        for lower in ch.to_lowercase() {
+            *index += lower.len_utf8();
+        }
+    }
+}
+
+fn append_lowercase_literal_with_masks(
+    input: &str,
+    literal_extracted: &[bool],
+    literal_eligible: &[bool],
+    literal_index: &mut usize,
+    decoded: &mut DecodedHeaderBlock,
+) {
+    for ch in input.chars() {
+        for lower in ch.to_lowercase() {
+            let end = *literal_index + lower.len_utf8();
+            let is_extracted = literal_extracted
+                .get(*literal_index..end)
+                .map(|bytes| bytes.iter().all(|is_extracted| *is_extracted))
+                .unwrap_or(false);
+            let is_eligible = literal_eligible
+                .get(*literal_index..end)
+                .map(|bytes| bytes.iter().all(|is_eligible| *is_eligible))
+                .unwrap_or(false);
+            decoded.text.push(lower);
+            decoded
+                .extracted_addr_spec
+                .extend(std::iter::repeat_n(is_extracted, lower.len_utf8()));
+            decoded
+                .addr_spec_eligible
+                .extend(std::iter::repeat_n(is_eligible, lower.len_utf8()));
+            *literal_index = end;
+        }
+    }
+}
+
+fn append_lowercase_unmapped(input: &str, decoded: &mut DecodedHeaderBlock) {
+    for ch in input.chars() {
+        for lower in ch.to_lowercase() {
+            decoded.text.push(lower);
+            decoded
+                .extracted_addr_spec
+                .extend(std::iter::repeat_n(false, lower.len_utf8()));
+            decoded
+                .addr_spec_eligible
+                .extend(std::iter::repeat_n(false, lower.len_utf8()));
+        }
+    }
+}
+
+fn append_rfc2047_decoded_with_literal_masks(
+    input: &str,
+    literal_extracted: &[bool],
+    literal_eligible: &[bool],
+    decoded: &mut DecodedHeaderBlock,
+) {
+    let mut literal_index = 0;
+    let mut rest = input;
+    while let Some(start) = rest.find("=?") {
+        append_lowercase_literal_with_masks(
+            &rest[..start],
+            literal_extracted,
+            literal_eligible,
+            &mut literal_index,
+            decoded,
+        );
+        let after = &rest[start + 2..];
+        match decode_rfc2047_word(after) {
+            Some((text, remainder)) => {
+                let consumed = rest.len() - remainder.len();
+                advance_lowercase_index(&rest[start..consumed], &mut literal_index);
+                append_lowercase_unmapped(&text, decoded);
+                rest = remainder;
+            }
+            None => {
+                append_lowercase_literal_with_masks(
+                    "=?",
+                    literal_extracted,
+                    literal_eligible,
+                    &mut literal_index,
+                    decoded,
+                );
+                rest = &rest[start + 2..];
+            }
+        }
+    }
+    append_lowercase_literal_with_masks(
+        rest,
+        literal_extracted,
+        literal_eligible,
+        &mut literal_index,
+        decoded,
+    );
 }
 
 /// The complete ORIGINAL header block, ending before the first RFC 5322
@@ -383,10 +492,12 @@ fn raw_header_block_decoded(
         }
     }
 
-    // Value-span edges cannot occur inside an encoded word. Decode each
-    // address value as one run, locate its extracted addr-specs and syntax
-    // eligibility in that decoded text, and transfer both masks to the
-    // global map.
+    // Value-span edges cannot occur inside an encoded word. For carve-out
+    // masks, each address value is analyzed as literal header syntax before
+    // RFC 2047 expansion: encoded-words are display/comment/unstructured
+    // content by definition, never addr-spec bytes. The decoded text still
+    // enters the raw leak haystack, but decoded encoded-word output receives
+    // no extracted/eligible source mask.
     let mut decoded = DecodedHeaderBlock {
         text: String::with_capacity(header_end),
         extracted_addr_spec: Vec::with_capacity(header_end),
@@ -403,26 +514,21 @@ fn raw_header_block_decoded(
             .iter()
             .map(|tagged| tagged.ch)
             .collect();
-        let run = decode_rfc2047(&run).to_lowercase();
-        let eligible = address_value
-            .map(|_| addr_spec_eligible_bytes(&run))
-            .unwrap_or_else(|| vec![true; run.len()]);
-        let carved = address_value
-            .map(|index| extracted_addr_spec_ranges(&run, &clean_address_values[index].extracted))
-            .unwrap_or_default();
-        for (index, ch) in run.char_indices() {
-            let end = index + ch.len_utf8();
-            let is_extracted = carved
-                .iter()
-                .any(|range| range.start <= index && end <= range.end);
-            decoded.text.push(ch);
-            decoded
-                .extracted_addr_spec
-                .extend(std::iter::repeat_n(is_extracted, ch.len_utf8()));
-            decoded
-                .addr_spec_eligible
-                .extend(std::iter::repeat_n(eligible[index], ch.len_utf8()));
-        }
+        let literal_run = run.to_lowercase();
+        let literal_eligible = address_value
+            .map(|_| addr_spec_eligible_bytes(&literal_run))
+            .unwrap_or_else(|| vec![true; literal_run.len()]);
+        let literal_extracted = address_value
+            .map(|index| {
+                extracted_addr_spec_mask(&literal_run, &clean_address_values[index].extracted)
+            })
+            .unwrap_or_else(|| vec![false; literal_run.len()]);
+        append_rfc2047_decoded_with_literal_masks(
+            &run,
+            &literal_extracted,
+            &literal_eligible,
+            &mut decoded,
+        );
         run_start = run_end;
     }
     decoded
@@ -1446,6 +1552,34 @@ mod tests {
         assert!(
             error.contains("bcc recipient leaked into MIME headers"),
             "decoded display-name duplicate must be caught by the narrow raw belt: {error}"
+        );
+
+        let decoded_comma_duplicate = b"From: sender@acme.example\r\nTo: =?UTF-8?B?ZGV2IW9wc0BleGFtcGxlLmNvbSw=?= <dev!ops@example.com>\r\n\r\nhello\r\n";
+        let error = verify_mime(
+            decoded_comma_duplicate,
+            &sha256_hex(decoded_comma_duplicate),
+            decoded_comma_duplicate.len() as u64,
+            "sender@acme.example",
+            &envelope(&[("to", "dev!ops@example.com"), ("bcc", "ops@example.com")]),
+        )
+        .expect_err("a decoded encoded-word display-name duplicate with comma must not be carved");
+        assert!(
+            error.contains("bcc recipient leaked into MIME headers"),
+            "decoded comma display-name duplicate must be caught by the narrow raw belt: {error}"
+        );
+
+        let encoded_exact_leak = b"From: sender@acme.example\r\nTo: =?UTF-8?B?b3BzQGV4YW1wbGUuY29t?= <innocent@example.net>\r\n\r\nhello\r\n";
+        let error = verify_mime(
+            encoded_exact_leak,
+            &sha256_hex(encoded_exact_leak),
+            encoded_exact_leak.len() as u64,
+            "sender@acme.example",
+            &envelope(&[("to", "innocent@example.net"), ("bcc", "ops@example.com")]),
+        )
+        .expect_err("a bcc address decoded in an encoded-word display name must be rejected");
+        assert!(
+            error.contains("bcc recipient leaked into MIME headers"),
+            "encoded-word exact display-name disclosure must be caught by the narrow raw belt: {error}"
         );
 
         let encoded_leak = b"From: sender@acme.example\r\nTo: =?UTF-8?B?c2VjcmV0QGV4YW1wbGUuY29t?= innocent@example.net\r\n\r\nhello\r\n";
