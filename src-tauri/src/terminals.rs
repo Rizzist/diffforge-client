@@ -20,6 +20,10 @@ const TERMINAL_WAITING_RELEASE_WATCHDOG_MS: u64 = 30 * 60_000;
 /// After this much quiet they decay to idle so the pane doesn't wear a stale
 /// attention badge forever.
 const TERMINAL_SETTLED_DECAY_WATCHDOG_MS: u64 = 30_000;
+/// A UserPromptSubmit can be emitted for local TUI menu/slash-command actions
+/// that never start a provider turn. If no todo or provider evidence follows,
+/// release the prompt-submit latch quickly.
+const TERMINAL_PROMPT_SUBMIT_THINKING_DECAY_WATCHDOG_MS: u64 = 4_000;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
 const TERMINAL_CONTROL_AUTOMATION_GUARD_TTL_MS: u64 = 60_000;
 const TERMINAL_CONTROL_PROMPT_ANSWER_GUARD_TTL_MS: u64 = 10_000;
@@ -1637,6 +1641,12 @@ fn terminal_runtime_apply_activity_payload(
         || interrupt_rejected
         || error_rejected
         || prompt_ready_recovery_rejected;
+    let preserve_prompt_submit_latch_after_passive_observation =
+        terminal_runtime_should_preserve_prompt_submit_latch_after_passive_observation(
+            &previous,
+            payload,
+            &projection,
+        );
     let active_state_override = projection.turn_active
         && (payload.input_ready
             || terminal_projection_state_is_idle(&payload.activity_status)
@@ -1788,26 +1798,31 @@ fn terminal_runtime_apply_activity_payload(
         } else {
             payload.turn_id.clone().or_else(|| previous.turn_id.clone())
         },
-        source: if terminal_event_rejected {
+        source: if terminal_event_rejected || preserve_prompt_submit_latch_after_passive_observation
+        {
             previous.source.clone()
         } else {
             payload.source.clone()
         },
         event_type: if projection.completion_accepted {
             "provider-turn-completed".to_string()
-        } else if terminal_event_rejected {
+        } else if terminal_event_rejected || preserve_prompt_submit_latch_after_passive_observation
+        {
             previous.event_type.clone()
         } else {
             payload.event_type.clone()
         },
         hook_event_name: if projection.completion_accepted {
             "Stop".to_string()
-        } else if terminal_event_rejected {
+        } else if terminal_event_rejected || preserve_prompt_submit_latch_after_passive_observation
+        {
             previous.hook_event_name.clone()
         } else {
             payload.hook_event_name.clone()
         },
-        updated_at_ms: if terminal_event_rejected {
+        updated_at_ms: if terminal_event_rejected
+            || preserve_prompt_submit_latch_after_passive_observation
+        {
             previous.updated_at_ms
         } else {
             payload.observed_at_ms
@@ -2639,6 +2654,79 @@ fn terminal_canonical_prompt_ready_recovery_correlates(
     }
 }
 
+fn terminal_runtime_snapshot_is_prompt_submit_thinking_latch(
+    runtime: &TerminalRuntimeSnapshot,
+) -> bool {
+    matches!(
+        terminal_projection_text(&runtime.canonical_state, "").as_str(),
+        "thinking"
+    ) && runtime.turn_active
+        && terminal_projection_text(&runtime.canonical_badge_label, "") == "thinking"
+        && runtime.active_interaction_id.is_none()
+        && terminal_activity_hook_is_prompt_submit_latch(&runtime.hook_event_name)
+        && matches!(
+            terminal_projection_text(&runtime.event_type, "").as_str(),
+            "provider_turn_started" | "message_submitted" | "pending_prompt_sent"
+        )
+}
+
+fn terminal_canonical_prompt_submit_thinking_decay_correlates(
+    previous: &TerminalRuntimeSnapshot,
+    payload: &TerminalActivityHookPayload,
+    open_structured_interaction: Option<&TerminalStructuredInteraction>,
+) -> bool {
+    terminal_runtime_snapshot_is_prompt_submit_thinking_latch(previous)
+        && open_structured_interaction.is_none()
+        && terminal_activity_hook_is_prompt_submit_thinking_decay(&payload.hook_event_name)
+        && terminal_projection_text(&payload.event_type, "") == "terminal_input_ready"
+        && payload.input_ready
+        && terminal_projection_state_is_idle(&payload.activity_status)
+        && payload.turn_generation_explicit
+        && payload.turn_generation == previous.turn_generation
+}
+
+fn terminal_runtime_snapshot_is_prompt_submit_decay_idle(
+    runtime: &TerminalRuntimeSnapshot,
+) -> bool {
+    terminal_projection_text(&runtime.canonical_state, "") == "idle"
+        && !runtime.turn_active
+        && terminal_activity_hook_is_prompt_submit_thinking_decay(&runtime.hook_event_name)
+        && terminal_projection_text(&runtime.event_type, "") == "terminal_input_ready"
+}
+
+fn terminal_activity_payload_is_provider_activity_evidence(
+    payload: &TerminalActivityHookPayload,
+) -> bool {
+    let event_type = terminal_projection_text(&payload.event_type, "");
+    if terminal_activity_payload_is_idle_ready(payload) {
+        return false;
+    }
+    if terminal_activity_payload_is_provider_observation(payload) {
+        return false;
+    }
+    if event_type == "provider_turn_completed" {
+        return false;
+    }
+    event_type.starts_with("provider_")
+}
+
+fn terminal_activity_payload_is_provider_observation(payload: &TerminalActivityHookPayload) -> bool {
+    terminal_projection_text(&payload.event_type, "") == "provider_observation"
+        || payload.completion_evidence == "cli_hook_provider_observation"
+}
+
+fn terminal_runtime_should_preserve_prompt_submit_latch_after_passive_observation(
+    previous: &TerminalRuntimeSnapshot,
+    payload: &TerminalActivityHookPayload,
+    projection: &TerminalCanonicalProjection,
+) -> bool {
+    terminal_runtime_snapshot_is_prompt_submit_thinking_latch(previous)
+        && terminal_activity_payload_is_provider_observation(payload)
+        && !terminal_activity_payload_is_provider_activity_evidence(payload)
+        && projection.canonical_state == "thinking"
+        && projection.turn_active
+}
+
 fn terminal_canonical_transition_allowed(previous: &str, next: &str) -> bool {
     if previous == next {
         return true;
@@ -2799,11 +2887,21 @@ fn terminal_reduce_canonical_state(
         authoritative_event,
         open_structured_interaction,
     );
+    let prompt_submit_thinking_decay = terminal_canonical_prompt_submit_thinking_decay_correlates(
+        previous_runtime,
+        authoritative_event,
+        open_structured_interaction,
+    );
+    let relatch_after_prompt_submit_decay =
+        terminal_runtime_snapshot_is_prompt_submit_decay_idle(previous_runtime)
+            && terminal_activity_payload_is_provider_activity_evidence(authoritative_event);
 
     let mut turn_generation = previous_runtime.turn_generation;
     let mut completed_turn_generation = previous_runtime.completed_turn_generation;
     let mut turn_active = previous_runtime.turn_active;
-    if (turn_started || prompt_accepts_missing_turn) && !previous_runtime.turn_active {
+    if (turn_started || prompt_accepts_missing_turn || relatch_after_prompt_submit_decay)
+        && !previous_runtime.turn_active
+    {
         turn_generation = turn_generation.saturating_add(1);
         turn_active = true;
     }
@@ -2848,6 +2946,10 @@ fn terminal_reduce_canonical_state(
         completed_turn_generation = turn_generation;
         turn_active = false;
     }
+    if prompt_submit_thinking_decay {
+        completed_turn_generation = turn_generation;
+        turn_active = false;
+    }
 
     let mut next_state = if close_event {
         "closing"
@@ -2867,6 +2969,8 @@ fn terminal_reduce_canonical_state(
         // thinking would flap the state and adopt unverified identifiers.
         "waiting"
     } else if prompt_ready_recovery {
+        "idle"
+    } else if prompt_submit_thinking_decay {
         "idle"
     } else if prompt_event {
         "uir"
@@ -2889,6 +2993,8 @@ fn terminal_reduce_canonical_state(
         "waiting"
     } else if task_parked {
         "paused"
+    } else if relatch_after_prompt_submit_decay {
+        "thinking"
     } else if turn_started {
         "thinking"
     } else if previous_state == "paused" {
@@ -17150,6 +17256,9 @@ fn terminal_activity_hook_lifecycle_kind(
         "promptreadyafterinterrupt" | "promptreadyafterstartuperror" => {
             Some(("terminal-input-ready", "idle", "active", "ready", true))
         }
+        "promptsubmitthinkingdecay" => {
+            Some(("terminal-input-ready", "idle", "active", "ready", true))
+        }
         "interrupt"
         | "interrupted"
         | "turninterrupt"
@@ -17410,6 +17519,15 @@ fn terminal_activity_hook_is_prompt_submit_key(hook_key: &str) -> bool {
 
 fn terminal_activity_hook_is_prompt_submit(hook_event_name: &str) -> bool {
     terminal_activity_hook_is_prompt_submit_key(&terminal_activity_hook_name_key(hook_event_name))
+}
+
+fn terminal_activity_hook_is_prompt_submit_latch(hook_event_name: &str) -> bool {
+    let hook_key = terminal_activity_hook_name_key(hook_event_name);
+    terminal_activity_hook_is_prompt_submit_key(&hook_key) || hook_key == "backendpromptsubmit"
+}
+
+fn terminal_activity_hook_is_prompt_submit_thinking_decay(hook_event_name: &str) -> bool {
+    terminal_activity_hook_name_key(hook_event_name) == "promptsubmitthinkingdecay"
 }
 
 fn terminal_activity_hook_tool_activity_status(event: &Value) -> &'static str {
@@ -19147,6 +19265,13 @@ struct TerminalActivityHookFileFingerprint {
     modified: Option<SystemTime>,
 }
 
+fn terminal_activity_hook_file_changed_since_last_drain(
+    latest: &Option<TerminalActivityHookFileFingerprint>,
+    last_drained: &Option<TerminalActivityHookFileFingerprint>,
+) -> bool {
+    latest.is_some() && latest != last_drained
+}
+
 async fn terminal_activity_hook_file_fingerprint(
     path: &Path,
 ) -> Option<TerminalActivityHookFileFingerprint> {
@@ -19174,6 +19299,7 @@ enum TerminalActivityWatchdogAction {
     McpStartupError,
     StaleHotStop,
     WaitingRelease,
+    PromptSubmitThinkingDecayIdle,
     SettledDecayIdle,
 }
 
@@ -19321,6 +19447,24 @@ fn terminal_activity_watchdog_waiting_release_action(
     } else {
         None
     }
+}
+
+/// Prompt-submit thinking decay: local TUI menu/slash-command submits can emit
+/// UserPromptSubmit without starting a model turn. If the runtime is still the
+/// original submit latch after 4s and no pane-bound todo is running, release it
+/// to idle through the canonical projection path. Any provider activity changes
+/// the runtime hook/event away from the submit latch and therefore fails closed.
+fn terminal_activity_watchdog_prompt_submit_thinking_decay_action(
+    runtime: &TerminalRuntimeSnapshot,
+    thinking_age_ms: u64,
+    pane_has_running_todo: bool,
+    activity_changed_since_last_drain: bool,
+) -> Option<TerminalActivityWatchdogAction> {
+    (thinking_age_ms >= TERMINAL_PROMPT_SUBMIT_THINKING_DECAY_WATCHDOG_MS
+        && !pane_has_running_todo
+        && !activity_changed_since_last_drain
+        && terminal_runtime_snapshot_is_prompt_submit_thinking_latch(runtime))
+    .then_some(TerminalActivityWatchdogAction::PromptSubmitThinkingDecayIdle)
 }
 
 /// Non-Claude panes launch (or may launch) the agent INSIDE a prewarmed
@@ -20183,6 +20327,52 @@ fn terminal_structured_interaction_matches_resolution(
         })
 }
 
+const TERMINAL_STRUCTURED_INTERACTION_RESOLVED_LOCALLY_MARKER: &str =
+    "_diffforge_resolved_locally";
+
+fn terminal_structured_interaction_resolved_locally_response(reason: &str) -> Value {
+    json!({
+        TERMINAL_STRUCTURED_INTERACTION_RESOLVED_LOCALLY_MARKER: true,
+        "resolution_reason": reason,
+    })
+}
+
+fn terminal_structured_interaction_response_resolved_locally(response: &Value) -> bool {
+    response
+        .get(TERMINAL_STRUCTURED_INTERACTION_RESOLVED_LOCALLY_MARKER)
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn terminal_structured_interaction_complete_waiter_locally(
+    state: &TerminalState,
+    interaction_id: &str,
+    reason: &str,
+) -> bool {
+    state
+        .terminal_structured_interaction_waiters
+        .lock()
+        .ok()
+        .and_then(|mut waiters| waiters.remove(interaction_id))
+        .is_some_and(|sender| {
+            sender
+                .send(terminal_structured_interaction_resolved_locally_response(
+                    reason,
+                ))
+                .is_ok()
+        })
+}
+
+fn terminal_structured_interaction_complete_waiters_locally<'a>(
+    state: &TerminalState,
+    interaction_ids: impl IntoIterator<Item = &'a String>,
+    reason: &str,
+) {
+    for interaction_id in interaction_ids {
+        terminal_structured_interaction_complete_waiter_locally(state, interaction_id, reason);
+    }
+}
+
 /// Tool-execution evidence resolves a latched permission prompt: answering a
 /// prompt INSIDE the provider TUI emits no resolution event, but when the
 /// prompt is BOUND to a specific tool use (the hook bridge stamps the
@@ -20198,6 +20388,9 @@ fn terminal_structured_interaction_tool_evidence_resolves(
     interaction: &TerminalStructuredInteraction,
     payload: &TerminalActivityHookPayload,
 ) -> bool {
+    if interaction.pane_id != payload.pane_id || interaction.instance_id != payload.instance_id {
+        return false;
+    }
     if payload.terminal_is_prompting_user {
         return false;
     }
@@ -20215,15 +20408,30 @@ fn terminal_structured_interaction_tool_evidence_resolves(
     };
     // Tool ids are session-scoped: evidence from another provider session
     // (id reuse after an in-PTY relaunch) proves nothing about this prompt.
-    if !terminal_structured_interaction_session_gate_allows(
-        interaction,
-        &terminal_activity_payload_session_id(payload),
-    ) {
+    let resolved_session_id = terminal_activity_payload_session_id(payload);
+    if !terminal_structured_interaction_session_gate_allows(interaction, &resolved_session_id) {
         return false;
     }
-    let bound_to_tool = interaction.provider_request_id == tool_use_id
+    let bound_tool_use_id = interaction
+        .tool_use_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let bound_tool_match = bound_tool_use_id == Some(tool_use_id);
+    let request_identity_match = interaction.provider_request_id == tool_use_id
         || interaction.prompt_id == tool_use_id
         || interaction.prompt_metadata.permission_request_id.as_deref() == Some(tool_use_id);
+    if bound_tool_match && !request_identity_match {
+        let interaction_session = interaction.provider_session_id.trim();
+        let resolved_session = resolved_session_id.trim();
+        if interaction_session.is_empty()
+            || resolved_session.is_empty()
+            || interaction_session != resolved_session
+        {
+            return false;
+        }
+    }
+    let bound_to_tool = bound_tool_match || request_identity_match;
     if !bound_to_tool {
         return false;
     }
@@ -20429,6 +20637,7 @@ fn terminal_structured_interaction_reconcile(
                 // session equality whenever both sides carry one.
                 provider_session_id: terminal_activity_payload_session_id(payload),
                 provider_request_id,
+                tool_use_id: payload.tool_use_id.clone(),
                 prompt_id: payload.prompt_id.clone().unwrap_or_default(),
                 hook_event_name: payload.hook_event_name.clone(),
                 response_mode: payload
@@ -20478,11 +20687,11 @@ fn terminal_structured_interaction_reconcile(
         );
         drop(interactions);
         if !superseded_ids.is_empty() {
-            if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-                for id in superseded_ids {
-                    waiters.remove(&id);
-                }
-            }
+            terminal_structured_interaction_complete_waiters_locally(
+                state.inner(),
+                superseded_ids.iter(),
+                "structured_interaction_superseded",
+            );
         }
         return false;
     }
@@ -20668,11 +20877,15 @@ fn terminal_structured_interaction_reconcile(
             );
         }
         if !removed_ids.is_empty() {
-            if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-                for id in removed_ids {
-                    waiters.remove(&id);
-                }
-            }
+            terminal_structured_interaction_complete_waiters_locally(
+                state.inner(),
+                removed_ids.iter(),
+                if tool_evidence_resolved {
+                    "tool_evidence_resolved"
+                } else {
+                    "provider_resolution_arrived"
+                },
+            );
         }
     }
     false
@@ -20768,11 +20981,11 @@ fn terminal_structured_interaction_clear_pane(state: &TerminalState, pane_id: &s
         })
         .unwrap_or_default();
     if !removed_ids.is_empty() {
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            for id in &removed_ids {
-                waiters.remove(id);
-            }
-        }
+        terminal_structured_interaction_complete_waiters_locally(
+            state,
+            removed_ids.iter(),
+            "structured_interaction_pane_cleared",
+        );
     }
     removed_ids.len()
 }
@@ -20802,11 +21015,11 @@ fn terminal_structured_interaction_clear_terminal(
         })
         .unwrap_or_default();
     if !removed_ids.is_empty() {
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            for id in &removed_ids {
-                waiters.remove(id);
-            }
-        }
+        terminal_structured_interaction_complete_waiters_locally(
+            state,
+            removed_ids.iter(),
+            "structured_interaction_terminal_cleared",
+        );
     }
     removed_ids.len()
 }
@@ -21437,6 +21650,34 @@ fn spawn_terminal_activity_hook_watcher(
                 .unwrap_or_default();
             let live_process = terminal_activity_watchdog_child_is_live(&instance).await;
             let starting_age_ms = now_ms.saturating_sub(runtime.updated_at_ms);
+            let prompt_submit_thinking_age_ms = now_ms.saturating_sub(runtime.updated_at_ms);
+            let should_check_prompt_submit_todo =
+                prompt_submit_thinking_age_ms
+                    >= TERMINAL_PROMPT_SUBMIT_THINKING_DECAY_WATCHDOG_MS
+                    && terminal_runtime_snapshot_is_prompt_submit_thinking_latch(&runtime);
+            let prompt_submit_decay_activity_fingerprint = if should_check_prompt_submit_todo {
+                terminal_activity_hook_file_fingerprint(&activity_events_path).await
+            } else {
+                None
+            };
+            let prompt_submit_decay_activity_changed_since_last_drain =
+                should_check_prompt_submit_todo
+                    && terminal_activity_hook_file_changed_since_last_drain(
+                        &prompt_submit_decay_activity_fingerprint,
+                        &last_activity_fingerprint,
+                    );
+            let pane_has_running_todo = if should_check_prompt_submit_todo
+                && !prompt_submit_decay_activity_changed_since_last_drain
+            {
+                let active_task_running = instance.active_task.lock().await.is_some();
+                active_task_running
+                    || todo_dispatch_pane_has_running_or_in_flight_todo(
+                        &instance.metadata.workspace_id,
+                        &pane_id,
+                    )
+            } else {
+                false
+            };
             let runtime_activity = terminal_projection_text(&runtime.activity_status, "");
             let runtime_interrupted = matches!(
                 runtime_activity.as_str(),
@@ -21503,6 +21744,18 @@ fn spawn_terminal_activity_hook_watcher(
                     now_ms.saturating_sub(last_hook_or_output_activity_ms),
                 )
             })
+            // Prompt-submit thinking decay is provider-agnostic and runs outside
+            // PTY recovery: it only releases a still-unproven submit latch when
+            // no pane-bound todo exists and no provider activity has overwritten
+            // the runtime's prompt-submit evidence.
+            .or_else(|| {
+                terminal_activity_watchdog_prompt_submit_thinking_decay_action(
+                    &runtime,
+                    prompt_submit_thinking_age_ms,
+                    pane_has_running_todo,
+                    prompt_submit_decay_activity_changed_since_last_drain,
+                )
+            })
             // Also outside the gate: interrupted/error decay applies to every
             // provider. Age = time since the runtime last changed (i.e. since
             // it ENTERED the settled state, plus benign metadata refreshes
@@ -21548,6 +21801,11 @@ fn spawn_terminal_activity_hook_watcher(
                         "backend-waiting-release-watchdog",
                         "waiting_background_ttl_exceeded",
                     ),
+                    TerminalActivityWatchdogAction::PromptSubmitThinkingDecayIdle => (
+                        "PromptSubmitThinkingDecay",
+                        "backend-prompt-submit-thinking-decay-watchdog",
+                        "prompt_submit_without_todo_or_activity",
+                    ),
                     TerminalActivityWatchdogAction::SettledDecayIdle => (
                         if terminal_projection_text(&runtime.canonical_state, "") == "error" {
                             "PromptReadyAfterStartupError"
@@ -21572,6 +21830,9 @@ fn spawn_terminal_activity_hook_watcher(
                         "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
                         "prompt_marker_visible": prompt_marker_visible,
                         "provider": clean_terminal_diagnostic_log_text(&instance.metadata.agent_kind),
+                        "prompt_submit_activity_changed_since_last_drain": prompt_submit_decay_activity_changed_since_last_drain,
+                        "pane_has_running_todo": pane_has_running_todo,
+                        "prompt_submit_thinking_age_ms": prompt_submit_thinking_age_ms,
                         "reason": reason,
                         "runtime_source": clean_terminal_diagnostic_log_text(&runtime.source),
                         "starting_age_ms": starting_age_ms,
@@ -21585,10 +21846,13 @@ fn spawn_terminal_activity_hook_watcher(
                     source,
                     reason,
                 );
-                if matches!(action, TerminalActivityWatchdogAction::SettledDecayIdle) {
-                    // The prompt-ready recovery correlator requires an
-                    // EXPLICIT matching generation; the runtime's own value
-                    // is exactly the settled turn being decayed.
+                if matches!(
+                    action,
+                    TerminalActivityWatchdogAction::SettledDecayIdle
+                        | TerminalActivityWatchdogAction::PromptSubmitThinkingDecayIdle
+                ) {
+                    // Both decay paths require an EXPLICIT matching generation;
+                    // the runtime's own value is exactly the turn being released.
                     if let Some(object) = event.as_object_mut() {
                         object.insert("turn_generation".to_string(), json!(runtime.turn_generation));
                     }
@@ -21648,122 +21912,132 @@ fn spawn_terminal_activity_hook_watcher(
                 sleep(Duration::from_millis(current_poll_ms)).await;
                 continue;
             }
-            last_activity_fingerprint = activity_fingerprint;
-            last_debug_fingerprint = debug_fingerprint;
-
             if activity_changed {
-                match read_terminal_activity_hook_chunk(&activity_events_path, offset).await {
-                    Ok((next_offset, chunk)) => {
-                        if next_offset < offset {
-                            partial.clear();
-                        }
-                        offset = next_offset;
-                        if !chunk.is_empty() {
-                            partial.push_str(&chunk);
-                            let has_complete_tail = partial.ends_with('\n');
-                            let mut lines = partial.lines().map(str::to_string).collect::<Vec<_>>();
-                            partial = if has_complete_tail {
-                                String::new()
-                            } else {
-                                lines.pop().unwrap_or_default()
-                            };
-
-                            for line in lines {
-                                let line = line.trim();
-                                if line.is_empty() {
-                                    continue;
-                                }
-                                let Ok(event) = serde_json::from_str::<Value>(line) else {
-                                    continue;
+                if activity_fingerprint.is_none() {
+                    last_activity_fingerprint = None;
+                } else {
+                    match read_terminal_activity_hook_chunk(&activity_events_path, offset).await {
+                        Ok((next_offset, chunk)) => {
+                            last_activity_fingerprint = activity_fingerprint;
+                            if next_offset < offset {
+                                partial.clear();
+                            }
+                            offset = next_offset;
+                            if !chunk.is_empty() {
+                                partial.push_str(&chunk);
+                                let has_complete_tail = partial.ends_with('\n');
+                                let mut lines =
+                                    partial.lines().map(str::to_string).collect::<Vec<_>>();
+                                partial = if has_complete_tail {
+                                    String::new()
+                                } else {
+                                    lines.pop().unwrap_or_default()
                                 };
-                                if terminal_activity_hook_event_was_transport_delivered(&event) {
-                                    continue;
+
+                                for line in lines {
+                                    let line = line.trim();
+                                    if line.is_empty() {
+                                        continue;
+                                    }
+                                    let Ok(event) = serde_json::from_str::<Value>(line) else {
+                                        continue;
+                                    };
+                                    if terminal_activity_hook_event_was_transport_delivered(&event) {
+                                        continue;
+                                    }
+                                    process_terminal_activity_hook_event(
+                                        &app,
+                                        &terminals,
+                                        &cloud_mcp_state,
+                                        &pane_id,
+                                        instance_id,
+                                        &instance,
+                                        &event,
+                                        "jsonl",
+                                    )
+                                    .await;
                                 }
-                                process_terminal_activity_hook_event(
-                                    &app,
-                                    &terminals,
-                                    &cloud_mcp_state,
-                                    &pane_id,
-                                    instance_id,
-                                    &instance,
-                                    &event,
-                                    "jsonl",
-                                )
-                                .await;
                             }
                         }
-                    }
-                    Err(error) => {
-                        if activity_events_path.exists() {
-                            log_terminal_status_event(
-                                "backend.terminal_activity_hook.read_error",
-                                json!({
-                                    "error": clean_terminal_diagnostic_log_text(&error),
-                                    "instance_id": instance_id,
-                                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                                }),
-                            );
+                        Err(error) => {
+                            if activity_events_path.exists() {
+                                log_terminal_status_event(
+                                    "backend.terminal_activity_hook.read_error",
+                                    json!({
+                                        "error": clean_terminal_diagnostic_log_text(&error),
+                                        "instance_id": instance_id,
+                                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                                    }),
+                                );
+                            }
                         }
                     }
                 }
             }
 
             if debug_changed {
-                match read_terminal_activity_hook_chunk(&activity_debug_path, debug_offset).await {
-                    Ok((next_offset, chunk)) => {
-                        if next_offset < debug_offset {
-                            debug_partial.clear();
-                        }
-                        debug_offset = next_offset;
-                        if !chunk.is_empty() {
-                            debug_partial.push_str(&chunk);
-                            let has_complete_tail = debug_partial.ends_with('\n');
-                            let mut lines = debug_partial
-                                .lines()
-                                .map(str::to_string)
-                                .collect::<Vec<_>>();
-                            debug_partial = if has_complete_tail {
-                                String::new()
-                            } else {
-                                lines.pop().unwrap_or_default()
-                            };
-
-                            for line in lines {
-                                let line = line.trim();
-                                if line.is_empty() {
-                                    continue;
-                                }
-                                let Ok(event) = serde_json::from_str::<Value>(line) else {
-                                    continue;
+                if debug_fingerprint.is_none() {
+                    last_debug_fingerprint = None;
+                } else {
+                    match read_terminal_activity_hook_chunk(&activity_debug_path, debug_offset)
+                        .await
+                    {
+                        Ok((next_offset, chunk)) => {
+                            last_debug_fingerprint = debug_fingerprint;
+                            if next_offset < debug_offset {
+                                debug_partial.clear();
+                            }
+                            debug_offset = next_offset;
+                            if !chunk.is_empty() {
+                                debug_partial.push_str(&chunk);
+                                let has_complete_tail = debug_partial.ends_with('\n');
+                                let mut lines = debug_partial
+                                    .lines()
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>();
+                                debug_partial = if has_complete_tail {
+                                    String::new()
+                                } else {
+                                    lines.pop().unwrap_or_default()
                                 };
+
+                                for line in lines {
+                                    let line = line.trim();
+                                    if line.is_empty() {
+                                        continue;
+                                    }
+                                    let Ok(event) = serde_json::from_str::<Value>(line) else {
+                                        continue;
+                                    };
+                                    log_terminal_status_event(
+                                        "backend.terminal_activity_hook.debug",
+                                        json!({
+                                            "activity_path": event.get("activity_path").and_then(Value::as_str).unwrap_or_default(),
+                                            "debug_phase": event.get("phase").and_then(Value::as_str).unwrap_or_default(),
+                                            "details": event.get("details").cloned().unwrap_or(Value::Null),
+                                            "hook_instance_id": event.get("instance_id").and_then(Value::as_u64).unwrap_or_default(),
+                                            "hook_pane_id": clean_terminal_diagnostic_log_text(event.get("pane_id").and_then(Value::as_str).unwrap_or_default()),
+                                            "hook_provider": event.get("provider").and_then(Value::as_str).unwrap_or_default(),
+                                            "instance_id": instance_id,
+                                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                                            "terminal_index": event.get("terminal_index").and_then(Value::as_str).unwrap_or_default(),
+                                            "workspace_id": event.get("workspace_id").and_then(Value::as_str).unwrap_or_default(),
+                                        }),
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if activity_debug_path.exists() {
                                 log_terminal_status_event(
-                                    "backend.terminal_activity_hook.debug",
+                                    "backend.terminal_activity_hook.debug_read_error",
                                     json!({
-                                        "activity_path": event.get("activity_path").and_then(Value::as_str).unwrap_or_default(),
-                                        "debug_phase": event.get("phase").and_then(Value::as_str).unwrap_or_default(),
-                                        "details": event.get("details").cloned().unwrap_or(Value::Null),
-                                        "hook_instance_id": event.get("instance_id").and_then(Value::as_u64).unwrap_or_default(),
-                                        "hook_pane_id": clean_terminal_diagnostic_log_text(event.get("pane_id").and_then(Value::as_str).unwrap_or_default()),
-                                        "hook_provider": event.get("provider").and_then(Value::as_str).unwrap_or_default(),
+                                        "error": clean_terminal_diagnostic_log_text(&error),
                                         "instance_id": instance_id,
                                         "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                                        "terminal_index": event.get("terminal_index").and_then(Value::as_str).unwrap_or_default(),
-                                        "workspace_id": event.get("workspace_id").and_then(Value::as_str).unwrap_or_default(),
                                     }),
                                 );
                             }
-                        }
-                    }
-                    Err(error) => {
-                        if activity_debug_path.exists() {
-                            log_terminal_status_event(
-                                "backend.terminal_activity_hook.debug_read_error",
-                                json!({
-                                    "error": clean_terminal_diagnostic_log_text(&error),
-                                    "instance_id": instance_id,
-                                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                                }),
-                            );
                         }
                     }
                 }
@@ -21802,11 +22076,11 @@ fn spawn_terminal_activity_hook_watcher(
                 removed
             })
             .unwrap_or_default();
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            for interaction_id in removed_interaction_ids {
-                waiters.remove(&interaction_id);
-            }
-        };
+        terminal_structured_interaction_complete_waiters_locally(
+            state.inner(),
+            removed_interaction_ids.iter(),
+            "terminal_activity_watcher_stopped",
+        );
         terminal_structured_interaction_clear_superseded(&pane_id, instance_id);
     });
 }
@@ -23003,11 +23277,11 @@ async fn terminal_codex_hook_trust_withdraw_stale_publication(
         })
         .unwrap_or_default();
     if !removed_ids.is_empty() {
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            for interaction_id in &removed_ids {
-                waiters.remove(interaction_id);
-            }
-        }
+        terminal_structured_interaction_complete_waiters_locally(
+            state.inner(),
+            removed_ids.iter(),
+            "codex_hook_trust_withdrawn",
+        );
     }
     let cloud_changed = cloud_mcp_withdraw_stale_terminal_prompt(
         cloud_mcp_state,
@@ -23450,17 +23724,20 @@ fn terminal_codex_gateway_spawn_web_waiter(
                     removed
                 })
                 .unwrap_or_default();
-            if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-                for interaction_id in removed_ids {
-                    waiters.remove(&interaction_id);
-                }
-            }
+            terminal_structured_interaction_complete_waiters_locally(
+                state.inner(),
+                removed_ids.iter(),
+                "codex_gateway_publish_aborted",
+            );
             return;
         }
         let result = match response_task.await {
             Ok(Ok(Some(result))) => result,
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return,
         };
+        if terminal_structured_interaction_response_resolved_locally(&result) {
+            return;
+        }
         if terminal_codex_gateway_claim_generation(
             &pending,
             &request_key,
@@ -25959,7 +26236,7 @@ async fn handle_terminal_activity_transport_message(
         return Err(error);
     }
 
-    let Some((interaction_id, receiver)) = blocking_receiver else {
+    let Some((interaction_id, mut receiver)) = blocking_receiver else {
         return Ok(None);
     };
 
@@ -25970,6 +26247,9 @@ async fn handle_terminal_activity_transport_message(
         .get(&interaction_id)
         .cloned();
     let Some(interaction) = interaction else {
+        if let Ok(response) = receiver.try_recv() {
+            return Ok(Some(response));
+        }
         if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
             waiters.remove(&interaction_id);
         }
@@ -28235,9 +28515,11 @@ fn terminal_structured_interaction_remove_generation(
             matches
         });
     if removed {
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            waiters.remove(&interaction.interaction_id);
-        }
+        terminal_structured_interaction_complete_waiter_locally(
+            state,
+            &interaction.interaction_id,
+            "structured_interaction_generation_removed",
+        );
     }
     removed
 }
@@ -28274,9 +28556,11 @@ fn terminal_structured_interaction_remove_answered_generation(
             )
         });
     if removed {
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            waiters.remove(&interaction.interaction_id);
-        }
+        terminal_structured_interaction_complete_waiter_locally(
+            state,
+            &interaction.interaction_id,
+            "structured_interaction_answered_generation_removed",
+        );
     }
     removed
 }
@@ -31554,6 +31838,7 @@ mod terminal_tests {
             provider: "codex".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "request-1".to_string(),
+            tool_use_id: None,
             prompt_id: "request-1".to_string(),
             hook_event_name: if method == "mcpServer/elicitation/request" {
                 "Elicitation".to_string()
@@ -33055,6 +33340,7 @@ mod terminal_tests {
             provider: "codex".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "codex-hook-trust-catalog-deadbeef".to_string(),
+            tool_use_id: None,
             prompt_id: "codex-hook-trust-catalog-deadbeef".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "structured_pty".to_string(),
@@ -33085,6 +33371,7 @@ mod terminal_tests {
             provider: "other".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "request-1".to_string(),
+            tool_use_id: None,
             options: vec![TerminalActivityHookPromptOption {
                 id: "allow_once".to_string(),
                 label: "Allow once".to_string(),
@@ -33166,6 +33453,7 @@ mod terminal_tests {
             provider: "codex".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "request-free-text".to_string(),
+            tool_use_id: None,
             prompt_id: "prompt-free-text".to_string(),
             hook_event_name: "UserInputRequired".to_string(),
             response_mode: "structured_pty".to_string(),
@@ -33276,6 +33564,7 @@ mod terminal_tests {
             provider: "codex".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "codex-hook-trust-catalog-deadbeef".to_string(),
+            tool_use_id: None,
             prompt_id: "codex-hook-trust-catalog-deadbeef".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "structured_pty".to_string(),
@@ -36464,6 +36753,7 @@ notifications = true
             provider: "opencode".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "req-1".to_string(),
+            tool_use_id: None,
             prompt_id: "req-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "provider_api".to_string(),
@@ -36659,6 +36949,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: "session-1".to_string(),
             provider_request_id: tool_use_id.to_string(),
+            tool_use_id: Some(tool_use_id.to_string()),
             prompt_id: tool_use_id.to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -36764,6 +37055,164 @@ notifications = true
             &interaction,
             &pre_tool,
         ));
+    }
+
+    #[test]
+    fn opencode_bound_tool_use_id_resolves_per_request_permission() {
+        let mut interaction = opencode_provider_api_test_interaction(2_000);
+        interaction.provider_session_id = "session-1".to_string();
+        interaction.provider_request_id = "per_f812".to_string();
+        interaction.prompt_id = "per_f812".to_string();
+        interaction.tool_use_id = Some("edit_5f81".to_string());
+        interaction.prompt_metadata.permission_request_id = Some("per_f812".to_string());
+
+        let mut active = TerminalRuntimeSnapshot::opened_idle(Some("session-1".to_string()));
+        active.canonical_state = "uir".to_string();
+        active.canonical_badge_label = "input required".to_string();
+        active.canonical_state_seq = 9;
+        active.prompt_state_seq = 4;
+        active.turn_generation = 2;
+        active.turn_active = true;
+        active.active_interaction_id = Some(interaction.interaction_id.clone());
+        active.active_interaction_revision = Some(interaction.revision);
+        active.interaction_actionable = true;
+
+        let mut tool_done = terminal_activity_hook_test_payload(
+            "provider-tool-completed",
+            "tool_completed",
+            "running",
+            false,
+            Some("session-1"),
+        );
+        tool_done.hook_event_name = "PostToolUse".to_string();
+        tool_done.tool_use_id = Some("edit_5f81".to_string());
+        tool_done.hook_timestamp_ms = 2_500;
+        tool_done.turn_generation = active.turn_generation;
+
+        assert!(terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &tool_done,
+        ));
+        let resolved =
+            terminal_reduce_canonical_state(&active, &tool_done, Some(&interaction), false, false);
+        assert_eq!(resolved.canonical_state, "thinking");
+        assert!(resolved.active_interaction_id.is_none());
+        assert!(resolved.active_interaction_revision.is_none());
+        assert!(!resolved.interaction_actionable);
+
+        let mut other_tool = tool_done.clone();
+        other_tool.tool_use_id = Some("edit_unrelated".to_string());
+        assert!(!terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &other_tool,
+        ));
+        let held =
+            terminal_reduce_canonical_state(&active, &other_tool, Some(&interaction), false, false);
+        assert_eq!(held.canonical_state, "uir");
+        assert_eq!(
+            held.active_interaction_id.as_deref(),
+            Some(interaction.interaction_id.as_str())
+        );
+        assert_eq!(held.active_interaction_revision, Some(interaction.revision));
+
+        let mut sessionless_tool = tool_done.clone();
+        sessionless_tool.provider_session_id = None;
+        sessionless_tool.native_session_id = None;
+        assert!(
+            !terminal_structured_interaction_tool_evidence_resolves(
+                &interaction,
+                &sessionless_tool,
+            ),
+            "distinct bound tool ids require same-session evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_tool_evidence_resolution_completes_blocking_waiter_with_marker() {
+        let interaction = claude_blocking_tool_test_interaction("toolu-1", 1_000);
+        let mut tool_done = terminal_activity_hook_test_payload(
+            "provider-tool-completed",
+            "tool_completed",
+            "running",
+            false,
+            Some("session-1"),
+        );
+        tool_done.hook_event_name = "PostToolUse".to_string();
+        tool_done.tool_use_id = Some("toolu-1".to_string());
+        tool_done.hook_timestamp_ms = 2_000;
+        assert!(terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &tool_done,
+        ));
+
+        let state = TerminalState {
+            terminals: Arc::new(RwLock::new(HashMap::new())),
+            pending_restart_intents: Arc::new(StdMutex::new(HashMap::new())),
+            next_restart_intent_seq: AtomicU64::new(1),
+            terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_input_transport: Arc::new(StdMutex::new(None)),
+            terminal_output_transport: Arc::new(StdMutex::new(None)),
+            terminal_activity_transport: Arc::new(StdMutex::new(None)),
+            terminal_activity_transport_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_structured_interactions: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_structured_interaction_waiters: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_output_transport_subscribers: Arc::new(StdMutex::new(HashMap::new())),
+            parked_prompts: Arc::new(RwLock::new(HashMap::new())),
+            active_audio_input_target: Arc::new(StdMutex::new(None)),
+            audio_route_gate: Arc::new(StdMutex::new(TerminalAudioRouteGate::default())),
+            lifecycle_lock: Arc::new(Mutex::new(())),
+            pty_pool: Arc::new(PtyPool::new()),
+            cleanup_tracker: Arc::new(TerminalCleanupTracker::new()),
+            workspace_topology_cache: Arc::new(RwLock::new(HashMap::new())),
+            terminal_process_epoch: "test-process-epoch".to_string(),
+            next_terminal_instance_id: AtomicU64::new(1),
+            next_terminal_input_queue_id: AtomicU64::new(1),
+            next_terminal_output_subscriber_id: AtomicU64::new(1),
+        };
+        let (sender, receiver) = oneshot::channel();
+        state
+            .terminal_structured_interaction_waiters
+            .lock()
+            .unwrap()
+            .insert(interaction.interaction_id.clone(), sender);
+
+        assert!(terminal_structured_interaction_complete_waiter_locally(
+            &state,
+            &interaction.interaction_id,
+            "tool_evidence_resolved",
+        ));
+        let response = timeout(Duration::from_millis(100), receiver)
+            .await
+            .expect("waiter completed")
+            .expect("waiter sender completed benignly");
+        assert_eq!(
+            response[TERMINAL_STRUCTURED_INTERACTION_RESOLVED_LOCALLY_MARKER],
+            json!(true)
+        );
+        assert_eq!(response["resolution_reason"], json!("tool_evidence_resolved"));
+        assert!(terminal_structured_interaction_response_resolved_locally(
+            &response
+        ));
+        assert!(!terminal_structured_interaction_response_resolved_locally(
+            &json!({"decision": "accepted"})
+        ));
+
+        let mut active = TerminalRuntimeSnapshot::opened_idle(Some("session-1".to_string()));
+        active.canonical_state = "uir".to_string();
+        active.canonical_badge_label = "input required".to_string();
+        active.canonical_state_seq = 3;
+        active.prompt_state_seq = 2;
+        active.turn_generation = 1;
+        active.turn_active = true;
+        active.active_interaction_id = Some(interaction.interaction_id.clone());
+        active.active_interaction_revision = Some(interaction.revision);
+        active.interaction_actionable = true;
+        let resolved =
+            terminal_reduce_canonical_state(&active, &tool_done, Some(&interaction), false, false);
+        assert_ne!(resolved.canonical_state, "error");
+        assert_eq!(resolved.canonical_state, "thinking");
+        assert!(resolved.turn_active);
+        std::mem::forget(state);
     }
 
     #[test]
@@ -38120,6 +38569,7 @@ notifications = true
             provider: "opencode".to_string(),
             provider_session_id: "ses_current".to_string(),
             provider_request_id: "req-current".to_string(),
+            tool_use_id: None,
             prompt_id: "req-current".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "provider_api".to_string(),
@@ -38904,6 +39354,41 @@ notifications = true
         payload
     }
 
+    fn prompt_submit_decay_test_runtime() -> TerminalRuntimeSnapshot {
+        let mut runtime = waiting_test_runtime_thinking();
+        runtime.source = "cli-hook:provider-turn-started".to_string();
+        runtime.event_type = "provider-turn-started".to_string();
+        runtime.hook_event_name = "UserPromptSubmit".to_string();
+        runtime.canonical_state = "thinking".to_string();
+        runtime.canonical_badge_label = "thinking".to_string();
+        runtime.turn_active = true;
+        runtime.active_interaction_id = None;
+        runtime.active_interaction_revision = None;
+        runtime.interaction_actionable = false;
+        runtime.input_ready = false;
+        runtime.updated_at_ms = 1;
+        runtime
+    }
+
+    fn prompt_submit_decay_payload(
+        runtime: &TerminalRuntimeSnapshot,
+    ) -> TerminalActivityHookPayload {
+        let mut decay = terminal_activity_hook_test_payload(
+            "terminal-input-ready",
+            "idle",
+            "ready",
+            true,
+            runtime.provider_session_id.as_deref(),
+        );
+        decay.hook_event_name = "PromptSubmitThinkingDecay".to_string();
+        decay.source = "backend-prompt-submit-thinking-decay-watchdog".to_string();
+        decay.provider_turn_id = runtime.provider_turn_id.clone();
+        decay.turn_id = runtime.turn_id.clone();
+        decay.turn_generation = runtime.turn_generation;
+        decay.turn_generation_explicit = true;
+        decay
+    }
+
     /// THE WAITING CONTRACT: a Stop that arrives while the harness still owns
     /// live background shells/subagents parks the session in `waiting` — the
     /// turn stays OPEN (no settlement, no completed generation, no false
@@ -39482,6 +39967,259 @@ notifications = true
     }
 
     #[test]
+    fn prompt_submit_thinking_decay_releases_unproven_submit_latch() {
+        let runtime = prompt_submit_decay_test_runtime();
+        assert_eq!(
+            terminal_activity_watchdog_prompt_submit_thinking_decay_action(
+                &runtime,
+                TERMINAL_PROMPT_SUBMIT_THINKING_DECAY_WATCHDOG_MS - 1,
+                false,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_activity_watchdog_prompt_submit_thinking_decay_action(
+                &runtime,
+                TERMINAL_PROMPT_SUBMIT_THINKING_DECAY_WATCHDOG_MS,
+                false,
+                false,
+            ),
+            Some(TerminalActivityWatchdogAction::PromptSubmitThinkingDecayIdle)
+        );
+
+        let decay = prompt_submit_decay_payload(&runtime);
+        let projection = terminal_reduce_canonical_state(&runtime, &decay, None, false, false);
+        assert_eq!(projection.canonical_state, "idle");
+        assert!(!projection.turn_active);
+        assert_eq!(
+            projection.completed_turn_generation,
+            projection.turn_generation
+        );
+    }
+
+    #[test]
+    fn prompt_submit_thinking_decay_holds_when_pane_todo_is_running() {
+        let runtime = prompt_submit_decay_test_runtime();
+        assert_eq!(
+            terminal_activity_watchdog_prompt_submit_thinking_decay_action(
+                &runtime,
+                TERMINAL_PROMPT_SUBMIT_THINKING_DECAY_WATCHDOG_MS,
+                true,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_submit_thinking_decay_skips_when_activity_file_changed_since_last_drain() {
+        let runtime = prompt_submit_decay_test_runtime();
+        let last_drained = Some(TerminalActivityHookFileFingerprint {
+            len: 128,
+            modified: None,
+        });
+        let latest = Some(TerminalActivityHookFileFingerprint {
+            len: 256,
+            modified: None,
+        });
+        let activity_changed_since_last_drain =
+            terminal_activity_hook_file_changed_since_last_drain(&latest, &last_drained);
+
+        assert!(activity_changed_since_last_drain);
+        assert_eq!(
+            terminal_activity_watchdog_prompt_submit_thinking_decay_action(
+                &runtime,
+                TERMINAL_PROMPT_SUBMIT_THINKING_DECAY_WATCHDOG_MS,
+                false,
+                activity_changed_since_last_drain,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_submit_thinking_decay_holds_after_provider_activity_evidence() {
+        let mut runtime = prompt_submit_decay_test_runtime();
+        runtime.event_type = "provider-tool-started".to_string();
+        runtime.hook_event_name = "PreToolUse".to_string();
+        runtime.canonical_badge_label = "tooling".to_string();
+
+        assert_eq!(
+            terminal_activity_watchdog_prompt_submit_thinking_decay_action(
+                &runtime,
+                TERMINAL_PROMPT_SUBMIT_THINKING_DECAY_WATCHDOG_MS,
+                false,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_submit_thinking_decay_survives_passive_observation_frames() {
+        let runtime = prompt_submit_decay_test_runtime();
+        let mut passive = terminal_activity_hook_test_payload(
+            "provider-observation",
+            "idle",
+            "observed",
+            false,
+            runtime.provider_session_id.as_deref(),
+        );
+        passive.hook_event_name = "TranscriptChanged".to_string();
+        passive.completion_evidence = "cli_hook_provider_observation".to_string();
+        passive.turn_generation = runtime.turn_generation;
+        passive.turn_generation_explicit = false;
+        passive.provider_turn_id = runtime.provider_turn_id.clone();
+        passive.turn_id = runtime.turn_id.clone();
+
+        let projection = terminal_reduce_canonical_state(&runtime, &passive, None, false, false);
+        assert_eq!(projection.canonical_state, "thinking");
+        assert!(terminal_runtime_should_preserve_prompt_submit_latch_after_passive_observation(
+            &runtime,
+            &passive,
+            &projection,
+        ));
+        assert_eq!(
+            terminal_activity_watchdog_prompt_submit_thinking_decay_action(
+                &runtime,
+                TERMINAL_PROMPT_SUBMIT_THINKING_DECAY_WATCHDOG_MS,
+                false,
+                false,
+            ),
+            Some(TerminalActivityWatchdogAction::PromptSubmitThinkingDecayIdle)
+        );
+    }
+
+    #[test]
+    fn prompt_submit_thinking_decay_allows_later_provider_evidence_to_relatch() {
+        let runtime = prompt_submit_decay_test_runtime();
+        let decay = prompt_submit_decay_payload(&runtime);
+        let decayed = terminal_reduce_canonical_state(&runtime, &decay, None, false, false);
+
+        let mut decayed_runtime = runtime.clone();
+        decayed_runtime.canonical_state = decayed.canonical_state;
+        decayed_runtime.canonical_badge_label = decayed.canonical_badge_label;
+        decayed_runtime.canonical_state_seq = decayed.canonical_state_seq;
+        decayed_runtime.turn_generation = decayed.turn_generation;
+        decayed_runtime.completed_turn_generation = decayed.completed_turn_generation;
+        decayed_runtime.turn_active = decayed.turn_active;
+        decayed_runtime.event_type = "terminal-input-ready".to_string();
+        decayed_runtime.hook_event_name = "PromptSubmitThinkingDecay".to_string();
+        decayed_runtime.activity_status = "idle".to_string();
+        decayed_runtime.command_phase = "ready".to_string();
+        decayed_runtime.input_ready = true;
+
+        let mut tool = terminal_activity_hook_test_payload(
+            "provider-tool-started",
+            "tool_running",
+            "tool_running",
+            false,
+            decayed_runtime.provider_session_id.as_deref(),
+        );
+        tool.hook_event_name = "PreToolUse".to_string();
+        tool.turn_generation = decayed_runtime.turn_generation;
+        tool.turn_generation_explicit = false;
+        tool.provider_turn_id = decayed_runtime.provider_turn_id.clone();
+        tool.turn_id = decayed_runtime.turn_id.clone();
+
+        let relatched =
+            terminal_reduce_canonical_state(&decayed_runtime, &tool, None, false, false);
+        assert_eq!(relatched.canonical_state, "thinking");
+        assert_eq!(relatched.canonical_badge_label, "tooling");
+        assert!(relatched.turn_active);
+        assert_eq!(
+            relatched.turn_generation,
+            decayed_runtime.turn_generation.saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn prompt_submit_decay_relatches_on_prompt_answer_evidence() {
+        let runtime = prompt_submit_decay_test_runtime();
+        let decay = prompt_submit_decay_payload(&runtime);
+        let decayed = terminal_reduce_canonical_state(&runtime, &decay, None, false, false);
+
+        let mut decayed_runtime = runtime.clone();
+        decayed_runtime.canonical_state = decayed.canonical_state;
+        decayed_runtime.canonical_badge_label = decayed.canonical_badge_label;
+        decayed_runtime.canonical_state_seq = decayed.canonical_state_seq;
+        decayed_runtime.turn_generation = decayed.turn_generation;
+        decayed_runtime.completed_turn_generation = decayed.completed_turn_generation;
+        decayed_runtime.turn_active = decayed.turn_active;
+        decayed_runtime.event_type = "terminal-input-ready".to_string();
+        decayed_runtime.hook_event_name = "PromptSubmitThinkingDecay".to_string();
+        decayed_runtime.activity_status = "idle".to_string();
+        decayed_runtime.command_phase = "ready".to_string();
+        decayed_runtime.input_ready = true;
+
+        let mut answer = terminal_activity_hook_test_payload(
+            "provider-user-prompt-answered",
+            "thinking",
+            "running",
+            false,
+            decayed_runtime.provider_session_id.as_deref(),
+        );
+        answer.hook_event_name = "PermissionResult".to_string();
+        answer.completion_evidence = "cli_hook_permission_resolved".to_string();
+        answer.turn_generation = decayed_runtime.turn_generation;
+        answer.turn_generation_explicit = false;
+        answer.provider_turn_id = decayed_runtime.provider_turn_id.clone();
+        answer.turn_id = decayed_runtime.turn_id.clone();
+
+        let relatched =
+            terminal_reduce_canonical_state(&decayed_runtime, &answer, None, false, false);
+        assert_eq!(relatched.canonical_state, "thinking");
+        assert!(relatched.turn_active);
+        assert_eq!(
+            relatched.turn_generation,
+            decayed_runtime.turn_generation.saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn prompt_submit_decay_does_not_relatch_on_final_stop() {
+        let runtime = prompt_submit_decay_test_runtime();
+        let decay = prompt_submit_decay_payload(&runtime);
+        let decayed = terminal_reduce_canonical_state(&runtime, &decay, None, false, false);
+
+        let mut decayed_runtime = runtime.clone();
+        decayed_runtime.canonical_state = decayed.canonical_state;
+        decayed_runtime.canonical_badge_label = decayed.canonical_badge_label;
+        decayed_runtime.canonical_state_seq = decayed.canonical_state_seq;
+        decayed_runtime.turn_generation = decayed.turn_generation;
+        decayed_runtime.completed_turn_generation = decayed.completed_turn_generation;
+        decayed_runtime.turn_active = decayed.turn_active;
+        decayed_runtime.event_type = "terminal-input-ready".to_string();
+        decayed_runtime.hook_event_name = "PromptSubmitThinkingDecay".to_string();
+        decayed_runtime.activity_status = "idle".to_string();
+        decayed_runtime.command_phase = "ready".to_string();
+        decayed_runtime.input_ready = true;
+
+        let mut stop = terminal_activity_hook_test_payload(
+            "provider-turn-completed",
+            "idle",
+            "completed",
+            true,
+            decayed_runtime.provider_session_id.as_deref(),
+        );
+        stop.hook_event_name = "Stop".to_string();
+        stop.turn_generation = decayed_runtime.turn_generation;
+        stop.turn_generation_explicit = true;
+        stop.provider_turn_id = decayed_runtime.provider_turn_id.clone();
+        stop.turn_id = decayed_runtime.turn_id.clone();
+
+        assert!(!terminal_activity_payload_is_provider_activity_evidence(
+            &stop
+        ));
+        let projected =
+            terminal_reduce_canonical_state(&decayed_runtime, &stop, None, false, false);
+        assert_eq!(projected.canonical_state, "idle");
+        assert!(!projected.turn_active);
+        assert_eq!(projected.turn_generation, decayed_runtime.turn_generation);
+    }
+
+    #[test]
     fn waiting_release_watchdog_fires_only_for_stale_waiting_sessions() {
         let mut runtime = waiting_test_runtime_thinking();
         runtime.canonical_state = "waiting".to_string();
@@ -39882,6 +40620,7 @@ notifications = true
             provider: "codex".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "codex-question-1".to_string(),
+            tool_use_id: None,
             prompt_id: "codex-question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -39982,6 +40721,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "permission-denied-1".to_string(),
+            tool_use_id: None,
             prompt_id: "permission-denied-1".to_string(),
             hook_event_name: "PermissionDenied".to_string(),
             response_mode: "diffforge_intervention".to_string(),
@@ -40018,6 +40758,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "permission-1".to_string(),
+            tool_use_id: None,
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -40063,6 +40804,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "question-1".to_string(),
+            tool_use_id: None,
             prompt_id: "question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -40107,6 +40849,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "question-1".to_string(),
+            tool_use_id: None,
             prompt_id: "question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -40150,6 +40893,7 @@ notifications = true
             provider: "opencode".to_string(),
             provider_session_id: "session-a".to_string(),
             provider_request_id: "permission-1".to_string(),
+            tool_use_id: None,
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "provider_api".to_string(),
@@ -40278,6 +41022,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "plan-1".to_string(),
+            tool_use_id: None,
             prompt_id: "plan-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -40360,6 +41105,7 @@ notifications = true
             provider: "opencode".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "permission-1".to_string(),
+            tool_use_id: None,
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "provider_api".to_string(),
@@ -40886,6 +41632,10 @@ notifications = true
         );
         assert_eq!(
             terminal_activity_hook_lifecycle_kind("PromptReadyAfterInterrupt"),
+            Some(("terminal-input-ready", "idle", "active", "ready", true))
+        );
+        assert_eq!(
+            terminal_activity_hook_lifecycle_kind("PromptSubmitThinkingDecay"),
             Some(("terminal-input-ready", "idle", "active", "ready", true))
         );
         assert_eq!(

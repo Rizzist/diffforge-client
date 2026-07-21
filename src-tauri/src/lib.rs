@@ -704,6 +704,11 @@ struct TerminalStructuredInteraction {
     /// in-PTY relaunch reuses an id.
     provider_session_id: String,
     provider_request_id: String,
+    /// Provider tool call id bound to this prompt, when the opening request
+    /// carried one. OpenCode permission ids (`per_*`) differ from tool ids
+    /// (`edit_*`/`read_*`), so request identity and tool-execution identity
+    /// are tracked separately.
+    tool_use_id: Option<String>,
     prompt_id: String,
     hook_event_name: String,
     response_mode: String,
