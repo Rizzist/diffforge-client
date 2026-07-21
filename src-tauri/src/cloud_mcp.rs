@@ -182,6 +182,8 @@ const CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_DONE_META_PREFIX: &str =
     "usage_event_prune_historical_day_ack_seed_done_v1:";
 const CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_PROGRESS_META_PREFIX: &str =
     "usage_event_prune_historical_day_ack_seed_progress_v1:";
+const CLOUD_MCP_TOKENOMICS_WINDOW_HASH_META_PREFIX: &str =
+    "cloud_mcp_tokenomics_window_content_hash_v1:";
 const CLOUD_MCP_TOKENOMICS_CONTRACT: &str = "diffforge.tokenomics.v3";
 const CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL: &str = "tokenomics.device.graph_facts.v1";
 const CLOUD_MCP_TOKENOMICS_SYNC_SCHEMA_VERSION: u64 = 4;
@@ -944,6 +946,12 @@ fn cloud_mcp_background_sync_ack(kind: &str, key: &str, reason: &str, extra: Val
 /// activity surface so the periodic sync does not flash a spinner each minute.
 const CLOUD_MCP_TOKENOMICS_PERIODIC_REASON: &str = "tokenomics_periodic";
 const CLOUD_MCP_TOKENOMICS_STARTUP_REASON: &str = "tokenomics_startup";
+const CLOUD_MCP_TOKENOMICS_WS_RECONNECT_REASON: &str = "tokenomics_websocket_reconnect";
+const CLOUD_MCP_TOKENOMICS_LIMITS_CHANGED_REASON: &str = "tokenomics_limits_changed";
+/// Baseline republish of the provider windows with no new usage rows. Enqueued
+/// only after the cheap window-hash pre-check found changed content; stays off
+/// the activity surface like the other background reasons.
+const CLOUD_MCP_TOKENOMICS_WINDOW_REPUBLISH_REASON: &str = "tokenomics_window_republish";
 /// Safety-net fallback when filesystem events are missed. Provider limit sample
 /// buckets are 15 minutes, so this preserves history without minute polling.
 const CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS: u64 = 15 * 60;
@@ -8613,7 +8621,24 @@ fn cloud_mcp_tokenomics_sync_reason_visible(
     // user- and event-triggered syncs remain visible.
     !matches!(
         reason,
-        CLOUD_MCP_TOKENOMICS_PERIODIC_REASON | CLOUD_MCP_TOKENOMICS_STARTUP_REASON
+        CLOUD_MCP_TOKENOMICS_PERIODIC_REASON
+            | CLOUD_MCP_TOKENOMICS_STARTUP_REASON
+            | CLOUD_MCP_TOKENOMICS_WS_RECONNECT_REASON
+            | CLOUD_MCP_TOKENOMICS_WINDOW_REPUBLISH_REASON
+    )
+}
+
+/// Reasons that may force a current-day `aus` republish when the provider
+/// window content hash changed. Only explicit triggers qualify — startup,
+/// websocket reconnect, and the pre-checked forced-refresh republish. The
+/// ordinary 60s live-limits poll (`tokenomics_limits_changed`) is deliberately
+/// NOT in this set: it must keep the skip-on-no-new-rows behavior.
+fn cloud_mcp_tokenomics_window_republish_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        CLOUD_MCP_TOKENOMICS_STARTUP_REASON
+            | CLOUD_MCP_TOKENOMICS_WS_RECONNECT_REASON
+            | CLOUD_MCP_TOKENOMICS_WINDOW_REPUBLISH_REASON
     )
 }
 
@@ -8996,6 +9021,96 @@ fn cloud_mcp_tokenomics_day_content_hash(
             0,
         ),
     })))
+}
+
+fn cloud_mcp_tokenomics_window_hash_value(window: &Value, key: &str) -> Value {
+    window.get(key).cloned().unwrap_or(Value::Null)
+}
+
+fn cloud_mcp_tokenomics_window_content_hash(summary: &Value, now_ms: u64) -> Option<String> {
+    // Dirtiness hash only — the actual `aus` packet content is unchanged.
+    // Hash only the live `limits` rows: the sync-job delta summary's
+    // `latest_windows` echoes are sync-cursor filtered, so including them
+    // would make this hash disagree between the cheap enqueue-side pre-check
+    // (which hashes a full live-limits snapshot) and the sync job's delta
+    // summary. Both build `limits` through the same provider-limit pipeline.
+    let limits_view = json!({
+        "limits": summary.get("limits").cloned().unwrap_or(Value::Null),
+    });
+    let snapshot = cloud_mcp_tokenomics_account_usage_snapshot(&limits_view, now_ms)?;
+    let mut windows = Vec::<Value>::new();
+    for (account_key, account) in snapshot
+        .get("a")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|accounts| accounts.iter())
+    {
+        for (window_kind, window) in account
+            .get("w")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|windows| windows.iter())
+        {
+            windows.push(json!({
+                "account_key": account_key,
+                "window_kind": window_kind,
+                "used_percent": cloud_mcp_tokenomics_window_hash_value(window, "up"),
+                "remaining_percent": cloud_mcp_tokenomics_window_hash_value(window, "rp"),
+                "display_percent": cloud_mcp_tokenomics_window_hash_value(window, "dp"),
+                "reset_at_ms": cloud_mcp_tokenomics_window_hash_value(window, "ram"),
+                "reset_at": cloud_mcp_tokenomics_window_hash_value(window, "ra"),
+                "plan_name": cloud_mcp_tokenomics_window_hash_value(window, "pn"),
+                "source": {
+                    "snapshot": cloud_mcp_tokenomics_window_hash_value(window, "src"),
+                    "limit": cloud_mcp_tokenomics_window_hash_value(window, "ls"),
+                    "limit_kind": cloud_mcp_tokenomics_window_hash_value(window, "lsk"),
+                    "plan": cloud_mcp_tokenomics_window_hash_value(window, "ps"),
+                },
+                "updated": {
+                    "observed_at_ms": cloud_mcp_tokenomics_window_hash_value(window, "o"),
+                    "updated_at": cloud_mcp_tokenomics_window_hash_value(window, "uat"),
+                    "last_known_at": cloud_mcp_tokenomics_window_hash_value(window, "lka"),
+                },
+                // `pace_strategy` (pstr) and `pace_confidence` (pcf) are
+                // intentionally excluded: both are functions of row AGE
+                // (live <=30s -> recent <=300s -> stale), so pure decay with
+                // unchanged usage would re-dirty the hash 2-3 extra times and
+                // cost redundant current-day packets. The numeric pace fields
+                // below reflect real usage and stay in.
+                "pace": {
+                    "status": cloud_mcp_tokenomics_window_hash_value(window, "pst"),
+                    "delta_percent": cloud_mcp_tokenomics_window_hash_value(window, "pdp"),
+                    "exhausts_before_reset": cloud_mcp_tokenomics_window_hash_value(window, "pebr"),
+                    "expected_used_percent": cloud_mcp_tokenomics_window_hash_value(window, "peup"),
+                    "window_elapsed_percent": cloud_mcp_tokenomics_window_hash_value(window, "pwep"),
+                    "projected_used_percent": cloud_mcp_tokenomics_window_hash_value(window, "ppup"),
+                    "projected_exhaustion_seconds": cloud_mcp_tokenomics_window_hash_value(window, "ppes"),
+                    "projected_exhaustion_at": cloud_mcp_tokenomics_window_hash_value(window, "ppea"),
+                    "reset_at": cloud_mcp_tokenomics_window_hash_value(window, "prs"),
+                    "sample_count": cloud_mcp_tokenomics_window_hash_value(window, "psc"),
+                    "sample_window_seconds": cloud_mcp_tokenomics_window_hash_value(window, "psw"),
+                    "last_sample_at": cloud_mcp_tokenomics_window_hash_value(window, "pla"),
+                    "last_sample_used_percent": cloud_mcp_tokenomics_window_hash_value(window, "plup"),
+                    "trajectory_status": cloud_mcp_tokenomics_window_hash_value(window, "pts"),
+                    "trajectory_delta_percent": cloud_mcp_tokenomics_window_hash_value(window, "ptdp"),
+                    "trajectory_projected_used_percent": cloud_mcp_tokenomics_window_hash_value(window, "ptpup"),
+                    "trajectory_projected_exhaustion_seconds": cloud_mcp_tokenomics_window_hash_value(window, "ptpes"),
+                    "trajectory_projected_exhaustion_at": cloud_mcp_tokenomics_window_hash_value(window, "ptpea"),
+                },
+            }));
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    windows.sort_by(|left, right| {
+        cloud_mcp_outbox_payload_hash(left).cmp(&cloud_mcp_outbox_payload_hash(right))
+    });
+    Some(cloud_mcp_outbox_payload_hash(
+        &cloud_mcp_tokenomics_stable_hash_value(&json!({
+            "account_device_usage_windows": windows,
+        })),
+    ))
 }
 
 fn cloud_mcp_tokenomics_limit_sample_ms(row: &Value, fallback_ms: u64) -> Option<i64> {
@@ -10250,6 +10365,78 @@ fn cloud_mcp_tokenomics_historical_prune_ack_meta_suffix(
     format!("{device_id}:{billing_scope_key}")
 }
 
+fn cloud_mcp_tokenomics_window_hash_meta_key(device_id: &str, billing_scope_key: &str) -> String {
+    format!("{CLOUD_MCP_TOKENOMICS_WINDOW_HASH_META_PREFIX}{device_id}:{billing_scope_key}")
+}
+
+fn cloud_mcp_tokenomics_last_window_content_hash(
+    app: &AppHandle,
+    device_id: &str,
+    billing_scope_key: &str,
+) -> Result<Option<String>, String> {
+    let conn = tokenomics_open_db(app)?;
+    Ok(tokenomics_meta_string(
+        &conn,
+        &cloud_mcp_tokenomics_window_hash_meta_key(device_id, billing_scope_key),
+    ))
+}
+
+fn cloud_mcp_tokenomics_store_window_content_hash(
+    app: &AppHandle,
+    device_id: &str,
+    billing_scope_key: &str,
+    content_hash: &str,
+) -> Result<(), String> {
+    let conn = tokenomics_open_db(app)?;
+    tokenomics_store_meta_value(
+        &conn,
+        &cloud_mcp_tokenomics_window_hash_meta_key(device_id, billing_scope_key),
+        content_hash,
+    )
+}
+
+/// Cheap window-republish dirtiness pre-check: hashes the provider-window
+/// content of an already-built live-limits summary and compares it against
+/// the last republished baseline. Runs BEFORE any sync job exists, so an
+/// unchanged hash skips the heavy sync-job summary build entirely. Errors
+/// count as dirty so a broken meta read cannot suppress a needed baseline
+/// republish — the sync job's own hash check is the final arbiter before a
+/// current-day packet is actually forced.
+async fn cloud_mcp_tokenomics_window_republish_dirty(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    summary: &Value,
+) -> bool {
+    let Some(content_hash) = cloud_mcp_tokenomics_window_content_hash(summary, cloud_mcp_now_ms())
+    else {
+        // No provider windows at all -> nothing to republish.
+        return false;
+    };
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
+    let tokenomics_scope = tokenomics_billing_scope_from_parts(
+        Some(billing_scope_type.as_str()),
+        team_id.as_deref(),
+        "window_republish_precheck",
+    );
+    let tokenomics_scope_key = tokenomics_billing_scope_key(
+        tokenomics_scope.scope_type.as_str(),
+        tokenomics_scope.team_id.as_deref(),
+    );
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let Ok(device_id) = cloud_mcp_tokenomics_device_id_from_profile(&device_profile) else {
+        return true;
+    };
+    let hash_app = app.clone();
+    let stored = tauri::async_runtime::spawn_blocking(move || {
+        cloud_mcp_tokenomics_last_window_content_hash(&hash_app, &device_id, &tokenomics_scope_key)
+    })
+    .await;
+    match stored {
+        Ok(Ok(stored_hash)) => stored_hash.as_deref() != Some(content_hash.as_str()),
+        _ => true,
+    }
+}
+
 fn cloud_mcp_tokenomics_historical_prune_ack_done_key(
     device_id: &str,
     billing_scope_key: &str,
@@ -10639,7 +10826,8 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     } else {
         None
     };
-    let limits_only = reason_for_worker == "tokenomics_limits_changed";
+    let limits_only = reason_for_worker == CLOUD_MCP_TOKENOMICS_LIMITS_CHANGED_REASON
+        || reason_for_worker == CLOUD_MCP_TOKENOMICS_WINDOW_REPUBLISH_REASON;
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(&worker_state).await;
     let tokenomics_scope = tokenomics_billing_scope_from_parts(
         Some(billing_scope_type.as_str()),
@@ -10778,6 +10966,30 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     let tokenomics_change_count = cloud_mcp_tokenomics_summary_change_count(&summary);
     let inserted_events = tokenomics_summary_inserted_events(&summary);
     let empty_non_full_delta = !force_full && !force_resync && tokenomics_change_count == 0;
+    let window_republish_content_hash =
+        if cloud_mcp_tokenomics_window_republish_reason(&reason_for_worker) {
+            cloud_mcp_tokenomics_window_content_hash(&summary, cloud_mcp_now_ms())
+        } else {
+            None
+        };
+    let window_republish_dirty = match window_republish_content_hash.as_deref() {
+        Some(content_hash) => match cloud_mcp_tokenomics_last_window_content_hash(
+            &app,
+            &device_id,
+            &tokenomics_scope_key,
+        ) {
+            Ok(last_hash) => last_hash.as_deref() != Some(content_hash),
+            Err(error) => {
+                cloud_mcp_record_tokenomics_sync_error(
+                    "window_hash_state_error",
+                    &reason_for_worker,
+                    &error,
+                );
+                false
+            }
+        },
+        None => false,
+    };
     cloud_mcp_record_tokenomics_sync_log(
         "summary_ready",
         "active",
@@ -10787,6 +10999,8 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             "inserted_events": inserted_events,
             "change_count": tokenomics_change_count,
             "empty_non_full_delta": empty_non_full_delta,
+            "window_republish_hash": window_republish_content_hash.clone(),
+            "window_republish_dirty": window_republish_dirty,
         }),
     );
     if empty_non_full_delta && reason_for_worker == CLOUD_MCP_TOKENOMICS_STARTUP_REASON {
@@ -10860,7 +11074,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             }
         }
     }
-    if empty_non_full_delta {
+    if empty_non_full_delta && !window_republish_dirty {
         cloud_mcp_tokenomics_run_historical_prune_ack_seed(
             &app,
             &worker_state,
@@ -10963,7 +11177,10 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     );
 
     cloud_mcp_tag_tokenomics_summary_device(&mut summary, &device_profile);
-    let day_buckets = cloud_mcp_tokenomics_day_buckets(&summary, cloud_mcp_now_ms());
+    let packet_now_ms = cloud_mcp_now_ms();
+    let current_day_start_ms =
+        cloud_mcp_tokenomics_day_start_ms(packet_now_ms.min(i64::MAX as u64) as i64);
+    let day_buckets = cloud_mcp_tokenomics_day_buckets(&summary, packet_now_ms);
     let hourly_count = summary
         .get("hourly")
         .and_then(Value::as_array)
@@ -11043,14 +11260,17 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     let mut enqueued_limit_count = 0usize;
     let mut last_event_kind = CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT;
     let mut prune_ack_seeds = Vec::<TokenomicsUsageEventPruneCloudAckSeed>::new();
+    let mut enqueued_window_republish = false;
     for bucket in day_buckets {
+        let force_window_republish_bucket =
+            window_republish_dirty && bucket.day_start_ms == current_day_start_ms;
         let decision_outcome = match cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
             &device_id,
             &tokenomics_scope_key,
             bucket.day_start_ms,
             &bucket.content_hash,
             summary_observed_at_ms,
-            force_full || force_resync,
+            force_full || force_resync || force_window_republish_bucket,
         ) {
             Ok(decision) => decision,
             Err(error) => {
@@ -11144,6 +11364,9 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         );
         enqueued_hourly_count = enqueued_hourly_count.saturating_add(bucket_hourly_count);
         enqueued_limit_count = enqueued_limit_count.saturating_add(bucket_limit_count);
+        if force_window_republish_bucket {
+            enqueued_window_republish = true;
+        }
         cloud_mcp_record_tokenomics_sync_log(
             "packet_ready",
             "active",
@@ -11160,6 +11383,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
                 "hc": bucket_hourly_count,
                 "lc": bucket_limit_count,
                 "cc": tokenomics_change_count,
+                "window_republish": force_window_republish_bucket,
             }),
         );
         let handoff_log_payload = json!({
@@ -11207,6 +11431,31 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         enqueued_day_count = enqueued_day_count.saturating_add(1);
     }
 
+    if enqueued_window_republish {
+        if let Some(content_hash) = window_republish_content_hash.as_deref() {
+            match cloud_mcp_tokenomics_store_window_content_hash(
+                &app,
+                &device_id,
+                &tokenomics_scope_key,
+                content_hash,
+            ) {
+                Ok(()) => cloud_mcp_record_tokenomics_sync_log(
+                    "window_hash_stored",
+                    "queued",
+                    &reason_for_worker,
+                    json!({
+                        "window_republish_hash": content_hash,
+                    }),
+                ),
+                Err(error) => cloud_mcp_record_tokenomics_sync_error(
+                    "window_hash_store_error",
+                    &reason_for_worker,
+                    &error,
+                ),
+            }
+        }
+    }
+
     if enqueued_day_count == 0 {
         let stored_prune_ack_seed_count =
             cloud_mcp_tokenomics_store_prune_ack_seeds(&app, prune_ack_seeds, &reason_for_worker)
@@ -11242,6 +11491,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
                 "skipped_acked_day_count": skipped_acked_day_count,
                 "skipped_pending_day_count": skipped_pending_day_count,
                 "change_count": tokenomics_change_count,
+                "window_republish_dirty": window_republish_dirty,
             }),
         );
         log_terminal_status_event(
@@ -11253,6 +11503,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
                 "skipped_acked_day_count": skipped_acked_day_count,
                 "skipped_pending_day_count": skipped_pending_day_count,
                 "change_count": tokenomics_change_count,
+                "window_republish_dirty": window_republish_dirty,
             }),
         );
         return;
@@ -18854,6 +19105,22 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
         let _ = cloud_mcp_outbox_release_backoff_now();
         cloud_mcp_background_sync_ensure_started(state);
         state.background_sync.notify.notify_one();
+        if let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get().cloned() {
+            let tokenomics_state = state.clone();
+            tauri::async_runtime::spawn(async move {
+                // Republish the provider-window baseline only when the cheap
+                // hash pre-check says the content changed since the last
+                // republish; an unchanged baseline schedules no sync job at
+                // all, so reconnect storms never trigger heavy summary builds.
+                tokenomics_enqueue_window_republish_sync_if_dirty(
+                    app,
+                    &tokenomics_state,
+                    CLOUD_MCP_TOKENOMICS_WS_RECONNECT_REASON,
+                    None,
+                )
+                .await;
+            });
+        }
         cloud_mcp_spawn_registered_device_registry_refresh(state, "websocket_hello_ack");
         cloud_mcp_spawn_account_live_state_reconcile(state, "websocket_hello_ack");
         cloud_mcp_spawn_account_sync_resume(state, "websocket_hello_ack");
@@ -80581,6 +80848,109 @@ mod cloud_mcp_tests {
         assert!(packet.get("provider_accounts").is_none());
         assert!(packet.get("hourly_groups").is_none());
         assert!(packet.get("device_aliases").is_none());
+    }
+
+    #[test]
+    fn tokenomics_window_content_hash_tracks_provider_window_content() {
+        let now_ms = cloud_mcp_tokenomics_timestamp_ms("2026-06-15T10:00:00Z").unwrap() as u64;
+        let summary = json!({
+            "limits": [{
+                "provider": "openai",
+                "agent_kind": "codex",
+                "provider_account_key": "openai:codex:pro",
+                "provider_account_label": "Codex Pro",
+                "window_kind": "weekly",
+                "used_percent": 22,
+                "remaining_percent": 78,
+                "display_percent": 78,
+                "reset_at_ms": 1781690400000i64,
+                "plan_name": "Codex Pro",
+                "limit_source": "codex_usage_api",
+                "updated_at": "2026-06-15T10:00:00Z",
+                "pace_status": "on_pace",
+                "pace_delta_percent": -18,
+                "pace_projected_used_percent": 82,
+                "pace_strategy": "live_10s_with_samples",
+                "pace_confidence": "live"
+            }]
+        });
+        // Same real content re-summarized 6 minutes later: the row aged past
+        // both decay boundaries (live <=30s -> recent <=300s -> stale), so
+        // pace_confidence and pace_strategy changed, and the local-only label
+        // was renamed. None of that may re-dirty the republish baseline.
+        let age_decayed_rebuild = json!({
+            "limits": [{
+                "provider": "openai",
+                "agent_kind": "codex",
+                "provider_account_key": "openai:codex:pro",
+                "provider_account_label": "Renamed Local Label",
+                "window_kind": "weekly",
+                "used_percent": 22,
+                "remaining_percent": 78,
+                "display_percent": 78,
+                "reset_at_ms": 1781690400000i64,
+                "plan_name": "Codex Pro",
+                "limit_source": "codex_usage_api",
+                "updated_at": "2026-06-15T10:00:00Z",
+                "pace_status": "on_pace",
+                "pace_delta_percent": -18,
+                "pace_projected_used_percent": 82,
+                "pace_strategy": "sample_trajectory",
+                "pace_confidence": "stale"
+            }]
+        });
+        let changed_usage = json!({
+            "limits": [{
+                "provider": "openai",
+                "agent_kind": "codex",
+                "provider_account_key": "openai:codex:pro",
+                "window_kind": "weekly",
+                "used_percent": 24,
+                "remaining_percent": 76,
+                "display_percent": 76,
+                "reset_at_ms": 1781690400000i64,
+                "plan_name": "Codex Pro",
+                "limit_source": "codex_usage_api",
+                "updated_at": "2026-06-15T10:05:00Z",
+                "pace_status": "off_pace",
+                "pace_delta_percent": 4,
+                "pace_projected_used_percent": 101,
+                "pace_strategy": "live_10s_with_samples",
+                "pace_confidence": "live"
+            }]
+        });
+        // The sync-job delta summary carries cursor-filtered `latest_windows`
+        // echoes; the hash must ignore them so it stays comparable with the
+        // cheap enqueue-side pre-check hash of a full live snapshot.
+        let with_latest_window_echo = {
+            let mut value = summary.clone();
+            value["latest_windows"] = json!([{
+                "provider": "openai",
+                "agent_kind": "codex",
+                "provider_account_key": "openai:codex:pro",
+                "window_kind": "session_5h",
+                "used_percent": 3,
+                "remaining_percent": 97,
+                "reset_at": "2026-06-15T14:00:00Z",
+                "updated_at": "2026-06-15T09:59:00Z"
+            }]);
+            value
+        };
+
+        let first = cloud_mcp_tokenomics_window_content_hash(&summary, now_ms).unwrap();
+        let decayed =
+            cloud_mcp_tokenomics_window_content_hash(&age_decayed_rebuild, now_ms + 360_000)
+                .unwrap();
+        let changed = cloud_mcp_tokenomics_window_content_hash(&changed_usage, now_ms).unwrap();
+        let echoed =
+            cloud_mcp_tokenomics_window_content_hash(&with_latest_window_echo, now_ms).unwrap();
+
+        // (a) Age-only pace decay does NOT change the hash.
+        assert_eq!(first, decayed);
+        // (b) A real usage-percent / pace-delta change DOES.
+        assert_ne!(first, changed);
+        // (c) Cursor-dependent latest_windows echoes are not part of the hash.
+        assert_eq!(first, echoed);
     }
 
     #[test]

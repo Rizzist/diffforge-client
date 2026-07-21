@@ -71,6 +71,10 @@ const TOKENOMICS_USAGE_EVENT_PRUNE_DELETED_SINCE_VACUUM_META_KEY: &str =
     "usage_event_prune_deleted_since_vacuum_v1";
 const TOKENOMICS_USAGE_EVENT_PRUNE_ACK_DAY_META_PREFIX: &str = "usage_event_prune_acked_day_v1:";
 const TOKENOMICS_LIMITS_CHANGED_SYNC_REASON: &str = "tokenomics_limits_changed";
+/// Invisible sync reason for baseline republishes of the provider windows:
+/// no new usage rows exist, but the current window content differs from the
+/// last republished `aus` packet, so the web Billing tab needs a fresh copy.
+const TOKENOMICS_WINDOW_REPUBLISH_SYNC_REASON: &str = "tokenomics_window_republish";
 const TOKENOMICS_DEVICE_IDENTITIES_KEY: &str = "device_identities";
 const TOKENOMICS_CLOUD_ACCOUNT_SYNC_CURSOR_KEY_PREFIX: &str = "cloud_account_sync_cursor:";
 const TOKENOMICS_CODEX_USAGE_CACHE_ALIAS_KEY_PREFIX: &str = "codex_usage_api_cache_alias:";
@@ -186,6 +190,7 @@ async fn tokenomics_scan_usage(
         &summary,
         "tokenomics_usage_scan",
         false,
+        false,
     )
     .await;
     Ok(summary)
@@ -210,6 +215,7 @@ async fn tokenomics_scan_usage_silent(
         state.inner(),
         &summary,
         "tokenomics_usage_scan_silent",
+        false,
         false,
     )
     .await;
@@ -247,6 +253,7 @@ async fn tokenomics_scan_realtime_usage(
         &summary,
         "tokenomics_realtime_usage_scan",
         false,
+        false,
     )
     .await;
     Ok(summary)
@@ -272,6 +279,7 @@ async fn tokenomics_resync_last_30_days(
         &summary,
         "tokenomics_resync_last_30_days",
         true,
+        false,
     )
     .await;
     Ok(summary)
@@ -307,6 +315,7 @@ async fn tokenomics_get_live_limits(
         &summary,
         TOKENOMICS_LIMITS_CHANGED_SYNC_REASON,
         false,
+        force_provider_refresh,
     )
     .await;
     Ok(summary)
@@ -359,6 +368,7 @@ async fn tokenomics_record_usage(
         state.inner(),
         &summary,
         "tokenomics_manual_usage_record",
+        false,
         false,
     )
     .await;
@@ -3756,10 +3766,25 @@ async fn tokenomics_enqueue_usage_sync_if_needed(
     summary: &Value,
     reason: &str,
     force_full: bool,
+    allow_window_republish: bool,
 ) {
     let inserted_events = tokenomics_summary_inserted_events(summary);
     let recorded_limit_rows = tokenomics_summary_recorded_limit_rows(summary);
     if inserted_events == 0 && recorded_limit_rows == 0 && !force_full {
+        // The ordinary 60s live-limits poll keeps the old skip-on-no-rows
+        // behavior. Only an explicitly forced provider refresh may republish
+        // the provider-window baseline without new rows, and only through the
+        // cheap hash pre-check below — never through the heavy sync job.
+        if !(allow_window_republish && reason == TOKENOMICS_LIMITS_CHANGED_SYNC_REASON) {
+            return;
+        }
+        tokenomics_enqueue_window_republish_sync_if_dirty(
+            app,
+            state,
+            TOKENOMICS_WINDOW_REPUBLISH_SYNC_REASON,
+            Some(summary),
+        )
+        .await;
         return;
     }
     let _ =
@@ -3771,6 +3796,61 @@ async fn tokenomics_enqueue_usage_sync_if_needed(
             "force_full": force_full,
             "inserted_events": inserted_events,
             "recorded_limit_rows": recorded_limit_rows,
+        }),
+    );
+}
+
+/// Enqueue an invisible provider-window republish sync when the current window
+/// content differs from the last republished baseline. The dirtiness pre-check
+/// is cheap — it hashes an existing (or cached) live-limits snapshot and reads
+/// one meta row — so startup-adjacent triggers (websocket reconnect, forced
+/// limit refresh) can call this without scheduling the heavy sync-job summary
+/// build when nothing changed.
+async fn tokenomics_enqueue_window_republish_sync_if_dirty(
+    app: AppHandle,
+    state: &CloudMcpState,
+    reason: &str,
+    live_limits_summary: Option<&Value>,
+) {
+    let dirty = match live_limits_summary {
+        Some(summary) => cloud_mcp_tokenomics_window_republish_dirty(&app, state, summary).await,
+        None => {
+            let limits_app = app.clone();
+            let loaded = tauri::async_runtime::spawn_blocking(move || {
+                let _span = BackendCpuSpan::new("tokenomics.window_republish_precheck");
+                tokenomics_cached_live_limits_for(&limits_app, false)
+            })
+            .await
+            .map_err(|error| format!("Unable to join window republish pre-check: {error}"))
+            .and_then(|result| result);
+            match loaded {
+                Ok(summary) => {
+                    cloud_mcp_tokenomics_window_republish_dirty(&app, state, &summary).await
+                }
+                Err(error) => {
+                    log_terminal_status_event(
+                        "backend.tokenomics.window_republish_precheck_error",
+                        json!({ "reason": reason, "error": error }),
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    if !dirty {
+        log_terminal_status_event(
+            "backend.tokenomics.window_republish_skipped",
+            json!({ "reason": reason, "skipped": "window_content_unchanged" }),
+        );
+        return;
+    }
+    let _ = cloud_mcp_enqueue_tokenomics_sync(app, state, reason.to_string(), false, false).await;
+    log_terminal_status_event(
+        "backend.tokenomics.sync_queued",
+        json!({
+            "reason": reason,
+            "force_full": false,
+            "window_republish": true,
         }),
     );
 }
