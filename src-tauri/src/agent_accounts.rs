@@ -3734,10 +3734,9 @@ fn agent_accounts_claude_default_store_is_keychain_backed() -> bool {
     let Some(default_home) = agent_accounts_default_home("claude") else {
         return false;
     };
-    let email = agent_accounts_profile_identity("claude", None)["email"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    // Raw read — never route policy helpers through profile_identity (it
+    // computes fossil policy itself; re-entry recursed unboundedly).
+    let email = agent_accounts_claude_identity_email_raw(None);
     if email.is_empty() {
         return false;
     }
@@ -3754,22 +3753,36 @@ fn agent_accounts_claude_default_store_is_keychain_backed() -> bool {
     false
 }
 
+/// Raw identity email for a Claude home/profile dir: reads `.claude.json`
+/// directly with NO auth-policy computation. Policy helpers (fossil
+/// detection, keychain probing) MUST use this instead of
+/// `agent_accounts_profile_identity` — that function computes those same
+/// policies itself, so calling it from a policy helper recursed unboundedly
+/// and stack-overflowed the capture thread.
+fn agent_accounts_claude_identity_email_raw(dir: Option<&Path>) -> String {
+    let state_path = match dir {
+        Some(dir) => dir.join(".claude.json"),
+        None => match user_home_dir() {
+            Some(home) => home.join(".claude.json"),
+            None => return String::new(),
+        },
+    };
+    agent_accounts_read_json_stable_with_retry(&state_path)
+        .as_ref()
+        .and_then(|state| state.pointer("/oauthAccount/emailAddress"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// A captured Claude profile naming the SAME account that is currently
 /// signed into the default home.
 fn agent_accounts_claude_profile_matches_default_identity(dir: &Path) -> bool {
-    let profile_email = agent_accounts_email_key(
-        agent_accounts_profile_identity("claude", Some(dir))["email"]
-            .as_str()
-            .unwrap_or_default(),
-    );
+    let profile_email = agent_accounts_email_key(&agent_accounts_claude_identity_email_raw(Some(dir)));
     if profile_email.is_empty() {
         return false;
     }
-    let default_email = agent_accounts_email_key(
-        agent_accounts_profile_identity("claude", None)["email"]
-            .as_str()
-            .unwrap_or_default(),
-    );
+    let default_email = agent_accounts_email_key(&agent_accounts_claude_identity_email_raw(None));
     profile_email == default_email
 }
 
@@ -8631,6 +8644,50 @@ mod agent_accounts_tests {
     use super::*;
 
     static AGENT_ACCOUNTS_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    // Regression (v0.9.25 startup crash): profile_identity computed the
+    // fossil policy, whose helpers called profile_identity back — unbounded
+    // mutual recursion that stack-overflowed the agent-accounts-capture
+    // thread on keychain-backed Macs. A fossil-shaped profile (expired
+    // credentials + identity present) must terminate regardless of the
+    // host's default-home/keychain state.
+    #[test]
+    fn fossil_shaped_profile_identity_terminates() {
+        let dir = env::temp_dir().join(format!(
+            "agent-accounts-fossil-recursion-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(".claude.json"),
+            serde_json::to_vec(&json!({
+                "oauthAccount": { "emailAddress": "fossil@example.com" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Token expired far beyond the fossil threshold.
+        fs::write(
+            dir.join(".credentials.json"),
+            serde_json::to_vec(&json!({
+                "claudeAiOauth": { "expiresAt": 1_000_000_u64 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let identity = agent_accounts_profile_identity("claude", Some(&dir));
+        assert_eq!(identity["email"], json!("fossil@example.com"));
+        assert_eq!(
+            agent_accounts_claude_identity_email_raw(Some(&dir)),
+            "fossil@example.com"
+        );
+        // Policy helpers must also terminate on their own.
+        let _ = agent_accounts_claude_profile_matches_default_identity(&dir);
+        let _ = agent_accounts_claude_default_store_is_keychain_backed();
+
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn registry_parse_rejects_torn_writes_and_last_good_survives() {
