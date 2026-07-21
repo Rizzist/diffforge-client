@@ -16,6 +16,7 @@ import { emitVideoAssetDrag } from "./videoDragEvents.js";
 import {
   VIDEO_ANNOTATION_UPDATED_EVENT,
   VIDEO_DESCRIBE_PROGRESS_EVENT,
+  VIDEO_GENERATE_PROGRESS_EVENT,
   VIDEO_POLISH_PROGRESS_EVENT,
 } from "./videoPanelBridge.js";
 import { buildKeepRanges, detectTakeGroups } from "./videoTakes.js";
@@ -173,6 +174,45 @@ const UpscaleInfo = styled.div`
 
   html[data-forge-theme="light"] & span {
     color: #64748b;
+  }
+`;
+
+// Live upscale run: phase label + bar between the model rows and Versions.
+const UpscaleProgressRow = styled.div`
+  display: grid;
+  gap: 4px;
+  padding: 7px 9px;
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 8px;
+  background: rgba(8, 14, 24, 0.7);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.25);
+    background: #eff6ff;
+  }
+`;
+
+const UpscalePhase = styled.div`
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+  font-weight: 750;
+  color: #93c5fd;
+
+  span {
+    font-weight: 650;
+    color: #7d8ca3;
+    font-variant-numeric: tabular-nums;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1d4ed8;
+
+    span {
+      color: #64748b;
+    }
   }
 `;
 
@@ -631,6 +671,27 @@ function formatBytes(bytes) {
   return `${Math.max(1, Math.round(value / 1000))} KB`;
 }
 
+// KEEP IN SYNC with rust-diffforge VIDEO_CLOUD_UPSCALE_MAX_SOURCE_BYTES and
+// cloud-diffforge MEDIA_GENERATE_MAX_SOURCE_BYTES.
+const UPSCALE_MAX_SOURCE_BYTES = 500 * 1024 * 1024;
+
+// Progress-event states → the three-phase story the Upscale section tells.
+function upscalePhaseLabel(state) {
+  switch (state) {
+    case "starting":
+    case "submitting":
+      return "Starting…";
+    case "uploading":
+      return "Uploading source";
+    case "queued":
+      return "Queued in cloud";
+    case "downloading":
+      return "Downloading result";
+    default:
+      return "Processing";
+  }
+}
+
 const VERSION_BADGES = {
   original: { label: "Original", color: "rgba(148, 163, 184, 0.45)", text: "#cbd5f5" },
   polish: { label: "Polished", color: "rgba(16, 185, 129, 0.5)", text: "#6ee7b7" },
@@ -700,7 +761,13 @@ export default function AssetPanel({
   repoPath = "",
 }) {
   const [error, setError] = useState("");
-  const [startedUpscaleId, setStartedUpscaleId] = useState("");
+  // Live upscale run for this panel: { jobId, modelId, assetPath, state,
+  // percent, message, error, done }. Survives asset switches (the upload keeps
+  // going); only rendered while inspecting the asset it belongs to.
+  const [upscaleRun, setUpscaleRun] = useState(null);
+  // Diff Forge AI credits balance — upscales always run through the cloud, so
+  // the button gates on it up front instead of failing after submit.
+  const [creditsRemaining, setCreditsRemaining] = useState(null);
   const [drag, setDrag] = useState(null); // { asset, x, y }
 
   // Polish state, all reset when the inspected asset changes.
@@ -882,6 +949,15 @@ export default function AssetPanel({
     () => (asset && (asset.kind === "video" || asset.kind === "image") ? upscaleModelsFor(asset.kind) : []),
     [asset],
   );
+  const upscaleOversize = Number(asset?.sizeBytes) > UPSCALE_MAX_SOURCE_BYTES;
+  // The run row renders only on the asset it belongs to; a settled run stays
+  // visible (✓ / error) until dismissed or another upscale starts.
+  const displayedUpscaleRun =
+    upscaleRun && upscaleRun.assetPath === asset?.path ? upscaleRun : null;
+  const activeUpscaleRun =
+    displayedUpscaleRun && !displayedUpscaleRun.done && !displayedUpscaleRun.error
+      ? displayedUpscaleRun
+      : null;
 
   const family = useMemo(() => collectVersionFamily(asset, assetsByPath), [asset, assetsByPath]);
 
@@ -985,6 +1061,75 @@ export default function AssetPanel({
     });
   }, [asset, polishPlan, repoPath]);
 
+  const refreshCredits = useCallback(() => {
+    invoke("cloud_mcp_get_billing_status")
+      .then((status) => {
+        const credits = status?.credits || {};
+        const remaining = Number(
+          credits.termRemainingCredits ?? credits.term_remaining_credits,
+        );
+        setCreditsRemaining(Number.isFinite(remaining) ? remaining : null);
+      })
+      .catch(() => {});
+  }, []);
+  useEffect(() => {
+    refreshCredits();
+  }, [refreshCredits]);
+
+  // Follow the started job through upload → cloud processing → download. The
+  // asset-panel run is the only surface that shows the error inline — history
+  // keeps the full record, but the click deserves an answer where it happened.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(VIDEO_GENERATE_PROGRESS_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      if (!payload.jobId) {
+        return;
+      }
+      setUpscaleRun((current) => {
+        if (!current) {
+          return current;
+        }
+        // The invoke result races the worker's first events: while jobId is
+        // still unknown, adopt the event that matches the started model.
+        const matches = current.jobId
+          ? current.jobId === payload.jobId
+          : current.state === "starting" && payload.model === current.modelId;
+        if (!matches) {
+          return current;
+        }
+        return {
+          ...current,
+          jobId: current.jobId || payload.jobId,
+          state: payload.state || current.state,
+          percent: payload.percent ?? null,
+          message: payload.message || "",
+          error: payload.error ? String(payload.error) : "",
+          done: Boolean(payload.done),
+        };
+      });
+      if (payload.done || payload.error) {
+        refreshCredits();
+      }
+    })
+      .then((next) => {
+        if (disposed) {
+          next();
+        } else {
+          unlisten = next;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [refreshCredits]);
+
   const startUpscale = useCallback(
     (model) => {
       if (!repoPath || !asset?.path) {
@@ -996,7 +1141,21 @@ export default function AssetPanel({
         setError("source duration unknown — reprobe the asset");
         return;
       }
-      setStartedUpscaleId(model.id);
+      if (Number(asset.sizeBytes) > UPSCALE_MAX_SOURCE_BYTES) {
+        setError(`Source is ${formatBytes(asset.sizeBytes)} — the upscale limit is 500 MB.`);
+        return;
+      }
+      const assetPath = asset.path;
+      setUpscaleRun({
+        jobId: "",
+        modelId: model.id,
+        assetPath,
+        state: "starting",
+        percent: null,
+        message: "",
+        error: "",
+        done: false,
+      });
       invoke("video_generate_start", {
         repoPath,
         request: {
@@ -1005,7 +1164,7 @@ export default function AssetPanel({
           kind: "upscale",
           mode: asset.kind === "video" ? "upscale-video" : "upscale-image",
           prompt: "",
-          inputAssetPaths: [asset.path],
+          inputAssetPaths: [assetPath],
           params: {
             durationSec:
               asset.kind === "video"
@@ -1021,9 +1180,20 @@ export default function AssetPanel({
           auth: { apiKey: "", secretKey: "", baseUrl: "" },
         },
       })
-        .then(() => window.setTimeout(() => setStartedUpscaleId(""), 2500))
+        .then((result) => {
+          const jobId = result?.jobId || "";
+          setUpscaleRun((current) =>
+            current && current.assetPath === assetPath && current.modelId === model.id
+              ? { ...current, jobId }
+              : current,
+          );
+        })
         .catch((err) => {
-          setStartedUpscaleId("");
+          setUpscaleRun((current) =>
+            current && current.assetPath === assetPath && current.modelId === model.id
+              ? null
+              : current,
+          );
           setError(String(err));
         });
     },
@@ -1446,10 +1616,19 @@ export default function AssetPanel({
               ) : null}
             </InlineRow>
           ) : null}
+          {upscaleOversize ? (
+            <VideoErrorText>
+              This file is {formatBytes(asset.sizeBytes)} — over the 500 MB upscale limit. Trim or
+              export a smaller version first.
+            </VideoErrorText>
+          ) : null}
           {upscalers.map((model) => {
             const credits = videoDurationKnown
               ? estimateModelCredits(model, { durationSec: durationSecEstimate })
               : null;
+            const insufficientCredits =
+              credits != null && creditsRemaining != null && creditsRemaining < credits;
+            const runActive = Boolean(activeUpscaleRun);
             return (
               <UpscaleRow key={model.id}>
                 <UpscaleInfo>
@@ -1460,18 +1639,70 @@ export default function AssetPanel({
                       ? ` · ≈ ${credits.toLocaleString()} credits · validated provider outputs`
                       : ""}
                   </span>
+                  {insufficientCredits ? (
+                    <span style={{ color: "#fca5a5" }}>
+                      Needs ≈ {credits.toLocaleString()} credits — {creditsRemaining.toLocaleString()}{" "}
+                      left. Top up in Generate.
+                    </span>
+                  ) : null}
                 </UpscaleInfo>
                 <SpeedBadge $speed={model.caps.speed}>{model.caps.speed}</SpeedBadge>
                 <VideoPaneButton
-                  disabled={startedUpscaleId === model.id}
+                  disabled={upscaleOversize || insufficientCredits || runActive}
                   onClick={() => startUpscale(model)}
+                  title={
+                    upscaleOversize
+                      ? "Over the 500 MB upscale limit"
+                      : insufficientCredits
+                        ? "Not enough Diff Forge AI credits"
+                        : runActive
+                          ? "An upscale is already running for this asset"
+                          : `Upscale with ${model.displayName}`
+                  }
                   type="button"
                 >
-                  {startedUpscaleId === model.id ? "Queued ✓" : "Upscale"}
+                  Upscale
                 </VideoPaneButton>
               </UpscaleRow>
             );
           })}
+          {displayedUpscaleRun ? (
+            <UpscaleProgressRow>
+              <UpscalePhase>
+                {displayedUpscaleRun.error
+                  ? "Upscale failed"
+                  : displayedUpscaleRun.done
+                    ? "Upscaled ✓ — see Versions above"
+                    : upscalePhaseLabel(displayedUpscaleRun.state)}
+                {!displayedUpscaleRun.done && !displayedUpscaleRun.error ? (
+                  <span>
+                    {displayedUpscaleRun.percent != null
+                      ? `${Math.round(displayedUpscaleRun.percent)}%`
+                      : "…"}
+                  </span>
+                ) : null}
+              </UpscalePhase>
+              {!displayedUpscaleRun.done && !displayedUpscaleRun.error ? (
+                <VideoProgressTrack>
+                  <VideoProgressFill
+                    style={{
+                      width: `${Math.min(100, Math.max(4, displayedUpscaleRun.percent ?? 4))}%`,
+                    }}
+                  />
+                </VideoProgressTrack>
+              ) : null}
+              {displayedUpscaleRun.error ? (
+                <VideoErrorText>{displayedUpscaleRun.error}</VideoErrorText>
+              ) : null}
+              {displayedUpscaleRun.done || displayedUpscaleRun.error ? (
+                <InlineRow>
+                  <VideoSecondaryButton onClick={() => setUpscaleRun(null)} type="button">
+                    Dismiss
+                  </VideoSecondaryButton>
+                </InlineRow>
+              ) : null}
+            </UpscaleProgressRow>
+          ) : null}
         </Section>
       ) : null}
 

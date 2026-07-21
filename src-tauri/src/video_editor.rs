@@ -52,6 +52,12 @@ const VIDEO_TRANSCRIBE_MP3_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 const VIDEO_TRANSCRIBE_TIMEOUT_SECS: u64 = 180;
 const VIDEO_CLOUD_GENERATE_MAX_B64_BYTES: usize = 40 * 1024 * 1024;
 const VIDEO_CLOUD_GENERATE_ACK_TIMEOUT_SECS: u64 = 45;
+// Upscale sources skip inline base64: the file PUTs to a cloud-minted fal
+// storage slot (raw bytes, streamed), so the cap is transfer patience — not
+// websocket frame size. KEEP IN SYNC with AssetPanel.jsx UPSCALE_MAX_SOURCE_BYTES
+// and cloud-diffforge MEDIA_GENERATE_MAX_SOURCE_BYTES.
+const VIDEO_CLOUD_UPSCALE_MAX_SOURCE_BYTES: u64 = 500 * 1024 * 1024;
+const VIDEO_CLOUD_UPSCALE_UPLOAD_TIMEOUT_SECS: u64 = 30 * 60;
 const VIDEO_DIRECT_UPSCALE_VIDEO_LIMIT_BYTES: u64 = 60 * 1024 * 1024;
 const VIDEO_DIRECT_UPSCALE_IMAGE_LIMIT_BYTES: u64 = 25 * 1024 * 1024;
 const VIDEO_DIRECT_GENERATION_AUDIO_LIMIT_BYTES: u64 = 15 * 1024 * 1024;
@@ -1098,7 +1104,7 @@ fn video_emit_manifest_changed(
     let _ = app.emit(
         VIDEO_STORE_CHANGED_EVENT,
         serde_json::json!({
-            "repoPath": root.to_string_lossy().to_string(),
+            "repoPath": workspace_path_display(&root),
             "paths": [manifest_rel.clone()],
             "manifestPath": manifest_rel,
             "changedAtMs": video_now_millis(),
@@ -1742,7 +1748,7 @@ fn video_build_media_item(
 
     Some(VideoMediaItem {
         path,
-        abs_path: abs_path.to_string_lossy().to_string(),
+        abs_path: workspace_path_display(abs_path),
         name: abs_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1796,7 +1802,7 @@ fn video_pending_generated_media_items(
             };
             items.push(VideoMediaItem {
                 path: planned_path.clone(),
-                abs_path: abs.to_string_lossy().to_string(),
+                abs_path: workspace_path_display(&abs),
                 name: abs
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -3021,7 +3027,7 @@ fn video_watch_start(app: tauri::AppHandle, repo_path: String) -> Result<(), Str
         }
         guard.insert(key);
     }
-    let repo_display = root.to_string_lossy().to_string();
+    let repo_display = workspace_path_display(&root);
     std::thread::spawn(move || {
         use notify::Watcher as _;
         let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
@@ -3085,6 +3091,14 @@ async fn video_media_list(
         let _span = BackendCpuSpan::new("video_media_list");
         let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
         video_ensure_media_dirs(&media_root)?;
+        // Workspaces can live outside the static asset-protocol scope
+        // ($HOME/**, $TEMP/** — e.g. another Windows drive). Allow this
+        // workspace's media tree at runtime so asset.localhost can serve the
+        // preview; best-effort, listing must not fail on it.
+        {
+            use tauri::Manager as _;
+            let _ = app.asset_protocol_scope().allow_directory(&media_root, true);
+        }
         let status = video_tools_status_for(&app);
         let ffmpeg_path = status.ffmpeg.path.as_deref();
         let ffprobe_path = status.ffprobe.path.as_deref();
@@ -3119,9 +3133,14 @@ async fn video_media_list(
             let _ = video_write_probe_cache(&cache_path, &probe_cache);
         }
         items.sort_by(|left, right| left.path.cmp(&right.path));
+        // Webview-facing absolute paths must be plain (non-verbatim): on
+        // Windows the canonicalized root is \\?\C:\..., and the asset
+        // protocol opens the /-joined URL path verbatim — the \\?\ prefix
+        // disables Win32 separator normalization, so every <img>/<video>
+        // request fails and the preview stays black.
         Ok(VideoMediaListResponse {
-            repo_path: root.to_string_lossy().to_string(),
-            media_root: media_root.to_string_lossy().to_string(),
+            repo_path: workspace_path_display(&root),
+            media_root: workspace_path_display(&media_root),
             ffmpeg_ready: status.ffmpeg.installed,
             items,
         })
@@ -3425,7 +3444,7 @@ async fn video_media_import(
             let _ = app.emit(
                 VIDEO_STORE_CHANGED_EVENT,
                 serde_json::json!({
-                    "repoPath": root.to_string_lossy().to_string(),
+                    "repoPath": workspace_path_display(&root),
                     "paths": changed_paths,
                     "changedAtMs": video_now_millis(),
                 }),
@@ -3504,7 +3523,7 @@ async fn video_media_delete(
         let _ = app.emit(
             VIDEO_STORE_CHANGED_EVENT,
             serde_json::json!({
-                "repoPath": root.to_string_lossy().to_string(),
+                "repoPath": workspace_path_display(&root),
                 "paths": paths,
                 "manifestPath": manifest_changed.then(|| video_relative_path(&root, &manifest_path)),
                 "changedAtMs": video_now_millis(),
@@ -4129,7 +4148,7 @@ async fn video_transcribe_worker(
         let _ = app.emit(
             VIDEO_STORE_CHANGED_EVENT,
             serde_json::json!({
-                "repoPath": root.to_string_lossy().to_string(),
+                "repoPath": workspace_path_display(&root),
                 "paths": [rel_path],
                 "changedAtMs": video_now_millis(),
             }),
@@ -4252,7 +4271,7 @@ async fn video_transcript_update(
         let _ = app.emit(
             VIDEO_TRANSCRIPT_UPDATED_EVENT,
             serde_json::json!({
-                "repoPath": root.to_string_lossy().to_string(),
+                "repoPath": workspace_path_display(&root),
                 "path": rel_path,
             }),
         );
@@ -4291,7 +4310,7 @@ async fn video_transcript_delete(
         let _ = app.emit(
             VIDEO_TRANSCRIPT_UPDATED_EVENT,
             serde_json::json!({
-                "repoPath": root.to_string_lossy().to_string(),
+                "repoPath": workspace_path_display(&root),
                 "path": rel_path,
                 "deleted": true,
             }),
@@ -4504,7 +4523,7 @@ async fn video_frame_extract(
         let _ = app.emit(
             VIDEO_STORE_CHANGED_EVENT,
             serde_json::json!({
-                "repoPath": root.to_string_lossy().to_string(),
+                "repoPath": workspace_path_display(&root),
                 "paths": [item.path.clone()],
                 "changedAtMs": video_now_millis(),
             }),
@@ -5670,7 +5689,7 @@ async fn video_project_create(
         Ok::<serde_json::Value, String>(serde_json::json!({
             "project": project,
             "path": video_relative_path(&root, &project_path),
-            "repoPath": root.to_string_lossy().to_string(),
+            "repoPath": workspace_path_display(&root),
         }))
     })
     .await
@@ -6926,7 +6945,7 @@ fn video_mcp_media_import_items(
         let _ = app.emit(
             VIDEO_STORE_CHANGED_EVENT,
             serde_json::json!({
-                "repoPath": root.to_string_lossy().to_string(),
+                "repoPath": workspace_path_display(&root),
                 "paths": changed_paths,
                 "changedAtMs": video_now_millis(),
             }),
@@ -7345,7 +7364,7 @@ async fn video_project_delete(
             .map_err(|error| format!("Unable to delete video project: {error}"))?;
         Ok::<serde_json::Value, String>(serde_json::json!({
             "path": rel_path,
-            "repoPath": root.to_string_lossy().to_string(),
+            "repoPath": workspace_path_display(&root),
         }))
     })
     .await
@@ -10125,7 +10144,7 @@ async fn video_mcp_edit(
         let _ = app.emit(
             VIDEO_STORE_CHANGED_EVENT,
             serde_json::json!({
-                "repoPath": root.to_string_lossy().to_string(),
+                "repoPath": workspace_path_display(&root),
                 "paths": [project_path.clone()],
                 "changedAtMs": video_now_millis(),
             }),
@@ -11769,7 +11788,12 @@ fn video_emit_export_progress(
     error: Option<&str>,
     output_path: Option<&str>,
 ) {
-    video_record_export_status(job_id, state, percent, done, error, output_path);
+    // Callers pass canonicalized roots/outputs; the webview needs plain
+    // (non-verbatim) Windows paths for repo matching and convertFileSrc.
+    let repo_path = workspace_path_display(std::path::Path::new(repo_path));
+    let output_path =
+        output_path.map(|path| workspace_path_display(std::path::Path::new(path)));
+    video_record_export_status(job_id, state, percent, done, error, output_path.as_deref());
     let _ = app.emit(
         VIDEO_EXPORT_PROGRESS_EVENT,
         serde_json::json!({
@@ -11813,7 +11837,7 @@ fn video_run_export_blocking(
 ) -> Result<(), String> {
     let _span = BackendCpuSpan::new("video_export");
     let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
-    let repo_display = root.to_string_lossy().to_string();
+    let repo_display = workspace_path_display(&root);
     video_ensure_media_dirs(&media_root)?;
     let status = video_tools_status_for(&app);
     let ffmpeg_path = status
@@ -12071,7 +12095,7 @@ fn video_run_export_blocking(
         let _ = app.emit(
             VIDEO_STORE_CHANGED_EVENT,
             serde_json::json!({
-                "repoPath": root.to_string_lossy().to_string(),
+                "repoPath": workspace_path_display(&root),
                 "paths": [output_rel],
                 "changedAtMs": video_now_millis(),
             }),
@@ -13517,6 +13541,11 @@ async fn video_download_generated_url(
     let temp = output.with_extension(format!("{extension}.download"));
     let mut file = std::fs::File::create(&temp)
         .map_err(|error| format!("Unable to write generated media: {error}"))?;
+    // Content-Length drives a live download percent (2% steps); servers that
+    // stream without it just keep the plain "downloading" state.
+    let total_bytes = response.content_length().filter(|value| *value > 0);
+    let mut received: u64 = 0;
+    let mut last_step: u64 = u64::MAX;
     while let Some(chunk) = response
         .chunk()
         .await
@@ -13528,6 +13557,23 @@ async fn video_download_generated_url(
         }
         file.write_all(&chunk)
             .map_err(|error| format!("Unable to write generated media: {error}"))?;
+        received += chunk.len() as u64;
+        if let Some(total) = total_bytes {
+            let step = received * 50 / total.max(1);
+            if step != last_step {
+                last_step = step;
+                let percent = (received as f64 / total.max(1) as f64) * 100.0;
+                video_emit_generate_progress(
+                    context,
+                    "downloading",
+                    Some(percent.min(100.0)),
+                    "Downloading generated media.",
+                    false,
+                    None,
+                    &[],
+                );
+            }
+        }
     }
     file.flush()
         .map_err(|error| format!("Unable to finish generated media write: {error}"))?;
@@ -14094,7 +14140,7 @@ async fn video_cloud_generate_result_worker(
             let _ = handle.context.app.emit(
                 VIDEO_STORE_CHANGED_EVENT,
                 serde_json::json!({
-                    "repoPath": handle.context.root.to_string_lossy().to_string(),
+                    "repoPath": workspace_path_display(&handle.context.root),
                     "paths": changed_paths,
                     "manifestPath": manifest_changed.then(|| video_relative_path(
                         &handle.context.root,
@@ -14367,6 +14413,7 @@ fn video_cloud_append_audio_b64_asset(
 fn video_cloud_generate_payload(
     context: &VideoGenerateJobContext,
     request: &VideoGenerateRequest,
+    upscale_source: Option<(String, String)>,
 ) -> Result<serde_json::Value, String> {
     let mut input = serde_json::Map::new();
     let prompt = request.prompt.trim();
@@ -14453,18 +14500,15 @@ fn video_cloud_generate_payload(
         input.insert("sourceB64".to_string(), serde_json::json!(b64));
         input.insert("sourceMime".to_string(), serde_json::json!(mime));
     } else if request.mode == "upscale-video" || request.mode == "upscale-image" {
-        let source_path = request
-            .input_asset_paths
-            .first()
-            .ok_or_else(|| format!("Cloud {} requires an input asset.", request.mode))?;
-        let (b64, mime) = video_cloud_append_b64_asset(
-            &context.root,
-            &context.media_root,
-            source_path,
-            &mut total_b64,
-        )?;
-        input.insert("sourceB64".to_string(), serde_json::json!(b64));
-        input.insert("sourceMime".to_string(), serde_json::json!(mime));
+        // Upscale sources were uploaded to a cloud-minted fal storage slot
+        // before this payload was built (video_cloud_upload_upscale_source) —
+        // raw bytes over HTTP, so a 500MB screen recording never has to fit a
+        // websocket frame as base64.
+        let (source_url, source_mime) = upscale_source.ok_or_else(|| {
+            format!("Cloud {} requires an uploaded source URL.", request.mode)
+        })?;
+        input.insert("sourceUrl".to_string(), serde_json::json!(source_url));
+        input.insert("sourceMime".to_string(), serde_json::json!(source_mime));
     } else if request.mode == "image-to-video" {
         let start_path = request
             .input_asset_paths
@@ -14535,6 +14579,160 @@ fn video_cloud_generate_payload(
     }))
 }
 
+// Upload an upscale source to a cloud-minted fal storage slot: ws
+// action:"upload" returns { uploadUrl, fileUrl }; the raw file streams to
+// uploadUrl in 1MB chunks with "uploading" progress events; the returned
+// fileUrl goes into the generate payload as input.sourceUrl.
+async fn video_cloud_upload_upscale_source(
+    context: &VideoGenerateJobContext,
+    request: &VideoGenerateRequest,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(String, String), String> {
+    let source_path = request
+        .input_asset_paths
+        .first()
+        .ok_or_else(|| format!("Cloud {} requires an input asset.", request.mode))?;
+    let abs = video_resolve_media_abs(&context.root, &context.media_root, source_path)?;
+    let size_bytes = std::fs::metadata(&abs)
+        .map_err(|error| format!("Unable to inspect the upscale source: {error}"))?
+        .len();
+    if size_bytes == 0 {
+        return Err("The upscale source file is empty.".to_string());
+    }
+    if size_bytes > VIDEO_CLOUD_UPSCALE_MAX_SOURCE_BYTES {
+        return Err(format!(
+            "Source is {}MB — the cloud upscale limit is {}MB. Trim or export a smaller file first.",
+            video_direct_payload_mb(size_bytes),
+            VIDEO_CLOUD_UPSCALE_MAX_SOURCE_BYTES / 1024 / 1024,
+        ));
+    }
+    let mime = video_mime_for_path(&abs).to_string();
+    video_emit_generate_progress(
+        context,
+        "uploading",
+        Some(0.0),
+        "Uploading source to the cloud.",
+        false,
+        None,
+        &[],
+    );
+    let file_name = abs
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("source.bin")
+        .to_string();
+    let slot_payload = serde_json::json!({
+        "action": "upload",
+        "requestId": format!("video-upscale-upload-{}-{}", video_now_millis(), uuid::Uuid::new_v4()),
+        "sizeBytes": size_bytes,
+        "contentType": mime,
+        "fileName": file_name,
+    });
+    let cloud_state = context.app.state::<CloudMcpState>().inner().clone();
+    let response = cloud_mcp_ws_request_once_with_timeout(
+        &cloud_state,
+        "media_generate_request",
+        &slot_payload,
+        std::time::Duration::from_secs(VIDEO_CLOUD_GENERATE_ACK_TIMEOUT_SECS),
+    )
+    .await?;
+    let data = response
+        .get("data")
+        .cloned()
+        .unwrap_or_else(|| response.clone());
+    if data.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(video_cloud_event_error(&data));
+    }
+    let upload_url = video_cloud_event_text(&data, &["uploadUrl", "upload_url"])
+        .ok_or_else(|| "Cloud upload slot omitted uploadUrl.".to_string())?;
+    let file_url = video_cloud_event_text(&data, &["fileUrl", "file_url"])
+        .ok_or_else(|| "Cloud upload slot omitted fileUrl.".to_string())?;
+    let file = tokio::fs::File::open(&abs)
+        .await
+        .map_err(|error| format!("Unable to read the upscale source: {error}"))?;
+    let progress_context = context.clone();
+    let cancel_flag = cancel.clone();
+    // Yield 1MB chunks, tracking (file, sent bytes, last emitted 2% step).
+    let body_stream = futures_util::stream::unfold(
+        (file, 0u64, u64::MAX),
+        move |(mut file, sent, last_step)| {
+            let progress_context = progress_context.clone();
+            let cancel_flag = cancel_flag.clone();
+            async move {
+                use tokio::io::AsyncReadExt as _;
+                if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+                    return Some((
+                        Err(std::io::Error::other("Video generation cancelled.")),
+                        (file, sent, last_step),
+                    ));
+                }
+                let mut buffer = vec![0u8; 1024 * 1024];
+                match file.read(&mut buffer).await {
+                    Ok(0) => None,
+                    Ok(count) => {
+                        buffer.truncate(count);
+                        let sent = sent + count as u64;
+                        let step = sent * 50 / size_bytes.max(1);
+                        if step != last_step {
+                            let percent = (sent as f64 / size_bytes.max(1) as f64) * 100.0;
+                            video_emit_generate_progress(
+                                &progress_context,
+                                "uploading",
+                                Some(percent.min(100.0)),
+                                "Uploading source to the cloud.",
+                                false,
+                                None,
+                                &[],
+                            );
+                        }
+                        Some((Ok(buffer), (file, sent, step)))
+                    }
+                    Err(error) => Some((Err(error), (file, sent, last_step))),
+                }
+            }
+        },
+    );
+    let client = http_client(std::time::Duration::from_secs(
+        VIDEO_CLOUD_UPSCALE_UPLOAD_TIMEOUT_SECS,
+    ))?;
+    let put = client
+        .put(&upload_url)
+        .header(reqwest::header::CONTENT_TYPE, mime.clone())
+        .header(reqwest::header::CONTENT_LENGTH, size_bytes)
+        .body(reqwest::Body::wrap_stream(body_stream))
+        .send()
+        .await
+        .map_err(|error| {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                "Video generation cancelled.".to_string()
+            } else {
+                format!("Unable to upload the upscale source: {error}")
+            }
+        })?;
+    let status = put.status();
+    if !status.is_success() {
+        let body = put
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unable to read response body>".to_string());
+        return Err(format!(
+            "Upscale source upload returned HTTP {}: {}",
+            status,
+            video_http_body_excerpt(&body)
+        ));
+    }
+    video_emit_generate_progress(
+        context,
+        "uploading",
+        Some(100.0),
+        "Source uploaded — submitting the upscale job.",
+        false,
+        None,
+        &[],
+    );
+    Ok((file_url, mime))
+}
+
 async fn video_generate_cloud(
     context: &VideoGenerateJobContext,
     request: &VideoGenerateRequest,
@@ -14543,7 +14741,15 @@ async fn video_generate_cloud(
     if cancel.load(std::sync::atomic::Ordering::Acquire) {
         return Err("Video generation cancelled.".to_string());
     }
-    let payload = video_cloud_generate_payload(context, request)?;
+    let upscale_source = if request.mode == "upscale-video" || request.mode == "upscale-image" {
+        Some(video_cloud_upload_upscale_source(context, request, cancel).await?)
+    } else {
+        None
+    };
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("Video generation cancelled.".to_string());
+    }
+    let payload = video_cloud_generate_payload(context, request, upscale_source)?;
     let request_id = video_cloud_event_text(&payload, &["requestId", "request_id"])
         .ok_or_else(|| "Cloud media generation payload omitted requestId.".to_string())?;
     let pending_provider_ref = serde_json::json!({
@@ -16496,7 +16702,7 @@ async fn video_generate_worker(
             let _ = context.app.emit(
                 VIDEO_STORE_CHANGED_EVENT,
                 serde_json::json!({
-                    "repoPath": context.root.to_string_lossy().to_string(),
+                    "repoPath": workspace_path_display(&context.root),
                     "paths": output_paths,
                     "changedAtMs": video_now_millis(),
                 }),
@@ -16773,7 +16979,7 @@ fn video_generate_start_hyperframes(
     let _ = app.emit(
         VIDEO_STORE_CHANGED_EVENT,
         serde_json::json!({
-            "repoPath": root.to_string_lossy().to_string(),
+            "repoPath": workspace_path_display(&root),
             "paths": [source_path.clone()],
             "changedAtMs": video_now_millis(),
         }),
@@ -17329,7 +17535,7 @@ async fn video_generate_resume_worker(
             let _ = context.app.emit(
                 VIDEO_STORE_CHANGED_EVENT,
                 serde_json::json!({
-                    "repoPath": context.root.to_string_lossy().to_string(),
+                    "repoPath": workspace_path_display(&context.root),
                     "paths": output_paths,
                     "changedAtMs": video_now_millis(),
                 }),
