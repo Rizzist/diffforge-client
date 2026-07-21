@@ -1,0 +1,4 @@
+# Contract fixture corpora are hashed byte-for-byte (the vendored corpus lock).
+# Windows checkout must NOT convert LF->CRLF or the computed digest drifts from
+# the pinned lock. Treat the whole contracts tree as binary — no EOL conversion.
+src-tauri/tests/contracts/** -text
