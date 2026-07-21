@@ -28409,6 +28409,27 @@ async fn terminal_codex_gateway_fail_hook_discovery(
     generation: u64,
     error: &str,
 ) {
+    if crate::daemon_mode_active() {
+        // No webview can answer the error prompt on a daemon; surface the
+        // failure to journald and let the session proceed untrusted rather
+        // than wedging it behind an unanswerable UserInputRequired.
+        terminal_codex_hook_trust_discovery_transition(
+            pane_id,
+            instance_id,
+            generation,
+            &[TerminalCodexHookTrustDiscoveryState::Pending],
+            TerminalCodexHookTrustDiscoveryState::Resolved,
+        );
+        crate::daemon_terminal_lifecycle_println(
+            "codex_hook_trust.discovery_failed_daemon",
+            &json!({
+                "error": clean_terminal_diagnostic_log_text(error),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            }),
+        );
+        return;
+    }
     let prompt_text = format!(
         "Codex could not load a valid hook trust catalog from app-server. The agent remains blocked; close and reopen this terminal to retry.\n\n{error}"
     );
@@ -28595,6 +28616,52 @@ async fn terminal_codex_gateway_handle_hooks_list_response(
         return;
     }
 
+    // Daemon devices have no webview to answer a hook-trust prompt, so a
+    // published UserInputRequired would wedge the Codex session forever
+    // (observed on BYOC: first message stuck "Queued", rail "input required").
+    // The hooks needing trust are the daemon's own managed hooks (the
+    // diff-forge activity hook it injected), so auto-continue by driving
+    // Codex's native menu: inject "trust all and continue" and mark discovery
+    // resolved instead of prompting.
+    if crate::daemon_mode_active() {
+        if terminal_codex_hook_trust_discovery_transition(
+            pane_id,
+            instance_id,
+            discovery.generation,
+            &[TerminalCodexHookTrustDiscoveryState::Pending],
+            TerminalCodexHookTrustDiscoveryState::Resolved,
+        ) {
+            let answer = terminal_codex_hook_trust_prompt_answer_input("trust_all_and_continue")
+                .unwrap_or_else(|| "2\r".to_string());
+            let injected = write_terminal_input_bytes(
+                state.inner(),
+                pane_id,
+                instance_id,
+                answer.as_bytes(),
+            )
+            .await
+            .unwrap_or(false);
+            crate::daemon_terminal_lifecycle_println(
+                "codex_hook_trust.auto_continued",
+                &json!({
+                    "hook_count": hooks.len(),
+                    "injected": injected,
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                }),
+            );
+            log_terminal_status_event(
+                "backend.codex_hook_trust.daemon_auto_continue",
+                json!({
+                    "hook_count": hooks.len(),
+                    "injected": injected,
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                }),
+            );
+        }
+        return;
+    }
     let identities = hooks
         .iter()
         .map(terminal_codex_hook_identity)
@@ -30675,6 +30742,15 @@ async fn resize_terminal_instance(
 
     let master = instance.master.lock().await;
 
+    crate::daemon_terminal_lifecycle_println(
+        "resize",
+        &json!({
+            "cols": size.cols,
+            "instance_id": instance.id,
+            "pane_id": clean_terminal_diagnostic_log_text(&instance.metadata.pane_id),
+            "rows": size.rows,
+        }),
+    );
     if let Err(error) = master.resize(size) {
         log_terminal_crash_forensics_event(
             "backend.terminal_resize.error",

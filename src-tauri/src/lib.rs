@@ -1691,6 +1691,56 @@ struct TerminalInputGate {
     cursor_position: usize,
 }
 
+
+/// Daemon-only diagnostic tap wrapped around an agent pane's PTY writer:
+/// hex-dumps every byte that enters the agent's stdin into journald. Added
+/// for the BYOC claude exit-1 investigation — the launch envelope was fully
+/// exonerated by faithful reproduction, leaving the live input path as the
+/// only unobserved surface; this names any killer byte sequence on the next
+/// reproduction. Low volume by construction (daemon agent panes only see
+/// viewer keystrokes and daemon-injected control writes).
+struct DaemonPtyWriteTap {
+    inner: Box<dyn Write + Send>,
+    pane_id: String,
+    enabled: bool,
+}
+
+/// Hard budget for tap output per daemon process (~100MB) so the diagnostic
+/// can never grow journald without bound; one final line marks exhaustion.
+static DAEMON_PTY_WRITE_TAP_BUDGET: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(100 * 1024 * 1024);
+
+impl Write for DaemonPtyWriteTap {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.enabled && !buf.is_empty() {
+            let head: String = buf
+                .iter()
+                .take(96)
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let line = format!(
+                "diffforge daemon: terminal.pty_write {{\"pane_id\":\"{}\",\"len\":{},\"hex\":\"{}\"}}",
+                self.pane_id,
+                buf.len(),
+                head
+            );
+            let cost = line.len() as u64 + 1;
+            let remaining =
+                DAEMON_PTY_WRITE_TAP_BUDGET.fetch_sub(cost, std::sync::atomic::Ordering::Relaxed);
+            if remaining >= cost {
+                println!("{line}");
+            } else if remaining > 0 {
+                println!("diffforge daemon: terminal.pty_write tap budget exhausted; suppressing further dumps");
+            }
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl TerminalInstance {
     fn from_warm_shell(
         id: u64,
@@ -1711,6 +1761,15 @@ impl TerminalInstance {
             reader,
             size,
         } = warm_pty;
+        let writer: Box<dyn Write + Send> = {
+            let agent_pane = cloud_mcp_agent_uses_activity_hooks(&metadata.agent_id)
+                || cloud_mcp_agent_uses_activity_hooks(&metadata.agent_kind);
+            Box::new(DaemonPtyWriteTap {
+                inner: writer,
+                pane_id: metadata.pane_id.clone(),
+                enabled: daemon_mode_active() && agent_pane,
+            })
+        };
 
         let initial_runtime = if cloud_mcp_agent_uses_activity_hooks(&metadata.agent_id)
             || cloud_mcp_agent_uses_activity_hooks(&metadata.agent_kind)
