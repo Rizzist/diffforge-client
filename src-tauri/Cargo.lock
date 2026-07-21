@@ -4854,7 +4854,7 @@ dependencies = [
 
 [[package]]
 name = "rust-diffforge"
-version = "0.9.35"
+version = "0.9.36"
 dependencies = [
  "arboard",
  "argon2",
