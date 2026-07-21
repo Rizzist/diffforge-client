@@ -10,6 +10,9 @@
     "at_ms": 1784900002202,
     "payload": {
       "message_uid": "019f9382-9901-7abc-8def-102132435465",
+      "semantic_category": "finance",
+      "workflow_status": "done",
+      "classification_state": "corrected",
       "run": {
         "category": "finance",
         "status": "ok",
