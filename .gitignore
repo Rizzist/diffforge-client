@@ -1,4 +1,8 @@
 /node_modules/
+/scratch
+/scratch/
+/media
+/media/
 /dist/
 /src-tauri/target/
 /src-tauri/gen/
@@ -11,6 +15,7 @@ logs/
 .env.*
 !.env.example
 .agents
+.claude
 # PWABuilder store packages (Android keystore + signed binaries) — never commit
 /pwa/
 /docs
@@ -21,3 +26,4 @@ logs/
 *.keychain-db
 # Local macOS code-signing material (certs, keys, Apple notarize creds) — never commit
 dist-signing-local/
+DEPRECATED_ARCHITECTURE_MCP_TOOLS.md
