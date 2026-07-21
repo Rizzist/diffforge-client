@@ -20183,6 +20183,52 @@ fn terminal_structured_interaction_matches_resolution(
         })
 }
 
+const TERMINAL_STRUCTURED_INTERACTION_RESOLVED_LOCALLY_MARKER: &str =
+    "_diffforge_resolved_locally";
+
+fn terminal_structured_interaction_resolved_locally_response(reason: &str) -> Value {
+    json!({
+        TERMINAL_STRUCTURED_INTERACTION_RESOLVED_LOCALLY_MARKER: true,
+        "resolution_reason": reason,
+    })
+}
+
+fn terminal_structured_interaction_response_resolved_locally(response: &Value) -> bool {
+    response
+        .get(TERMINAL_STRUCTURED_INTERACTION_RESOLVED_LOCALLY_MARKER)
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn terminal_structured_interaction_complete_waiter_locally(
+    state: &TerminalState,
+    interaction_id: &str,
+    reason: &str,
+) -> bool {
+    state
+        .terminal_structured_interaction_waiters
+        .lock()
+        .ok()
+        .and_then(|mut waiters| waiters.remove(interaction_id))
+        .is_some_and(|sender| {
+            sender
+                .send(terminal_structured_interaction_resolved_locally_response(
+                    reason,
+                ))
+                .is_ok()
+        })
+}
+
+fn terminal_structured_interaction_complete_waiters_locally<'a>(
+    state: &TerminalState,
+    interaction_ids: impl IntoIterator<Item = &'a String>,
+    reason: &str,
+) {
+    for interaction_id in interaction_ids {
+        terminal_structured_interaction_complete_waiter_locally(state, interaction_id, reason);
+    }
+}
+
 /// Tool-execution evidence resolves a latched permission prompt: answering a
 /// prompt INSIDE the provider TUI emits no resolution event, but when the
 /// prompt is BOUND to a specific tool use (the hook bridge stamps the
@@ -20198,6 +20244,9 @@ fn terminal_structured_interaction_tool_evidence_resolves(
     interaction: &TerminalStructuredInteraction,
     payload: &TerminalActivityHookPayload,
 ) -> bool {
+    if interaction.pane_id != payload.pane_id || interaction.instance_id != payload.instance_id {
+        return false;
+    }
     if payload.terminal_is_prompting_user {
         return false;
     }
@@ -20215,15 +20264,30 @@ fn terminal_structured_interaction_tool_evidence_resolves(
     };
     // Tool ids are session-scoped: evidence from another provider session
     // (id reuse after an in-PTY relaunch) proves nothing about this prompt.
-    if !terminal_structured_interaction_session_gate_allows(
-        interaction,
-        &terminal_activity_payload_session_id(payload),
-    ) {
+    let resolved_session_id = terminal_activity_payload_session_id(payload);
+    if !terminal_structured_interaction_session_gate_allows(interaction, &resolved_session_id) {
         return false;
     }
-    let bound_to_tool = interaction.provider_request_id == tool_use_id
+    let bound_tool_use_id = interaction
+        .tool_use_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let bound_tool_match = bound_tool_use_id == Some(tool_use_id);
+    let request_identity_match = interaction.provider_request_id == tool_use_id
         || interaction.prompt_id == tool_use_id
         || interaction.prompt_metadata.permission_request_id.as_deref() == Some(tool_use_id);
+    if bound_tool_match && !request_identity_match {
+        let interaction_session = interaction.provider_session_id.trim();
+        let resolved_session = resolved_session_id.trim();
+        if interaction_session.is_empty()
+            || resolved_session.is_empty()
+            || interaction_session != resolved_session
+        {
+            return false;
+        }
+    }
+    let bound_to_tool = bound_tool_match || request_identity_match;
     if !bound_to_tool {
         return false;
     }
@@ -20429,6 +20493,7 @@ fn terminal_structured_interaction_reconcile(
                 // session equality whenever both sides carry one.
                 provider_session_id: terminal_activity_payload_session_id(payload),
                 provider_request_id,
+                tool_use_id: payload.tool_use_id.clone(),
                 prompt_id: payload.prompt_id.clone().unwrap_or_default(),
                 hook_event_name: payload.hook_event_name.clone(),
                 response_mode: payload
@@ -20478,11 +20543,11 @@ fn terminal_structured_interaction_reconcile(
         );
         drop(interactions);
         if !superseded_ids.is_empty() {
-            if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-                for id in superseded_ids {
-                    waiters.remove(&id);
-                }
-            }
+            terminal_structured_interaction_complete_waiters_locally(
+                state.inner(),
+                superseded_ids.iter(),
+                "structured_interaction_superseded",
+            );
         }
         return false;
     }
@@ -20668,11 +20733,15 @@ fn terminal_structured_interaction_reconcile(
             );
         }
         if !removed_ids.is_empty() {
-            if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-                for id in removed_ids {
-                    waiters.remove(&id);
-                }
-            }
+            terminal_structured_interaction_complete_waiters_locally(
+                state.inner(),
+                removed_ids.iter(),
+                if tool_evidence_resolved {
+                    "tool_evidence_resolved"
+                } else {
+                    "provider_resolution_arrived"
+                },
+            );
         }
     }
     false
@@ -20768,11 +20837,11 @@ fn terminal_structured_interaction_clear_pane(state: &TerminalState, pane_id: &s
         })
         .unwrap_or_default();
     if !removed_ids.is_empty() {
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            for id in &removed_ids {
-                waiters.remove(id);
-            }
-        }
+        terminal_structured_interaction_complete_waiters_locally(
+            state,
+            removed_ids.iter(),
+            "structured_interaction_pane_cleared",
+        );
     }
     removed_ids.len()
 }
@@ -20802,11 +20871,11 @@ fn terminal_structured_interaction_clear_terminal(
         })
         .unwrap_or_default();
     if !removed_ids.is_empty() {
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            for id in &removed_ids {
-                waiters.remove(id);
-            }
-        }
+        terminal_structured_interaction_complete_waiters_locally(
+            state,
+            removed_ids.iter(),
+            "structured_interaction_terminal_cleared",
+        );
     }
     removed_ids.len()
 }
@@ -21802,11 +21871,11 @@ fn spawn_terminal_activity_hook_watcher(
                 removed
             })
             .unwrap_or_default();
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            for interaction_id in removed_interaction_ids {
-                waiters.remove(&interaction_id);
-            }
-        };
+        terminal_structured_interaction_complete_waiters_locally(
+            state.inner(),
+            removed_interaction_ids.iter(),
+            "terminal_activity_watcher_stopped",
+        );
         terminal_structured_interaction_clear_superseded(&pane_id, instance_id);
     });
 }
@@ -23003,11 +23072,11 @@ async fn terminal_codex_hook_trust_withdraw_stale_publication(
         })
         .unwrap_or_default();
     if !removed_ids.is_empty() {
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            for interaction_id in &removed_ids {
-                waiters.remove(interaction_id);
-            }
-        }
+        terminal_structured_interaction_complete_waiters_locally(
+            state.inner(),
+            removed_ids.iter(),
+            "codex_hook_trust_withdrawn",
+        );
     }
     let cloud_changed = cloud_mcp_withdraw_stale_terminal_prompt(
         cloud_mcp_state,
@@ -23450,17 +23519,20 @@ fn terminal_codex_gateway_spawn_web_waiter(
                     removed
                 })
                 .unwrap_or_default();
-            if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-                for interaction_id in removed_ids {
-                    waiters.remove(&interaction_id);
-                }
-            }
+            terminal_structured_interaction_complete_waiters_locally(
+                state.inner(),
+                removed_ids.iter(),
+                "codex_gateway_publish_aborted",
+            );
             return;
         }
         let result = match response_task.await {
             Ok(Ok(Some(result))) => result,
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return,
         };
+        if terminal_structured_interaction_response_resolved_locally(&result) {
+            return;
+        }
         if terminal_codex_gateway_claim_generation(
             &pending,
             &request_key,
@@ -25959,7 +26031,7 @@ async fn handle_terminal_activity_transport_message(
         return Err(error);
     }
 
-    let Some((interaction_id, receiver)) = blocking_receiver else {
+    let Some((interaction_id, mut receiver)) = blocking_receiver else {
         return Ok(None);
     };
 
@@ -25970,6 +26042,9 @@ async fn handle_terminal_activity_transport_message(
         .get(&interaction_id)
         .cloned();
     let Some(interaction) = interaction else {
+        if let Ok(response) = receiver.try_recv() {
+            return Ok(Some(response));
+        }
         if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
             waiters.remove(&interaction_id);
         }
@@ -28235,9 +28310,11 @@ fn terminal_structured_interaction_remove_generation(
             matches
         });
     if removed {
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            waiters.remove(&interaction.interaction_id);
-        }
+        terminal_structured_interaction_complete_waiter_locally(
+            state,
+            &interaction.interaction_id,
+            "structured_interaction_generation_removed",
+        );
     }
     removed
 }
@@ -28274,9 +28351,11 @@ fn terminal_structured_interaction_remove_answered_generation(
             )
         });
     if removed {
-        if let Ok(mut waiters) = state.terminal_structured_interaction_waiters.lock() {
-            waiters.remove(&interaction.interaction_id);
-        }
+        terminal_structured_interaction_complete_waiter_locally(
+            state,
+            &interaction.interaction_id,
+            "structured_interaction_answered_generation_removed",
+        );
     }
     removed
 }
@@ -31554,6 +31633,7 @@ mod terminal_tests {
             provider: "codex".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "request-1".to_string(),
+            tool_use_id: None,
             prompt_id: "request-1".to_string(),
             hook_event_name: if method == "mcpServer/elicitation/request" {
                 "Elicitation".to_string()
@@ -33055,6 +33135,7 @@ mod terminal_tests {
             provider: "codex".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "codex-hook-trust-catalog-deadbeef".to_string(),
+            tool_use_id: None,
             prompt_id: "codex-hook-trust-catalog-deadbeef".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "structured_pty".to_string(),
@@ -33085,6 +33166,7 @@ mod terminal_tests {
             provider: "other".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "request-1".to_string(),
+            tool_use_id: None,
             options: vec![TerminalActivityHookPromptOption {
                 id: "allow_once".to_string(),
                 label: "Allow once".to_string(),
@@ -33166,6 +33248,7 @@ mod terminal_tests {
             provider: "codex".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "request-free-text".to_string(),
+            tool_use_id: None,
             prompt_id: "prompt-free-text".to_string(),
             hook_event_name: "UserInputRequired".to_string(),
             response_mode: "structured_pty".to_string(),
@@ -33276,6 +33359,7 @@ mod terminal_tests {
             provider: "codex".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "codex-hook-trust-catalog-deadbeef".to_string(),
+            tool_use_id: None,
             prompt_id: "codex-hook-trust-catalog-deadbeef".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "structured_pty".to_string(),
@@ -36464,6 +36548,7 @@ notifications = true
             provider: "opencode".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "req-1".to_string(),
+            tool_use_id: None,
             prompt_id: "req-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "provider_api".to_string(),
@@ -36659,6 +36744,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: "session-1".to_string(),
             provider_request_id: tool_use_id.to_string(),
+            tool_use_id: Some(tool_use_id.to_string()),
             prompt_id: tool_use_id.to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -36764,6 +36850,164 @@ notifications = true
             &interaction,
             &pre_tool,
         ));
+    }
+
+    #[test]
+    fn opencode_bound_tool_use_id_resolves_per_request_permission() {
+        let mut interaction = opencode_provider_api_test_interaction(2_000);
+        interaction.provider_session_id = "session-1".to_string();
+        interaction.provider_request_id = "per_f812".to_string();
+        interaction.prompt_id = "per_f812".to_string();
+        interaction.tool_use_id = Some("edit_5f81".to_string());
+        interaction.prompt_metadata.permission_request_id = Some("per_f812".to_string());
+
+        let mut active = TerminalRuntimeSnapshot::opened_idle(Some("session-1".to_string()));
+        active.canonical_state = "uir".to_string();
+        active.canonical_badge_label = "input required".to_string();
+        active.canonical_state_seq = 9;
+        active.prompt_state_seq = 4;
+        active.turn_generation = 2;
+        active.turn_active = true;
+        active.active_interaction_id = Some(interaction.interaction_id.clone());
+        active.active_interaction_revision = Some(interaction.revision);
+        active.interaction_actionable = true;
+
+        let mut tool_done = terminal_activity_hook_test_payload(
+            "provider-tool-completed",
+            "tool_completed",
+            "running",
+            false,
+            Some("session-1"),
+        );
+        tool_done.hook_event_name = "PostToolUse".to_string();
+        tool_done.tool_use_id = Some("edit_5f81".to_string());
+        tool_done.hook_timestamp_ms = 2_500;
+        tool_done.turn_generation = active.turn_generation;
+
+        assert!(terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &tool_done,
+        ));
+        let resolved =
+            terminal_reduce_canonical_state(&active, &tool_done, Some(&interaction), false, false);
+        assert_eq!(resolved.canonical_state, "thinking");
+        assert!(resolved.active_interaction_id.is_none());
+        assert!(resolved.active_interaction_revision.is_none());
+        assert!(!resolved.interaction_actionable);
+
+        let mut other_tool = tool_done.clone();
+        other_tool.tool_use_id = Some("edit_unrelated".to_string());
+        assert!(!terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &other_tool,
+        ));
+        let held =
+            terminal_reduce_canonical_state(&active, &other_tool, Some(&interaction), false, false);
+        assert_eq!(held.canonical_state, "uir");
+        assert_eq!(
+            held.active_interaction_id.as_deref(),
+            Some(interaction.interaction_id.as_str())
+        );
+        assert_eq!(held.active_interaction_revision, Some(interaction.revision));
+
+        let mut sessionless_tool = tool_done.clone();
+        sessionless_tool.provider_session_id = None;
+        sessionless_tool.native_session_id = None;
+        assert!(
+            !terminal_structured_interaction_tool_evidence_resolves(
+                &interaction,
+                &sessionless_tool,
+            ),
+            "distinct bound tool ids require same-session evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_tool_evidence_resolution_completes_blocking_waiter_with_marker() {
+        let interaction = claude_blocking_tool_test_interaction("toolu-1", 1_000);
+        let mut tool_done = terminal_activity_hook_test_payload(
+            "provider-tool-completed",
+            "tool_completed",
+            "running",
+            false,
+            Some("session-1"),
+        );
+        tool_done.hook_event_name = "PostToolUse".to_string();
+        tool_done.tool_use_id = Some("toolu-1".to_string());
+        tool_done.hook_timestamp_ms = 2_000;
+        assert!(terminal_structured_interaction_tool_evidence_resolves(
+            &interaction,
+            &tool_done,
+        ));
+
+        let state = TerminalState {
+            terminals: Arc::new(RwLock::new(HashMap::new())),
+            pending_restart_intents: Arc::new(StdMutex::new(HashMap::new())),
+            next_restart_intent_seq: AtomicU64::new(1),
+            terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_input_transport: Arc::new(StdMutex::new(None)),
+            terminal_output_transport: Arc::new(StdMutex::new(None)),
+            terminal_activity_transport: Arc::new(StdMutex::new(None)),
+            terminal_activity_transport_tokens: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_structured_interactions: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_structured_interaction_waiters: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_output_transport_subscribers: Arc::new(StdMutex::new(HashMap::new())),
+            parked_prompts: Arc::new(RwLock::new(HashMap::new())),
+            active_audio_input_target: Arc::new(StdMutex::new(None)),
+            audio_route_gate: Arc::new(StdMutex::new(TerminalAudioRouteGate::default())),
+            lifecycle_lock: Arc::new(Mutex::new(())),
+            pty_pool: Arc::new(PtyPool::new()),
+            cleanup_tracker: Arc::new(TerminalCleanupTracker::new()),
+            workspace_topology_cache: Arc::new(RwLock::new(HashMap::new())),
+            terminal_process_epoch: "test-process-epoch".to_string(),
+            next_terminal_instance_id: AtomicU64::new(1),
+            next_terminal_input_queue_id: AtomicU64::new(1),
+            next_terminal_output_subscriber_id: AtomicU64::new(1),
+        };
+        let (sender, receiver) = oneshot::channel();
+        state
+            .terminal_structured_interaction_waiters
+            .lock()
+            .unwrap()
+            .insert(interaction.interaction_id.clone(), sender);
+
+        assert!(terminal_structured_interaction_complete_waiter_locally(
+            &state,
+            &interaction.interaction_id,
+            "tool_evidence_resolved",
+        ));
+        let response = timeout(Duration::from_millis(100), receiver)
+            .await
+            .expect("waiter completed")
+            .expect("waiter sender completed benignly");
+        assert_eq!(
+            response[TERMINAL_STRUCTURED_INTERACTION_RESOLVED_LOCALLY_MARKER],
+            json!(true)
+        );
+        assert_eq!(response["resolution_reason"], json!("tool_evidence_resolved"));
+        assert!(terminal_structured_interaction_response_resolved_locally(
+            &response
+        ));
+        assert!(!terminal_structured_interaction_response_resolved_locally(
+            &json!({"decision": "accepted"})
+        ));
+
+        let mut active = TerminalRuntimeSnapshot::opened_idle(Some("session-1".to_string()));
+        active.canonical_state = "uir".to_string();
+        active.canonical_badge_label = "input required".to_string();
+        active.canonical_state_seq = 3;
+        active.prompt_state_seq = 2;
+        active.turn_generation = 1;
+        active.turn_active = true;
+        active.active_interaction_id = Some(interaction.interaction_id.clone());
+        active.active_interaction_revision = Some(interaction.revision);
+        active.interaction_actionable = true;
+        let resolved =
+            terminal_reduce_canonical_state(&active, &tool_done, Some(&interaction), false, false);
+        assert_ne!(resolved.canonical_state, "error");
+        assert_eq!(resolved.canonical_state, "thinking");
+        assert!(resolved.turn_active);
+        std::mem::forget(state);
     }
 
     #[test]
@@ -38120,6 +38364,7 @@ notifications = true
             provider: "opencode".to_string(),
             provider_session_id: "ses_current".to_string(),
             provider_request_id: "req-current".to_string(),
+            tool_use_id: None,
             prompt_id: "req-current".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "provider_api".to_string(),
@@ -39882,6 +40127,7 @@ notifications = true
             provider: "codex".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "codex-question-1".to_string(),
+            tool_use_id: None,
             prompt_id: "codex-question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -39982,6 +40228,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "permission-denied-1".to_string(),
+            tool_use_id: None,
             prompt_id: "permission-denied-1".to_string(),
             hook_event_name: "PermissionDenied".to_string(),
             response_mode: "diffforge_intervention".to_string(),
@@ -40018,6 +40265,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "permission-1".to_string(),
+            tool_use_id: None,
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -40063,6 +40311,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "question-1".to_string(),
+            tool_use_id: None,
             prompt_id: "question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -40107,6 +40356,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "question-1".to_string(),
+            tool_use_id: None,
             prompt_id: "question-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -40150,6 +40400,7 @@ notifications = true
             provider: "opencode".to_string(),
             provider_session_id: "session-a".to_string(),
             provider_request_id: "permission-1".to_string(),
+            tool_use_id: None,
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "provider_api".to_string(),
@@ -40278,6 +40529,7 @@ notifications = true
             provider: "claude".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "plan-1".to_string(),
+            tool_use_id: None,
             prompt_id: "plan-1".to_string(),
             hook_event_name: "PreToolUse".to_string(),
             response_mode: "blocking_hook".to_string(),
@@ -40360,6 +40612,7 @@ notifications = true
             provider: "opencode".to_string(),
             provider_session_id: String::new(),
             provider_request_id: "permission-1".to_string(),
+            tool_use_id: None,
             prompt_id: "permission-1".to_string(),
             hook_event_name: "PermissionRequest".to_string(),
             response_mode: "provider_api".to_string(),

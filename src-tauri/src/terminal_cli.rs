@@ -4563,7 +4563,9 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
                         json!({ "error": error }),
                     );
                 }
-                if let Some(hook_response) = hook_response {
+                if let Some(hook_response) = hook_response.and_then(|hook_response| {
+                    diff_forge_activity_hook_resolved_locally_response(&record, hook_response)
+                }) {
                     if let Ok(response) = serde_json::to_string(&hook_response) {
                         println!("{response}");
                     }
@@ -4829,6 +4831,100 @@ fn send_diff_forge_activity_hook_transport(
             .unwrap_or("Activity transport rejected event.")
             .to_string())
     }
+}
+
+fn diff_forge_activity_hook_resolved_locally_response(
+    record: &Value,
+    response: Value,
+) -> Option<Value> {
+    if response
+        .get("_diffforge_resolved_locally")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Some(response);
+    }
+    let reason = response
+        .get("resolution_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let hook_name = record
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let provider = record
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !provider.contains("claude") {
+        return None;
+    }
+
+    let proof_of_provider_acceptance = matches!(reason.trim(), "tool_evidence_resolved");
+    let response = match (hook_name.as_str(), proof_of_provider_acceptance) {
+        ("permissionrequest", true) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "allow",
+                }
+            }
+        }),
+        ("permissionrequest", false) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "deny",
+                    "message": format!(
+                        "Diff Forge observed this interaction close locally without approval proof ({reason})."
+                    ),
+                }
+            }
+        }),
+        ("elicitation", true) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "Elicitation",
+                "action": "accept",
+            }
+        }),
+        ("elicitation", false) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "Elicitation",
+                "action": "cancel",
+            }
+        }),
+        ("permissiondenied", _) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionDenied",
+                "retry": false,
+            }
+        }),
+        ("pretooluse", true) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": format!(
+                    "Diff Forge observed this interaction resolve locally ({reason})."
+                ),
+            }
+        }),
+        ("pretooluse", false) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": format!(
+                    "Diff Forge observed this interaction close locally without approval proof ({reason})."
+                ),
+            }
+        }),
+        ("stop" | "subagentstop", _) => json!({}),
+        _ => json!({}),
+    };
+    Some(response)
 }
 
 fn diff_forge_activity_hook_blocking_fallback_response(record: &Value) -> Option<Value> {
@@ -8257,8 +8353,12 @@ mod terminal_cli_tests {
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("reconcilePendingInteractions"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("client.permission.list"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("client.permission.list(undefined, signal ? { signal } : undefined)"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("opencodeFetch(serverUrl, \"/permission\", undefined, \"GET\", signal)"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("client.question.list"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("client.question.list(undefined, signal ? { signal } : undefined)"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("opencodeFetch(serverUrl, \"/question\", undefined, \"GET\", signal)"));
         assert!(
@@ -8268,6 +8368,8 @@ mod terminal_cli_tests {
             .contains("await handlePendingPermission(sessionId, requestId, props, interactionAskFingerprint(props))"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("hook_event_name: \"PermissionRequest\""));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("tool_use_id: props.callID || props.callId"));
         assert_eq!(
             DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
                 .matches("interaction_id: interactionGeneration.interaction_id")
@@ -8369,6 +8471,17 @@ mod terminal_cli_tests {
         assert!(
             DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("scheduleHandledQuestionRevalidation")
         );
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("function isOpenCodeQuestionReplyResponse(response)"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("Array.isArray(response.answers) && response.answers.length > 0"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("if (!isOpenCodeQuestionReplyResponse(response)) return false;"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("if (promptId && isOpenCodeQuestionReplyResponse(response))"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("const questionReplied = await replyOpenCodeQuestion"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const answers = response.answers;"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
             .contains("scheduleNativeInteractionResolutionRevalidation"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
@@ -8703,6 +8816,117 @@ mod terminal_cli_tests {
         assert_eq!(record["session_crons"][0]["id"], "cron-1");
         assert_eq!(record["approval_id"], "approval-123");
         assert_eq!(record["prompting_user_kind"], "approval");
+    }
+
+    #[test]
+    fn local_resolution_marker_mapping_is_reason_sensitive_and_never_raw() {
+        let permission = diff_forge_activity_hook_resolved_locally_response(
+            &json!({
+                "provider": "claude",
+                "hook_event_name": "PermissionRequest",
+            }),
+            json!({
+                "_diffforge_resolved_locally": true,
+                "resolution_reason": "tool_evidence_resolved",
+            }),
+        )
+        .expect("evidence marker maps to Claude hook output");
+        assert_eq!(
+            permission.pointer("/hookSpecificOutput/hookEventName"),
+            Some(&json!("PermissionRequest"))
+        );
+        assert_eq!(
+            permission.pointer("/hookSpecificOutput/decision/behavior"),
+            Some(&json!("allow"))
+        );
+        assert!(permission.get("_diffforge_resolved_locally").is_none());
+
+        let cleared_permission = diff_forge_activity_hook_resolved_locally_response(
+            &json!({
+                "provider": "claude",
+                "hook_event_name": "PermissionRequest",
+            }),
+            json!({
+                "_diffforge_resolved_locally": true,
+                "resolution_reason": "structured_interaction_terminal_cleared",
+            }),
+        )
+        .expect("cleanup marker maps to Claude hook output");
+        assert_eq!(
+            cleared_permission.pointer("/hookSpecificOutput/hookEventName"),
+            Some(&json!("PermissionRequest"))
+        );
+        assert_eq!(
+            cleared_permission.pointer("/hookSpecificOutput/decision/behavior"),
+            Some(&json!("deny"))
+        );
+        assert_ne!(
+            cleared_permission.pointer("/hookSpecificOutput/decision/behavior"),
+            Some(&json!("allow"))
+        );
+
+        let pre_tool = diff_forge_activity_hook_resolved_locally_response(
+            &json!({
+                "provider": "claude",
+                "hook_event_name": "PreToolUse",
+            }),
+            json!({
+                "_diffforge_resolved_locally": true,
+                "resolution_reason": "terminal_activity_watcher_stopped",
+            }),
+        )
+        .expect("cleanup marker maps to Claude hook output");
+        assert_eq!(
+            pre_tool.pointer("/hookSpecificOutput/hookEventName"),
+            Some(&json!("PreToolUse"))
+        );
+        assert_eq!(
+            pre_tool.pointer("/hookSpecificOutput/permissionDecision"),
+            Some(&json!("deny"))
+        );
+
+        let elicitation = diff_forge_activity_hook_resolved_locally_response(
+            &json!({
+                "provider": "claude",
+                "hook_event_name": "Elicitation",
+            }),
+            json!({
+                "_diffforge_resolved_locally": true,
+                "resolution_reason": "structured_interaction_superseded",
+            }),
+        )
+        .expect("cleanup marker maps to Claude hook output");
+        assert_eq!(
+            elicitation.pointer("/hookSpecificOutput/action"),
+            Some(&json!("cancel"))
+        );
+
+        let opencode_marker = json!({
+            "_diffforge_resolved_locally": true,
+            "resolution_reason": "tool_evidence_resolved",
+        });
+        assert_eq!(
+            diff_forge_activity_hook_resolved_locally_response(
+                &json!({
+                    "provider": "opencode",
+                    "hook_event_name": "PermissionRequest",
+                }),
+                opencode_marker.clone(),
+            ),
+            None
+        );
+
+        let opencode_answer = json!({"answers": [["React"]]});
+        assert_eq!(
+            diff_forge_activity_hook_resolved_locally_response(
+                &json!({
+                    "provider": "opencode",
+                    "hook_event_name": "UserPromptRequired",
+                }),
+                opencode_answer.clone(),
+            ),
+            Some(opencode_answer)
+        );
     }
 
     #[test]
@@ -9742,15 +9966,24 @@ async function replyOpenCodePermission(client, serverUrl, sessionId, requestId, 
   throw new Error("OpenCode permission reply API is unavailable.");
 }
 
+function isOpenCodeQuestionReplyResponse(response) {
+  return !!(
+    response
+    && (response.rejected === true
+      || (Array.isArray(response.answers) && response.answers.length > 0))
+  );
+}
+
 async function replyOpenCodeQuestion(client, serverUrl, requestId, response) {
+  if (!isOpenCodeQuestionReplyResponse(response)) return false;
   const id = encodeURIComponent(requestId);
   const authenticatedTransport = client && client._client;
-  if (response && response.rejected) {
+  if (response.rejected === true) {
     const reject = client && client.question && client.question.reject;
     if (typeof reject === "function") {
       try {
         await reject({ path: { requestID: requestId }, throwOnError: true });
-        return;
+        return true;
       } catch {}
     }
     if (authenticatedTransport && typeof authenticatedTransport.post === "function") {
@@ -9761,20 +9994,20 @@ async function replyOpenCodeQuestion(client, serverUrl, requestId, response) {
           body: {},
           throwOnError: true,
         });
-        return;
+        return true;
       } catch {}
     }
     try {
-      if (await opencodeFetch(serverUrl, `/question/${id}/reject`, {})) return;
+      if (await opencodeFetch(serverUrl, `/question/${id}/reject`, {})) return true;
     } catch {}
     throw new Error("OpenCode question rejection API is unavailable.");
   }
-  const answers = response && Array.isArray(response.answers) ? response.answers : [];
+  const answers = response.answers;
   const reply = client && client.question && client.question.reply;
   if (typeof reply === "function") {
     try {
       await reply({ path: { requestID: requestId }, body: { answers }, throwOnError: true });
-      return;
+      return true;
     } catch {}
   }
   if (authenticatedTransport && typeof authenticatedTransport.post === "function") {
@@ -9785,11 +10018,11 @@ async function replyOpenCodeQuestion(client, serverUrl, requestId, response) {
         body: { answers },
         throwOnError: true,
       });
-      return;
+      return true;
     } catch {}
   }
   try {
-    if (await opencodeFetch(serverUrl, `/question/${id}/reply`, { answers })) return;
+    if (await opencodeFetch(serverUrl, `/question/${id}/reply`, { answers })) return true;
   } catch {}
   throw new Error("OpenCode question reply API is unavailable.");
 }
@@ -10387,7 +10620,7 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
     if (kind === "permission") {
       if (client && client.permission && typeof client.permission.list === "function") {
         try {
-          response = await client.permission.list(signal ? { signal } : undefined);
+          response = await client.permission.list(undefined, signal ? { signal } : undefined);
           if (response && response.error) throw response.error;
         } catch {
           response = await opencodeFetch(serverUrl, "/permission", undefined, "GET", signal);
@@ -10404,7 +10637,7 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
     }
     if (client && client.question && typeof client.question.list === "function") {
       try {
-        response = await client.question.list(signal ? { signal } : undefined);
+        response = await client.question.list(undefined, signal ? { signal } : undefined);
         if (response && response.error) throw response.error;
       } catch {
         response = await opencodeFetch(serverUrl, "/question", undefined, "GET", signal);
@@ -10782,9 +11015,10 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
         interaction_id: interactionGeneration.interaction_id,
         interaction_revision: interactionGeneration.interaction_revision,
       });
-      if (promptId && response) {
+      if (promptId && isOpenCodeQuestionReplyResponse(response)) {
         try {
-          await replyOpenCodeQuestion(client, serverUrl, promptId, response);
+          const questionReplied = await replyOpenCodeQuestion(client, serverUrl, promptId, response);
+          if (!questionReplied) return;
           retireInteractionGeneration(
             interactionKey,
             interactionGeneration.interaction_id,
@@ -10795,7 +11029,7 @@ export const DiffForgeActivityPlugin = async ({ client, serverUrl } = {}) => {
             hook_event_name: "ElicitationResult",
             session_id: sessionId,
             permission_request_id: promptId,
-            decision: response.rejected ? "rejected" : "accepted",
+            decision: response.rejected === true ? "rejected" : "accepted",
             resolved_interaction_id: response._diffforge_interaction_id,
             resolved_interaction_revision: response._diffforge_interaction_revision,
           });
