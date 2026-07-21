@@ -504,7 +504,7 @@ fn addr_spec_token_ranges(haystack: &str, needle: &str) -> Vec<Range<usize>> {
 fn contains_unprotected_addr_spec_token(block: &DecodedHeaderBlock, needle: &str) -> bool {
     addr_spec_token_ranges(&block.text, needle)
         .into_iter()
-        .any(|range| {
+        .any(|mut range| {
             !range.all(|index| block.extracted_addr_spec[index] && block.addr_spec_eligible[index])
         })
 }
