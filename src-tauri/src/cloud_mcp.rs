@@ -20108,14 +20108,6 @@ fn cloud_mcp_daemon_gui_block_message(command_kind: &str) -> Option<&'static str
         | "open_session"
         | "resume_agent_chat_session"
         | "resume_session"
-        | "terminal_relaunch_agent"
-        | "relaunch_terminal_agent"
-        | "relaunch_terminal"
-        | "terminal_relaunch"
-        | "terminal_restart"
-        | "terminal_restart_agent"
-        | "restart_terminal"
-        | "restart_terminal_agent"
         | "terminal_switch_agent"
         | "switch_terminal_agent" => {
             Some("Remote terminal foreground controls are unavailable in daemon mode.")
@@ -29010,6 +29002,211 @@ fn cloud_mcp_apply_remote_terminal_interrupt_lever(
     true
 }
 
+
+/// Daemon-native terminal restart/relaunch. Closes the live instance (after
+/// validating the caller's restart identity when `require_identity`) and
+/// respawns the slot from the workspace catalog. Only daemon devices route
+/// here: with a webview available, relaunch orchestration stays
+/// webview-owned, and before this existed a daemon device answered restart
+/// commands with a hard "requires the desktop UI" block — a BYOC box had no
+/// way to restart a terminal at all.
+async fn cloud_mcp_daemon_execute_terminal_restart(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+    workspace_id: &str,
+    target_terminal_id: &str,
+    target_terminal_index: Option<usize>,
+    require_identity: bool,
+) {
+    let Some((pane_id, live_instance_id, terminal_index)) =
+        cloud_mcp_remote_workspace_live_terminal_target(
+            app,
+            state,
+            workspace_id,
+            target_terminal_id,
+            target_terminal_index,
+        )
+        .await
+    else {
+        let _ = cloud_mcp_send_remote_command_status_event(
+            state,
+            event,
+            "failed",
+            "No terminal matched the requested terminal id on this device.",
+            None,
+        )
+        .await;
+        return;
+    };
+    let terminal_state = app.state::<TerminalState>();
+    let instance = {
+        let terminals = terminal_state.terminals.read().await;
+        terminals.get(&pane_id).cloned()
+    };
+    if require_identity {
+        let Some(instance) = instance.as_ref() else {
+            let _ = cloud_mcp_send_remote_command_status_event(
+                state,
+                event,
+                "failed",
+                "Target terminal is not live on this device.",
+                None,
+            )
+            .await;
+            return;
+        };
+        let requested_instance_id = event
+            .get("terminal_instance_id")
+            .or_else(|| event.get("instance_id"))
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                cloud_mcp_payload_text(event, &["terminal_instance_id", "instance_id"])
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        let requested_launch_epoch =
+            cloud_mcp_payload_text(event, &["launch_epoch", "terminal_launch_epoch"])
+                .unwrap_or_default();
+        if requested_instance_id == 0 || requested_launch_epoch.trim().is_empty() {
+            let _ = cloud_mcp_send_remote_command_status_event(
+                state,
+                event,
+                "failed",
+                "Restart command must include the exact terminal instance and launch epoch.",
+                None,
+            )
+            .await;
+            return;
+        }
+        let live_launch_epoch = terminal_instance_launch_epoch(instance);
+        if requested_instance_id != instance.id || requested_launch_epoch != live_launch_epoch {
+            let details = json!({
+                "current_launch_epoch": live_launch_epoch,
+                "current_terminal_instance_id": instance.id,
+                "requested_launch_epoch": requested_launch_epoch,
+                "requested_terminal_instance_id": requested_instance_id,
+            });
+            let _ = cloud_mcp_send_remote_command_status_event(
+                state,
+                event,
+                "failed",
+                "Restart command targets a stale terminal instance or launch epoch.",
+                Some(&details),
+            )
+            .await;
+            return;
+        }
+        let restart_mode = cloud_mcp_payload_text(event, &["restart_mode", "mode"])
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if restart_mode == "restart_when_idle" {
+            let runtime = terminal_runtime_snapshot(instance);
+            if runtime.turn_active || !runtime.input_ready {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    state,
+                    event,
+                    "blocked",
+                    "Terminal is busy. Daemon devices do not queue restart-when-idle yet; retry when the terminal is idle or use restart now.",
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+    }
+    let Some(terminal_index) = terminal_index else {
+        let _ = cloud_mcp_send_remote_command_status_event(
+            state,
+            event,
+            "failed",
+            "Terminal slot index is unknown; cannot respawn the configured terminal.",
+            None,
+        )
+        .await;
+        return;
+    };
+    crate::daemon_terminal_lifecycle_println(
+        "restart.begin",
+        &json!({
+            "instance_id": live_instance_id,
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "require_identity": require_identity,
+            "terminal_index": terminal_index,
+            "workspace_id": workspace_id,
+        }),
+    );
+    if let Err(error) = close_terminal_session(
+        Some(app.clone()),
+        terminal_state.inner(),
+        Some(state),
+        &pane_id,
+        live_instance_id,
+        false,
+        true,
+        None,
+    )
+    .await
+    {
+        crate::daemon_terminal_lifecycle_println(
+            "restart.close_failed",
+            &json!({
+                "error": clean_terminal_telemetry_text(&error),
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            }),
+        );
+        let details = json!({ "error": clean_terminal_telemetry_text(&error) });
+        let _ = cloud_mcp_send_remote_command_status_event(
+            state,
+            event,
+            "failed",
+            "Unable to close the terminal for restart.",
+            Some(&details),
+        )
+        .await;
+        return;
+    }
+    match cloud_mcp_remote_workspace_spawn_configured_terminal(app, workspace_id, terminal_index)
+        .await
+    {
+        Ok(result) => {
+            crate::daemon_terminal_lifecycle_println(
+                "restart.respawned",
+                &json!({
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "result": result,
+                }),
+            );
+            let _ = cloud_mcp_send_remote_command_status_event(
+                state,
+                event,
+                "completed",
+                "Terminal restarted.",
+                Some(&result),
+            )
+            .await;
+        }
+        Err(error) => {
+            crate::daemon_terminal_lifecycle_println(
+                "restart.respawn_failed",
+                &json!({
+                    "error": clean_terminal_telemetry_text(&error),
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                }),
+            );
+            let details = json!({ "error": clean_terminal_telemetry_text(&error) });
+            let _ = cloud_mcp_send_remote_command_status_event(
+                state,
+                event,
+                "failed",
+                "Terminal was closed but the configured slot failed to respawn.",
+                Some(&details),
+            )
+            .await;
+        }
+    }
+}
+
 /// Headless actuation for remote terminal levers. Close-idle commands run
 /// natively against the live PTY sessions (resolved from the cached presence
 /// snapshot by exact pane id); relaunch is deferred as a replayed remote
@@ -29040,6 +29237,10 @@ fn cloud_mcp_apply_remote_terminal_lever(
         | "terminal_relaunch"
         | "terminal_switch_agent"
         | "switch_terminal_agent" => "relaunch",
+        "terminal_restart"
+        | "terminal_restart_agent"
+        | "restart_terminal"
+        | "restart_terminal_agent" => "restart",
         // Terminal spawn, todo dispatch, and breakout-window actuation live
         // in the webview, so these replay as remote commands on the next
         // foreground session.
@@ -29074,6 +29275,9 @@ fn cloud_mcp_apply_remote_terminal_lever(
         }
         _ => return false,
     };
+    if action == "restart" && !crate::daemon_mode_active() {
+        return false;
+    }
     let workspace_id = cloud_mcp_payload_text(event, &["workspace_id"])
         .map(|value| cloud_mcp_workspace_id_match_key(&value))
         .unwrap_or_default();
@@ -29095,6 +29299,30 @@ fn cloud_mcp_apply_remote_terminal_lever(
     let event = event.clone();
     let action = action.to_string();
     tauri::async_runtime::spawn(async move {
+        if matches!(action.as_str(), "restart" | "relaunch") && crate::daemon_mode_active() {
+            if target_terminal_id.trim().is_empty() && target_terminal_index.is_none() {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "failed",
+                    "Terminal restart requires an exact terminal id.",
+                    None,
+                )
+                .await;
+                return;
+            }
+            cloud_mcp_daemon_execute_terminal_restart(
+                &app,
+                &state,
+                &event,
+                &workspace_id,
+                &target_terminal_id,
+                target_terminal_index.and_then(|value| usize::try_from(value).ok()),
+                action == "restart",
+            )
+            .await;
+            return;
+        }
         if matches!(
             action.as_str(),
             "relaunch"
@@ -45233,6 +45461,98 @@ fn cloud_mcp_upsert_device_terminal_orchestrator(
 /// Daemon mode has no AppShell hydration pass, so Rust must establish that a
 /// missing catalog is an authoritative empty catalog before cloud presence is
 /// connected. The returned rows are then published after the connection is up.
+
+/// Daemon boot reconcile: reopen the configured terminals of every ACTIVE
+/// workspace. A GUI desktop's webview does this when its window mounts; a
+/// daemon has no webview, so before this a service restart left every pane
+/// dead ("Terminal ended") until a user manually reopened them from the
+/// dashboard. Redundant opens are safe: daemon-mode terminal_open adopts a
+/// live, shape-matching instance instead of replacing it.
+async fn cloud_mcp_daemon_startup_reopen_workspace_terminals(
+    app: &AppHandle,
+    workspaces: &[Value],
+) {
+    for workspace in workspaces {
+        if !cloud_mcp_workspace_explicit_active_state(workspace).unwrap_or(false) {
+            continue;
+        }
+        let Some(workspace_id) = cloud_mcp_payload_text(workspace, &["workspace_id", "id"])
+        else {
+            continue;
+        };
+        let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
+        if workspace_id.is_empty() {
+            continue;
+        }
+        let workspace_settings = app_local_state_read(app, "workspace-settings");
+        let resolved = match workspace_activation_resolve_workspace(
+            app,
+            &workspace_id,
+            &workspace_settings,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                crate::daemon_terminal_lifecycle_println(
+                    "startup_reopen.workspace_skipped",
+                    &json!({
+                        "error": clean_terminal_telemetry_text(&error),
+                        "workspace_id": workspace_id,
+                    }),
+                );
+                continue;
+            }
+        };
+        let settings =
+            workspace_activation_settings_for_workspace(&workspace_settings, &resolved.id);
+        let threads_state =
+            match workspace_activation_threads_state(&resolved.id, &resolved.root).await {
+                Ok(threads_state) => threads_state,
+                Err(error) => {
+                    crate::daemon_terminal_lifecycle_println(
+                        "startup_reopen.workspace_skipped",
+                        &json!({
+                            "error": clean_terminal_telemetry_text(&error),
+                            "workspace_id": workspace_id,
+                        }),
+                    );
+                    continue;
+                }
+            };
+        let descriptors = workspace_activation_terminal_descriptors_from_values(
+            &resolved,
+            settings,
+            &threads_state,
+        );
+        for descriptor in descriptors {
+            let terminal_index = descriptor.terminal_index as usize;
+            match cloud_mcp_remote_workspace_spawn_configured_terminal(
+                app,
+                &workspace_id,
+                terminal_index,
+            )
+            .await
+            {
+                Ok(result) => crate::daemon_terminal_lifecycle_println(
+                    "startup_reopen.opened",
+                    &json!({
+                        "result": result,
+                        "terminal_index": terminal_index,
+                        "workspace_id": workspace_id,
+                    }),
+                ),
+                Err(error) => crate::daemon_terminal_lifecycle_println(
+                    "startup_reopen.failed",
+                    &json!({
+                        "error": clean_terminal_telemetry_text(&error),
+                        "terminal_index": terminal_index,
+                        "workspace_id": workspace_id,
+                    }),
+                ),
+            }
+        }
+    }
+}
+
 async fn cloud_mcp_prepare_daemon_startup_workspace_catalog(
     app: &AppHandle,
 ) -> Result<Vec<Value>, String> {

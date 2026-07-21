@@ -1898,7 +1898,7 @@ struct ExchangeDesktopSessionRequest<'a> {
     state: &'a str,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AgentProvider {
     Codex,
     Claude,
@@ -3474,6 +3474,19 @@ fn log_cloud_sync_event(phase: &str, fields: Value) {
         return;
     };
     let _ = writeln!(file, "{entry}");
+}
+
+/// Terminal lifecycle breadcrumbs for daemon (headless) devices, printed to
+/// stdout so they land in journald. The crash-forensics file logger is
+/// compiled out of production builds and a BYOC box has no webview console,
+/// so without these a daemon terminal can be closed with zero on-box trace
+/// of who initiated it or why (exactly what made the 2026-07 BYOC claude
+/// close undiagnosable from the droplet).
+pub(crate) fn daemon_terminal_lifecycle_println(phase: &str, detail: &Value) {
+    if !daemon_mode_active() {
+        return;
+    }
+    println!("diffforge daemon: terminal.{phase} {detail}");
 }
 
 fn log_terminal_crash_forensics_event(phase: &str, fields: Value) {
@@ -10479,7 +10492,7 @@ fn run_app(daemon: bool) {
                     if let Some(workspaces) = daemon_workspace_catalog {
                         if let Err(error) = cloud_mcp_publish_daemon_startup_workspace_catalog(
                             &cloud_mcp_state,
-                            workspaces,
+                            workspaces.clone(),
                         )
                         .await
                         {
@@ -10487,6 +10500,11 @@ fn run_app(daemon: bool) {
                                 "diffforge daemon: unable to publish startup workspace catalog: {error}"
                             );
                         }
+                        cloud_mcp_daemon_startup_reopen_workspace_terminals(
+                            &cloud_mcp_app,
+                            &workspaces,
+                        )
+                        .await;
                     }
                 }
                 if cloud_connected

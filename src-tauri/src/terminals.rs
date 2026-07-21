@@ -8458,6 +8458,15 @@ fn spawn_terminal_reader(
                         "reader_exit"
                     },
                 );
+                crate::daemon_terminal_lifecycle_println(
+                    "reader_exit",
+                    &json!({
+                        "exit_code": terminal_exit_code,
+                        "instance_id": instance.id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&cleanup_pane_id),
+                        "will_respawn": respawn_candidate.is_some(),
+                    }),
+                );
                 if let Some(respawn_candidate) = respawn_candidate {
                     let _ = terminal_daemon_reader_exit_respawn(
                         cleanup_app.clone(),
@@ -8620,15 +8629,32 @@ fn terminal_daemon_reader_exit_respawn_candidate(
     daemon_mode: bool,
     generic_shell: bool,
 ) -> Option<TerminalDaemonRespawnCandidate> {
-    if !daemon_mode || !generic_shell {
+    if !daemon_mode {
         return None;
     }
+    // Persistent workspace slots respawn in daemon mode: generic shells AND
+    // hook-managed agent panes. A headless device has no webview relaunch
+    // flow, so an unexpected agent death (OOM kill, provider crash, /exit)
+    // would otherwise strand the slot until the box is reprovisioned.
+    // Intentional closes never reach this path: close_terminal_session
+    // removes the instance from the map before the reader observes EOF.
+    let slot_role = if generic_shell {
+        "generic".to_string()
+    } else {
+        let kind = terminal_normalize_agent_kind(Some(metadata.agent_kind.as_str()))?;
+        // Only hook-managed agent panes qualify; generic-shaped metadata on a
+        // non-generic-shell instance (login shells, misc panes) stays out.
+        if !matches!(kind.as_str(), "claude" | "codex" | "opencode") {
+            return None;
+        }
+        kind
+    };
     let workspace_id = cloud_mcp_workspace_id_match_key(&metadata.workspace_id);
     if workspace_id.is_empty() {
         return None;
     }
     let terminal_index = metadata.terminal_index.map(usize::from)?;
-    let slot_key = format!("{workspace_id}:{terminal_index}:generic");
+    let slot_key = format!("{workspace_id}:{terminal_index}:{slot_role}");
     Some(TerminalDaemonRespawnCandidate {
         pane_id: metadata.pane_id.clone(),
         workspace_id,
@@ -9254,6 +9280,14 @@ async fn close_terminal_session(
             "pane_id": clean_terminal_diagnostic_log_text(pane_id),
             "preserve_coordination_session": preserve_coordination_session,
             "wait_for_cleanup": wait_for_cleanup,
+        }),
+    );
+    crate::daemon_terminal_lifecycle_println(
+        "close.begin",
+        &json!({
+            "expected_instance_id": instance_id,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "restart_if_idle": restart_if_idle_launch_epoch.is_some(),
         }),
     );
 
@@ -10364,6 +10398,148 @@ fn terminal_slot_key_from_request(
     crate::coordination::CoordinationKernel::normalize_slot_key_static("1")
 }
 
+
+/// Daemon-mode idempotent open: a plain re-open of a pane whose current
+/// instance is alive and already matches the requested shape adopts that
+/// instance instead of replacing it. Returns None when the request must go
+/// through the normal (replace) path.
+///
+/// The replace path closes the live PTY before spawning, and on a daemon
+/// device no webview exists to relaunch a pane afterwards — so a redundant
+/// open (an activation replay or pane reconcile arriving moments after a
+/// session goes live) would kill the very session it meant to ensure
+/// (observed on BYOC: claude closed ~1s after its first SessionStart).
+/// GUI keeps replace semantics: the webview binds its output channel through
+/// the spawn path, and adoption would leave that channel unbound.
+async fn terminal_open_adopt_existing_instance(
+    instance: &TerminalInstance,
+    kind: &str,
+    provider: Option<&str>,
+    plain_shell: bool,
+    resolved_launch: &TerminalProviderResolvedLaunchOptions,
+    requested_workspace_id: Option<&str>,
+    requested_terminal_index: Option<u16>,
+    requested_provider_session_id: Option<&str>,
+    requested_fork_provider_session_id: Option<&str>,
+) -> Option<TerminalOpenResult> {
+    // Fork targeting always means a new launch.
+    if requested_fork_provider_session_id.is_some() {
+        return None;
+    }
+    // Slot identity: a request naming a different workspace or slot index
+    // than the live instance must never adopt it — a stale/explicit persisted
+    // pane id could otherwise hand workspace B a PTY running in workspace A's
+    // root. (Working directories are deliberately NOT compared: coordination
+    // panes run in per-agent worktrees, so cwd inequality is normal; the
+    // flows that move a workspace root tear the pane down first.)
+    if let Some(requested_workspace_id) = requested_workspace_id {
+        let requested_key = cloud_mcp_workspace_id_match_key(requested_workspace_id);
+        let live_key = cloud_mcp_workspace_id_match_key(&instance.metadata.workspace_id);
+        if !requested_key.is_empty() && requested_key != live_key {
+            return None;
+        }
+    }
+    if let Some(requested_terminal_index) = requested_terminal_index {
+        if instance.metadata.terminal_index != Some(requested_terminal_index) {
+            return None;
+        }
+    }
+    // Shape match: generic-shell request adopts only a generic-shell
+    // instance; an agent request adopts only the same provider kind.
+    if plain_shell {
+        if !terminal_instance_is_generic_shell(instance) {
+            return None;
+        }
+    } else {
+        let requested_provider = terminal_launch_provider(kind, provider).ok()?;
+        let live_kind =
+            terminal_normalize_agent_kind(Some(instance.metadata.agent_kind.as_str()))?;
+        if parse_agent_provider(&live_kind).ok()? != requested_provider {
+            return None;
+        }
+    }
+    // Resolved launch options that differ from the live launch are a real
+    // configuration change (workspace settings edit) — apply via replace.
+    // Both sides went through the same resolution/normalization: the stored
+    // launch metadata was captured from a resolved launch at spawn time.
+    let launch_metadata = instance.launch_metadata.lock().ok()?.clone();
+    for (requested, live) in [
+        (resolved_launch.model.as_deref(), launch_metadata.model.as_deref()),
+        (
+            resolved_launch.reasoning_effort.as_deref(),
+            launch_metadata.reasoning_effort.as_deref(),
+        ),
+        (resolved_launch.speed.as_deref(), launch_metadata.speed.as_deref()),
+        (
+            resolved_launch.permission_mode.as_deref(),
+            launch_metadata.permission_mode.as_deref(),
+        ),
+    ] {
+        if let Some(requested) = requested {
+            if live != Some(requested) {
+                return None;
+            }
+        }
+    }
+    // Liveness: not mid-close, child still running. Close paths that do not
+    // hold the lifecycle lock can still race this check; the worst case is an
+    // adopted result naming an instance that just died, which the truthful
+    // close events and the daemon respawn/reconcile paths then correct.
+    if instance.operation_admission.lock().ok()?.closing {
+        return None;
+    }
+    {
+        let mut child = instance.child.lock().await;
+        let child = child.as_mut()?;
+        if !matches!(child.try_wait(), Ok(None)) {
+            return None;
+        }
+    }
+    let runtime = terminal_runtime_snapshot(instance);
+    let projected = terminal_project_runtime(&instance.metadata, &runtime, false);
+    let metadata = &instance.metadata;
+    let working_directory = workspace_path_display(instance.working_directory.as_ref());
+    Some(TerminalOpenResult {
+        pane_id: metadata.pane_id.clone(),
+        instance_id: instance.id,
+        launch_epoch: terminal_instance_launch_epoch(instance),
+        command: if plain_shell {
+            "shell".to_string()
+        } else {
+            metadata.agent_kind.clone()
+        },
+        working_directory: working_directory.clone(),
+        project_root: working_directory,
+        agent_id: (!metadata.agent_id.trim().is_empty()).then(|| metadata.agent_id.clone()),
+        session_id: instance
+            .coordination
+            .as_ref()
+            .map(|coordination| coordination.session_id.clone()),
+        agent_branch_root: None,
+        agent_branch: None,
+        slot_key: None,
+        thread_id: (!metadata.thread_id.trim().is_empty()).then(|| metadata.thread_id.clone()),
+        coordination_mode: None,
+        session_mode: instance.session_mode.as_str().to_string(),
+        file_authority: instance.session_mode.file_authority().to_string(),
+        provider_session_id: runtime.provider_session_id.clone(),
+        native_session_id: runtime.native_session_id.clone(),
+        fork_from_provider_session_id: runtime.fork_from_provider_session_id.clone(),
+        shared_history_id: None,
+        requested_provider_session_id: requested_provider_session_id.map(str::to_string),
+        model: launch_metadata.model,
+        model_source: launch_metadata.model_source,
+        reasoning_effort: launch_metadata.reasoning_effort,
+        speed: launch_metadata.speed,
+        permission_mode: launch_metadata.permission_mode,
+        activity_status: runtime.activity_status.clone(),
+        command_phase: runtime.command_phase.clone(),
+        input_ready: runtime.input_ready,
+        input_ready_at: runtime.input_ready_at.clone(),
+        terminal_work_state: projected.terminal_work_state,
+    })
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn terminal_open(
     app: AppHandle,
@@ -10410,6 +10586,7 @@ async fn terminal_open(
         return Err("Shell terminals do not have provider sessions to fork.".to_string());
     }
     let mut fresh_session = request.fresh_session.unwrap_or(false) && !plain_shell;
+    let requested_fresh_session = fresh_session;
     let working_directory_request = request.working_directory;
     let workspace_root_was_empty_at_selection = request
         .workspace_root_was_empty_at_selection
@@ -10565,6 +10742,64 @@ async fn terminal_open(
             requested_provider_session_id.is_some()
                 || requested_fork_provider_session_id.is_some(),
         )?;
+    }
+
+    // Daemon devices adopt a live, shape-matching instance instead of
+    // replacing it; see terminal_open_adopt_existing_instance for why. The
+    // check runs AFTER launch resolution so option comparison is
+    // resolved-vs-stored (both normalized the same way) — comparing the raw
+    // request against normalized stored metadata would mismatch cosmetically
+    // and silently fall through to the replace path. Gated on the REQUESTED
+    // fresh_session: a resume that fell back to fresh is not an instruction
+    // to replace a live pane.
+    if crate::daemon_mode_active() && !is_prewarm_pty && !requested_fresh_session {
+        let existing_instance = {
+            let terminals = state.terminals.read().await;
+            terminals.get(&pane_id).cloned()
+        };
+        if let Some(existing_instance) = existing_instance {
+            if let Some(adopted) = terminal_open_adopt_existing_instance(
+                &existing_instance,
+                &kind,
+                provider.as_deref(),
+                plain_shell,
+                &resolved_launch,
+                workspace_id.as_deref(),
+                terminal_index,
+                requested_provider_session_id.as_deref(),
+                requested_fork_provider_session_id.as_deref(),
+            )
+            .await
+            {
+                // A requested resume session differing from the live one is
+                // logged, not honored: daemon catalog bindings lag the live
+                // session, and no interactive daemon flow resumes a specific
+                // session over a live pane.
+                let session_requested = requested_provider_session_id.clone().unwrap_or_default();
+                let session_live = adopted.provider_session_id.clone().unwrap_or_default();
+                log_terminal_crash_forensics_event(
+                    "backend.terminal_open.adopted_existing",
+                    json!({
+                        "instance_id": adopted.instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "session_live": clean_terminal_diagnostic_log_text(&session_live),
+                        "session_requested":
+                            clean_terminal_diagnostic_log_text(&session_requested),
+                    }),
+                );
+                crate::daemon_terminal_lifecycle_println(
+                    "open.adopted_existing",
+                    &json!({
+                        "instance_id": adopted.instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "session_live": clean_terminal_diagnostic_log_text(&session_live),
+                        "session_requested":
+                            clean_terminal_diagnostic_log_text(&session_requested),
+                    }),
+                );
+                return Ok(adopted);
+            }
+        }
     }
 
     // Resolve (and, when necessary, downgrade) the provider resume before the
@@ -31912,6 +32147,244 @@ mod terminal_tests {
         let mut no_index = metadata;
         no_index.terminal_index = None;
         assert!(terminal_daemon_reader_exit_respawn_candidate(&no_index, true, true).is_none());
+    }
+
+    #[test]
+    fn daemon_reader_exit_respawn_candidate_covers_agent_panes() {
+        let metadata = TerminalInstanceMetadata {
+            pane_id: "workspace-terminal-workspace-a-0-claude".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            terminal_index: Some(0),
+            agent_id: "claude".to_string(),
+            agent_kind: "claude".to_string(),
+            ..TerminalInstanceMetadata::default()
+        };
+        let candidate = terminal_daemon_reader_exit_respawn_candidate(&metadata, true, false)
+            .expect("daemon agent workspace slot respawns");
+        assert_eq!(candidate.workspace_id, "workspace-a");
+        assert_eq!(candidate.terminal_index, 0);
+        assert_eq!(candidate.slot_key, "workspace-a:0:claude");
+
+        // GUI devices keep webview-owned relaunch semantics.
+        assert!(
+            terminal_daemon_reader_exit_respawn_candidate(&metadata, false, false).is_none()
+        );
+        // Agent panes without a workspace slot (orchestrators, login shells)
+        // never respawn.
+        let mut no_workspace = metadata.clone();
+        no_workspace.workspace_id.clear();
+        assert!(
+            terminal_daemon_reader_exit_respawn_candidate(&no_workspace, true, false).is_none()
+        );
+        // Plain/unknown kinds on a non-generic-shell instance stay out.
+        let mut plain = metadata;
+        plain.agent_kind = "terminal".to_string();
+        assert!(terminal_daemon_reader_exit_respawn_candidate(&plain, true, false).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_open_adoption_matches_only_live_same_shape_instances() {
+        let root = env::temp_dir().join(format!("adopt-live-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let warm = create_warm_shell_pty_in_directory(
+            PtySize {
+                rows: 12,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            &root,
+        )
+        .unwrap();
+        let metadata = TerminalInstanceMetadata {
+            pane_id: "workspace-terminal-workspace-a-0-claude".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            terminal_index: Some(0),
+            agent_id: "claude".to_string(),
+            agent_kind: "claude".to_string(),
+            terminal_process_epoch: "test-process-epoch".to_string(),
+            ..TerminalInstanceMetadata::default()
+        };
+        let (instance, mut reader) = TerminalInstance::from_warm_shell(
+            7,
+            warm,
+            root.clone(),
+            false,
+            None,
+            TerminalSessionMode::General,
+            metadata,
+            TerminalLaunchRuntimeMetadata {
+                model: Some("opus".to_string()),
+                ..TerminalLaunchRuntimeMetadata::default()
+            },
+            None,
+            false,
+        );
+        let reader_thread = thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while reader.read(&mut buffer).is_ok_and(|read| read > 0) {}
+        });
+        *instance.runtime.lock().unwrap() = TerminalRuntimeSnapshot::opened_idle(None);
+        let default_options = TerminalProviderResolvedLaunchOptions::default();
+
+        // Same shape, no session targeting, live child → adopt.
+        let adopted = terminal_open_adopt_existing_instance(
+            &instance,
+            "claude",
+            None,
+            false,
+            &default_options,
+            Some("workspace-a"),
+            Some(0),
+            None,
+            None,
+        )
+        .await
+        .expect("live same-shape instance adopts");
+        assert_eq!(adopted.instance_id, 7);
+        assert_eq!(adopted.pane_id, "workspace-terminal-workspace-a-0-claude");
+        assert!(!adopted.launch_epoch.is_empty());
+        assert_eq!(adopted.model.as_deref(), Some("opus"));
+
+        // A different provider is a real reconfiguration → replace.
+        assert!(terminal_open_adopt_existing_instance(
+            &instance,
+            "codex",
+            None,
+            false,
+            &default_options,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .is_none());
+
+        // A generic-shell request never adopts an agent instance.
+        assert!(terminal_open_adopt_existing_instance(
+            &instance,
+            "shell",
+            None,
+            true,
+            &default_options,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .is_none());
+
+        // A changed launch option is a real reconfiguration → replace.
+        let changed_model = TerminalProviderResolvedLaunchOptions {
+            model: Some("sonnet".to_string()),
+            ..TerminalProviderResolvedLaunchOptions::default()
+        };
+        assert!(terminal_open_adopt_existing_instance(
+            &instance,
+            "claude",
+            None,
+            false,
+            &changed_model,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .is_none());
+
+        // A different workspace or slot index never adopts (stale/explicit
+        // pane-id collisions must not hand this PTY to another workspace).
+        assert!(terminal_open_adopt_existing_instance(
+            &instance,
+            "claude",
+            None,
+            false,
+            &default_options,
+            Some("workspace-b"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .is_none());
+        assert!(terminal_open_adopt_existing_instance(
+            &instance,
+            "claude",
+            None,
+            false,
+            &default_options,
+            Some("workspace-a"),
+            Some(3),
+            None,
+            None,
+        )
+        .await
+        .is_none());
+
+        // Fork targeting always launches fresh.
+        assert!(terminal_open_adopt_existing_instance(
+            &instance,
+            "claude",
+            None,
+            false,
+            &default_options,
+            None,
+            None,
+            None,
+            Some("fork-session"),
+        )
+        .await
+        .is_none());
+
+        // A closing instance never adopts.
+        instance.operation_admission.lock().unwrap().closing = true;
+        assert!(terminal_open_adopt_existing_instance(
+            &instance,
+            "claude",
+            None,
+            false,
+            &default_options,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .is_none());
+        instance.operation_admission.lock().unwrap().closing = false;
+
+        // A dead child never adopts.
+        {
+            let mut child = instance.child.lock().await;
+            if let Some(child) = child.as_mut() {
+                let _ = child.kill();
+            }
+        }
+        let mut adopted_dead = None;
+        for _ in 0..50 {
+            adopted_dead = terminal_open_adopt_existing_instance(
+                &instance,
+                "claude",
+                None,
+                false,
+                &default_options,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            if adopted_dead.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(adopted_dead.is_none(), "dead child must not adopt");
+        let _ = reader_thread.join();
     }
 
     #[test]
