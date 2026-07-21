@@ -88,20 +88,21 @@ impl CredentialStore for OsKeyringStore {
         if cfg!(test) {
             return CredentialStoreHealth::Unavailable;
         }
+        // Health MUST NOT prompt. A write-probe (set_password) creates an item,
+        // and on an ad-hoc / dev-signed macOS build (whose cdhash changes each
+        // launch) the OS pops the "enter your login keychain password" dialog on
+        // every probe — which, on the 60s health cadence, is the popup that
+        // keeps reappearing. Instead READ-probe a name that does not exist:
+        // reading a missing generic password returns NoEntry with NO
+        // authorization prompt, and still proves the store is reachable. The
+        // keychain is only ever written when the user deliberately saves a
+        // credential (a single, expected prompt on unsigned builds).
         let probe_name = "diffforge-health-probe";
         let Ok(entry) = Self::entry(probe_name) else {
             return CredentialStoreHealth::Unavailable;
         };
-        match entry.set_password("ok") {
-            Ok(()) => {
-                let readable = matches!(entry.get_password().as_deref(), Ok("ok"));
-                let _ = entry.delete_credential();
-                if readable {
-                    CredentialStoreHealth::Healthy
-                } else {
-                    CredentialStoreHealth::Unavailable
-                }
-            }
+        match entry.get_password() {
+            Ok(_) | Err(keyring::Error::NoEntry) => CredentialStoreHealth::Healthy,
             Err(keyring::Error::NoStorageAccess(_)) => CredentialStoreHealth::Locked,
             Err(_) => CredentialStoreHealth::Unavailable,
         }
