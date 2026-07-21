@@ -18489,6 +18489,13 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           fork_from_provider_session_id: forkFromProviderSessionId,
           has_active_task: session.has_active_task === true || Boolean(activeTask),
           instance_id: instanceId,
+          // Relay-only, never invent: the canonical fallback is
+          // "{terminal_process_epoch}:{pane}:{instance}" (Rust
+          // terminal_instance_launch_epoch) and the webview lacks
+          // terminal_process_epoch, so a value minted here would mismatch the
+          // device-published identity and make restarts read as stale. Blank
+          // is safe — the cloud terminal merge refuses to let a blank
+          // overwrite a stored non-blank identity.
           launch_epoch: cleanAppCloseText(
             session.launch_epoch || coordination?.terminal_launch_epoch,
           ),
