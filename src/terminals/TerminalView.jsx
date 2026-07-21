@@ -123,6 +123,7 @@ import {
 import {
   cloudVoiceAgentEventKind,
   createCloudVoiceAgentTtsPlayer,
+  executeVoiceAgentHighlightAppToolCall,
   finishCloudVoiceAgentInput,
   prewarmCloudVoiceAgentStream,
   sendCloudVoiceAgentTextMessage,
@@ -17985,14 +17986,14 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           logTerminalStatus("frontend.voice_agent.tool_call_ignored", {
             kind,
             reason: "orchestrator_voice_events_inactive",
-            tool_name: String(event?.name || event?.tool_name || "").trim(),
+            tool_name: String(event?.name || event?.tool_name || event?.tool || "").trim(),
             workspace_id: currentWorkspaceId,
           });
           return;
         }
         cancelOrchestratorFastResponseGate("tool_call");
-        const toolName = String(event?.name || event?.tool_name || "").trim();
-        if (toolName === "queue" || toolName === "open_coding_agents" || toolName === "highlight_terminal" || toolName === "create_plan") {
+        const toolName = String(event?.name || event?.tool_name || event?.tool || "").trim();
+        if (toolName === "queue" || toolName === "open_coding_agents" || toolName === "highlight_terminal" || toolName === "highlight_app" || toolName === "create_plan") {
           logTerminalStatus("frontend.voice_agent.tool_call_arrived", {
             tool_name: toolName,
             workspace_id: currentWorkspaceId,
@@ -18005,9 +18006,11 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
               ? "Opening coding agents..."
               : toolName === "highlight_terminal"
                 ? "Highlighting terminal..."
-                : toolName === "create_plan"
-                  ? "Creating plan..."
-                  : "Queued voice todo.",
+                : toolName === "highlight_app"
+                  ? "Opening settings..."
+                  : toolName === "create_plan"
+                    ? "Creating plan..."
+                    : "Queued voice todo.",
           );
         }
         return;
@@ -32141,7 +32144,7 @@ function TerminalView({
   ]);
 
   const handleVoiceAgentToolCall = useCallback(async (toolCall) => {
-    const toolName = String(toolCall?.name || toolCall?.tool_name || "").trim();
+    const toolName = String(toolCall?.name || toolCall?.tool_name || toolCall?.tool || "").trim();
     logTerminalStatus("frontend.voice_agent.tool_call_handle", {
       call_id: String(toolCall?.call_id || "").trim(),
       tool_name: toolName,
@@ -32169,6 +32172,17 @@ function TerminalView({
         return null;
       }
       return executeVoiceAgentHighlightTerminalToolCall(toolCall);
+    }
+    if (toolName === "highlight_app") {
+      if (!claimVoiceAgentToolCall(toolCall)) {
+        logTerminalStatus("frontend.voice_agent.tool_call_skip", {
+          reason: "duplicate_highlight_app",
+          tool_name: toolName,
+          workspace_id: terminalWorkspace?.id || "",
+        });
+        return null;
+      }
+      return executeVoiceAgentHighlightAppToolCall(toolCall);
     }
     if (toolName === "create_plan") {
       if (!claimVoiceAgentToolCall(toolCall)) {

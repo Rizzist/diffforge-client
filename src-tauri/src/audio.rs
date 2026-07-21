@@ -11903,6 +11903,7 @@ async fn start_cloud_voice_agent_stream(
         let start_request = json!({
             "kind": "start",
             "contract": CLOUD_VOICE_AGENT_CONTRACT,
+            "source": "native",
             "voice_protocol": "diffforge.voice.realtime.v2",
             // GPT-Realtime engine opt-in (cloud falls back to the pipeline
             // when its env kill switch is set).
@@ -11965,7 +11966,7 @@ async fn start_cloud_voice_agent_stream(
                     "browser_search",
                     "file_search"
                 ],
-                "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks", "device_control", "highlight_terminal"],
+                "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks", "device_control", "highlight_terminal", "highlight_app"],
                 "context_sources": ["recent_agent_sessions"],
                 "tool_choice": "auto",
                 "response_contract": {

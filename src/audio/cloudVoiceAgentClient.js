@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 
 import { readDeepgramLanguage } from "./audioCapture.js";
 
@@ -58,6 +58,46 @@ export function logVoiceOrchestratorDiagnosticEvent(phase, fields = {}) {
       ...fields,
     },
   }).catch(() => {});
+}
+
+/* Tauri event carrying a validated highlight_app target from either voice
+   surface (terminal orchestrator voice or the audio widget window) to the
+   main window's AppShell, which owns the Settings view and the
+   permission-highlight flow. A Tauri broadcast (not a window CustomEvent)
+   because the audio widget runs in its own webview window. */
+export const VOICE_AGENT_HIGHLIGHT_APP_EVENT = "forge-voice-highlight-app";
+
+const VOICE_AGENT_HIGHLIGHT_APP_TARGETS = new Set([
+  "microphone",
+  "shortcuts",
+  "screen",
+  "notifications",
+  "settings",
+]);
+
+export function executeVoiceAgentHighlightAppToolCall(toolCall) {
+  let args = toolCall?.arguments ?? toolCall?.args;
+  if (typeof args === "string") {
+    try {
+      args = JSON.parse(args);
+    } catch {
+      args = {};
+    }
+  }
+  args = args && typeof args === "object" ? args : {};
+  const target = String(args.target || "").trim().toLowerCase();
+  if (!VOICE_AGENT_HIGHLIGHT_APP_TARGETS.has(target)) {
+    logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.highlight_app.skip", {
+      reason: "unknown_target",
+      target: cleanVoiceOrchestratorDiagnosticText(target),
+    });
+    return { ok: false, target };
+  }
+  emit(VOICE_AGENT_HIGHLIGHT_APP_EVENT, { target }).catch(() => {});
+  logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.highlight_app.dispatched", {
+    target,
+  });
+  return { ok: true, target };
 }
 
 export function startCloudVoiceAgentStream(request = {}) {

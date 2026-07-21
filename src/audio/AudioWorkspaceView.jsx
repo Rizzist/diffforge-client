@@ -109,6 +109,7 @@ import {
 import {
   cloudVoiceAgentEventKind,
   createCloudVoiceAgentTtsPlayer,
+  executeVoiceAgentHighlightAppToolCall,
   finishCloudVoiceAgentInput,
   prewarmCloudVoiceAgentStream,
   startCloudVoiceAgentStream,
@@ -10658,6 +10659,14 @@ export function AudioWidgetWindow() {
       ) {
         const feedback = String(event?.feedback || event?.text || "").trim();
         setMessage(feedback ? "Forge voice responding" : "Forge voice thinking");
+        return;
+      }
+
+      if (kind === "voice_agent_tool_call") {
+        const toolName = String(event?.name || event?.tool_name || event?.tool || "").trim();
+        if (toolName === "highlight_app") {
+          executeVoiceAgentHighlightAppToolCall(event);
+        }
         return;
       }
 

@@ -1103,6 +1103,7 @@ import AudioWorkspaceView, {
   AUDIO_WIDGET_HASH,
   AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT,
 } from "../audio/AudioWorkspaceView.jsx";
+import { VOICE_AGENT_HIGHLIGHT_APP_EVENT } from "../audio/cloudVoiceAgentClient.js";
 import TerminalWindowHost, { TERMINAL_WINDOW_HASH } from "../terminals/TerminalWindowHost.jsx";
 import PcbWindowHost, { PCB_WINDOW_HASH } from "../pcb/PcbWindowHost.jsx";
 import { SshSettingsPanel } from "../ssh/SshSettingsPanel.jsx";
@@ -3317,6 +3318,12 @@ function workspaceThreadRequestAllowsHookTranscriptPolling(event = {}) {
 }
 
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
+const VOICE_AGENT_HIGHLIGHT_APP_PERMISSION_TARGETS = new Set([
+  "microphone",
+  "shortcuts",
+  "screen",
+  "notifications",
+]);
 const TERMINAL_IDLE_STATUS_EVENT_TYPES = new Set([
   "provider-turn-completed",
 ]);
@@ -29423,6 +29430,38 @@ export default function App() {
         immediate: true,
         telemetrySource: "snipping_permission_attention",
       });
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [highlightSettingsPermission, showView]);
+
+  // Voice orchestrator highlight_app tool call (both voice surfaces emit this
+  // Tauri event via the shared helper in src/audio/cloudVoiceAgentClient.js,
+  // which validates targets): permission targets get the Settings→Permissions
+  // pulsing-ring flow; the plain "settings" target just opens Settings.
+  useEffect(() => {
+    let cancelled = false;
+    const unsubscribe = listenShared(VOICE_AGENT_HIGHLIGHT_APP_EVENT, (highlightEvent) => {
+      if (cancelled) {
+        return;
+      }
+      const target = String(highlightEvent?.payload?.target || "").trim();
+      if (VOICE_AGENT_HIGHLIGHT_APP_PERMISSION_TARGETS.has(target)) {
+        highlightSettingsPermission(target);
+        showView("settings", {
+          immediate: true,
+          telemetrySource: "voice_agent_highlight_app",
+        });
+        return;
+      }
+      if (target === "settings") {
+        showView("settings", {
+          immediate: true,
+          telemetrySource: "voice_agent_highlight_app",
+        });
+      }
     });
     return () => {
       cancelled = true;
