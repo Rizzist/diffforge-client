@@ -5461,6 +5461,8 @@ struct ClaudePreToolUseCorrelation {
     tool_name: String,
     canonical_tool_input_sha256: String,
     tool_use_id: String,
+    #[serde(default)]
+    subagent_correlation_id: String,
     arrival_ordinal: u64,
 }
 
@@ -5484,8 +5486,17 @@ impl ClaudeHookCorrelationState {
         tool_name: &str,
         tool_input: &Value,
         tool_use_id: &str,
-    ) {
+    ) -> String {
         let arrival_ordinal = self.next_ordinal();
+        let subagent_correlation_id = if diff_forge_activity_hook_is_subagent_tool_name(tool_name) {
+            diff_forge_activity_hook_subagent_correlation_id(
+                session_id,
+                tool_use_id,
+                arrival_ordinal,
+            )
+        } else {
+            String::new()
+        };
         while self
             .pre_tool_uses
             .iter()
@@ -5508,11 +5519,13 @@ impl ClaudeHookCorrelationState {
             tool_name: tool_name.to_string(),
             canonical_tool_input_sha256: diff_forge_activity_hook_canonical_sha256(tool_input),
             tool_use_id: tool_use_id.to_string(),
+            subagent_correlation_id: subagent_correlation_id.clone(),
             arrival_ordinal,
         });
         while self.pre_tool_uses.len() > CLAUDE_HOOK_CORRELATION_MAX_TOTAL {
             self.pre_tool_uses.pop_front();
         }
+        subagent_correlation_id
     }
 
     fn take_permission_match(
@@ -5540,6 +5553,33 @@ impl ClaudeHookCorrelationState {
         self.pre_tool_uses
             .retain(|record| record.session_id != session_id);
     }
+
+    fn take_subagent_launch_match(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+        tool_input: &Value,
+        tool_use_id: &str,
+    ) -> Option<ClaudePreToolUseCorrelation> {
+        let tool_key = diff_forge_activity_hook_name_key(tool_name);
+        let canonical_tool_input_sha256 = diff_forge_activity_hook_canonical_sha256(tool_input);
+        let index = self
+            .pre_tool_uses
+            .iter()
+            .rposition(|record| {
+                if record.session_id != session_id
+                    || record.subagent_correlation_id.trim().is_empty()
+                {
+                    return false;
+                }
+                if !tool_use_id.trim().is_empty() {
+                    return record.tool_use_id == tool_use_id;
+                }
+                diff_forge_activity_hook_name_key(&record.tool_name) == tool_key
+                    && record.canonical_tool_input_sha256 == canonical_tool_input_sha256
+            })?;
+        self.pre_tool_uses.remove(index)
+    }
 }
 
 fn diff_forge_activity_hook_name_key(value: &str) -> String {
@@ -5548,6 +5588,170 @@ fn diff_forge_activity_hook_name_key(value: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn diff_forge_activity_hook_is_subagent_tool_name(value: &str) -> bool {
+    matches!(
+        diff_forge_activity_hook_name_key(value).as_str(),
+        "agent" | "task"
+    )
+}
+
+fn diff_forge_activity_hook_subagent_correlation_id(
+    session_id: &str,
+    tool_use_id: &str,
+    arrival_ordinal: u64,
+) -> String {
+    let seed = if tool_use_id.trim().is_empty() {
+        format!(
+            "claude-subagent\n{}\n{}",
+            session_id.trim(),
+            arrival_ordinal.max(1)
+        )
+    } else {
+        format!("claude-subagent\n{}\n{}", session_id.trim(), tool_use_id.trim())
+    };
+    let digest = format!("{:x}", Sha256::digest(seed.as_bytes()));
+    format!("claude-subagent-{}", &digest[..32])
+}
+
+fn diff_forge_activity_hook_bounded_subagent_label(value: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_CHARS {
+        normalized
+    } else {
+        normalized.chars().take(MAX_CHARS).collect()
+    }
+}
+
+#[derive(Default)]
+struct DiffForgeSubagentBridgeFields {
+    spawned_agent_id: String,
+    launch_tool_use_id: String,
+    status: String,
+}
+
+fn diff_forge_activity_hook_value_string(value: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn diff_forge_activity_hook_subagent_bridge_merge(
+    target: &mut DiffForgeSubagentBridgeFields,
+    source: DiffForgeSubagentBridgeFields,
+) {
+    if target.spawned_agent_id.is_empty() && !source.spawned_agent_id.is_empty() {
+        target.spawned_agent_id = source.spawned_agent_id;
+    }
+    if target.launch_tool_use_id.is_empty() && !source.launch_tool_use_id.is_empty() {
+        target.launch_tool_use_id = source.launch_tool_use_id;
+    }
+    if target.status.is_empty() && !source.status.is_empty() {
+        target.status = source.status;
+    }
+}
+
+fn diff_forge_activity_hook_subagent_bridge_fields_from_value(
+    value: &Value,
+    allow_generic_agent_id: bool,
+    depth: usize,
+) -> DiffForgeSubagentBridgeFields {
+    if depth > 6 {
+        return DiffForgeSubagentBridgeFields::default();
+    }
+    let mut fields = DiffForgeSubagentBridgeFields::default();
+    let Some(object) = value.as_object() else {
+        if allow_generic_agent_id {
+            fields.spawned_agent_id = value.as_str().unwrap_or_default().trim().to_string();
+        }
+        return fields;
+    };
+    fields.spawned_agent_id = diff_forge_activity_hook_value_string(
+        value,
+        &[
+            "spawned_agent_id",
+            "spawnedAgentId",
+            "child_agent_id",
+            "childAgentId",
+            "subagent_id",
+            "subagentId",
+            "agent_id",
+            "agentId",
+        ],
+    );
+    if fields.spawned_agent_id.is_empty() && allow_generic_agent_id {
+        fields.spawned_agent_id = diff_forge_activity_hook_value_string(value, &["id"]);
+    }
+    fields.launch_tool_use_id = diff_forge_activity_hook_value_string(
+        value,
+        &[
+            "launch_tool_use_id",
+            "launchToolUseId",
+            "agent_tool_use_id",
+            "agentToolUseId",
+            "tool_use_id",
+            "toolUseId",
+            "toolUseID",
+            "tool_call_id",
+            "toolCallId",
+            "call_id",
+            "callId",
+            "callID",
+        ],
+    );
+    fields.status = diff_forge_activity_hook_value_string(
+        value,
+        &[
+            "status",
+            "state",
+            "phase",
+            "activity_status",
+            "activityStatus",
+            "command_phase",
+            "commandPhase",
+        ],
+    );
+    for key in [
+        "agentId",
+        "agent_id",
+        "spawnedAgentId",
+        "spawned_agent_id",
+        "childAgentId",
+        "child_agent_id",
+        "subagent",
+        "subagent_id",
+        "agent",
+        "child",
+        "result",
+        "data",
+        "metadata",
+    ] {
+        if let Some(nested) = object.get(key) {
+            diff_forge_activity_hook_subagent_bridge_merge(
+                &mut fields,
+                diff_forge_activity_hook_subagent_bridge_fields_from_value(
+                    nested,
+                    matches!(
+                        key,
+                        "agentId"
+                            | "agent_id"
+                            | "spawnedAgentId"
+                            | "spawned_agent_id"
+                            | "childAgentId"
+                            | "child_agent_id"
+                            | "subagent_id"
+                    ),
+                    depth + 1,
+                ),
+            );
+        }
+    }
+    fields
 }
 
 fn diff_forge_activity_hook_canonical_value(value: &Value) -> Value {
@@ -5686,10 +5890,10 @@ fn diff_forge_activity_hook_record_base(
     let permission_mode = hook_string(&["permission_mode", "permissionMode"]);
     let transcript_path = hook_string(&["transcript_path", "transcriptPath"]);
     let agent_id = hook_string(&["agent_id", "agentId"]);
-    let agent_type = first_string(vec![
+    let agent_type = diff_forge_activity_hook_bounded_subagent_label(&first_string(vec![
         hook_string(&["agent_type", "agentType"]),
         tool_string(&["agent_type", "agentType", "subagent_type", "subagentType"]),
-    ]);
+    ]));
     let agent_transcript_path = hook_string(&["agent_transcript_path", "agentTranscriptPath"]);
     let last_message = hook_text_value(&[
         "last_assistant_message",
@@ -5776,6 +5980,7 @@ fn diff_forge_activity_hook_record_base(
         hook_string(&["tool_name", "toolName"]),
         tool_string(&["tool_name", "toolName"]),
     ]);
+    let is_subagent_tool = diff_forge_activity_hook_is_subagent_tool_name(&tool_name);
     let tool_use_id = first_string(vec![
         hook_string(&["tool_use_id", "toolUseId"]),
         tool_string(&["tool_use_id", "toolUseId"]),
@@ -5794,6 +5999,64 @@ fn diff_forge_activity_hook_record_base(
         "result",
         "response",
         "stdout",
+    ]);
+    let subagent_bridge =
+        diff_forge_activity_hook_subagent_bridge_fields_from_value(&tool_output, false, 0);
+    let spawned_agent_id = if is_subagent_tool {
+        first_string(vec![
+            hook_string(&[
+                "spawned_agent_id",
+                "spawnedAgentId",
+                "child_agent_id",
+                "childAgentId",
+                "subagent_id",
+                "subagentId",
+            ]),
+            subagent_bridge.spawned_agent_id.clone(),
+        ])
+    } else {
+        String::new()
+    };
+    let launch_tool_use_id = if is_subagent_tool {
+        first_string(vec![
+            hook_string(&[
+                "launch_tool_use_id",
+                "launchToolUseId",
+                "agent_tool_use_id",
+                "agentToolUseId",
+            ]),
+            subagent_bridge.launch_tool_use_id.clone(),
+            tool_use_id.clone(),
+        ])
+    } else {
+        String::new()
+    };
+    let subagent_correlation_id = if is_subagent_tool {
+        first_string(vec![
+            hook_string(&[
+                "subagent_correlation_id",
+                "subagentCorrelationId",
+                "launch_correlation_id",
+                "launchCorrelationId",
+            ]),
+            tool_string(&[
+                "subagent_correlation_id",
+                "subagentCorrelationId",
+                "launch_correlation_id",
+                "launchCorrelationId",
+            ]),
+        ])
+    } else {
+        String::new()
+    };
+    let status = first_string(vec![
+        hook_string(&["status", "activity_status", "activityStatus", "command_phase", "commandPhase"]),
+        tool_string(&["status", "activity_status", "activityStatus", "command_phase", "commandPhase"]),
+        if is_subagent_tool {
+            subagent_bridge.status.clone()
+        } else {
+            String::new()
+        },
     ]);
     let tool_error = hook_value(&["tool_error", "toolError", "error", "stderr"]);
     let error_details = hook_value(&[
@@ -6159,6 +6422,9 @@ fn diff_forge_activity_hook_record_base(
         "agent_id": agent_id,
         "agent_type": agent_type,
         "agent_transcript_path": agent_transcript_path,
+        "spawned_agent_id": spawned_agent_id,
+        "launch_tool_use_id": launch_tool_use_id,
+        "subagent_correlation_id": subagent_correlation_id,
         "assistant_message": assistant_message,
         "assistant_delta": assistant_delta,
         "assistant_message_snapshot": assistant_message_snapshot,
@@ -6170,6 +6436,7 @@ fn diff_forge_activity_hook_record_base(
         "prompt": user_prompt.clone(),
         "tool_name": tool_name,
         "tool_use_id": tool_use_id,
+        "status": status,
         "tool_server": tool_server,
         "tool_input": tool_input.clone(),
         "tool_output": tool_output,
@@ -6292,16 +6559,29 @@ fn diff_forge_activity_hook_apply_claude_source_fidelity(
     let tool_use_id = diff_forge_activity_hook_record_string(record, "tool_use_id");
     let tool_input = record.get("tool_input").cloned().unwrap_or(Value::Null);
 
-    if hook_key == "pretooluse" && !tool_use_id.is_empty() {
+    let is_subagent_tool = diff_forge_activity_hook_is_subagent_tool_name(&tool_name);
+
+    if hook_key == "pretooluse" && (!tool_use_id.is_empty() || is_subagent_tool) {
         let common_prompt_id =
             diff_forge_activity_hook_record_string(record, "permission_request_id");
-        state.remember_pre_tool_use(
+        let subagent_correlation_id = state.remember_pre_tool_use(
             &session_id,
             &common_prompt_id,
             &tool_name,
             &tool_input,
             &tool_use_id,
         );
+        if is_subagent_tool {
+            if !tool_use_id.is_empty()
+                && diff_forge_activity_hook_record_string(record, "launch_tool_use_id").is_empty()
+            {
+                record["launch_tool_use_id"] = json!(tool_use_id.clone());
+            }
+            if diff_forge_activity_hook_record_string(record, "subagent_correlation_id").is_empty()
+            {
+                record["subagent_correlation_id"] = json!(subagent_correlation_id);
+            }
+        }
 
         if matches!(tool_key.as_str(), "askuserquestion" | "exitplanmode") {
             diff_forge_activity_hook_set_prompt_identity(record, &tool_use_id);
@@ -6462,6 +6742,27 @@ fn diff_forge_activity_hook_apply_claude_source_fidelity(
         record["interaction_response_mode"] = json!("diffforge_intervention");
         record["interaction_kind"] = json!("diffforge_retry_intervention");
         record["provider_native_prompt"] = json!(false);
+    }
+
+    if matches!(hook_key.as_str(), "posttooluse" | "posttoolusefailure") && is_subagent_tool {
+        if let Some(matched) =
+            state.take_subagent_launch_match(&session_id, &tool_name, &tool_input, &tool_use_id)
+        {
+            if diff_forge_activity_hook_record_string(record, "subagent_correlation_id").is_empty()
+            {
+                record["subagent_correlation_id"] = json!(matched.subagent_correlation_id);
+            }
+            if diff_forge_activity_hook_record_string(record, "launch_tool_use_id").is_empty()
+                && !matched.tool_use_id.is_empty()
+            {
+                record["launch_tool_use_id"] = json!(matched.tool_use_id);
+            }
+        }
+        if diff_forge_activity_hook_record_string(record, "launch_tool_use_id").is_empty()
+            && !tool_use_id.is_empty()
+        {
+            record["launch_tool_use_id"] = json!(tool_use_id.clone());
+        }
     }
 
     if matches!(
@@ -8220,6 +8521,204 @@ mod terminal_cli_tests {
         assert_eq!(record["tool_output"]["stdout"].as_str(), Some("ok"));
         assert_eq!(record["duration_ms"].as_u64(), Some(1234));
         assert_eq!(record["exit_code"].as_i64(), Some(0));
+    }
+
+    #[test]
+    fn claude_agent_post_tool_use_promotes_nested_bridge_distinct_from_root_agent() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-1",
+                "agent_id": "root-agent",
+                "tool_name": "Agent",
+                "tool_use_id": "tool-agent-1",
+                "tool_response": {
+                    "agentId": {
+                        "agent_id": "child-agent-1",
+                        "tool_use_id": "tool-agent-1"
+                    },
+                    "status": "async_launched"
+                }
+            }),
+        );
+
+        assert_eq!(record["agent_id"], "root-agent");
+        assert_eq!(record["spawned_agent_id"], "child-agent-1");
+        assert_eq!(record["launch_tool_use_id"], "tool-agent-1");
+        assert_eq!(record["status"], "async_launched");
+    }
+
+    #[test]
+    fn claude_agent_pre_tool_use_mints_launch_correlation_for_post_tool_use() {
+        let mut state = ClaudeHookCorrelationState::default();
+        let pre = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-1",
+                "tool_name": "Agent",
+                "tool_use_id": "tool-agent-2",
+                "tool_input": {"description": "Investigate flaky test"}
+            }),
+            &mut state,
+        );
+        let correlation_id = pre["subagent_correlation_id"]
+            .as_str()
+            .expect("correlation id")
+            .to_string();
+        assert!(correlation_id.starts_with("claude-subagent-"));
+        assert_eq!(pre["launch_tool_use_id"], "tool-agent-2");
+
+        let post = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-1",
+                "tool_name": "Agent",
+                "tool_use_id": "tool-agent-2",
+                "tool_response": {
+                    "agentId": {
+                        "agent_id": "child-agent-2",
+                        "tool_use_id": "tool-agent-2"
+                    },
+                    "status": "async_launched"
+                }
+            }),
+            &mut state,
+        );
+        assert_eq!(
+            post["subagent_correlation_id"].as_str(),
+            Some(correlation_id.as_str())
+        );
+        assert_eq!(post["spawned_agent_id"], "child-agent-2");
+        assert_eq!(post["launch_tool_use_id"], "tool-agent-2");
+
+        let bash = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-1",
+                "tool_name": "Bash",
+                "tool_use_id": "tool-bash-1",
+                "tool_input": {"command": "echo untouched"}
+            }),
+            &mut state,
+        );
+        assert_eq!(bash["subagent_correlation_id"], "");
+        assert_eq!(bash["launch_tool_use_id"], "");
+    }
+
+    #[test]
+    fn claude_agent_empty_tool_use_launch_match_consumes_newest_correlation() {
+        let mut state = ClaudeHookCorrelationState::default();
+        let agent_input = json!({"description": "Run the same delegated check"});
+        let pre_one = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-empty-tool",
+                "tool_name": "Agent",
+                "tool_input": agent_input.clone()
+            }),
+            &mut state,
+        );
+        let first_correlation = pre_one["subagent_correlation_id"]
+            .as_str()
+            .expect("first correlation")
+            .to_string();
+        let pre_two = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-empty-tool",
+                "tool_name": "Agent",
+                "tool_input": agent_input.clone()
+            }),
+            &mut state,
+        );
+        let second_correlation = pre_two["subagent_correlation_id"]
+            .as_str()
+            .expect("second correlation")
+            .to_string();
+        assert_ne!(first_correlation, second_correlation);
+
+        let post_two = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-empty-tool",
+                "tool_name": "Agent",
+                "tool_input": agent_input.clone(),
+                "tool_response": {
+                    "agentId": {
+                        "agent_id": "child-agent-two"
+                    },
+                    "status": "async_launched"
+                }
+            }),
+            &mut state,
+        );
+        assert_eq!(
+            post_two["subagent_correlation_id"].as_str(),
+            Some(second_correlation.as_str())
+        );
+        assert_eq!(post_two["spawned_agent_id"], "child-agent-two");
+
+        let post_one = diff_forge_activity_hook_record_with_claude_state(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session-empty-tool",
+                "tool_name": "Agent",
+                "tool_input": agent_input.clone(),
+                "tool_response": {
+                    "agentId": {
+                        "agent_id": "child-agent-one"
+                    },
+                    "status": "async_launched"
+                }
+            }),
+            &mut state,
+        );
+        assert_eq!(
+            post_one["subagent_correlation_id"].as_str(),
+            Some(first_correlation.as_str())
+        );
+        assert_eq!(post_one["spawned_agent_id"], "child-agent-one");
+        assert!(state.pre_tool_uses.is_empty());
     }
 
     #[test]

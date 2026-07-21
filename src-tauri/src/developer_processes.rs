@@ -11,6 +11,8 @@ const DEVELOPER_PROCESS_PORT_SCAN_LIMIT: usize = 2048;
 const DEVELOPER_PROCESS_SNAPSHOT_CACHE_MS: u64 = 1500;
 const DEVELOPER_PROCESS_PORT_CACHE_MS: u64 = 60_000;
 const DOCKER_CONTAINER_SNAPSHOT_CACHE_MS: u64 = 25_000;
+const TERMINAL_ACTIVITY_SUBAGENT_TOOL_TTL_MS: u64 = 10 * 60 * 1000;
+const TERMINAL_ACTIVITY_SUBAGENT_LABEL_MAX_CHARS: usize = 96;
 
 struct DeveloperProcessMonitorState {
     system: Arc<StdMutex<SysSystem>>,
@@ -1383,6 +1385,224 @@ fn terminal_activity_event_key(value: &str) -> String {
         .collect()
 }
 
+fn terminal_activity_value_string(value: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+#[derive(Default)]
+struct TerminalActivitySubagentBridge {
+    agent_id: String,
+    tool_use_id: String,
+    correlation_id: String,
+    status: String,
+}
+
+fn terminal_activity_subagent_bridge_merge(
+    target: &mut TerminalActivitySubagentBridge,
+    source: TerminalActivitySubagentBridge,
+) {
+    if target.agent_id.is_empty() && !source.agent_id.is_empty() {
+        target.agent_id = source.agent_id;
+    }
+    if target.tool_use_id.is_empty() && !source.tool_use_id.is_empty() {
+        target.tool_use_id = source.tool_use_id;
+    }
+    if target.correlation_id.is_empty() && !source.correlation_id.is_empty() {
+        target.correlation_id = source.correlation_id;
+    }
+    if target.status.is_empty() && !source.status.is_empty() {
+        target.status = source.status;
+    }
+}
+
+fn terminal_activity_subagent_bridge_from_value(
+    value: &Value,
+    allow_generic_agent_id: bool,
+    depth: usize,
+) -> TerminalActivitySubagentBridge {
+    if depth > 6 {
+        return TerminalActivitySubagentBridge::default();
+    }
+    let mut bridge = TerminalActivitySubagentBridge::default();
+    let Some(object) = value.as_object() else {
+        if allow_generic_agent_id {
+            bridge.agent_id = value.as_str().unwrap_or_default().trim().to_string();
+        }
+        return bridge;
+    };
+
+    bridge.agent_id = terminal_activity_value_string(
+        value,
+        &[
+            "spawned_agent_id",
+            "spawnedAgentId",
+            "child_agent_id",
+            "childAgentId",
+            "subagent_id",
+            "subagentId",
+            "agent_id",
+            "agentId",
+        ],
+    );
+    if bridge.agent_id.is_empty() && allow_generic_agent_id {
+        bridge.agent_id = terminal_activity_value_string(value, &["id"]);
+    }
+    bridge.tool_use_id = terminal_activity_value_string(
+        value,
+        &[
+            "launch_tool_use_id",
+            "launchToolUseId",
+            "agent_tool_use_id",
+            "agentToolUseId",
+            "tool_use_id",
+            "toolUseId",
+            "toolUseID",
+            "tool_call_id",
+            "toolCallId",
+            "call_id",
+            "callId",
+            "callID",
+        ],
+    );
+    bridge.correlation_id = terminal_activity_value_string(
+        value,
+        &[
+            "subagent_correlation_id",
+            "subagentCorrelationId",
+            "launch_correlation_id",
+            "launchCorrelationId",
+        ],
+    );
+    bridge.status = terminal_activity_value_string(
+        value,
+        &[
+            "status",
+            "state",
+            "phase",
+            "activity_status",
+            "activityStatus",
+            "command_phase",
+            "commandPhase",
+        ],
+    );
+
+    for key in [
+        "agentId",
+        "agent_id",
+        "spawnedAgentId",
+        "spawned_agent_id",
+        "childAgentId",
+        "child_agent_id",
+        "subagent",
+        "subagent_id",
+        "agent",
+        "child",
+        "result",
+        "data",
+        "metadata",
+    ] {
+        if let Some(nested) = object.get(key) {
+            terminal_activity_subagent_bridge_merge(
+                &mut bridge,
+                terminal_activity_subagent_bridge_from_value(
+                    nested,
+                    matches!(
+                        key,
+                        "agentId"
+                            | "agent_id"
+                            | "spawnedAgentId"
+                            | "spawned_agent_id"
+                            | "childAgentId"
+                            | "child_agent_id"
+                            | "subagent_id"
+                    ),
+                    depth + 1,
+                ),
+            );
+        }
+    }
+    bridge
+}
+
+fn terminal_activity_subagent_bridge_from_event(event: &Value) -> TerminalActivitySubagentBridge {
+    let mut bridge = TerminalActivitySubagentBridge {
+        agent_id: terminal_activity_event_string(
+            event,
+            &[
+                "spawned_agent_id",
+                "spawnedAgentId",
+                "child_agent_id",
+                "childAgentId",
+                "subagent_id",
+                "subagentId",
+            ],
+        ),
+        tool_use_id: terminal_activity_event_string(
+            event,
+            &[
+                "launch_tool_use_id",
+                "launchToolUseId",
+                "agent_tool_use_id",
+                "agentToolUseId",
+            ],
+        ),
+        correlation_id: terminal_activity_event_string(
+            event,
+            &[
+                "subagent_correlation_id",
+                "subagentCorrelationId",
+                "launch_correlation_id",
+                "launchCorrelationId",
+            ],
+        ),
+        status: terminal_activity_event_string(
+            event,
+            &[
+                "spawned_agent_status",
+                "spawnedAgentStatus",
+                "subagent_status",
+                "subagentStatus",
+            ],
+        ),
+    };
+    for key in [
+        "tool_output",
+        "toolOutput",
+        "tool_response",
+        "toolResponse",
+        "output",
+        "result",
+        "response",
+    ] {
+        if let Some(value) = event.get(key) {
+            terminal_activity_subagent_bridge_merge(
+                &mut bridge,
+                terminal_activity_subagent_bridge_from_value(value, false, 0),
+            );
+        }
+    }
+    bridge
+}
+
+fn terminal_activity_event_is_agent_tool(event: &Value) -> bool {
+    event["tool_name"]
+        .as_str()
+        .is_some_and(|tool| matches!(terminal_activity_event_key(tool).as_str(), "agent" | "task"))
+}
+
+fn terminal_activity_event_key_is_subagent_lifecycle(event_key: &str) -> bool {
+    matches!(event_key, "subagentstart" | "subagentstop")
+}
+
+fn terminal_activity_subagent_bridge_allowed(event_key: &str, event: &Value) -> bool {
+    terminal_activity_event_key_is_subagent_lifecycle(event_key)
+        || terminal_activity_event_is_agent_tool(event)
+}
+
 fn terminal_activity_subagent_event_is_pending(event: &Value) -> bool {
     let status = terminal_activity_event_key(&terminal_activity_event_string(
         event,
@@ -1457,27 +1677,233 @@ fn terminal_activity_subagent_event_status(event_key: &str, event: &Value) -> St
         return "awaiting_instruction".to_string();
     }
 
-    let status = terminal_activity_event_key(&terminal_activity_event_string(
-        event,
-        &["status", "activity_status", "command_phase"],
-    ));
-    if matches!(
-        status.as_str(),
-        "done" | "complete" | "completed" | "finished" | "success" | "toolcompleted"
-    ) {
-        return "done".to_string();
-    }
-    if matches!(
-        status.as_str(),
-        "blocked" | "failed" | "failure" | "error" | "interrupted" | "stopped"
-    ) {
+    let bridge = if terminal_activity_subagent_bridge_allowed(event_key, event) {
+        terminal_activity_subagent_bridge_from_event(event)
+    } else {
+        TerminalActivitySubagentBridge::default()
+    };
+    let statuses = [
+        terminal_activity_event_string(event, &["status", "activity_status", "command_phase"]),
+        bridge.status,
+    ]
+    .into_iter()
+    .map(|status| terminal_activity_event_key(&status))
+    .filter(|status| !status.is_empty())
+    .collect::<Vec<_>>();
+    if event_key == "posttoolusefailure"
+        || statuses.iter().any(|status| {
+            matches!(
+                status.as_str(),
+                "blocked" | "failed" | "failure" | "error" | "interrupted" | "stopped"
+            )
+        })
+    {
         return "failed".to_string();
+    }
+    if statuses.iter().any(|status| {
+        matches!(
+            status.as_str(),
+            "active" | "asynclaunched" | "asyncstarted" | "launched" | "running" | "started"
+        )
+    }) {
+        return "running".to_string();
+    }
+    if statuses.iter().any(|status| {
+        matches!(
+            status.as_str(),
+            "done" | "complete" | "completed" | "finished" | "success" | "toolcompleted"
+        )
+    }) {
+        return "done".to_string();
     }
 
     if event_key == "subagentstop" || event_key == "posttooluse" {
         return "done".to_string();
     }
     "running".to_string()
+}
+
+struct TerminalActivitySubagentEntry {
+    subagent: TerminalActivitySubagent,
+    aliases: HashSet<String>,
+    status_updated_at_ms: u64,
+    label_quality: u8,
+}
+
+fn terminal_activity_subagent_identity_key(prefix: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| format!("{prefix}:{value}"))
+}
+
+fn terminal_activity_subagent_resolve_alias(
+    aliases: &HashMap<String, String>,
+    key: &str,
+) -> String {
+    aliases
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| key.to_string())
+}
+
+fn terminal_activity_subagent_update_alias_targets(
+    aliases: &mut HashMap<String, String>,
+    from: &str,
+    to: &str,
+) {
+    for target in aliases.values_mut() {
+        if target == from {
+            *target = to.to_string();
+        }
+    }
+}
+
+fn terminal_activity_subagent_status_merge_rank(status: &str) -> u8 {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "failed" => 4,
+        "done" | "completed" => 3,
+        "awaiting_instruction" | "awaiting_input" | "awaiting_user" | "blocked" => 2,
+        "running" | "active" => 1,
+        _ => 0,
+    }
+}
+
+fn terminal_activity_subagent_label_quality(agent_type: &str, description: &str) -> u8 {
+    if !agent_type.trim().is_empty() {
+        3
+    } else if !description.trim().is_empty() {
+        2
+    } else {
+        1
+    }
+}
+
+fn terminal_activity_subagent_merge_entries(
+    target: &mut TerminalActivitySubagentEntry,
+    source: TerminalActivitySubagentEntry,
+) {
+    target.aliases.extend(source.aliases);
+    if target.subagent.provider.trim().is_empty() && !source.subagent.provider.trim().is_empty() {
+        target.subagent.provider = source.subagent.provider.clone();
+    }
+    if target.subagent.agent_id.trim().is_empty() && !source.subagent.agent_id.trim().is_empty() {
+        target.subagent.agent_id = source.subagent.agent_id.clone();
+    }
+    if target.subagent.agent_type.trim().is_empty() && !source.subagent.agent_type.trim().is_empty() {
+        target.subagent.agent_type = source.subagent.agent_type.clone();
+    }
+    if target.subagent.description.trim().is_empty() && !source.subagent.description.trim().is_empty()
+    {
+        target.subagent.description = source.subagent.description.clone();
+    }
+    if source.label_quality > target.label_quality
+        || (source.label_quality == target.label_quality
+            && source.subagent.updated_at_ms >= target.subagent.updated_at_ms)
+    {
+        target.subagent.label = source.subagent.label.clone();
+        if !source.subagent.agent_type.trim().is_empty() {
+            target.subagent.agent_type = source.subagent.agent_type.clone();
+        }
+        if !source.subagent.description.trim().is_empty() {
+            target.subagent.description = source.subagent.description.clone();
+        }
+        target.label_quality = source.label_quality;
+    }
+    target.subagent.started_at_ms = match (
+        target.subagent.started_at_ms,
+        source.subagent.started_at_ms,
+    ) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
+    if source.status_updated_at_ms > target.status_updated_at_ms
+        || (source.status_updated_at_ms == target.status_updated_at_ms
+            && terminal_activity_subagent_status_merge_rank(&source.subagent.status)
+                > terminal_activity_subagent_status_merge_rank(&target.subagent.status))
+    {
+        target.subagent.status = source.subagent.status.clone();
+        target.status_updated_at_ms = source.status_updated_at_ms;
+    }
+    target.subagent.finished_at_ms = match (
+        target.subagent.finished_at_ms,
+        source.subagent.finished_at_ms,
+    ) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
+    target.subagent.updated_at_ms = target
+        .subagent
+        .updated_at_ms
+        .max(source.subagent.updated_at_ms);
+    if target.subagent.transcript_path.trim().is_empty()
+        && !source.subagent.transcript_path.trim().is_empty()
+    {
+        target.subagent.transcript_path = source.subagent.transcript_path.clone();
+    }
+    if target.subagent.agent_transcript_path.trim().is_empty()
+        && !source.subagent.agent_transcript_path.trim().is_empty()
+    {
+        target.subagent.agent_transcript_path = source.subagent.agent_transcript_path.clone();
+    }
+    if !source.subagent.last_message.trim().is_empty() {
+        target.subagent.last_message = source.subagent.last_message.clone();
+    }
+    if target.subagent.confidence != "named" && source.subagent.confidence == "named" {
+        target.subagent.confidence = source.subagent.confidence.clone();
+    }
+}
+
+fn terminal_activity_subagent_merge_aliases(
+    subagents: &mut HashMap<String, TerminalActivitySubagentEntry>,
+    aliases: &mut HashMap<String, String>,
+    preferred_key: &str,
+    identity_keys: &[String],
+) -> String {
+    let target_key = if preferred_key.starts_with("agent:") {
+        preferred_key.to_string()
+    } else {
+        terminal_activity_subagent_resolve_alias(aliases, preferred_key)
+    };
+    let mut keys = vec![preferred_key.to_string()];
+    for key in identity_keys {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    for key in &keys {
+        let resolved = terminal_activity_subagent_resolve_alias(aliases, key);
+        if resolved != target_key {
+            if let Some(source) = subagents.remove(&resolved) {
+                if let Some(target) = subagents.get_mut(&target_key) {
+                    terminal_activity_subagent_merge_entries(target, source);
+                } else {
+                    subagents.insert(target_key.clone(), source);
+                }
+            }
+            terminal_activity_subagent_update_alias_targets(aliases, &resolved, &target_key);
+        }
+        aliases.insert(key.clone(), target_key.clone());
+    }
+    if let Some(entry) = subagents.get_mut(&target_key) {
+        entry.aliases.extend(keys);
+        entry.subagent.id = target_key.clone();
+    }
+    target_key
+}
+
+fn terminal_activity_subagent_bounded_text(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= TERMINAL_ACTIVITY_SUBAGENT_LABEL_MAX_CHARS {
+        normalized
+    } else {
+        normalized
+            .chars()
+            .take(TERMINAL_ACTIVITY_SUBAGENT_LABEL_MAX_CHARS)
+            .collect()
+    }
 }
 
 fn terminal_activity_subagents_from_events(
@@ -1490,7 +1916,8 @@ fn terminal_activity_subagents_from_events(
     let Ok(body) = fs::read_to_string(activity_events_path) else {
         return Vec::new();
     };
-    let mut subagents = HashMap::<String, TerminalActivitySubagent>::new();
+    let mut subagents = HashMap::<String, TerminalActivitySubagentEntry>::new();
+    let mut aliases = HashMap::<String, String>::new();
 
     for line in body.lines().rev().take(500).collect::<Vec<_>>().into_iter().rev() {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
@@ -1517,7 +1944,7 @@ fn terminal_activity_subagents_from_events(
         let timestamp_ms = event["timestamp_ms"]
             .as_u64()
             .unwrap_or_else(current_time_ms);
-        let agent_id = event["agent_id"].as_str().unwrap_or_default().trim();
+        let top_level_agent_id = event["agent_id"].as_str().unwrap_or_default().trim();
         let tool_use_id = event["tool_use_id"].as_str().unwrap_or_default().trim();
         let agent_type = event["agent_type"]
             .as_str()
@@ -1525,96 +1952,133 @@ fn terminal_activity_subagents_from_events(
             .unwrap_or_default()
             .trim();
         let description = event["description"].as_str().unwrap_or_default().trim();
-        let is_agent_tool = event["tool_name"]
-            .as_str()
-            .is_some_and(|tool| tool.eq_ignore_ascii_case("Agent") || tool.eq_ignore_ascii_case("Task"));
-        let is_subagent_event = event_key == "subagentstart" || event_key == "subagentstop";
+        let is_agent_tool = terminal_activity_event_is_agent_tool(&event);
+        let is_subagent_event = terminal_activity_event_key_is_subagent_lifecycle(&event_key);
+        let bridge = if is_agent_tool || is_subagent_event {
+            terminal_activity_subagent_bridge_from_event(&event)
+        } else {
+            TerminalActivitySubagentBridge::default()
+        };
+        let agent_id = if is_subagent_event {
+            top_level_agent_id
+        } else {
+            bridge.agent_id.as_str()
+        };
+        let launch_tool_use_id = if bridge.tool_use_id.is_empty() {
+            tool_use_id
+        } else {
+            bridge.tool_use_id.as_str()
+        };
         let event_status = terminal_activity_subagent_event_status(&event_key, &event);
         let is_agent_prompt = event_status == "awaiting_instruction"
-            && (!agent_id.is_empty() || !tool_use_id.is_empty() || !agent_type.is_empty());
-        if !is_subagent_event && !is_agent_tool && !is_agent_prompt {
+            && (!agent_id.is_empty()
+                || !tool_use_id.is_empty()
+                || !launch_tool_use_id.is_empty()
+                || !bridge.correlation_id.is_empty()
+                || !agent_type.is_empty());
+        let has_subagent_bridge = !bridge.agent_id.is_empty()
+            || !bridge.tool_use_id.is_empty()
+            || !bridge.correlation_id.is_empty();
+        if !is_subagent_event && !is_agent_tool && !is_agent_prompt && !has_subagent_bridge {
             continue;
         }
-        let key = if !agent_id.is_empty() {
-            format!("agent:{agent_id}")
-        } else if !tool_use_id.is_empty() {
-            format!("tool:{tool_use_id}")
-        } else if !agent_type.is_empty() {
-            format!("type:{agent_type}:{timestamp_ms}")
+        let mut identity_keys = Vec::new();
+        if let Some(key) = terminal_activity_subagent_identity_key("agent", agent_id) {
+            identity_keys.push(key);
+        }
+        if let Some(key) = terminal_activity_subagent_identity_key("tool", tool_use_id) {
+            identity_keys.push(key);
+        }
+        if let Some(key) = terminal_activity_subagent_identity_key("tool", launch_tool_use_id) {
+            if !identity_keys.contains(&key) {
+                identity_keys.push(key);
+            }
+        }
+        if let Some(key) = terminal_activity_subagent_identity_key("launch", &bridge.correlation_id) {
+            identity_keys.push(key);
+        }
+        let preferred_key = if let Some(key) = terminal_activity_subagent_identity_key("agent", agent_id)
+        {
+            key
+        } else if let Some(key) =
+            terminal_activity_subagent_identity_key("launch", &bridge.correlation_id)
+        {
+            terminal_activity_subagent_resolve_alias(&aliases, &key)
+        } else if let Some(key) =
+            terminal_activity_subagent_identity_key("tool", launch_tool_use_id)
+        {
+            terminal_activity_subagent_resolve_alias(&aliases, &key)
+        } else if let Some(key) = terminal_activity_subagent_identity_key("tool", tool_use_id) {
+            terminal_activity_subagent_resolve_alias(&aliases, &key)
         } else {
             continue;
         };
-        let entry = subagents.entry(key.clone()).or_insert_with(|| {
-            let label = terminal_activity_subagent_label(agent_type, description);
-            TerminalActivitySubagent {
+        let key = terminal_activity_subagent_merge_aliases(
+            &mut subagents,
+            &mut aliases,
+            &preferred_key,
+            &identity_keys,
+        );
+        let last_message = terminal_activity_event_string(
+            &event,
+            &["prompting_user_text", "last_message", "message"],
+        );
+        let mut event_aliases = HashSet::new();
+        event_aliases.extend(identity_keys);
+        let bounded_agent_type = terminal_activity_subagent_bounded_text(agent_type);
+        let label = terminal_activity_subagent_label(&bounded_agent_type, description);
+        let event_entry = TerminalActivitySubagentEntry {
+            subagent: TerminalActivitySubagent {
                 id: key.clone(),
                 provider: provider.clone(),
                 agent_id: agent_id.to_string(),
-                agent_type: agent_type.to_string(),
+                agent_type: bounded_agent_type.clone(),
                 label,
                 description: description.to_string(),
                 status: event_status.clone(),
                 started_at_ms: Some(timestamp_ms),
-                finished_at_ms: None,
+                finished_at_ms: matches!(event_status.as_str(), "done" | "failed")
+                    .then_some(timestamp_ms),
                 updated_at_ms: timestamp_ms,
                 transcript_path: event["transcript_path"].as_str().unwrap_or_default().to_string(),
                 agent_transcript_path: event["agent_transcript_path"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string(),
-                last_message: String::new(),
+                last_message,
                 source: "provider-hook".to_string(),
                 confidence: if is_subagent_event { "named" } else { "inferred" }.to_string(),
-            }
-        });
-
-        if !provider.trim().is_empty() {
-            entry.provider = provider;
+            },
+            aliases: event_aliases,
+            status_updated_at_ms: timestamp_ms,
+            label_quality: terminal_activity_subagent_label_quality(&bounded_agent_type, description),
+        };
+        if let Some(entry) = subagents.get_mut(&key) {
+            terminal_activity_subagent_merge_entries(entry, event_entry);
+        } else {
+            subagents.insert(key.clone(), event_entry);
         }
-        if !agent_id.is_empty() {
-            entry.agent_id = agent_id.to_string();
-        }
-        if !agent_type.is_empty() {
-            entry.agent_type = agent_type.to_string();
-        }
-        if !description.is_empty() {
-            entry.description = description.to_string();
-        }
-        entry.label = terminal_activity_subagent_label(&entry.agent_type, &entry.description);
-        entry.updated_at_ms = timestamp_ms;
-        if event_status == "done" {
-            entry.status = event_status;
-            entry.finished_at_ms = Some(timestamp_ms);
-        } else if event_status == "awaiting_instruction" || event_status == "failed" {
-            entry.status = event_status;
-        } else if event_key == "subagentstart" || event_key == "pretooluse" {
-            entry.status = event_status;
-            entry.started_at_ms = entry.started_at_ms.or(Some(timestamp_ms));
-        }
-        if let Some(value) = event["transcript_path"].as_str().filter(|value| !value.trim().is_empty()) {
-            entry.transcript_path = value.to_string();
-        }
-        if let Some(value) = event["agent_transcript_path"]
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-        {
-            entry.agent_transcript_path = value.to_string();
-        }
-        let last_message = terminal_activity_event_string(
-            &event,
-            &["prompting_user_text", "last_message", "message"],
+        terminal_activity_subagent_merge_aliases(
+            &mut subagents,
+            &mut aliases,
+            &key,
+            &[key.clone()],
         );
-        if !last_message.is_empty() {
-            entry.last_message = last_message;
-        } else if let Some(value) = event["last_message"].as_str().filter(|value| !value.trim().is_empty()) {
-            entry.last_message = value.to_string();
-        }
-        if is_subagent_event {
-            entry.confidence = "named".to_string();
-        }
     }
 
-    let mut values = subagents.into_values().collect::<Vec<_>>();
+    let now_ms = current_time_ms();
+    let mut values = subagents
+        .into_values()
+        .filter(|entry| {
+            let unresolved_tool_only = entry.subagent.agent_id.trim().is_empty()
+                && !entry.aliases.iter().any(|alias| alias.starts_with("agent:"))
+                && matches!(entry.subagent.status.as_str(), "running" | "active");
+            !(unresolved_tool_only
+                && now_ms.saturating_sub(entry.subagent.updated_at_ms)
+                    > TERMINAL_ACTIVITY_SUBAGENT_TOOL_TTL_MS)
+        })
+        .map(|entry| entry.subagent)
+        .collect::<Vec<_>>();
     values.sort_by(|left, right| {
         terminal_activity_subagent_status_rank(&right.status)
             .cmp(&terminal_activity_subagent_status_rank(&left.status))
@@ -1654,15 +2118,16 @@ fn terminal_activity_event_matches_terminal(
 fn terminal_activity_subagent_label(agent_type: &str, description: &str) -> String {
     let agent_type = agent_type.trim();
     if !agent_type.is_empty() {
-        return agent_type.to_string();
+        return terminal_activity_subagent_bounded_text(agent_type);
     }
     let description = description.trim();
     if !description.is_empty() {
-        return description
+        let label = description
             .split_whitespace()
             .take(6)
             .collect::<Vec<_>>()
             .join(" ");
+        return terminal_activity_subagent_bounded_text(&label);
     }
     "Subagent".to_string()
 }
@@ -5365,6 +5830,450 @@ mod developer_process_docker_tests {
             terminal_activity_subagents_from_events(&path, "claude", "pane-1", 7, "workspace-a");
         let _ = fs::remove_file(&path);
 
+        assert!(subagents.is_empty());
+    }
+
+    fn subagent_activity_test_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "diffforge-{name}-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn extract_test_subagents(path: &Path) -> Vec<TerminalActivitySubagent> {
+        terminal_activity_subagents_from_events(path, "claude", "pane-1", 7, "workspace-a")
+    }
+
+    fn write_subagent_events(path: &Path, events: Vec<Value>) {
+        fs::write(
+            path,
+            events
+                .into_iter()
+                .map(|event| event.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    fn scoped_event(mut event: Value) -> Value {
+        event["provider"] = json!("claude");
+        event["pane_id"] = json!("pane-1");
+        event["instance_id"] = json!(7);
+        event["workspace_id"] = json!("workspace-a");
+        event
+    }
+
+    #[test]
+    fn terminal_activity_subagent_alias_merge_collapses_doubling_scenario() {
+        let path = subagent_activity_test_path("subagent-doubling");
+        let without_stop = vec![
+            scoped_event(json!({
+                "timestamp_ms": 1000,
+                "event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_use_id": "tool-1",
+                "agent_type": "Researcher",
+                "description": "Inspect the failing test"
+            })),
+            scoped_event(json!({
+                "timestamp_ms": 1100,
+                "event_name": "SubagentStart",
+                "agent_id": "agent-1",
+                "agent_type": "Researcher",
+                "agent_transcript_path": "/tmp/agent-1.jsonl"
+            })),
+            scoped_event(json!({
+                "timestamp_ms": 1200,
+                "event_name": "PostToolUse",
+                "tool_name": "Agent",
+                "tool_use_id": "tool-1",
+                "spawned_agent_id": "agent-1",
+                "launch_tool_use_id": "tool-1",
+                "status": "async_launched"
+            })),
+        ];
+        write_subagent_events(&path, without_stop);
+        let running = extract_test_subagents(&path);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, "agent:agent-1");
+        assert_eq!(running[0].agent_id, "agent-1");
+        assert_eq!(running[0].status, "running");
+
+        write_subagent_events(
+            &path,
+            vec![
+                scoped_event(json!({
+                    "timestamp_ms": 1000,
+                    "event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "tool-1",
+                    "agent_type": "Researcher",
+                    "description": "Inspect the failing test"
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1100,
+                    "event_name": "SubagentStart",
+                    "agent_id": "agent-1",
+                    "agent_type": "Researcher"
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1200,
+                    "event_name": "PostToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "tool-1",
+                    "spawned_agent_id": "agent-1",
+                    "launch_tool_use_id": "tool-1",
+                    "status": "async_launched"
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1300,
+                    "event_name": "SubagentStop",
+                    "agent_id": "agent-1",
+                    "agent_type": "Researcher"
+                })),
+            ],
+        );
+        let done = extract_test_subagents(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].id, "agent:agent-1");
+        assert_eq!(done[0].status, "done");
+        assert_eq!(done[0].started_at_ms, Some(1000));
+        assert_eq!(done[0].finished_at_ms, Some(1300));
+    }
+
+    #[test]
+    fn terminal_activity_subagent_alias_merge_is_order_independent() {
+        let path = subagent_activity_test_path("subagent-order");
+        write_subagent_events(
+            &path,
+            vec![
+                scoped_event(json!({
+                    "timestamp_ms": 1000,
+                    "event_name": "SubagentStart",
+                    "agent_id": "agent-first",
+                    "agent_type": "Planner"
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1100,
+                    "event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "tool-first",
+                    "agent_type": "Planner"
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1200,
+                    "event_name": "PostToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "tool-first",
+                    "tool_output": {
+                        "agentId": {
+                            "agent_id": "agent-first",
+                            "tool_use_id": "tool-first"
+                        },
+                        "status": "async_launched"
+                    }
+                })),
+            ],
+        );
+        let subagents = extract_test_subagents(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].id, "agent:agent-first");
+        assert_eq!(subagents[0].status, "running");
+    }
+
+    #[test]
+    fn terminal_activity_subagent_old_files_merge_from_nested_bridge() {
+        let path = subagent_activity_test_path("subagent-old-bridge");
+        write_subagent_events(
+            &path,
+            vec![
+                scoped_event(json!({
+                    "timestamp_ms": 1000,
+                    "event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "legacy-tool",
+                    "agent_type": "Legacy"
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1100,
+                    "event_name": "SubagentStart",
+                    "agent_id": "legacy-agent",
+                    "agent_type": "Legacy"
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1200,
+                    "event_name": "PostToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "legacy-tool",
+                    "tool_output": {
+                        "agentId": {
+                            "agent_id": "legacy-agent",
+                            "tool_use_id": "legacy-tool"
+                        },
+                        "status": "async_launched"
+                    }
+                })),
+            ],
+        );
+        let subagents = extract_test_subagents(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].id, "agent:legacy-agent");
+    }
+
+    #[test]
+    fn terminal_activity_subagent_async_launched_stays_running() {
+        let path = subagent_activity_test_path("subagent-async");
+        write_subagent_events(
+            &path,
+            vec![scoped_event(json!({
+                "timestamp_ms": current_time_ms(),
+                "event_name": "PostToolUse",
+                "tool_name": "Agent",
+                "tool_use_id": "async-tool",
+                "tool_output": {
+                    "agentId": {
+                        "agent_id": "async-agent",
+                        "tool_use_id": "async-tool"
+                    },
+                    "status": "async_launched"
+                }
+            }))],
+        );
+        let subagents = extract_test_subagents(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].status, "running");
+    }
+
+    #[test]
+    fn terminal_activity_subagent_nested_failure_resolves_failed() {
+        let path = subagent_activity_test_path("subagent-failure");
+        write_subagent_events(
+            &path,
+            vec![
+                scoped_event(json!({
+                    "timestamp_ms": 1000,
+                    "event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "fail-tool",
+                    "agent_type": "Debugger"
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1100,
+                    "event_name": "PostToolUseFailure",
+                    "tool_name": "Agent",
+                    "tool_use_id": "fail-tool",
+                    "tool_output": {
+                        "agentId": {
+                            "agent_id": "fail-agent",
+                            "tool_use_id": "fail-tool"
+                        },
+                        "status": "failed"
+                    }
+                })),
+            ],
+        );
+        let subagents = extract_test_subagents(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].id, "agent:fail-agent");
+        assert_eq!(subagents[0].status, "failed");
+    }
+
+    #[test]
+    fn terminal_activity_subagent_expires_unbridged_tool_rows() {
+        let path = subagent_activity_test_path("subagent-ttl");
+        write_subagent_events(
+            &path,
+            vec![scoped_event(json!({
+                "timestamp_ms": current_time_ms() - TERMINAL_ACTIVITY_SUBAGENT_TOOL_TTL_MS - 1,
+                "event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_use_id": "stale-tool",
+                "agent_type": "Stale"
+            }))],
+        );
+        let subagents = extract_test_subagents(&path);
+        let _ = fs::remove_file(&path);
+        assert!(subagents.is_empty());
+    }
+
+    #[test]
+    fn terminal_activity_subagent_label_has_character_cap() {
+        let path = subagent_activity_test_path("subagent-label");
+        write_subagent_events(
+            &path,
+            vec![scoped_event(json!({
+                "timestamp_ms": 1000,
+                "event_name": "SubagentStart",
+                "agent_id": "label-agent",
+                "agent_type": format!("{}{}", "Verifier ".repeat(20), "tail")
+            }))],
+        );
+        let subagents = extract_test_subagents(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(subagents.len(), 1);
+        assert!(subagents[0].label.chars().count() <= TERMINAL_ACTIVITY_SUBAGENT_LABEL_MAX_CHARS);
+        assert!(subagents[0].agent_type.chars().count() <= TERMINAL_ACTIVITY_SUBAGENT_LABEL_MAX_CHARS);
+    }
+
+    #[test]
+    fn terminal_activity_subagent_identical_agent_launches_stay_distinct_by_correlation() {
+        let path = subagent_activity_test_path("subagent-identical-correlations");
+        write_subagent_events(
+            &path,
+            vec![
+                scoped_event(json!({
+                    "timestamp_ms": 1000,
+                    "event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "",
+                    "subagent_correlation_id": "launch-one",
+                    "description": "Run the same delegated check"
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1001,
+                    "event_name": "PreToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "",
+                    "subagent_correlation_id": "launch-two",
+                    "description": "Run the same delegated check"
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1010,
+                    "event_name": "PostToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "",
+                    "subagent_correlation_id": "launch-two",
+                    "tool_output": {
+                        "agentId": {
+                            "agent_id": "child-agent-two"
+                        },
+                        "status": "async_launched"
+                    }
+                })),
+                scoped_event(json!({
+                    "timestamp_ms": 1011,
+                    "event_name": "PostToolUse",
+                    "tool_name": "Agent",
+                    "tool_use_id": "",
+                    "subagent_correlation_id": "launch-one",
+                    "tool_output": {
+                        "agentId": {
+                            "agent_id": "child-agent-one"
+                        },
+                        "status": "async_launched"
+                    }
+                })),
+            ],
+        );
+        let subagents = extract_test_subagents(&path);
+        let _ = fs::remove_file(&path);
+        let ids = subagents
+            .iter()
+            .map(|subagent| subagent.id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(subagents.len(), 2);
+        assert!(ids.contains("agent:child-agent-one"));
+        assert!(ids.contains("agent:child-agent-two"));
+    }
+
+    #[test]
+    fn terminal_activity_subagent_marathon_shape_produces_one_row_per_agent() {
+        let path = subagent_activity_test_path("subagent-marathon");
+        let mut events = Vec::new();
+        for index in 0..22 {
+            let tool_use_id = format!("tool-{index}");
+            let agent_id = format!("agent-{index}");
+            events.push(scoped_event(json!({
+                "timestamp_ms": 1000 + index * 10,
+                "event_name": "PreToolUse",
+                "tool_name": "Agent",
+                "tool_use_id": tool_use_id,
+                "agent_type": "Worker"
+            })));
+            events.push(scoped_event(json!({
+                "timestamp_ms": 1001 + index * 10,
+                "event_name": "PostToolUse",
+                "tool_name": "Agent",
+                "tool_use_id": tool_use_id,
+                "tool_output": {
+                    "agentId": {
+                        "agent_id": agent_id,
+                        "tool_use_id": tool_use_id
+                    },
+                    "status": "async_launched"
+                }
+            })));
+            events.push(scoped_event(json!({
+                "timestamp_ms": 1002 + index * 10,
+                "event_name": "SubagentStop",
+                "agent_id": agent_id,
+                "tool_use_id": "",
+                "agent_type": "Worker"
+            })));
+        }
+        events.push(scoped_event(json!({
+            "timestamp_ms": 2000,
+            "event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "bash-tool",
+            "tool_input": { "command": "echo untouched" }
+        })));
+        events.push(scoped_event(json!({
+            "timestamp_ms": 2001,
+            "event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "bash-tool",
+            "tool_output": { "stdout": "untouched" }
+        })));
+        write_subagent_events(&path, events);
+        let subagents = extract_test_subagents(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(subagents.len(), 22);
+        for index in 0..22 {
+            let agent_id = format!("agent-{index}");
+            let row = subagents
+                .iter()
+                .find(|subagent| subagent.agent_id == agent_id)
+                .expect("subagent row exists");
+            assert_eq!(row.id, format!("agent:{agent_id}"));
+            assert_eq!(row.status, "done");
+        }
+        assert!(!subagents
+            .iter()
+            .any(|subagent| subagent.id.contains("bash-tool")));
+    }
+
+    #[test]
+    fn terminal_activity_subagent_ignores_bridge_shaped_json_from_non_agent_tool() {
+        let path = subagent_activity_test_path("subagent-non-agent-bridge");
+        write_subagent_events(
+            &path,
+            vec![scoped_event(json!({
+                "timestamp_ms": 1000,
+                "event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_use_id": "bash-tool-json",
+                "tool_output": {
+                    "agentId": {
+                        "agent_id": "fake-child-agent",
+                        "tool_use_id": "bash-tool-json"
+                    },
+                    "child": {
+                        "agent_id": "fake-nested-agent"
+                    },
+                    "status": "async_launched",
+                    "stdout": "{\"agentId\":\"fake-child-agent\"}"
+                }
+            }))],
+        );
+        let subagents = extract_test_subagents(&path);
+        let _ = fs::remove_file(&path);
         assert!(subagents.is_empty());
     }
 
