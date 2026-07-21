@@ -127,6 +127,9 @@ struct DecodedHeaderBlock {
     /// One flag per UTF-8 byte in `text`. True means that byte is part of an
     /// addr-spec token actually extracted by the structured parser.
     extracted_addr_spec: Vec<bool>,
+    /// One flag per UTF-8 byte in `text`. True means that byte is in syntax
+    /// position where an extracted addr-spec token may be carved out.
+    addr_spec_eligible: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -155,6 +158,7 @@ fn addr_spec_eligible_bytes(value: &str) -> Vec<bool> {
     let mut angle_depth = 0usize;
     let mut angle_content_start = 0usize;
     let mut segment_start = 0usize;
+    let mut bare_segments = Vec::new();
 
     for (index, ch) in value.char_indices() {
         let end = index + ch.len_utf8();
@@ -216,18 +220,65 @@ fn addr_spec_eligible_bytes(value: &str) -> Vec<bool> {
                 eligible[segment_start..end].fill(false);
                 segment_start = end;
             }
-            ',' | ';' if angle_depth == 0 => segment_start = end,
+            ',' | ';' if angle_depth == 0 => {
+                bare_segments.push(segment_start..index);
+                segment_start = end;
+            }
             _ => {}
         }
+    }
+    bare_segments.push(segment_start..value.len());
+    for segment in bare_segments {
+        mark_bare_display_name_prefix_ineligible(value, &mut eligible, segment);
     }
     eligible
 }
 
-/// Locate only literal decoded occurrences of addr-specs that the structured
-/// parser actually extracted. The syntax mask prevents a coincidental copy
-/// in a display name/comment/route from receiving the carve-out.
+fn mark_bare_display_name_prefix_ineligible(
+    value: &str,
+    eligible: &mut [bool],
+    segment: Range<usize>,
+) {
+    if segment.start >= segment.end || value[segment.clone()].contains(['<', '>']) {
+        return;
+    }
+
+    let mut addr_tokens = Vec::new();
+    let mut token_start = None;
+    let mut finish_token = |start: usize, end: usize| {
+        if value[start..end].contains('@') && normalize_addr_spec(&value[start..end]).is_some() {
+            addr_tokens.push(start..end);
+        }
+    };
+
+    for (relative_index, ch) in value[segment.clone()].char_indices() {
+        let index = segment.start + relative_index;
+        let end = index + ch.len_utf8();
+        let token_char = eligible[index..end].iter().all(|is_eligible| *is_eligible)
+            && !ch.is_whitespace()
+            && !matches!(ch, '<' | '>' | '(' | ')' | ',' | ';' | ':');
+        match (token_start, token_char) {
+            (None, true) => token_start = Some(index),
+            (Some(start), false) => {
+                finish_token(start, index);
+                token_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = token_start {
+        finish_token(start, segment.end);
+    }
+
+    if let Some(addr_token) = addr_tokens.last() {
+        eligible[segment.start..addr_token.start].fill(false);
+    }
+}
+
+/// Locate literal decoded occurrences of addr-specs that the structured
+/// parser extracted. A caller must intersect this mask with
+/// `addr_spec_eligible_bytes` before granting any raw-belt carve-out.
 fn extracted_addr_spec_ranges(value: &str, extracted: &[String]) -> Vec<Range<usize>> {
-    let eligible = addr_spec_eligible_bytes(value);
     let mut ranges = Vec::new();
     for address in extracted {
         if address.is_empty() {
@@ -237,9 +288,7 @@ fn extracted_addr_spec_ranges(value: &str, extracted: &[String]) -> Vec<Range<us
         while let Some(relative_start) = value[search_start..].find(address) {
             let start = search_start + relative_start;
             let end = start + address.len();
-            if eligible[start..end].iter().all(|is_eligible| *is_eligible) {
-                ranges.push(start..end);
-            }
+            ranges.push(start..end);
             search_start = start
                 + address
                     .chars()
@@ -256,8 +305,9 @@ fn extracted_addr_spec_ranges(value: &str, extracted: &[String]) -> Vec<Range<us
 /// The complete ORIGINAL header block, ending before the first RFC 5322
 /// blank-line body separator. Folded continuation lines are unfolded while
 /// physical boundaries between distinct header lines remain visible. For a
-/// cleanly parsed address header, only decoded bytes belonging to a located,
-/// extracted addr-spec token are tagged for the narrow-belt carve-out.
+/// cleanly parsed address header, only decoded bytes belonging to both a
+/// located extracted addr-spec token and an addr-spec-eligible syntax region
+/// are protected by the narrow-belt carve-out.
 /// Malformed colon-less lines and all other bytes remain fully enforced.
 fn raw_header_block_decoded(
     bytes: &[u8],
@@ -334,11 +384,13 @@ fn raw_header_block_decoded(
     }
 
     // Value-span edges cannot occur inside an encoded word. Decode each
-    // address value as one run, locate its extracted addr-specs in that
-    // decoded text, and transfer only those token ranges to the global map.
+    // address value as one run, locate its extracted addr-specs and syntax
+    // eligibility in that decoded text, and transfer both masks to the
+    // global map.
     let mut decoded = DecodedHeaderBlock {
         text: String::with_capacity(header_end),
         extracted_addr_spec: Vec::with_capacity(header_end),
+        addr_spec_eligible: Vec::with_capacity(header_end),
     };
     let mut run_start = 0;
     while run_start < unfolded.len() {
@@ -352,6 +404,9 @@ fn raw_header_block_decoded(
             .map(|tagged| tagged.ch)
             .collect();
         let run = decode_rfc2047(&run).to_lowercase();
+        let eligible = address_value
+            .map(|_| addr_spec_eligible_bytes(&run))
+            .unwrap_or_else(|| vec![true; run.len()]);
         let carved = address_value
             .map(|index| extracted_addr_spec_ranges(&run, &clean_address_values[index].extracted))
             .unwrap_or_default();
@@ -364,6 +419,9 @@ fn raw_header_block_decoded(
             decoded
                 .extracted_addr_spec
                 .extend(std::iter::repeat_n(is_extracted, ch.len_utf8()));
+            decoded
+                .addr_spec_eligible
+                .extend(std::iter::repeat_n(eligible[index], ch.len_utf8()));
         }
         run_start = run_end;
     }
@@ -378,12 +436,17 @@ fn strip_header_whitespace(input: &DecodedHeaderBlock) -> DecodedHeaderBlock {
     let mut stripped = DecodedHeaderBlock {
         text: String::with_capacity(input.text.len()),
         extracted_addr_spec: Vec::with_capacity(input.extracted_addr_spec.len()),
+        addr_spec_eligible: Vec::with_capacity(input.addr_spec_eligible.len()),
     };
     for (index, ch) in input.text.char_indices() {
         if ch == '\n' || !ch.is_whitespace() {
             stripped.text.push(ch);
             stripped.extracted_addr_spec.extend(std::iter::repeat_n(
                 input.extracted_addr_spec[index],
+                ch.len_utf8(),
+            ));
+            stripped.addr_spec_eligible.extend(std::iter::repeat_n(
+                input.addr_spec_eligible[index],
                 ch.len_utf8(),
             ));
         }
@@ -442,9 +505,7 @@ fn contains_unprotected_addr_spec_token(block: &DecodedHeaderBlock, needle: &str
     addr_spec_token_ranges(&block.text, needle)
         .into_iter()
         .any(|range| {
-            !block.extracted_addr_spec[range]
-                .iter()
-                .all(|is_extracted| *is_extracted)
+            !range.all(|index| block.extracted_addr_spec[index] && block.addr_spec_eligible[index])
         })
 }
 
@@ -962,7 +1023,8 @@ pub fn verify_mime(
 
     // Belt 2 scans the entire original header region. Source tags derived
     // from mail-parser's value offsets identify each decoded value, then only
-    // located extracted addr-spec token bytes receive the carve-out.
+    // located extracted addr-spec token bytes in eligible syntax regions
+    // receive the carve-out.
     let raw_headers = raw_header_block_decoded(bytes, &clean_address_values);
     let raw_headers_stripped = strip_header_whitespace(&raw_headers);
     for (needle, needle_stripped) in &bcc_needles {
@@ -1370,6 +1432,37 @@ mod tests {
         assert!(
             error.contains("bcc recipient leaked into MIME headers"),
             "display-name disclosure must be caught by the narrow raw belt: {error}"
+        );
+
+        let duplicate = b"From: sender@acme.example\r\nTo: =?UTF-8?B?ZGV2IW9wc0BleGFtcGxlLmNvbQ==?= dev!ops@example.com\r\n\r\nhello\r\n";
+        let error = verify_mime(
+            duplicate,
+            &sha256_hex(duplicate),
+            duplicate.len() as u64,
+            "sender@acme.example",
+            &envelope(&[("to", "dev!ops@example.com"), ("bcc", "ops@example.com")]),
+        )
+        .expect_err("a decoded encoded-word display-name duplicate must not be carved");
+        assert!(
+            error.contains("bcc recipient leaked into MIME headers"),
+            "decoded display-name duplicate must be caught by the narrow raw belt: {error}"
+        );
+
+        let encoded_leak = b"From: sender@acme.example\r\nTo: =?UTF-8?B?c2VjcmV0QGV4YW1wbGUuY29t?= innocent@example.net\r\n\r\nhello\r\n";
+        let error = verify_mime(
+            encoded_leak,
+            &sha256_hex(encoded_leak),
+            encoded_leak.len() as u64,
+            "sender@acme.example",
+            &envelope(&[
+                ("to", "innocent@example.net"),
+                ("bcc", "secret@example.com"),
+            ]),
+        )
+        .expect_err("a bcc address decoded in an encoded-word display name must be rejected");
+        assert!(
+            error.contains("bcc recipient leaked into MIME headers"),
+            "encoded-word display-name disclosure must be caught by the narrow raw belt: {error}"
         );
     }
 
