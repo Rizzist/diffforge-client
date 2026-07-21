@@ -982,6 +982,206 @@ fn app_update_validate_platform_install_target() -> Result<(), String> {
     Ok(())
 }
 
+
+/// True when this Linux install is dpkg-owned (BYOC droplets install the
+/// .deb; there is no AppImage to swap, so the AppImage updater can never
+/// apply here). Detection is manifest + packaged-binary-path, never a guess
+/// from APPIMAGE alone (env-sanitized AppImage launches lack APPIMAGE too).
+#[cfg(target_os = "linux")]
+fn app_update_linux_deb_install() -> bool {
+    std::env::var_os("APPIMAGE").is_none()
+        && std::path::Path::new("/var/lib/dpkg/info/diff-forge-ai.list").exists()
+        && std::env::current_exe()
+            .map(|exe| exe.starts_with("/usr/bin") || exe.starts_with("/usr/lib"))
+            .unwrap_or(false)
+}
+
+/// Daemon deb self-update applies only headless: a GUI deb desktop must not
+/// have its systemd-less process silently killed and repackaged under it.
+#[cfg(target_os = "linux")]
+fn app_update_daemon_deb_flavor() -> bool {
+    crate::daemon_mode_active() && app_update_linux_deb_install()
+}
+
+fn app_update_parse_semver(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.trim().trim_start_matches('v').splitn(3, '.');
+    let major = parts.next()?.trim().parse::<u64>().ok()?;
+    let minor = parts.next()?.trim().parse::<u64>().ok()?;
+    let patch = parts
+        .next()?
+        .trim()
+        .split(|character: char| !character.is_ascii_digit())
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    Some((major, minor, patch))
+}
+
+#[cfg(target_os = "linux")]
+fn app_update_deb_feed_url() -> String {
+    std::env::var("DIFFFORGE_UPDATER_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://diffforge.ai/downloads/desktop/updater.json".to_string())
+}
+
+/// Feed check for deb installs: the tauri updater plugin is AppImage-bound on
+/// Linux, so deb devices read the same updater.json feed directly and only
+/// compare versions.
+#[cfg(target_os = "linux")]
+async fn app_update_deb_remote_version() -> Result<Option<AppUpdateInfo>, String> {
+    let response = reqwest::Client::new()
+        .get(app_update_deb_feed_url())
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| format!("Update check failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Update check failed: {error}"))?;
+    let feed = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Update check failed: {error}"))?;
+    let remote_version = feed
+        .get("version")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().trim_start_matches('v').to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Update check failed: feed had no version.".to_string())?;
+    let remote = app_update_parse_semver(&remote_version)
+        .ok_or_else(|| "Update check failed: feed version was not semver.".to_string())?;
+    let current = app_update_parse_semver(env!("CARGO_PKG_VERSION"))
+        .ok_or_else(|| "Update check failed: current version was not semver.".to_string())?;
+    if remote <= current {
+        return Ok(None);
+    }
+    Ok(Some(AppUpdateInfo {
+        version: remote_version,
+        notes: feed
+            .get("notes")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }))
+}
+
+fn app_update_deb_asset_name(version: &str) -> String {
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "aarch64",
+        _ => "x86_64",
+    };
+    format!("diffforge-ai-{version}-linux-{arch}.deb")
+}
+
+fn app_update_deb_expected_sum(sums: &str, asset_name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let digest = fields.next()?;
+        let name = fields.next()?;
+        (name.trim_start_matches('*') == asset_name).then(|| digest.to_ascii_lowercase())
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn app_update_deb_download_verified(version: &str) -> Result<std::path::PathBuf, String> {
+    use sha2::Digest;
+    let asset_name = app_update_deb_asset_name(version);
+    let base = format!(
+        "https://github.com/Rizzist/diffforge-client/releases/download/v{version}"
+    );
+    let client = reqwest::Client::new();
+    let deb_bytes = client
+        .get(format!("{base}/{asset_name}"))
+        .timeout(std::time::Duration::from_secs(600))
+        .send()
+        .await
+        .map_err(|error| format!("Update download failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Update download failed: {error}"))?
+        .bytes()
+        .await
+        .map_err(|error| format!("Update download failed: {error}"))?;
+    let sums = client
+        .get(format!("{base}/SHA256SUMS"))
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|error| format!("Update checksum fetch failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Update checksum fetch failed: {error}"))?
+        .text()
+        .await
+        .map_err(|error| format!("Update checksum fetch failed: {error}"))?;
+    let expected = app_update_deb_expected_sum(&sums, &asset_name)
+        .ok_or_else(|| format!("Update checksum fetch failed: {asset_name} not in SHA256SUMS."))?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&deb_bytes);
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected {
+        return Err("Update download failed checksum verification.".to_string());
+    }
+    let target = std::env::temp_dir().join(format!("diffforge-deb-update-{version}.deb"));
+    std::fs::write(&target, &deb_bytes)
+        .map_err(|error| format!("Update staging failed: {error}"))?;
+    Ok(target)
+}
+
+/// Full deb self-update: verify feed, download + checksum the deb, then hand
+/// installation to a detached shell (dpkg -i + systemd restart) that survives
+/// this process being restarted out from under it. Root-only — BYOC daemons
+/// run as root; anything else keeps the explicit error.
+#[cfg(target_os = "linux")]
+async fn app_update_deb_install_and_restart(app: &AppHandle, generation: u64) -> Result<(), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(
+            "Linux .deb self-update requires the daemon to run as root; update the package manually (dpkg -i).".to_string(),
+        );
+    }
+    app_update_store_state(APP_UPDATE_STATE_CHECKING);
+    app_update_publish_device_state(app, "app_update_checking");
+    let info = app_update_deb_remote_version()
+        .await?
+        .ok_or_else(|| "No update is available.".to_string())?;
+    app_update_store_available(Some(info.clone()));
+    app_update_store_state(APP_UPDATE_STATE_DOWNLOADING);
+    app_update_publish_device_state(app, "app_update_downloading");
+    log_terminal_status_event(
+        "backend.app_update.deb_download_started",
+        json!({ "version": info.version }),
+    );
+    let staged_path = app_update_deb_download_verified(&info.version).await?;
+    app_update_store_state(APP_UPDATE_STATE_RESTARTING);
+    app_update_publish_device_state_now(app, "app_update_restarting").await;
+    let _ = app.emit(
+        APP_UPDATE_STATE_EVENT,
+        json!({ "state": "restarting", "version": info.version }),
+    );
+    app_update_notify_remote_command_terminal_before_restart(
+        generation,
+        "completed",
+        "App update installed; restarting now.",
+    )
+    .await;
+    log_terminal_status_event(
+        "backend.app_update.deb_restarting",
+        json!({ "version": info.version }),
+    );
+    let staged = staged_path.to_string_lossy().to_string();
+    let script = format!(
+        "sleep 2; dpkg -i '{staged}' >>/var/log/diffforge-deb-update.log 2>&1; rm -f '{staged}'; systemctl try-restart diffforge-daemon >>/var/log/diffforge-deb-update.log 2>&1 || true"
+    );
+    std::process::Command::new("setsid")
+        .arg("sh")
+        .arg("-c")
+        .arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Update apply failed to launch: {error}"))?;
+    Ok(())
+}
+
 fn app_updater_instance(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
     app_update_validate_platform_install_target()?;
     let override_url = std::env::var("DIFFFORGE_UPDATER_URL")
@@ -1396,6 +1596,37 @@ async fn app_updater_run_check_with_failure_reporting(
     if failure_reporting == AppUpdateCheckFailureReporting::StoreAndPublish {
         app_update_store_state(APP_UPDATE_STATE_CHECKING);
         app_update_publish_device_state(app, "app_update_checking");
+    }
+    #[cfg(target_os = "linux")]
+    if app_update_daemon_deb_flavor() {
+        match app_update_deb_remote_version().await {
+            Ok(Some(info)) => {
+                APP_UPDATE_CHECK_NETWORK_FAILURES.store(0, Ordering::Release);
+                app_update_store_available(Some(info.clone()));
+                app_update_store_state(APP_UPDATE_STATE_IDLE);
+                app_update_publish_device_state(app, "app_update_available");
+                let _ = app.emit(
+                    APP_UPDATE_AVAILABLE_EVENT,
+                    json!({ "version": info.version, "notes": info.notes }),
+                );
+                return Ok(Some(info));
+            }
+            Ok(None) => {
+                APP_UPDATE_CHECK_NETWORK_FAILURES.store(0, Ordering::Release);
+                app_update_store_available(None);
+                app_update_store_state(APP_UPDATE_STATE_IDLE);
+                app_update_publish_device_state(app, "app_update_idle");
+                return Ok(None);
+            }
+            Err(error) => {
+                let error = app_update_scrub_external_text(&error);
+                if failure_reporting == AppUpdateCheckFailureReporting::StoreAndPublish {
+                    app_update_store_failed_state(&error);
+                    app_update_publish_device_state(app, "app_update_failed");
+                }
+                return Err(error);
+            }
+        }
     }
     let updater = match app_updater_instance(app) {
         Ok(updater) => updater,
@@ -2353,6 +2584,11 @@ async fn app_update_remote_restart_when_idle(app: AppHandle, generation: u64) {
 }
 
 async fn app_update_download_inner(app: &AppHandle) -> Result<Value, String> {
+    #[cfg(target_os = "linux")]
+    if app_update_daemon_deb_flavor() {
+        app_update_deb_install_and_restart(app, 0).await?;
+        return Ok(app_update_status_snapshot());
+    }
     app_update_store_state(APP_UPDATE_STATE_CHECKING);
     app_update_publish_device_state(app, "app_update_checking");
     let updater = app_updater_instance(app)?;
@@ -2421,6 +2657,18 @@ async fn app_update_download_inner(app: &AppHandle) -> Result<Value, String> {
 }
 
 async fn app_update_install_inner(app: &AppHandle, generation: u64) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if app_update_daemon_deb_flavor() {
+        return match app_update_deb_install_and_restart(app, generation).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let error = app_update_scrub_external_text(&error);
+                app_update_store_failed_state(&error);
+                app_update_publish_device_state(app, "app_update_failed");
+                Err(error)
+            }
+        };
+    }
     if app_update_staged_info().is_some() {
         return app_update_restart_inner(app, generation).await;
     }
@@ -2765,6 +3013,50 @@ async fn app_update_restart_inner(app: &AppHandle, generation: u64) -> Result<()
     app_update_restart_or_exit(app);
     #[allow(unreachable_code)]
     Ok(())
+}
+
+#[cfg(test)]
+mod app_update_deb_tests {
+    use super::*;
+
+    #[test]
+    fn parse_semver_handles_plain_prefixed_and_suffixed() {
+        assert_eq!(app_update_parse_semver("0.9.33"), Some((0, 9, 33)));
+        assert_eq!(app_update_parse_semver("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(app_update_parse_semver(" 0.10.0 "), Some((0, 10, 0)));
+        assert_eq!(app_update_parse_semver("1.2.3-rc1"), Some((1, 2, 3)));
+        assert_eq!(app_update_parse_semver("nonsense"), None);
+        assert_eq!(app_update_parse_semver("1.2"), None);
+    }
+
+    #[test]
+    fn semver_tuple_ordering_matches_version_ordering() {
+        assert!(app_update_parse_semver("0.9.33") > app_update_parse_semver("0.9.31"));
+        assert!(app_update_parse_semver("0.10.0") > app_update_parse_semver("0.9.99"));
+        assert!(app_update_parse_semver("1.0.0") > app_update_parse_semver("0.99.99"));
+        assert!(app_update_parse_semver("0.9.33") <= app_update_parse_semver("0.9.33"));
+    }
+
+    #[test]
+    fn deb_asset_name_matches_release_pipeline_naming() {
+        let name = app_update_deb_asset_name("0.9.34");
+        assert!(name.starts_with("diffforge-ai-0.9.34-linux-"));
+        assert!(name.ends_with(".deb"));
+    }
+
+    #[test]
+    fn sha256sums_lookup_finds_exact_asset_with_or_without_binary_marker() {
+        let sums = "abc123  diffforge-ai-0.9.34-linux-x86_64.deb\nDEF456 *diffforge-ai-0.9.34-linux-aarch64.deb\n999 other.file\n";
+        assert_eq!(
+            app_update_deb_expected_sum(sums, "diffforge-ai-0.9.34-linux-x86_64.deb"),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            app_update_deb_expected_sum(sums, "diffforge-ai-0.9.34-linux-aarch64.deb"),
+            Some("def456".to_string())
+        );
+        assert_eq!(app_update_deb_expected_sum(sums, "missing.deb"), None);
+    }
 }
 
 #[cfg(test)]
