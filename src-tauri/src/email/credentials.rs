@@ -88,23 +88,27 @@ impl CredentialStore for OsKeyringStore {
         if cfg!(test) {
             return CredentialStoreHealth::Unavailable;
         }
-        // Health MUST NOT prompt. A write-probe (set_password) creates an item,
-        // and on an ad-hoc / dev-signed macOS build (whose cdhash changes each
-        // launch) the OS pops the "enter your login keychain password" dialog on
-        // every probe — which, on the 60s health cadence, is the popup that
-        // keeps reappearing. Instead READ-probe a name that does not exist:
-        // reading a missing generic password returns NoEntry with NO
-        // authorization prompt, and still proves the store is reachable. The
-        // keychain is only ever written when the user deliberately saves a
-        // credential (a single, expected prompt on unsigned builds).
-        let probe_name = "diffforge-health-probe";
-        let Ok(entry) = Self::entry(probe_name) else {
-            return CredentialStoreHealth::Unavailable;
-        };
-        match entry.get_password() {
-            Ok(_) | Err(keyring::Error::NoEntry) => CredentialStoreHealth::Healthy,
-            Err(keyring::Error::NoStorageAccess(_)) => CredentialStoreHealth::Locked,
-            Err(_) => CredentialStoreHealth::Unavailable,
+        // Health MUST NOT touch keychain items AT ALL — not even a read of a
+        // "missing" probe name. Earlier builds write-probed, which created
+        // `diffforge-health-probe` under our service; that item's ACL pins the
+        // creating build's code signature, and ad-hoc/unsigned cdhashes change
+        // every release — so on any machine that ever ran a write-probing
+        // build, the read-probe finds the item and macOS pops the "login
+        // keychain password" dialog on every 60s health tick, forever
+        // ("Always Allow" cannot stick across builds). The OS store's
+        // availability is a platform property: report it statically, and let
+        // the explicit user actions (saving a profile, sending) surface real
+        // errors when the user is actually present to see them.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            CredentialStoreHealth::Healthy
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            match Self::entry("diffforge-health-probe") {
+                Ok(_) => CredentialStoreHealth::Healthy,
+                Err(_) => CredentialStoreHealth::Unavailable,
+            }
         }
     }
 
