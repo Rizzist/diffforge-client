@@ -24083,6 +24083,9 @@ export default function App() {
   const [apiMessage, setApiMessage] = useState("Checking connection");
   const [activeView, setActiveView] = useState(DEFAULT_WORKSPACE_VIEW);
   const [visibleView, setVisibleView] = useState(DEFAULT_WORKSPACE_VIEW);
+  // Communication view sub-tabs: "devices" (live device roster) | "email"
+  // (sender profiles / delivery settings). Kept alive across switches.
+  const [communicationTab, setCommunicationTab] = useState("devices");
   const [visitedAccountViews, setVisitedAccountViews] = useState(() => ({
     audio: false,
     tokenomics: false,
@@ -56147,15 +56150,15 @@ export default function App() {
                         <span>Tokenomics</span>
                       </RailActionButton>
                       <RailActionButton
-                        aria-label="Devices"
+                        aria-label="Communication"
                         data-active={activeView === "devices"}
                         data-scope="global"
                         onClick={() => showView("devices")}
-                        title="Devices"
+                        title="Communication — devices & email"
                         type="button"
                       >
                         <RailDevicesIcon aria-hidden="true" />
-                        <span>Devices</span>
+                        <span>Communication</span>
                       </RailActionButton>
                       <RailActionButton
                         aria-label="Settings"
@@ -58244,14 +58247,100 @@ export default function App() {
                       data-visible={devicesViewVisible}
                     >
                       <ForgeWorkspace
-                        aria-label="Devices"
+                        aria-label="Communication"
                         data-motion={devicesViewActive ? viewMotion : "entered"}
                       >
-                        <DevicesView
-                          active={devicesViewActive}
-                          deviceRows={accountDeviceRowsForDevicesView}
-                          local_device_id={cloudDesktopDeviceProfile?.device_id || ""}
-                        />
+                        <div
+                          style={{
+                            display: "flex",
+                            flexDirection: "column",
+                            height: "100%",
+                            minHeight: 0,
+                          }}
+                        >
+                          <div
+                            role="tablist"
+                            aria-label="Communication"
+                            style={{
+                              display: "flex",
+                              gap: 6,
+                              padding: "12px 16px 0",
+                              flex: "0 0 auto",
+                            }}
+                          >
+                            {[
+                              { id: "devices", label: "Devices" },
+                              { id: "email", label: "Email" },
+                            ].map((tab) => {
+                              const selected = communicationTab === tab.id;
+                              return (
+                                <button
+                                  key={tab.id}
+                                  role="tab"
+                                  type="button"
+                                  aria-selected={selected}
+                                  onClick={() => setCommunicationTab(tab.id)}
+                                  style={{
+                                    appearance: "none",
+                                    border: "1px solid",
+                                    borderColor: selected
+                                      ? "rgba(120,170,255,0.55)"
+                                      : "rgba(255,255,255,0.08)",
+                                    background: selected
+                                      ? "rgba(120,170,255,0.14)"
+                                      : "rgba(255,255,255,0.03)",
+                                    color: selected ? "#dbe7ff" : "rgba(255,255,255,0.62)",
+                                    fontSize: 13,
+                                    fontWeight: 600,
+                                    letterSpacing: "0.01em",
+                                    padding: "6px 18px",
+                                    borderRadius: 8,
+                                    cursor: "pointer",
+                                    transition:
+                                      "background 120ms, color 120ms, border-color 120ms",
+                                  }}
+                                >
+                                  {tab.label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <div
+                            style={{
+                              flex: "1 1 auto",
+                              minHeight: 0,
+                              position: "relative",
+                            }}
+                          >
+                            <div
+                              style={{
+                                position: "absolute",
+                                inset: 0,
+                                display:
+                                  communicationTab === "devices" ? "block" : "none",
+                              }}
+                            >
+                              <DevicesView
+                                active={devicesViewActive && communicationTab === "devices"}
+                                deviceRows={accountDeviceRowsForDevicesView}
+                                local_device_id={cloudDesktopDeviceProfile?.device_id || ""}
+                              />
+                            </div>
+                            {communicationTab === "email" ? (
+                              <div
+                                style={{
+                                  position: "absolute",
+                                  inset: 0,
+                                  overflow: "auto",
+                                }}
+                              >
+                                <Suspense fallback={null}>
+                                  <EmailDeliverySettingsPanel />
+                                </Suspense>
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
                       </ForgeWorkspace>
                     </WorkspaceRuntimeLayer>
                   ) : null}
