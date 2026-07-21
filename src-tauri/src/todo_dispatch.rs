@@ -8141,6 +8141,13 @@ fn todo_dispatch_fresh_active_queue_item_ids_for_pane(
         .collect()
 }
 
+pub(crate) fn todo_dispatch_pane_has_running_or_in_flight_todo(
+    workspace_id: &str,
+    pane_id: &str,
+) -> bool {
+    !todo_dispatch_fresh_active_queue_item_ids_for_pane(workspace_id, pane_id).is_empty()
+}
+
 fn todo_dispatch_active_queue_item_ids_for_pane(
     workspace_id: &str,
     pane_id: &str,
