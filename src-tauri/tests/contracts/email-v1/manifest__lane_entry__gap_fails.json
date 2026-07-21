@@ -14,14 +14,14 @@
     },
     "segments": [
       {
-        "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/lanes/email/1-5-01J2ZKQ5E8XY0123456789ABCD.jsonl.zst",
+        "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/sections/email/segments/1-5-01J2ZKQ5E8XY0123456789ABCD.jsonl.zst",
         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "size": 8192,
         "first_seq": 1,
         "last_seq": 5
       },
       {
-        "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/lanes/email/7-9-01J2ZKQ5E8XY0123456789ABCD.jsonl.zst",
+        "key": "df/accounts/acct_mfrggzdfmztwq2lknnwg23tpob/checkpoints/sections/email/segments/7-9-01J2ZKQ5E8XY0123456789ABCD.jsonl.zst",
         "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "size": 4096,
         "first_seq": 7,
