@@ -58341,9 +58341,24 @@ export default function App() {
                                   overflow: "auto",
                                 }}
                               >
-                                <Suspense fallback={null}>
-                                  <EmailDeliverySettingsPanel />
-                                </Suspense>
+                                {/* AccountSettingsPanel is padding-less (the
+                                    Settings modal supplies its own); this
+                                    scroller must pad, or the panel jams the
+                                    workspace rail on the left and clips its
+                                    action buttons on the right edge. */}
+                                <div
+                                  style={{
+                                    boxSizing: "border-box",
+                                    margin: "0 auto",
+                                    maxWidth: 1080,
+                                    padding: "6px 22px 30px",
+                                    width: "100%",
+                                  }}
+                                >
+                                  <Suspense fallback={null}>
+                                    <EmailDeliverySettingsPanel />
+                                  </Suspense>
+                                </div>
                               </div>
                             ) : null}
                           </div>
