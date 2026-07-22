@@ -2892,9 +2892,13 @@ fn claude_allowed_tools_arg(
             | TERMINAL_PERMISSION_MODE_FULL_ACCESS
     ) {
         let workspace_files = claude_workspace_permission_glob(coordination);
+        // Claude 2.1.216: an Edit(glob) permission rule covers ALL file-editing
+        // tools (Edit, Write, NotebookEdit) for that path. Separate Write()/
+        // NotebookEdit() path rules are no longer matched and make Claude log
+        // "... is not matched by file permission checks — use Edit(...) instead"
+        // on every launch (seen on BYOC). One Edit(glob) rule is the correct,
+        // equally path-scoped grant.
         tools.push(format!("Edit({workspace_files})"));
-        tools.push(format!("Write({workspace_files})"));
-        tools.push(format!("NotebookEdit({workspace_files})"));
     }
     tools.extend(
         crate::coordination::mcp::TOOL_NAMES
@@ -2965,11 +2969,10 @@ fn claude_write_authority_guard_settings(
             | TERMINAL_PERMISSION_MODE_AUTO
             | TERMINAL_PERMISSION_MODE_FULL_ACCESS
     ) {
-        vec![
-            format!("Edit({workspace_files})"),
-            format!("Write({workspace_files})"),
-            format!("NotebookEdit({workspace_files})"),
-        ]
+        // Edit(glob) covers Edit, Write, and NotebookEdit for that path in
+        // Claude 2.1.216; separate Write()/NotebookEdit() rules warn as
+        // unmatched. Keep one path-scoped Edit rule.
+        vec![format!("Edit({workspace_files})")]
     } else {
         Vec::new()
     };
@@ -3241,7 +3244,15 @@ fn claude_write_authority_guard_settings(
     if !cfg!(windows) {
         settings["sandbox"] = json!({
             "enabled": true,
-            "failIfUnavailable": true,
+            // Headless BYOC daemons (running under xvfb-run + systemd) cannot
+            // initialize Claude's bwrap sandbox, and with failIfUnavailable=true
+            // Claude EXITS ~1s after reaching the REPL — the BYOC "Terminal
+            // ended" death (root-caused via a byte-level bisect: removing the
+            // sandbox key is the only change that lets the daemon-spawned
+            // authenticated Claude survive). In daemon mode fall back to
+            // unsandboxed operation instead of killing the session; GUI desktops
+            // (where bwrap works) keep the strict fail-closed behavior.
+            "failIfUnavailable": !crate::daemon_mode_active(),
             "allowUnsandboxedCommands": true,
             "filesystem": {
                 "allowWrite": sandbox_write_roots
