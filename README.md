@@ -24,6 +24,22 @@
 
 ---
 
+## ⬇️ Download
+
+Grab the [**latest release**](https://github.com/Rizzist/diffforge-client/releases/latest) and pick the installer for your platform:
+
+| Platform | Asset |
+|---|---|
+| 🍎 macOS (Apple Silicon) | `diffforge-ai-<version>-macos-aarch64.dmg` |
+| 🪟 Windows | `diffforge-ai-<version>-windows-x86_64-setup.exe` |
+| 🐧 Linux | `.AppImage`, `.deb`, or `.rpm` |
+
+Install it like any other app (drag to Applications / run the installer), then sign in — the app updates itself from here on out.
+
+> **First launch:** builds are not yet OS-signed. On macOS, right-click the app → **Open** (or run `xattr -dr com.apple.quarantine "/Applications/Diff Forge AI.app"`). On Windows, if SmartScreen appears, click **More info → Run anyway**.
+
+---
+
 ## 🔥 What is Diff Forge AI?
 
 Diff Forge AI is an open source Agentic Development Environment: a native desktop app, built in Rust and Tauri, where you run coding agents (Claude Code, Codex, and OpenCode) across a grid of terminals and direct them from one place.
