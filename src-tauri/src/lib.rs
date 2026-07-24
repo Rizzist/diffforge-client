@@ -10967,6 +10967,7 @@ fn run_app(daemon: bool) {
             cloud_mcp_sync_tokenomics_state,
             cloud_mcp_schedule_tokenomics_sync,
             cloud_mcp_reset_device_tokenomics,
+            cloud_mcp_tokenomics_republish_cloud_history,
             tokenomics_scan_usage,
             tokenomics_scan_realtime_usage,
             tokenomics_scan_usage_silent,

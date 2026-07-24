@@ -15004,6 +15004,58 @@ fn tokenomics_historical_prune_ack_candidate_days(
     Ok(days)
 }
 
+/// Every UTC day (oldest first) that has hourly rollup rows for the scope,
+/// as (day_key, day_start_ms). Unlike the historical prune-ack candidates
+/// this does NOT exclude days with local ack metadata: cloud-coverage
+/// reconciliation must see every day the device can republish, because a
+/// local ack can outlive cloud facts that were never durably checkpointed
+/// (the post-B2-refactor deploy wipe).
+fn tokenomics_all_rollup_day_starts(
+    conn: &rusqlite::Connection,
+    scope_filter: &TokenomicsBillingScope,
+    older_than_day_start_ms: i64,
+) -> Result<Vec<(String, i64)>, String> {
+    let older_than_unix = ((older_than_day_start_ms.max(0) as u64) / 1000)
+        .checked_div(86_400)
+        .unwrap_or(0)
+        .saturating_mul(86_400);
+    let (_, older_than_hour) = tokenomics_utc_hour_bucket_from_unix(older_than_unix);
+    let mut statement = conn
+        .prepare(
+            "SELECT substr(bucket_start, 1, 10) AS bucket_day
+             FROM tokenomics_rollups
+             WHERE bucket_width='hour'
+               AND bucket_start GLOB '????-??-??T??:00:00Z'
+               AND bucket_start < ?1
+               AND COALESCE(NULLIF(billing_scope_type, ''), 'unknown')=?2
+               AND COALESCE(billing_team_id, '')=?3
+             GROUP BY bucket_day
+             ORDER BY bucket_day ASC",
+        )
+        .map_err(|error| format!("Unable to prepare Tokenomics rollup day listing: {error}"))?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![
+                older_than_hour.as_str(),
+                scope_filter.scope_type.as_str(),
+                scope_filter.team_id.as_deref().unwrap_or_default(),
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| format!("Unable to query Tokenomics rollup days: {error}"))?;
+    let mut days = Vec::new();
+    for row in rows {
+        let day = row.map_err(|error| format!("Unable to read Tokenomics rollup day: {error}"))?;
+        if let Some(day_unix) = tokenomics_timestamp_unix(&format!("{day}T00:00:00Z")) {
+            days.push((
+                day,
+                day_unix.min((i64::MAX as u64) / 1000).saturating_mul(1000) as i64,
+            ));
+        }
+    }
+    Ok(days)
+}
+
 fn tokenomics_store_cloud_provider_limits(
     conn: &rusqlite::Connection,
     summary: &Value,
@@ -18719,6 +18771,83 @@ mod tokenomics_tests {
             )
             .unwrap();
         assert_eq!(live_rollup, preserved);
+    }
+
+    #[test]
+    fn tokenomics_all_rollup_day_starts_includes_acked_days_and_filters_scope() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        // 2026-06-01 and 2026-06-03 for the personal scope; 2026-06-02 for a
+        // team scope that must not leak in.
+        for (id, unix) in [("day-a", 1_780_290_000u64), ("day-b", 1_780_470_000u64)] {
+            let event = tokenomics_test_event(
+                id,
+                "/tmp/all-days.jsonl",
+                unix,
+                Some("anthropic:claude:acct"),
+                10,
+            );
+            assert!(tokenomics_insert_event(&conn, &event).unwrap());
+        }
+        let mut team_event = tokenomics_test_event(
+            "day-team",
+            "/tmp/all-days-team.jsonl",
+            1_780_380_000,
+            Some("anthropic:claude:acct"),
+            10,
+        );
+        team_event.billing_scope_type = "team".to_string();
+        team_event.billing_team_id = Some("team-1".to_string());
+        assert!(tokenomics_insert_event(&conn, &team_event).unwrap());
+
+        // Mark 2026-06-01 as prune-acked: the historical prune-ack candidate
+        // listing excludes it, but cloud-coverage reconciliation must NOT —
+        // an ack can outlive cloud facts that were never durably published.
+        let scope = TokenomicsBillingScope {
+            scope_type: "personal".to_string(),
+            team_id: None,
+            source: "test".to_string(),
+        };
+        let scope_key = tokenomics_billing_scope_key("personal", None);
+        tokenomics_store_meta_value(
+            &conn,
+            &format!("{TOKENOMICS_USAGE_EVENT_PRUNE_ACK_DAY_META_PREFIX}{scope_key}:2026-06-01"),
+            "unix:1780500000",
+        )
+        .unwrap();
+
+        let older_than_day_start_ms = 1_780_617_600_000i64; // 2026-06-05
+        let days =
+            tokenomics_all_rollup_day_starts(&conn, &scope, older_than_day_start_ms).unwrap();
+        assert_eq!(
+            days,
+            vec![
+                ("2026-06-01".to_string(), 1_780_272_000_000i64),
+                ("2026-06-03".to_string(), 1_780_444_800_000i64),
+            ],
+            "ack state and foreign scopes must not affect the listing"
+        );
+
+        let candidates = tokenomics_historical_prune_ack_candidate_days(
+            &conn,
+            &scope,
+            older_than_day_start_ms,
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            candidates,
+            vec![1_780_444_800_000i64],
+            "prune-ack candidates still exclude acked days"
+        );
+
+        let bounded = tokenomics_all_rollup_day_starts(&conn, &scope, 1_780_444_800_000).unwrap();
+        assert_eq!(
+            bounded,
+            vec![("2026-06-01".to_string(), 1_780_272_000_000i64)],
+            "the older-than bound is exclusive"
+        );
     }
 
     #[test]

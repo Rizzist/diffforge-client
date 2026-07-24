@@ -178,6 +178,11 @@ const CLOUD_MCP_TOKENOMICS_DAY_MS: i64 = 86_400_000;
 const CLOUD_MCP_TOKENOMICS_SYNC_LOOKBACK_DAYS: i64 = 30;
 const CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_BATCH_DAYS: usize = 80;
 const CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_ENQUEUE_LIMIT: usize = 40;
+const CLOUD_MCP_TOKENOMICS_COVERAGE_RECONCILE_META_PREFIX: &str =
+    "tokenomics_cloud_day_coverage_reconcile_ms_v1:";
+const CLOUD_MCP_TOKENOMICS_COVERAGE_RECONCILE_MIN_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
+const CLOUD_MCP_TOKENOMICS_COVERAGE_RECONCILE_ENQUEUE_LIMIT: usize = 180;
+const CLOUD_MCP_TOKENOMICS_DAY_COVERAGE_REQUEST_KIND: &str = "tokenomics_day_coverage_request";
 const CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_DONE_META_PREFIX: &str =
     "usage_event_prune_historical_day_ack_seed_done_v1:";
 const CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_PROGRESS_META_PREFIX: &str =
@@ -10578,6 +10583,407 @@ fn cloud_mcp_tokenomics_prepare_historical_prune_ack_plan(
     })
 }
 
+fn cloud_mcp_tokenomics_coverage_reconcile_meta_key(
+    device_id: &str,
+    billing_scope_key: &str,
+) -> String {
+    format!("{CLOUD_MCP_TOKENOMICS_COVERAGE_RECONCILE_META_PREFIX}{device_id}:{billing_scope_key}")
+}
+
+fn cloud_mcp_tokenomics_stamp_coverage_reconcile_attempt(
+    app: &AppHandle,
+    device_id: &str,
+    billing_scope_key: &str,
+) -> Result<(), String> {
+    let conn = tokenomics_open_db(app)?;
+    let meta_key = cloud_mcp_tokenomics_coverage_reconcile_meta_key(device_id, billing_scope_key);
+    let now_ms = cloud_mcp_now_ms().min(i64::MAX as u64) as i64;
+    tokenomics_store_meta_value(&conn, &meta_key, &now_ms.to_string())
+}
+
+fn cloud_mcp_tokenomics_coverage_reconcile_throttled(
+    app: &AppHandle,
+    device_id: &str,
+    billing_scope_key: &str,
+) -> Result<bool, String> {
+    let conn = tokenomics_open_db(app)?;
+    let meta_key = cloud_mcp_tokenomics_coverage_reconcile_meta_key(device_id, billing_scope_key);
+    let now_ms = cloud_mcp_now_ms().min(i64::MAX as u64) as i64;
+    let last_ms = tokenomics_meta_string(&conn, &meta_key)
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    Ok(last_ms > 0
+        && now_ms.saturating_sub(last_ms) < CLOUD_MCP_TOKENOMICS_COVERAGE_RECONCILE_MIN_INTERVAL_MS)
+}
+
+/// True while the day's current packet (per local day-sync state) is still
+/// queued/retrying/in-flight in the outbox — re-enqueueing then would just
+/// race the pending packet with a duplicate sequence claim.
+fn cloud_mcp_tokenomics_day_packet_in_flight(
+    outbox_conn: &rusqlite::Connection,
+    device_id: &str,
+    billing_scope_key: &str,
+    day_start_ms: i64,
+) -> bool {
+    let Some(state) = cloud_mcp_tokenomics_day_sync_state_from_conn(
+        outbox_conn,
+        device_id,
+        billing_scope_key,
+        day_start_ms,
+    ) else {
+        return false;
+    };
+    if state.idempotency_key.trim().is_empty() {
+        return false;
+    }
+    matches!(
+        outbox_conn
+            .query_row(
+                &format!(
+                    "SELECT status
+                     FROM {CLOUD_MCP_OUTBOX_TABLE}
+                     WHERE idempotency_key=?1"
+                ),
+                rusqlite::params![state.idempotency_key.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .as_deref(),
+        Some("queued" | "retrying" | "in_flight")
+    )
+}
+
+struct CloudMcpTokenomicsCoverageRepublishPlan {
+    local_day_count: usize,
+    missing_day_count: usize,
+    truncated_day_count: usize,
+    in_flight_day_count: usize,
+    unbuildable_day_count: usize,
+    buckets: Vec<CloudMcpTokenomicsDayBucket>,
+}
+
+/// Build republish buckets for every local rollup day (strictly before
+/// today — the live producer owns the current day) that the cloud's
+/// fact-based coverage does not contain. `cloud_covered_days: None` means
+/// republish ALL local days (the manual full-history command). Local ACK
+/// state is deliberately ignored for day SELECTION — an ACK can outlive
+/// cloud facts that were never durably checkpointed — but days whose packet
+/// is still pending in the outbox are skipped. Days whose rollups hold only
+/// unknown-account rows produce no bucket and are skipped, matching what
+/// the packets would have contained.
+fn cloud_mcp_tokenomics_prepare_cloud_coverage_republish_plan(
+    app: AppHandle,
+    device_profile: Value,
+    device_id: String,
+    billing_scope: TokenomicsBillingScope,
+    billing_scope_key: String,
+    cloud_covered_days: Option<HashSet<String>>,
+) -> Result<CloudMcpTokenomicsCoverageRepublishPlan, String> {
+    let conn = tokenomics_open_db(&app)?;
+    let now_ms = cloud_mcp_now_ms();
+    let current_day_start = cloud_mcp_tokenomics_day_start_ms(now_ms.min(i64::MAX as u64) as i64);
+    let local_days = tokenomics_all_rollup_day_starts(&conn, &billing_scope, current_day_start)?;
+    let local_day_count = local_days.len();
+    let missing_days: Vec<(String, i64)> = match &cloud_covered_days {
+        Some(covered) => local_days
+            .into_iter()
+            .filter(|(day_key, _)| !covered.contains(day_key))
+            .collect(),
+        None => local_days,
+    };
+    let missing_day_count = missing_days.len();
+    let outbox_conn = cloud_mcp_open_outbox_conn()?;
+    let mut in_flight_day_count = 0usize;
+    let mut unbuildable_day_count = 0usize;
+    let mut examined_day_count = 0usize;
+    let mut truncated_day_count = 0usize;
+    let mut buckets = Vec::<CloudMcpTokenomicsDayBucket>::new();
+    // The cap counts BUILT buckets, not raw missing days: days whose rollups
+    // hold only unknown-account rows never produce a packet (and the cloud
+    // therefore never reports them covered), so capping the raw list would
+    // let them permanently occupy every slot and wedge the sweep short of
+    // the recoverable days behind them.
+    for (_, day_start_ms) in missing_days.into_iter() {
+        if buckets.len() >= CLOUD_MCP_TOKENOMICS_COVERAGE_RECONCILE_ENQUEUE_LIMIT {
+            truncated_day_count = missing_day_count.saturating_sub(examined_day_count);
+            break;
+        }
+        examined_day_count = examined_day_count.saturating_add(1);
+        if cloud_mcp_tokenomics_day_packet_in_flight(
+            &outbox_conn,
+            &device_id,
+            &billing_scope_key,
+            day_start_ms,
+        ) {
+            in_flight_day_count = in_flight_day_count.saturating_add(1);
+            continue;
+        }
+        let mut summary =
+            tokenomics_sync_delta_for_day_from_conn(&conn, Some(&billing_scope), day_start_ms)?;
+        cloud_mcp_tag_tokenomics_summary_device(&mut summary, &device_profile);
+        let mut day_buckets = cloud_mcp_tokenomics_day_buckets_for_range(
+            &summary,
+            now_ms,
+            day_start_ms,
+            day_start_ms,
+        );
+        let Some(bucket) = day_buckets
+            .drain(..)
+            .find(|bucket| bucket.day_start_ms == day_start_ms)
+        else {
+            unbuildable_day_count = unbuildable_day_count.saturating_add(1);
+            continue;
+        };
+        buckets.push(bucket);
+    }
+    Ok(CloudMcpTokenomicsCoverageRepublishPlan {
+        local_day_count,
+        missing_day_count,
+        truncated_day_count,
+        in_flight_day_count,
+        unbuildable_day_count,
+        buckets,
+    })
+}
+
+/// Fact-based anti-entropy for tokenomics history: ask the cloud which days
+/// it actually holds hourly fact rows for (never receipts or ACK state —
+/// those can survive a restore that lost the facts), then republish any
+/// local rollup day the cloud is missing with a fresh device_seq and packet
+/// id. This is what heals history after a deploy restored a checkpoint that
+/// predated ingested-but-never-published packets.
+#[allow(clippy::too_many_arguments)]
+async fn cloud_mcp_tokenomics_reconcile_cloud_day_coverage(
+    app: &AppHandle,
+    worker_state: &CloudMcpState,
+    device_profile: &Value,
+    billing_scope_type: &str,
+    team_id: Option<&str>,
+    billing_scope: &TokenomicsBillingScope,
+    billing_scope_key: &str,
+    device_id: &str,
+    reason: &str,
+    force_all: bool,
+    bypass_throttle: bool,
+) -> Result<Value, String> {
+    if !bypass_throttle {
+        let throttle_app = app.clone();
+        let throttle_device_id = device_id.to_string();
+        let throttle_scope_key = billing_scope_key.to_string();
+        let throttled = tauri::async_runtime::spawn_blocking(move || {
+            cloud_mcp_tokenomics_coverage_reconcile_throttled(
+                &throttle_app,
+                &throttle_device_id,
+                &throttle_scope_key,
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        if throttled {
+            return Ok(json!({ "skipped": "throttled" }));
+        }
+    }
+    // Stamp the attempt up front: reconnect storms and old clouds without the
+    // coverage endpoint must not replan large histories every quiet cycle.
+    {
+        let stamp_app = app.clone();
+        let stamp_device_id = device_id.to_string();
+        let stamp_scope_key = billing_scope_key.to_string();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            cloud_mcp_tokenomics_stamp_coverage_reconcile_attempt(
+                &stamp_app,
+                &stamp_device_id,
+                &stamp_scope_key,
+            )
+        })
+        .await;
+    }
+    let cloud_covered_days = if force_all {
+        None
+    } else {
+        let response = match cloud_mcp_ws_request_once_with_timeout(
+            worker_state,
+            CLOUD_MCP_TOKENOMICS_DAY_COVERAGE_REQUEST_KIND,
+            &json!({ "device_id": device_id }),
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(json!({
+                    "skipped": "coverage_request_failed",
+                    "error": clean_terminal_telemetry_text(&error),
+                }));
+            }
+        };
+        if !response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            // Old clouds answer unknown kinds with an error envelope — treat
+            // coverage as unavailable and retry on the next throttled pass.
+            return Ok(json!({ "skipped": "coverage_unavailable" }));
+        }
+        let data = response.get("data").unwrap_or(&response);
+        let mut covered = HashSet::<String>::new();
+        for entry in data
+            .get("days")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(day) = entry.get("day").and_then(Value::as_str) else {
+                continue;
+            };
+            // KNOWN LIMITATION: row_count > 0 counts the day as covered, so a
+            // PARTIALLY restored day (cloud snapshot cut mid-day, device offline
+            // past the 30-day window) is not healed here — a token-sum
+            // comparison would need the exact packet-eligible local subtotal or
+            // it would flap on unknown-account rows. Partial days inside the
+            // window heal via day-hash republish; outside it, the manual
+            // force_all command re-sends everything.
+            let row_count = entry.get("row_count").and_then(Value::as_i64).unwrap_or(0);
+            if !day.trim().is_empty() && row_count > 0 {
+                covered.insert(day.trim().to_string());
+            }
+        }
+        Some(covered)
+    };
+    let plan_app = app.clone();
+    let plan_device_profile = device_profile.clone();
+    let plan_device_id = device_id.to_string();
+    let plan_billing_scope = billing_scope.clone();
+    let plan_billing_scope_key = billing_scope_key.to_string();
+    let plan = tauri::async_runtime::spawn_blocking(move || {
+        let _heavy_permit =
+            backend_heavy_job_acquire("cloud_mcp.tokenomics_cloud_coverage_republish_plan");
+        let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_cloud_coverage_republish_plan");
+        cloud_mcp_tokenomics_prepare_cloud_coverage_republish_plan(
+            plan_app,
+            plan_device_profile,
+            plan_device_id,
+            plan_billing_scope,
+            plan_billing_scope_key,
+            cloud_covered_days,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    let mut enqueued_day_count = 0usize;
+    for bucket in &plan.buckets {
+        let packet_bucket = CloudMcpTokenomicsPacketBucket {
+            day_start_ms: bucket.day_start_ms,
+            day_key: bucket.day_key.clone(),
+            content_hash: bucket.content_hash.clone(),
+        };
+        let enqueued_packet = match cloud_mcp_tokenomics_claim_and_enqueue_day_packet(
+            &bucket.summary,
+            device_profile,
+            billing_scope_type,
+            team_id,
+            billing_scope_key,
+            device_id,
+            CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
+            "cloud_day_coverage_republish",
+            true,
+            &packet_bucket,
+            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM,
+        ) {
+            Ok(packet) => packet,
+            Err(error) => {
+                cloud_mcp_record_tokenomics_sync_error(
+                    "cloud_coverage_republish_enqueue_error",
+                    reason,
+                    &error,
+                );
+                break;
+            }
+        };
+        cloud_mcp_background_sync_ensure_started(worker_state);
+        worker_state.background_sync.notify.notify_one();
+        cloud_mcp_record_tokenomics_sync_log(
+            "outbox_queued",
+            "queued",
+            "cloud_day_coverage_republish",
+            json!({
+                "event_kind": CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
+                "outbox_id": &enqueued_packet.outbox_row.outbox_id,
+                "idempotency_key": &enqueued_packet.idempotency_key,
+                "day_key": &packet_bucket.day_key,
+            }),
+        );
+        enqueued_day_count = enqueued_day_count.saturating_add(1);
+    }
+    let summary = json!({
+        "reason": reason,
+        "force_all": force_all,
+        "local_day_count": plan.local_day_count,
+        "missing_day_count": plan.missing_day_count,
+        "truncated_day_count": plan.truncated_day_count,
+        "in_flight_day_count": plan.in_flight_day_count,
+        "unbuildable_day_count": plan.unbuildable_day_count,
+        "enqueued_day_count": enqueued_day_count,
+    });
+    if plan.missing_day_count > 0 {
+        cloud_mcp_record_tokenomics_sync_log(
+            "cloud_coverage_republish",
+            "active",
+            reason,
+            summary.clone(),
+        );
+        log_terminal_status_event(
+            "backend.cloud_mcp.tokenomics_background.cloud_coverage_republish",
+            summary.clone(),
+        );
+    }
+    Ok(summary)
+}
+
+/// Quiet-cycle maintenance: the historical prune-ack seed plus the cloud
+/// day-coverage reconcile. Runs whenever a sync cycle settles with nothing
+/// new to send — exactly when a silently wiped cloud would otherwise stay
+/// wiped forever behind local ACK state.
+#[allow(clippy::too_many_arguments)]
+async fn cloud_mcp_tokenomics_run_quiet_cycle_maintenance(
+    app: &AppHandle,
+    worker_state: &CloudMcpState,
+    device_profile: &Value,
+    billing_scope_type: &str,
+    team_id: Option<&str>,
+    billing_scope: &TokenomicsBillingScope,
+    billing_scope_key: &str,
+    device_id: &str,
+    reason: &str,
+) {
+    cloud_mcp_tokenomics_run_historical_prune_ack_seed(
+        app,
+        worker_state,
+        device_profile,
+        billing_scope_type,
+        team_id,
+        billing_scope,
+        billing_scope_key,
+        device_id,
+        reason,
+    )
+    .await;
+    if let Err(error) = cloud_mcp_tokenomics_reconcile_cloud_day_coverage(
+        app,
+        worker_state,
+        device_profile,
+        billing_scope_type,
+        team_id,
+        billing_scope,
+        billing_scope_key,
+        device_id,
+        reason,
+        false,
+        false,
+    )
+    .await
+    {
+        cloud_mcp_record_tokenomics_sync_error("cloud_coverage_reconcile_error", reason, &error);
+    }
+}
+
 async fn cloud_mcp_tokenomics_finish_historical_prune_ack_seed(
     app: &AppHandle,
     device_id: &str,
@@ -11075,7 +11481,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         }
     }
     if empty_non_full_delta && !window_republish_dirty {
-        cloud_mcp_tokenomics_run_historical_prune_ack_seed(
+        cloud_mcp_tokenomics_run_quiet_cycle_maintenance(
             &app,
             &worker_state,
             &device_profile,
@@ -11201,7 +11607,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         }),
     );
     if day_buckets.is_empty() {
-        cloud_mcp_tokenomics_run_historical_prune_ack_seed(
+        cloud_mcp_tokenomics_run_quiet_cycle_maintenance(
             &app,
             &worker_state,
             &device_profile,
@@ -11468,7 +11874,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
                 json!({ "stored_count": stored_prune_ack_seed_count }),
             );
         }
-        cloud_mcp_tokenomics_run_historical_prune_ack_seed(
+        cloud_mcp_tokenomics_run_quiet_cycle_maintenance(
             &app,
             &worker_state,
             &device_profile,
@@ -50310,6 +50716,45 @@ async fn cloud_mcp_schedule_tokenomics_sync(
             "enqueued_ms": queued_job.enqueued_ms,
         }),
     ))
+}
+
+/// Manual recovery: reconcile local rollup history against the cloud's
+/// fact-based day coverage and republish what the cloud is missing, with
+/// fresh packet ids and device sequences. `force_all: true` republishes
+/// every retained local day regardless of what the cloud reports.
+#[tauri::command(rename_all = "snake_case")]
+async fn cloud_mcp_tokenomics_republish_cloud_history(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+    force_all: Option<bool>,
+) -> Result<Value, String> {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "machine_id"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Unable to determine the native desktop device id.".to_string())?;
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state.inner()).await;
+    let billing_scope_key =
+        tokenomics_billing_scope_key(billing_scope_type.as_str(), team_id.as_deref());
+    let billing_scope = TokenomicsBillingScope {
+        scope_type: billing_scope_type.clone(),
+        team_id: team_id.clone(),
+        source: "cloud_mcp_republish_command".to_string(),
+    };
+    cloud_mcp_tokenomics_reconcile_cloud_day_coverage(
+        &app,
+        state.inner(),
+        &device_profile,
+        billing_scope_type.as_str(),
+        team_id.as_deref(),
+        &billing_scope,
+        &billing_scope_key,
+        &device_id,
+        "cloud_history_republish_command",
+        force_all.unwrap_or(false),
+        true,
+    )
+    .await
 }
 
 #[tauri::command(rename_all = "snake_case")]
