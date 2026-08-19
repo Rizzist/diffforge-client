@@ -4549,7 +4549,7 @@ fn developer_energy_coordination_db_paths(root: &str) -> Vec<PathBuf> {
     vec![
         root.join(".agents").join("kernel.sqlite"),
         root.join(".agents").join("coordination.db"),
-        coordination::db::coordination_repo_state_root(&root).join("kernel.sqlite"),
+        root.join(".agents").join("kernel.sqlite"),
     ]
 }
 

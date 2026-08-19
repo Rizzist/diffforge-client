@@ -510,7 +510,8 @@ fn push_codex_managed_home_candidates(
             .join(".agents")
             .join("codex-home")
             .join("coordinated"),
-        coordination::db::coordination_repo_state_root(repo_root)
+        repo_root
+            .join(".agents")
             .join("codex-home")
             .join("coordinated"),
     ] {

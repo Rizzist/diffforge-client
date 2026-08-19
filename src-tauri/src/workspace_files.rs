@@ -1588,10 +1588,6 @@ fn ensure_workspace_git_ready_for_coordination(
     })
 }
 
-pub(crate) fn ensure_workspace_git_ready_for_late_coordination(root: &Path) -> Result<(), String> {
-    ensure_workspace_git_ready_for_coordination(root).map(|_| ())
-}
-
 #[tauri::command(rename_all = "snake_case")]
 async fn workspace_initialize_git(repo_path: String) -> Result<WorkspaceGitBootstrap, String> {
     let root = resolve_workspace_root_directory(Some(repo_path.as_str()))?;

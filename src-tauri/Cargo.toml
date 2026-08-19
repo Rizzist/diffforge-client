@@ -4,7 +4,6 @@ version = "0.9.39"
 description = "Diff Forge AI desktop app"
 authors = ["Diff Forge AI"]
 edition = "2021"
-default-run = "rust-diffforge"
 
 [lib]
 name = "rust_diffforge_lib"

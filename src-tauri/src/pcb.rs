@@ -272,8 +272,8 @@ fn pcb_source_is_default_starter(board_name: &str, source: &str) -> bool {
 // missing from the local catalog (live entries across every scope file) is
 // orphaned and reclaimable by the requesting workspace. `None` means the
 // catalog could not be read — stay conservative and treat every owner as live.
-fn pcb_live_workspace_ids(app: &tauri::AppHandle) -> Option<std::collections::HashSet<String>> {
-    local_workspace_catalog_all_workspace_ids(app).ok()
+fn pcb_live_workspace_ids(_app: &tauri::AppHandle) -> Option<std::collections::HashSet<String>> {
+    None
 }
 
 fn pcb_owner_is_orphaned(

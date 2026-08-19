@@ -74,6 +74,19 @@ fn validate_web_panel_label(label: &str) -> Result<(), String> {
     }
 }
 
+fn validate_workspace_webview_label(label: &str) -> Result<(), String> {
+    let valid = label.starts_with("workspace-web-")
+        && label.len() <= 96
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err("Invalid workspace webview label.".to_string())
+    }
+}
+
 fn emit_web_panel_closed(app: &AppHandle, window_id: &str, pane_id: &str) {
     let _ = app.emit(
         WEB_PANEL_CLOSED_EVENT,

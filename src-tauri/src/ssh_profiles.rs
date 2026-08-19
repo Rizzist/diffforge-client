@@ -309,7 +309,7 @@ fn ssh_profile_save(request: SshProfileSaveRequest) -> Result<SshProfileSummary,
         .lock()
         .map_err(|_| "Unable to lock SSH profiles storage.".to_string())?;
     let mut registry = ssh_profiles_read_registry_locked()?;
-    let now = crate::coordination::kernel::now_rfc3339();
+    let now = cloud_mcp_rfc3339_now();
 
     let saved = if let Some(id) = request.id.as_deref() {
         let Some(profile) = registry

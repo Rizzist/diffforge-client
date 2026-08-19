@@ -102,11 +102,26 @@ fn orchestrator_pool_agent_id(event: &Value) -> String {
     } else {
         agent.as_str()
     };
-    workspace_activation_clean_role(Some(agent))
+    orchestrator_pool_clean_role(Some(agent))
+}
+
+fn orchestrator_pool_clean_role(value: Option<&str>) -> String {
+    let normalized = value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_'], "-");
+    match normalized.as_str() {
+        "claude-code" | "claudecode" => "claude".to_string(),
+        "open-code" | "open-code-ai" | "opencode-ai" => "opencode".to_string(),
+        "terminal" | "shell" | "plain-shell" => "generic".to_string(),
+        "claude" | "codex" | "generic" | "haider" | "opencode" => normalized,
+        _ => "codex".to_string(),
+    }
 }
 
 fn orchestrator_pool_agent_label(agent_id: &str) -> String {
-    match workspace_activation_clean_role(Some(agent_id)).as_str() {
+    match orchestrator_pool_clean_role(Some(agent_id)).as_str() {
         "claude" => "Claude Code".to_string(),
         "codex" => "Codex".to_string(),
         "generic" => "Terminal".to_string(),
@@ -215,7 +230,7 @@ fn orchestrator_pool_requested_index(event: &Value) -> Option<u16> {
 }
 
 fn orchestrator_pool_permission_mode(agent_id: &str) -> Option<String> {
-    match workspace_activation_clean_role(Some(agent_id)).as_str() {
+    match orchestrator_pool_clean_role(Some(agent_id)).as_str() {
         "claude" => Some("auto".to_string()),
         "codex" => Some("full_access".to_string()),
         "generic" => None,
@@ -224,7 +239,7 @@ fn orchestrator_pool_permission_mode(agent_id: &str) -> Option<String> {
 }
 
 fn orchestrator_pool_session_mode(agent_id: &str) -> &'static str {
-    if workspace_activation_clean_role(Some(agent_id)) == "generic" {
+    if orchestrator_pool_clean_role(Some(agent_id)) == "generic" {
         "general"
     } else {
         "direct_edit"
@@ -240,7 +255,26 @@ async fn orchestrator_pool_entry_current(app: &AppHandle, entry: &OrchestratorPo
 }
 
 async fn orchestrator_pool_entry_ready(app: &AppHandle, entry: &OrchestratorPoolEntry) -> bool {
-    workspace_activation_terminal_ready(app, &entry.pane_id, entry.instance_id).await == Some(true)
+    let terminal_state = app.state::<TerminalState>();
+    let instance = {
+        let guard = terminal_state.terminals.read().await;
+        guard
+            .get(&entry.pane_id)
+            .filter(|instance| instance.id == entry.instance_id)
+            .cloned()
+    };
+    let Some(instance) = instance else {
+        return false;
+    };
+    let parked = {
+        let guard = terminal_state.parked_prompts.read().await;
+        guard.values().any(|prompt| {
+            prompt.pane_id == entry.pane_id && prompt.instance_id == entry.instance_id
+        })
+    };
+    let runtime = terminal_runtime_snapshot(&instance);
+    let projected = terminal_project_runtime(&instance.metadata, &runtime, parked);
+    todo_dispatch_core_terminal_ready_for_submit(&runtime, &projected, parked) == Some(true)
 }
 
 async fn orchestrator_pool_reap_stale(app: &AppHandle) {
