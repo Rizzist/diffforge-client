@@ -68,14 +68,12 @@ import {
 } from "../agents/agentLaunchDefaults.js";
 import { buildAgentChatChangeEffortCommand } from "../agents/agentRemoteConfig.js";
 import {
-  AGENT_UPDATE_QUEUE_TIMEOUT_MS,
   agentPackageResultSucceeded,
   agentUpdateCanRetryAsAdministrator,
   agentUpdateMessageLooksPermissionDenied,
   agentUpdateProgressIsBusy,
   agentUpdateProgressMessage,
   agentUpdateResultSucceeded,
-  normalizeAgentUpdateProgress,
 } from "../agents/agentUpdateUi.js";
 import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
 import {
@@ -511,7 +509,6 @@ import {
   LaunchStatusPanel,
   LaunchStatusIcon,
   LaunchStatusCopy,
-  LaunchActions,
   LoginScreen,
   LoginLayout,
   BrandPanel,
@@ -1147,8 +1144,6 @@ const AUTH_EXCHANGE_TIMEOUT_MESSAGE = "Desktop sign in timed out. Try again.";
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS = 25000;
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE = "Cloud workspace connection timed out. Try again.";
 const OPEN_BROWSER_TIMEOUT_MS = 5000;
-const BACKEND_HELLO_TIMEOUT_MS = 5000;
-const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
 const BILLING_STATUS_REFRESH_MS = 5 * 60 * 1000;
 // Sync-status events fire several times a minute during agent activity; the
 // event-driven billing refresh is an HTTP fallback (live credits already ride
@@ -3019,8 +3014,6 @@ const APP_CLOSE_REQUESTED_EVENT = "forge-app-close-requested";
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT = "forge-terminal-close-all-progress";
 const TERMINAL_PROMPT_SUBMITTED_EVENT = "forge-terminal-prompt-submitted";
 const AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT = "forge-agent-thread-transcript-updated";
-const AGENT_STATUS_CACHE_KEY = "diffforge.agentStatuses.v1";
-const AGENT_STATUS_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const WORKSPACE_SETTINGS_STORAGE_KEY = "diffforge.workspaceSettings.v1";
 const WORKSPACE_LIFECYCLE_STORAGE_KEY = "diffforge.workspaceLifecycle.v1";
 const WORKSPACE_RAIL_STORAGE_KEY = "diffforge.workspaceRail.v1";
@@ -5578,77 +5571,6 @@ function canonicalCodingAgentId(value) {
   return "";
 }
 
-function sanitizeCodingAgentStatusForCloud(status) {
-  if (!status || typeof status !== "object") {
-    return null;
-  }
-  const id = canonicalCodingAgentId(status.id || status.agent_id);
-  const provider = AGENT_PROVIDERS.find((item) => item.id === id);
-  if (!provider) {
-    return null;
-  }
-  const installed = Boolean(status.installed);
-  const authenticated = Boolean(status.authenticated);
-  const npmAvailable = Boolean(status.npm_available);
-  const npmInstalled = Boolean(status.npm_installed);
-  const npmPackageVersion = safeCloudMcpText(status.npm_package_version, "").slice(0, 120);
-  const npmLatestVersion = safeCloudMcpText(status.npm_latest_version, "").slice(0, 120);
-  const npmUpdateAvailable = Boolean(installed && npmInstalled && status.npm_update_available);
-  const npmPackageVersionKnown = Boolean(
-    npmPackageVersion
-      && npmPackageVersion !== "Not checked"
-      && npmPackageVersion !== "Detected",
-  );
-  const npmLatestVersionKnown = Boolean(npmLatestVersion && npmLatestVersion !== "Not checked");
-  const updateKnown = Boolean(installed && npmInstalled && npmPackageVersionKnown && npmLatestVersionKnown);
-  const upToDate = Boolean(updateKnown && !npmUpdateAvailable);
-  const operation = safeCloudMcpText(status.packageOperation || status.operation, "").slice(0, 40);
-  const installing = operation === "installing" || Boolean(status.installing);
-  const updating = operation === "updating" || Boolean(status.updating);
-  const packageStatus = installing
-    ? "installing"
-    : updating
-      ? "updating"
-      : npmUpdateAvailable
-        ? "update_available"
-        : upToDate
-          ? "up_to_date"
-          : installed
-            ? "installed"
-            : "missing";
-  const updateStage = safeCloudMcpText(status.update_stage ?? status.updateStage, "")
-    .toLowerCase()
-    .slice(0, 40);
-  return {
-    id,
-    label: safeCloudMcpText(status.label || status.agent_label, provider.label).slice(0, 80),
-    installed,
-    authenticated,
-    version: safeCloudMcpText(status.version, "").slice(0, 120),
-    npm_available: npmAvailable,
-    npm_installed: npmInstalled,
-    npm_package_version: npmPackageVersion,
-    npm_latest_version: npmLatestVersion,
-    npm_update_available: npmUpdateAvailable,
-    update_available: npmUpdateAvailable,
-    update_known: updateKnown,
-    up_to_date: upToDate,
-    installing,
-    updating,
-    operation: installing ? "installing" : updating ? "updating" : operation,
-    package_status: packageStatus,
-    ...(updateStage
-      ? {
-        update_stage: updateStage,
-        update_stage_seq: Number(status.update_stage_seq ?? status.updateStageSeq) || 0,
-        update_to_version: safeCloudMcpText(status.update_to_version ?? status.updateToVersion, "").slice(0, 120),
-        update_error_reason: safeCloudMcpText(status.update_error_reason ?? status.updateErrorReason, "").slice(0, 240),
-        update_failed_stage: safeCloudMcpText(status.update_failed_stage ?? status.updateFailedStage, "").slice(0, 40),
-      }
-      : {}),
-  };
-}
-
 function getAgentStatusReportedModel(status) {
   return String(
     status?.active_model
@@ -5703,70 +5625,6 @@ function resolveWorkspaceAgentLaunchOptions({
   };
 }
 
-function normalizeCachedAgentStatus(status) {
-  if (!status || typeof status !== "object") {
-    return null;
-  }
-
-  const provider = AGENT_PROVIDERS.find((item) => item.id === status.id);
-  const defaults = provider ? getDefaultAgentStatus(provider.id) : null;
-
-  if (!provider || !defaults) {
-    return null;
-  }
-
-  return {
-    ...defaults,
-    ...provider,
-    authenticated: Boolean(status.authenticated),
-    auth_message: status.authenticated
-      ? "Cached terminal CLI session. Rechecking..."
-      : "Cached terminal CLI state. Rechecking...",
-    cached: true,
-    installed: Boolean(status.installed),
-    image_input_reason: typeof status.imageInputReason === "string"
-      ? status.imageInputReason.slice(0, 240)
-      : defaults.image_input_reason,
-    image_input_supported: Boolean(status.imageInputSupported),
-    image_input_support: typeof status.imageInputSupport === "string"
-      ? status.imageInputSupport.slice(0, 40)
-      : defaults.image_input_support,
-    active_model: typeof status.activeModel === "string"
-      ? status.activeModel.slice(0, 120)
-      : defaults.active_model,
-    active_model_supports_images: Boolean(status.activeModelSupportsImages),
-    npm_available: Boolean(status.npmAvailable),
-    npm_installed: Boolean(status.npmInstalled),
-    npm_latest_version: typeof status.npmLatestVersion === "string"
-      ? status.npmLatestVersion.slice(0, 120)
-      : defaults.npm_latest_version,
-    npm_package_version: typeof status.npmPackageVersion === "string"
-      ? status.npmPackageVersion.slice(0, 120)
-      : defaults.npm_package_version,
-    npm_update_available: Boolean(status.npmUpdateAvailable),
-    npm_version: typeof status.npmVersion === "string"
-      ? status.npmVersion.slice(0, 80)
-      : defaults.npm_version,
-    recommend_native_install: status.recommendNativeInstall !== false,
-    update_error_reason: typeof status.updateErrorReason === "string"
-      ? status.updateErrorReason.slice(0, 240)
-      : "",
-    update_failed_stage: typeof status.updateFailedStage === "string"
-      ? status.updateFailedStage.slice(0, 40)
-      : "",
-    update_stage: typeof status.updateStage === "string"
-      ? status.updateStage.slice(0, 40)
-      : "",
-    update_stage_seq: Number(status.updateStageSeq) || 0,
-    update_to_version: typeof status.updateToVersion === "string"
-      ? status.updateToVersion.slice(0, 120)
-      : "",
-    version: typeof status.version === "string"
-      ? status.version.slice(0, 120)
-      : defaults.version,
-  };
-}
-
 function normalizeTerminalNativeRailState(value, fallback = "") {
   const text = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
   return text || fallback;
@@ -5811,70 +5669,6 @@ function markWorkspaceLastKnownRuntimeReadOnly(workspace = {}) {
     workspace_active: false,
     workspace_status: "deactivated",
   };
-}
-
-function readCachedAgentStatuses() {
-  try {
-    const cached = JSON.parse(window.localStorage.getItem(AGENT_STATUS_CACHE_KEY) || "null");
-    const savedAt = Number(cached?.savedAt);
-
-    if (!Number.isFinite(savedAt) || Date.now() - savedAt > AGENT_STATUS_CACHE_TTL_MS) {
-      return DEFAULT_AGENT_STATUSES;
-    }
-
-    const statusMap = new Map(
-      (Array.isArray(cached?.statuses) ? cached.statuses : [])
-        .map(normalizeCachedAgentStatus)
-        .filter(Boolean)
-        .map((status) => [status.id, status]),
-    );
-
-    if (!statusMap.size) {
-      return DEFAULT_AGENT_STATUSES;
-    }
-
-    return AGENT_PROVIDERS.map((provider) => statusMap.get(provider.id) || getDefaultAgentStatus(provider.id));
-  } catch {
-    return DEFAULT_AGENT_STATUSES;
-  }
-}
-
-function persistAgentStatusCache(statuses) {
-  try {
-    const safeStatuses = statuses.map((status) => ({
-      authenticated: Boolean(status.authenticated),
-      id: status.id,
-      installed: Boolean(status.installed),
-      imageInputReason: typeof status.image_input_reason === "string" ? status.image_input_reason.slice(0, 240) : "",
-      imageInputSupported: Boolean(status.image_input_supported),
-      imageInputSupport: typeof status.image_input_support === "string" ? status.image_input_support.slice(0, 40) : "",
-      activeModel: typeof status.active_model === "string" ? status.active_model.slice(0, 120) : "",
-      activeModelSupportsImages: Boolean(status.active_model_supports_images),
-      npmAvailable: Boolean(status.npm_available),
-      npmInstalled: Boolean(status.npm_installed),
-      npmLatestVersion: typeof status.npm_latest_version === "string" ? status.npm_latest_version.slice(0, 120) : "",
-      npmPackageVersion: typeof status.npm_package_version === "string" ? status.npm_package_version.slice(0, 120) : "",
-      npmUpdateAvailable: Boolean(status.npm_update_available),
-      npmVersion: typeof status.npm_version === "string" ? status.npm_version.slice(0, 80) : "",
-      recommendNativeInstall: status.recommend_native_install !== false,
-      updateErrorReason: typeof status.update_error_reason === "string" ? status.update_error_reason.slice(0, 240) : "",
-      updateFailedStage: typeof status.update_failed_stage === "string" ? status.update_failed_stage.slice(0, 40) : "",
-      updateStage: typeof status.update_stage === "string" ? status.update_stage.slice(0, 40) : "",
-      updateStageSeq: Number(status.update_stage_seq) || 0,
-      updateToVersion: typeof status.update_to_version === "string" ? status.update_to_version.slice(0, 120) : "",
-      version: typeof status.version === "string" ? status.version.slice(0, 120) : "",
-    }));
-
-    window.localStorage.setItem(
-      AGENT_STATUS_CACHE_KEY,
-      JSON.stringify({
-        savedAt: Date.now(),
-        statuses: safeStatuses,
-      }),
-    );
-  } catch {
-    // Cached readiness is only a startup hint; fresh native checks remain authoritative.
-  }
 }
 
 let nextWorkspaceTerminalInstanceId = 1;
@@ -19169,43 +18963,6 @@ function getAgentStatusSummary(agentStatuses) {
   return [codex, claude, opencode].filter(Boolean);
 }
 
-function getAgentUpdatesAvailable(agentStatuses) {
-  return agentStatuses.filter((agent) => (
-    agent.installed
-    && agent.npm_installed
-    && agent.npm_update_available
-  ));
-}
-
-function formatAgentList(agents) {
-  const labels = agents.map((agent) => agent.shortLabel || agent.label).filter(Boolean);
-
-  if (labels.length <= 1) {
-    return labels[0] || "terminal CLIs";
-  }
-
-  if (labels.length === 2) {
-    return `${labels[0]} and ${labels[1]}`;
-  }
-
-  return `${labels.slice(0, -1).join(", ")}, and ${labels[labels.length - 1]}`;
-}
-
-function getAgentUpdateSummary(agents) {
-  const updateLabels = agents.map((agent) => {
-    const currentVersion = agent.npm_package_version && agent.npm_package_version !== "Detected"
-      ? agent.npm_package_version
-      : "installed";
-    const latestVersion = agent.npm_latest_version && agent.npm_latest_version !== "Not checked"
-      ? agent.npm_latest_version
-      : "latest";
-
-    return `${agent.shortLabel || agent.label} ${currentVersion} -> ${latestVersion}`;
-  });
-
-  return updateLabels.join(" / ");
-}
-
 function cleanWorkspaceRootDirectory(value) {
   if (typeof value !== "string") {
     return "";
@@ -19940,34 +19697,6 @@ function getReadyWorkspaceTerminalAgent(agentStatuses, role) {
   }
 
   return DEFAULT_AGENT_STATUSES.find((agent) => agent?.id === roleId) || null;
-}
-
-// Fail-open harness availability. A `<binary> --version` probe returns Err (→
-// installed:false) not only for a genuine uninstall but for a transient miss — most
-// commonly while the harness's own npm package self-updates and its bin symlink is
-// momentarily swapped (the exact trigger observed for the OpenCode→Codex incident).
-// Demoting a previously-installed harness on that flicker hides its Settings card and
-// disables new launches for a few seconds. Retain the last-known installed identity
-// when the new snapshot omits the provider entirely, or reports it not-installed while
-// the independent npm package check still detects the package. Only a corroborated
-// removal (probe AND npm both absent) demotes. Roster membership + live-pane identity
-// are already sticky (getWorkspaceTerminalRoleOptions / getReadyWorkspaceTerminalAgent);
-// this keeps the availability signal itself from thrashing.
-function mergeAgentStatusFailOpen(prev, next, present) {
-  if (!prev?.installed || next?.installed) {
-    return next;
-  }
-  const packageStillDetected = Boolean(next?.npm_installed);
-  if (!present || packageStillDetected) {
-    return {
-      ...next,
-      installed: true,
-      authenticated: prev.authenticated,
-      version: prev.version,
-      auth_message: prev.auth_message,
-    };
-  }
-  return next;
 }
 
 function isWorkspacePermissionAgentRole(role) {
@@ -24093,8 +23822,6 @@ export default function App() {
     billingStatus: persistedBillingStatus,
   } = useAuthSnapshot();
   const resolvedTokenomicsAccountKey = authAccountKey || user?.id || user?.$id || user?.email || "";
-  const [apiState, setApiState] = useState("checking");
-  const [apiMessage, setApiMessage] = useState("Checking connection");
   const [activeView, setActiveView] = useState(DEFAULT_WORKSPACE_VIEW);
   const [visibleView, setVisibleView] = useState(DEFAULT_WORKSPACE_VIEW);
   // Communication view sub-tabs: "devices" (live device roster) | "email"
@@ -24107,11 +23834,9 @@ export default function App() {
   }));
   const [viewMotion, setViewMotion] = useState("entered");
   const [activeAgent, setActiveAgent] = useState("codex");
-  const [agentStatuses, setAgentStatuses] = useState(readCachedAgentStatuses);
+  const [agentStatuses, setAgentStatuses] = useState(DEFAULT_AGENT_STATUSES);
   const [agentStatusState, setAgentStatusState] = useState("idle");
   const [agentStatusError, setAgentStatusError] = useState("");
-  const [startupAgentGateState, setStartupAgentGateState] = useState("idle");
-  const [startupAgentUpdateMessage, setStartupAgentUpdateMessage] = useState("");
   const [agentInstallState, setAgentInstallState] = useState({});
   const [agentInstallResults, setAgentInstallResults] = useState({});
   const [agentUpdateProgress, setAgentUpdateProgress] = useState({});
@@ -24384,14 +24109,11 @@ export default function App() {
   const workspaceGitPullPromptCheckRef = useRef("");
   const workspaceGitPullPromptSkippedRef = useRef(new Set());
   const viewTransitionTimeoutRef = useRef(null);
-  const agentStatusCacheHitRef = useRef(agentStatuses.some((agent) => agent.cached));
   const agentStatusesRef = useRef(agentStatuses);
   const manualAgentUpdateProvidersRef = useRef(new Set());
   const agentUpdateQueueTimeoutsRef = useRef(new Map());
-  const agentInitialStatusUserRef = useRef("");
+  const workspaceCatalogStartupUserRef = useRef("");
   const previousAccountScopeKeyRef = useRef("");
-  const startupAgentFlowIdRef = useRef(0);
-  const startupAgentSettingsPendingRef = useRef(false);
   const audioAutoOpenStartupKeyRef = useRef("");
   const spaceModeRef = useRef(spaceMode);
   const selectedWorkspaceIdRef = useRef("");
@@ -24893,7 +24615,6 @@ export default function App() {
   const workspaceMcpStartupIndexJobsRef = useRef(new Map());
   const workspaceMcpStartupIndexEmptyKeyRef = useRef("");
   const workspaceDeactivationInFlightRef = useRef("");
-  const agentInstallationSyncKeyRef = useRef("");
   const workspaceTerminalsSyncKeyRef = useRef("");
   const workspaceTerminalsSyncTimerRef = useRef(0);
   const workspaceTerminalsSyncInFlightRef = useRef(false);
@@ -28170,13 +27891,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!agentStatusCacheHitRef.current) {
-      return;
-    }
-
-  }, []);
-
-  useEffect(() => {
     let cancelled = false;
 
     const unsubscribe = listenShared(AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, (progressEvent) => {
@@ -28453,13 +28167,9 @@ export default function App() {
       setWorkspaceTerminalDisplayLayouts(restoredDisplayLayouts);
     }
     setCloudWorkspaceProgress(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
-    agentInitialStatusUserRef.current = "";
+    workspaceCatalogStartupUserRef.current = "";
     workspaceTerminalsSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
-    startupAgentFlowIdRef.current += 1;
-    startupAgentSettingsPendingRef.current = false;
-    setStartupAgentGateState("idle");
-    setStartupAgentUpdateMessage("");
     setWorkspaceError("");
   }, []);
 
@@ -28544,11 +28254,7 @@ export default function App() {
       setWorkspaceTerminalLogicalIndexes(restoredLogicalLayouts);
       setWorkspaceTerminalDisplayLayouts(restoredDisplayLayouts);
     }
-    agentInitialStatusUserRef.current = "";
-    startupAgentFlowIdRef.current += 1;
-    startupAgentSettingsPendingRef.current = false;
-    setStartupAgentGateState("checking");
-    setStartupAgentUpdateMessage("");
+    workspaceCatalogStartupUserRef.current = "";
     setWorkspaceError("");
   }, [updateCloudWorkspaceProgress]);
 
@@ -31544,29 +31250,6 @@ export default function App() {
     setAuthInitialized(true);
   }, []);
 
-  const checkBackend = useCallback(async () => {
-    setApiState("checking");
-    setApiMessage("Checking connection");
-
-    try {
-      await withTimeout(
-        invoke("backend_ping"),
-        BACKEND_HELLO_TIMEOUT_MS,
-        BACKEND_HELLO_TIMEOUT_MESSAGE,
-      );
-      setApiState("online");
-      setApiMessage("Diff Forge API online");
-    } catch (error) {
-      const errorMessage = getErrorMessage(error, BACKEND_HELLO_TIMEOUT_MESSAGE);
-      setApiState("offline");
-      setApiMessage(
-        errorMessage === BACKEND_HELLO_TIMEOUT_MESSAGE
-          ? "Connection check timed out. Check your internet connection."
-          : "Unable to reach Diff Forge API. Check your internet connection.",
-      );
-    }
-  }, []);
-
   const validateStoredSession = useCallback(async () => {
     const validationFlowId = authFlowIdRef.current;
 
@@ -31955,265 +31638,6 @@ export default function App() {
     void warmAccountTokenomics({ account_key: accountKey });
   }, [resolvedTokenomicsAccountKey]);
 
-  const resolveAgentInstallationSyncTarget = useCallback(() => {
-    const currentWorkspaces = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
-    const targetWorkspaceId = (
-      activatedWorkspaceIdRef.current
-      || selectedWorkspaceIdRef.current
-      || workspaceLifecycleSettingsRef.current?.default_workspace_id
-      || ""
-    );
-    const workspace = targetWorkspaceId
-      ? findWorkspaceById(currentWorkspaces, targetWorkspaceId)
-      : null;
-    const workspaceId = workspace?.id || targetWorkspaceId || "";
-    const repoPath = (
-      (workspaceId ? getWorkspaceRootDirectory(workspaceSettingsRef.current, workspaceId) : "")
-      || cleanWorkspaceRootDirectory(defaultWorkingDirectoryRef.current)
-    );
-
-    return {
-      repo_path: repoPath,
-      workspace_id: workspaceId,
-      workspace_name: workspace?.name || "",
-    };
-  }, []);
-
-  const syncAgentInstallationsToCloud = useCallback((statuses, reason = "agent_status_refresh", packageState = {}) => {
-    const syncStatuses = Array.isArray(statuses)
-      ? statuses.filter((status) => status && typeof status === "object")
-      : [];
-    const codingAgents = syncStatuses
-      .map((status) => sanitizeCodingAgentStatusForCloud({
-        ...status,
-        packageOperation: packageState[status.id] || "",
-      }))
-      .filter(Boolean);
-    const hasCheckedStatus = syncStatuses.some((status) => (
-      !status.cached && String(status.version || "").trim() !== "Not checked"
-    ));
-    if (!codingAgents.length || !hasCheckedStatus || syncStatuses.every((status) => status.cached)) {
-      return;
-    }
-
-    const target = resolveAgentInstallationSyncTarget();
-    if (!target) {
-      return;
-    }
-
-    const syncKey = JSON.stringify({
-      scope: "connected-device-agent-installations",
-      agents: codingAgents,
-    });
-    if (agentInstallationSyncKeyRef.current === syncKey) {
-      return;
-    }
-    agentInstallationSyncKeyRef.current = syncKey;
-
-    invoke("cloud_mcp_sync_agent_installations", {
-      repo_path: target.repo_path,
-      workspace_id: target.workspace_id || null,
-      workspace_name: target.workspace_name || null,
-      agent_statuses: codingAgents,
-      reason,
-    }).catch((error) => {
-      agentInstallationSyncKeyRef.current = "";
-      logBigViewSyncDiagnosticEvent("cloud_mcp.agent_installations_sync.failed", {
-        message: getErrorMessage(error, "Unable to sync installed agent inventory."),
-        repo_path: target.repo_path,
-        workspace_id: target.workspace_id,
-        agentCount: codingAgents.length,
-        reason,
-      });
-    });
-  }, [resolveAgentInstallationSyncTarget]);
-
-  useEffect(() => {
-    if (
-      authState !== "authenticated"
-      || !accountIsPaid
-      || !cloudLiveSyncEpoch
-    ) {
-      return;
-    }
-
-    syncAgentInstallationsToCloud(
-      agentStatuses,
-      "cloud_connection_initial_state",
-    );
-  }, [
-    agentStatuses,
-    authState,
-    cloudLiveSyncEpoch,
-    syncAgentInstallationsToCloud,
-    user,
-  ]);
-
-  const refreshAgentStatuses = useCallback(async () => {
-    const agentStatusStartedAt = performance.now();
-    setAgentStatusState("checking");
-    setAgentStatusError("");
-
-    try {
-      const statuses = await invoke("agent_statuses");
-      const statusMap = new Map(statuses.map((status) => [status.id, status]));
-      const prevStatusMap = new Map(
-        (agentStatusesRef.current || []).map((status) => [status.id, status]),
-      );
-      const nextStatuses = AGENT_PROVIDERS.map((provider) => {
-        const merged = {
-          ...DEFAULT_AGENT_STATUSES.find((status) => status.id === provider.id),
-          ...provider,
-          ...(statusMap.get(provider.id) || {}),
-        };
-        return mergeAgentStatusFailOpen(
-          prevStatusMap.get(provider.id),
-          merged,
-          statusMap.has(provider.id),
-        );
-      });
-      persistAgentStatusCache(nextStatuses);
-      agentStatusesRef.current = nextStatuses;
-      setAgentStatuses(nextStatuses);
-      syncAgentInstallationsToCloud(nextStatuses, "agent_status_refresh");
-      setAgentStatusState("idle");
-      return nextStatuses;
-    } catch (error) {
-      setAgentStatusState("error");
-      setAgentStatusError(getErrorMessage(error, "Unable to check terminal CLIs."));
-      return null;
-    }
-  }, [syncAgentInstallationsToCloud]);
-
-  // Headless agent inventory: the Rust watcher probes CLI installs/updates
-  // (including ones made in terminals while this window never looked) and
-  // emits the fresh statuses; apply them like a local refresh so the agent
-  // gates and Tools tab stay current without polling.
-  useEffect(() => {
-    let disposed = false;
-    const unsubscribe = listenShared("agent-inventory-changed", (event) => {
-      if (disposed) {
-        return;
-      }
-      const statuses = Array.isArray(event?.payload?.statuses) ? event.payload.statuses : [];
-      if (!statuses.length) {
-        return;
-      }
-      const statusMap = new Map(statuses.map((status) => [status.id, status]));
-      const prevStatusMap = new Map(
-        (agentStatusesRef.current || []).map((status) => [status.id, status]),
-      );
-      const nextStatuses = AGENT_PROVIDERS.map((provider) => {
-        const merged = {
-          ...DEFAULT_AGENT_STATUSES.find((status) => status.id === provider.id),
-          ...provider,
-          ...(statusMap.get(provider.id) || {}),
-        };
-        return mergeAgentStatusFailOpen(
-          prevStatusMap.get(provider.id),
-          merged,
-          statusMap.has(provider.id),
-        );
-      });
-      persistAgentStatusCache(nextStatuses);
-      agentStatusesRef.current = nextStatuses;
-      setAgentStatuses(nextStatuses);
-    });
-    return () => {
-      disposed = true;
-      unsubscribe();
-    };
-  }, []);
-
-  // Settings consumes the same Rust-owned progress stream as Tools. Manual
-  // updates also own a bounded queued wait: after the visible timeout we ask
-  // Rust to cancel its active-terminal gate and settle the local spinner.
-  useEffect(() => {
-    let disposed = false;
-    const clearQueueTimeout = (provider) => {
-      const timeoutId = agentUpdateQueueTimeoutsRef.current.get(provider);
-      if (timeoutId) {
-        window.clearTimeout(timeoutId);
-        agentUpdateQueueTimeoutsRef.current.delete(provider);
-      }
-    };
-    const unsubscribe = listenShared("agent-update-progress", (event) => {
-      if (disposed) {
-        return;
-      }
-      const progress = normalizeAgentUpdateProgress(event?.payload);
-      if (!progress) {
-        return;
-      }
-      setAgentUpdateProgress((current) => {
-        const currentSeq = Number(current[progress.provider]?.stage_seq) || 0;
-        if (progress.stage_seq && currentSeq && progress.stage_seq < currentSeq) {
-          return current;
-        }
-        return { ...current, [progress.provider]: progress };
-      });
-
-      if (progress.stage !== "queued" || !manualAgentUpdateProvidersRef.current.has(progress.provider)) {
-        clearQueueTimeout(progress.provider);
-        return;
-      }
-      if (agentUpdateQueueTimeoutsRef.current.has(progress.provider)) {
-        return;
-      }
-      const timeoutId = window.setTimeout(() => {
-        agentUpdateQueueTimeoutsRef.current.delete(progress.provider);
-        const message = `${progress.provider} update timed out while waiting for active terminals to close.`;
-        setAgentUpdateProgress((current) => ({
-          ...current,
-          [progress.provider]: {
-            ...(current[progress.provider] || progress),
-            stage: "failed",
-            failed_stage: "queued",
-            error_reason: message,
-          },
-        }));
-        setAgentInstallResults((current) => ({
-          ...current,
-          [progress.provider]: {
-            source: "npm-update",
-            ok: false,
-            installed: false,
-            updated: false,
-            permission_denied: false,
-            error_kind: "queued_timeout",
-            failed_stage: "queued",
-            installed_version: "",
-            message,
-          },
-        }));
-        setAgentInstallState((current) => ({ ...current, [progress.provider]: "idle" }));
-        void invoke("cancel_agent_update", { provider: progress.provider }).catch(() => {});
-      }, AGENT_UPDATE_QUEUE_TIMEOUT_MS);
-      agentUpdateQueueTimeoutsRef.current.set(progress.provider, timeoutId);
-    });
-    return () => {
-      disposed = true;
-      unsubscribe();
-      for (const timeoutId of agentUpdateQueueTimeoutsRef.current.values()) {
-        window.clearTimeout(timeoutId);
-      }
-      agentUpdateQueueTimeoutsRef.current.clear();
-    };
-  }, []);
-
-  useEffect(() => {
-    syncAgentInstallationsToCloud(agentStatuses, "workspace_context_ready");
-  }, [
-    activatedWorkspaceId,
-    agentStatuses,
-    defaultWorkingDirectory,
-    selectedWorkspaceId,
-    syncAgentInstallationsToCloud,
-    workspaceLifecycleSettings,
-    workspaceSettings,
-    workspaces,
-  ]);
-
   const refreshAudioModelStatus = useCallback(async () => {
     setAudioStatusState("checking");
     setAudioError("");
@@ -32340,7 +31764,7 @@ export default function App() {
         ...results,
         [provider]: {
           tone: "neutral",
-          message: "Opened login in a terminal. Use Recheck after the login completes.",
+          message: "Opened login in a terminal.",
         },
       }));
     } catch (error) {
@@ -32378,8 +31802,6 @@ export default function App() {
       ));
       agentStatusesRef.current = nextStatuses;
       setAgentStatuses(nextStatuses);
-      persistAgentStatusCache(nextStatuses);
-      syncAgentInstallationsToCloud(nextStatuses, "agent_disconnect");
     } catch (error) {
       setAgentActionResults((results) => ({
         ...results,
@@ -32391,11 +31813,10 @@ export default function App() {
     } finally {
       setAgentDisconnectState((state) => ({ ...state, [provider]: "idle" }));
     }
-  }, [agentStatuses, syncAgentInstallationsToCloud]);
+  }, [agentStatuses]);
 
   const installAgentWithNpm = useCallback(async (provider) => {
     setAgentInstallState((state) => ({ ...state, [provider]: "installing" }));
-    syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, "agent_install_start", { [provider]: "installing" });
     setAgentStatusError("");
     setAgentInstallResults((results) => {
       const nextResults = { ...results };
@@ -32403,14 +31824,9 @@ export default function App() {
       return nextResults;
     });
 
-    let refreshedStatuses = null;
     try {
       const result = await invoke("install_agent", { provider });
       setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source: "npm" } }));
-
-      if (result?.ok === true && result?.installed === true) {
-        refreshedStatuses = await refreshAgentStatuses();
-      }
     } catch (error) {
       const message = getErrorMessage(error, "Unable to install terminal CLI.");
       setAgentInstallResults((results) => ({
@@ -32429,14 +31845,12 @@ export default function App() {
       }));
     } finally {
       setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
-      syncAgentInstallationsToCloud(refreshedStatuses || agentStatusesRef.current || agentStatuses, "agent_install_idle", { [provider]: "idle" });
     }
-  }, [agentStatuses, refreshAgentStatuses, syncAgentInstallationsToCloud]);
+  }, []);
 
   const runManualAgentUpdate = useCallback(async (provider, command = "update_agent") => {
     manualAgentUpdateProvidersRef.current.add(provider);
     setAgentInstallState((state) => ({ ...state, [provider]: "updating" }));
-    syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, "agent_update_start", { [provider]: "updating" });
     setAgentStatusError("");
     setAgentInstallResults((results) => {
       const nextResults = { ...results };
@@ -32449,14 +31863,9 @@ export default function App() {
       return next;
     });
 
-    let refreshedStatuses = null;
     try {
       const result = await invoke(command, { provider });
       setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source: "npm-update" } }));
-
-      if (agentUpdateResultSucceeded(result)) {
-        refreshedStatuses = await refreshAgentStatuses();
-      }
     } catch (error) {
       const message = getErrorMessage(error, "Unable to update terminal CLI.");
       setAgentInstallResults((results) => ({
@@ -32481,9 +31890,8 @@ export default function App() {
         agentUpdateQueueTimeoutsRef.current.delete(provider);
       }
       setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
-      syncAgentInstallationsToCloud(refreshedStatuses || agentStatusesRef.current || agentStatuses, "agent_update_idle", { [provider]: "idle" });
     }
-  }, [agentStatuses, refreshAgentStatuses, syncAgentInstallationsToCloud]);
+  }, []);
 
   const updateAgentWithNpm = useCallback((provider) => (
     runManualAgentUpdate(provider, "update_agent")
@@ -32538,72 +31946,6 @@ export default function App() {
     });
   }, []);
 
-  const finishStartupAgentGate = useCallback((statuses = agentStatuses, reason = "complete") => {
-    const nextStatuses = Array.isArray(statuses) && statuses.length ? statuses : agentStatuses;
-    const readyCount = nextStatuses.filter((agent) => agent.installed && agent.authenticated).length;
-    const updateAvailableCount = getAgentUpdatesAvailable(nextStatuses).length;
-
-    startupAgentSettingsPendingRef.current = readyCount === 0;
-    setStartupAgentGateState("complete");
-    setStartupAgentUpdateMessage("");
-  }, [agentStatuses]);
-
-  const enterWorkspaceAfterAgentCheck = useCallback(() => {
-    finishStartupAgentGate(agentStatuses, "enter_without_update");
-  }, [agentStatuses, finishStartupAgentGate]);
-
-  const updateStartupAgents = useCallback(async () => {
-    const updates = getAgentUpdatesAvailable(agentStatuses);
-
-    if (!updates.length) {
-      finishStartupAgentGate(agentStatuses, "no_updates");
-      return;
-    }
-
-    const updateStartedAt = performance.now();
-    setStartupAgentGateState("updating");
-    setStartupAgentUpdateMessage(`Updating ${formatAgentList(updates)}...`);
-
-    for (const agent of updates) {
-      setStartupAgentUpdateMessage(`Updating ${agent.label}...`);
-      setAgentInstallState((state) => ({ ...state, [agent.id]: "updating" }));
-      syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, "startup_agent_update_start", { [agent.id]: "updating" });
-      setAgentInstallResults((results) => {
-        const nextResults = { ...results };
-        delete nextResults[agent.id];
-        return nextResults;
-      });
-
-      try {
-        const result = await invoke("update_agent", { provider: agent.id });
-        setAgentInstallResults((results) => ({ ...results, [agent.id]: { ...result, source: "npm-update" } }));
-      } catch (error) {
-        const message = getErrorMessage(error, "Unable to update terminal CLI.");
-        setAgentInstallResults((results) => ({
-          ...results,
-          [agent.id]: {
-            source: "npm-update",
-            ok: false,
-            installed: false,
-            updated: false,
-            permission_denied: agentUpdateMessageLooksPermissionDenied(message),
-            error_kind: "invoke_error",
-            failed_stage: "installing",
-            installed_version: "",
-            message,
-          },
-        }));
-      } finally {
-        setAgentInstallState((state) => ({ ...state, [agent.id]: "idle" }));
-        syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, "startup_agent_update_idle", { [agent.id]: "idle" });
-      }
-    }
-
-    setStartupAgentUpdateMessage("Refreshing terminal CLI status...");
-    const nextStatuses = await refreshAgentStatuses();
-    finishStartupAgentGate(nextStatuses || agentStatuses, "updated");
-  }, [agentStatuses, finishStartupAgentGate, refreshAgentStatuses, syncAgentInstallationsToCloud]);
-
   const openAgentNativeInstaller = useCallback(async (agent) => {
     const guide = AGENT_INSTALL_GUIDES[agent.id] || {};
     const nativeInstallUrl = agent.native_install_url || guide.native_install_url;
@@ -32636,7 +31978,7 @@ export default function App() {
           ok: true,
           installed: false,
           permission_denied: false,
-          message: `Opened ${agent.native_install_label || guide.native_install_label}. Recheck after install finishes.`,
+          message: `Opened ${agent.native_install_label || guide.native_install_label}.`,
         },
       }));
     } catch (error) {
@@ -35956,10 +35298,6 @@ export default function App() {
   }, [closeWindow]);
 
   useEffect(() => {
-    checkBackend();
-  }, [checkBackend]);
-
-  useEffect(() => {
     let cancelled = false;
     let lastApplied = null;
     let demoteTimer = 0;
@@ -36366,9 +35704,7 @@ export default function App() {
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceSettingsModalId("");
-    agentInitialStatusUserRef.current = "";
-    startupAgentFlowIdRef.current += 1;
-    startupAgentSettingsPendingRef.current = false;
+    workspaceCatalogStartupUserRef.current = "";
     workspaceAgentLaunchKeyRef.current = "";
     workspaceAgentBatchInFlightKeyRef.current = "";
     workspaceAgentBatchStartedSessionKeysRef.current.clear();
@@ -36378,8 +35714,6 @@ export default function App() {
     workspaceRuntimeSelectionLogKeyRef.current = "";
     workspaceMcpStartupIndexEmptyKeyRef.current = "";
     preparedTerminalsRef.current.clear();
-    setStartupAgentGateState("idle");
-    setStartupAgentUpdateMessage("");
     setWorkspaceAgentLaunchEpoch(0);
     setWorkspaceAgentBatchSentLaunchKey("");
     setPreparedTerminalVersion((version) => version + 1);
@@ -36572,7 +35906,6 @@ export default function App() {
   }, [
     authState,
     isLaunchScreenVisible,
-    user,
     workspaceListHydrated,
     workspaceState,
   ]);
@@ -36598,79 +35931,21 @@ export default function App() {
 
     const userKey = `${authAccountKey || user?.id || user?.email || "user"}`;
 
-    if (agentInitialStatusUserRef.current !== userKey) {
-      const startupFlowId = startupAgentFlowIdRef.current + 1;
-      const cachedStartupStatuses = Array.isArray(agentStatusesRef.current)
-        ? agentStatusesRef.current
-        : agentStatuses;
-      const hasCachedStartupStatuses = cachedStartupStatuses.some((status) => status?.cached);
-
-      startupAgentFlowIdRef.current = startupFlowId;
-      agentInitialStatusUserRef.current = userKey;
-      setStartupAgentUpdateMessage("");
-      refreshAudioModelStatus();
-      loadWorkspaces();
-
-      const applyStartupAgentStatuses = (nextStatuses) => {
-        if (startupAgentFlowIdRef.current !== startupFlowId || agentInitialStatusUserRef.current !== userKey) {
-          return;
-        }
-
-        if (!nextStatuses) {
-          finishStartupAgentGate(agentStatuses, "status_error");
-          return;
-        }
-
-        const updates = getAgentUpdatesAvailable(nextStatuses);
-
-        if (updates.length) {
-          setStartupAgentGateState("choice");
-          return;
-        }
-
-        finishStartupAgentGate(nextStatuses, "no_updates");
-      };
-      const refreshStartupAgentStatuses = () => {
-        refreshAgentStatuses().then(applyStartupAgentStatuses);
-      };
-
-      if (hasCachedStartupStatuses) {
-        applyStartupAgentStatuses(cachedStartupStatuses);
-        return scheduleWorkspaceStartupIdleTask(refreshStartupAgentStatuses, {
-          delay_ms: WORKSPACE_APP_STARTUP_MCP_INDEX_IDLE_DELAY_MS,
-          timeout_ms: WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS,
-        });
-      }
-
-      setStartupAgentGateState("checking");
-      refreshStartupAgentStatuses();
+    if (workspaceCatalogStartupUserRef.current !== userKey) {
+      workspaceCatalogStartupUserRef.current = userKey;
+      void refreshAudioModelStatus();
+      void loadWorkspaces();
     }
 
     return undefined;
   }, [
-    agentStatuses,
-    authState,
-    finishStartupAgentGate,
-    loadWorkspaces,
-    refreshAgentStatuses,
-    refreshAudioModelStatus,
     authAccountKey,
+    authState,
+    loadWorkspaces,
+    refreshAudioModelStatus,
     user,
     workspaceState,
   ]);
-
-  useEffect(() => {
-    if (
-      authState !== "authenticated"
-      || workspaceState !== "ready"
-      || !startupAgentSettingsPendingRef.current
-    ) {
-      return;
-    }
-
-    startupAgentSettingsPendingRef.current = false;
-    showView("settings");
-  }, [authState, showView, workspaceState]);
 
   useEffect(() => {
     if (
@@ -36754,7 +36029,6 @@ export default function App() {
   const cloudWorkspaceTitle = cloudWorkspaceProgress.title || "Preparing cloud workspace";
   const cloudWorkspaceDetail = cloudWorkspaceProgress.detail || "Waiting for the assigned cloud workspace.";
   const shouldShowCloudWorkspaceSetup = userIsPaid && !cloudWorkspaceReady;
-  const shouldShowStartupAgentSetup = userIsPaid && cloudWorkspaceReady;
   const planLabel = billingPlanLabelFromStatus(billingStatus, user);
   const billingPlanName = useMemo(
     () => billingPlanNameFromStatus(billingStatus, user),
@@ -36826,49 +36100,11 @@ export default function App() {
     writeDismissedLowCreditWarningKey(nextDismissedKey);
     setDismissedLowCreditWarningKey(nextDismissedKey);
   }, [billingStatus]);
-  const {
-    connectedAgentCount,
-    optionalAgentCount,
-    startupAgentUpdates,
-  } = useMemo(() => {
-    const nextConnectedAgentCount = agentStatuses.filter((agent) => (
+  const connectedAgentCount = useMemo(() => (
+    agentStatuses.filter((agent) => (
       agent.installed && agent.authenticated
-    )).length;
-    return {
-      connectedAgentCount: nextConnectedAgentCount,
-      optionalAgentCount: Math.max(0, AGENT_PROVIDERS.length - nextConnectedAgentCount),
-      startupAgentUpdates: getAgentUpdatesAvailable(agentStatuses),
-    };
-  }, [agentStatuses]);
-  const startupAgentStatusTitle = startupAgentGateState === "choice"
-    ? "Terminal CLI updates available"
-    : startupAgentGateState === "updating"
-      ? startupAgentUpdateMessage || "Updating terminal CLIs..."
-      : startupAgentGateState === "checking"
-        ? "Checking terminal CLIs..."
-        : startupAgentGateState === "complete"
-          ? "Terminal readiness checked"
-          : "Preparing terminal CLI check...";
-  const startupAgentStatusDetail = startupAgentGateState === "choice"
-    ? `${getAgentUpdateSummary(startupAgentUpdates)} Choose whether to update now or enter the workspace without updating.`
-    : startupAgentGateState === "updating"
-      ? "The workspace will open when the selected updates finish."
-      : startupAgentGateState === "checking"
-        ? "Terminal CLI readiness is being checked while the workspace loads."
-        : startupAgentGateState === "complete"
-          ? connectedAgentCount > 0
-            ? `${connectedAgentCount} terminal CLI${connectedAgentCount === 1 ? "" : "s"} ready. ${optionalAgentCount} optional provider${optionalAgentCount === 1 ? "" : "s"} unavailable.`
-            : "No ready terminal CLIs found. Settings will open so you can install or connect one."
-          : "Waiting for the live workspace connection to finish first.";
-  const startupAgentStatusState = startupAgentGateState === "choice"
-    ? "update"
-    : startupAgentGateState === "updating"
-      ? "checking"
-      : startupAgentGateState !== "complete"
-        ? "checking"
-        : connectedAgentCount > 0
-        ? "ready"
-        : "warning";
+    )).length
+  ), [agentStatuses]);
   const selectedWorkspaceRootDirectory = selectedWorkspace
     ? getWorkspaceRootDirectory(workspaceSettings, selectedWorkspace.id)
     : "";
@@ -42898,9 +42134,6 @@ export default function App() {
       }
 
       setAgentInstallState((state) => ({ ...state, [provider]: updating ? "updating" : "installing" }));
-      syncAgentInstallationsToCloud(agentStatusesRef.current || agentStatuses, updating ? "remote_agent_update_start" : "remote_agent_install_start", {
-        [provider]: updating ? "updating" : "installing",
-      });
       setAgentInstallResults((results) => {
         const nextResults = { ...results };
         delete nextResults[provider];
@@ -42915,12 +42148,9 @@ export default function App() {
         source,
       });
 
-      let refreshedStatuses = null;
       try {
         const result = await invoke(updating ? "update_agent" : "install_agent", { provider });
         setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source, remote: true } }));
-        const nextStatuses = await refreshAgentStatuses();
-        refreshedStatuses = nextStatuses;
         const completed = updating
           ? agentUpdateResultSucceeded(result)
           : Boolean(result?.ok === true && result?.installed === true);
@@ -42935,9 +42165,6 @@ export default function App() {
             command_id: commandId,
             command_kind: commandKind,
             result,
-            status: Array.isArray(nextStatuses)
-              ? nextStatuses.find((status) => status.id === provider) || null
-              : null,
           },
         );
       } catch (error) {
@@ -42965,9 +42192,6 @@ export default function App() {
         });
       } finally {
         setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
-        syncAgentInstallationsToCloud(refreshedStatuses || agentStatusesRef.current || agentStatuses, updating ? "remote_agent_update_idle" : "remote_agent_install_idle", {
-          [provider]: "idle",
-        });
       }
     };
     const handleRemoteLifecycleControl = async ({
@@ -46789,7 +46013,7 @@ export default function App() {
       staleLedgerTimers.forEach((timer) => window.clearTimeout(timer));
       staleLedgerTimers.clear();
     };
-  }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, ensureWorkspaceActivated, enterLoopspacesMode, logout, loopspaces, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, rustTerminalAuthorityOrchestrators, selectLoopspaceFromRail, showView, syncAgentInstallationsToCloud, workspaces]);
+  }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, ensureWorkspaceActivated, enterLoopspacesMode, logout, loopspaces, manageWorkspaceAgents, requestWorkspaceActivation, requestWorkspaceTerminalFocus, rustTerminalAuthorityOrchestrators, selectLoopspaceFromRail, showView, workspaces]);
 
   useEffect(() => {
     let disposed = false;
@@ -55304,7 +54528,6 @@ export default function App() {
     workspaceSyncState,
   ]);
 
-  const isConnectivityBlocked = false;
   const isPaidPlanUser = accountIsPaid || billingStatusPlanStatus(billingStatus) === "paid";
   const toolsWorkspaceArchitectures = useMemo(() => ({
     catalog: architectureHub.catalog,
@@ -55410,30 +54633,17 @@ export default function App() {
   const shouldShowStartupPhases = !hasEnteredWorkspaceShell;
   const shouldShowLaunchScreen = shouldShowStartupPhases && (
     isLaunchScreenVisible
-    || isConnectivityBlocked
     || shouldHoldWorkspaceShellForStartup
   );
-  const launchState = isConnectivityBlocked && apiState === "offline"
-    ? "offline"
-    : isConnectivityBlocked && apiState === "checking"
-      ? "checking"
-      : "loading";
-  const launchStatus = launchState === "offline"
-    ? "No internet connection"
-    : launchState === "checking"
-      ? "Checking connection..."
-      : !authInitialized
-        ? "Checking secure session..."
-        : authState === "authenticated"
-          ? "Preparing workspace..."
-          : "Opening sign in...";
-  const launchDetail = launchState === "offline"
-    ? apiMessage
-    : launchState === "checking"
-      ? "Contacting the Diff Forge API before opening sign in."
-      : !authInitialized
-        ? "Validating this device before showing your workspace."
-        : "Finishing the desktop handoff.";
+  const launchState = "loading";
+  const launchStatus = !authInitialized
+    ? "Checking secure session..."
+    : authState === "authenticated"
+      ? "Preparing workspace..."
+      : "Opening sign in...";
+  const launchDetail = !authInitialized
+    ? "Validating this device before showing your workspace."
+    : "Finishing the desktop handoff.";
   const windowControlPlatform = getWindowControlPlatform();
   const isWindowFrameExpanded = windowFrameState.isFullscreen || windowFrameState.isMaximized;
   const windowResizeActive = windowFrameState.isFullscreen
@@ -55909,33 +55119,19 @@ export default function App() {
               <SplashCenter>
                 <SplashLogo src="/logo.webp" alt="" />
                 <SplashTitle>{BRAND_NAME}</SplashTitle>
-                <SplashTagline>Manage Codex & Claude Code. Build faster.</SplashTagline>
+                <SplashTagline>Your agentic development environment.</SplashTagline>
                 <LoadingTrack aria-hidden="true" data-state={launchState}>
-                  {launchState !== "offline" && <LoadingFill />}
+                  <LoadingFill />
                 </LoadingTrack>
                 <LaunchStatusPanel data-state={launchState}>
                   <LaunchStatusIcon aria-hidden="true" data-state={launchState}>
-                    {launchState === "offline" ? (
-                      <ErrorIcon />
-                    ) : launchState === "checking" ? (
-                      <PendingIcon />
-                    ) : (
-                      <ConnectedIcon />
-                    )}
+                    <ConnectedIcon />
                   </LaunchStatusIcon>
                   <LaunchStatusCopy>
                     <LoadingText>{launchStatus}</LoadingText>
                     <LoadingDetail>{launchDetail}</LoadingDetail>
                   </LaunchStatusCopy>
                 </LaunchStatusPanel>
-                {launchState === "offline" && (
-                  <LaunchActions>
-                    <SecondaryButton disabled={apiState === "checking"} onClick={checkBackend} type="button">
-                      <ButtonRefreshIcon aria-hidden="true" />
-                      <span>Retry connection</span>
-                    </SecondaryButton>
-                  </LaunchActions>
-                )}
               </SplashCenter>
             </SplashScreen>
           ) : authState === "authenticated" ? (
@@ -56419,7 +55615,6 @@ export default function App() {
                             onWorkspaceToolRuntimeBridgeChange={updateWorkspaceToolRuntimeBridge}
                             onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
                             onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
-                            refreshAgentStatuses={refreshAgentStatuses}
                             reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
                             setWorkspaceName={setWorkspaceName}
                             newWorkspaceRootDraft={newWorkspaceRootDraft}
@@ -57243,10 +56438,6 @@ export default function App() {
                       >
                         {connectedAgentCount}/{AGENT_PROVIDERS.length} ready
                       </em>
-                      <SecondaryButton disabled={agentStatusState === "checking"} onClick={refreshAgentStatuses} type="button">
-                        <ButtonRefreshIcon aria-hidden="true" />
-                        <span>{agentStatusState === "checking" ? "Checking..." : "Recheck"}</span>
-                      </SecondaryButton>
                     </SettingsSectionHeader>
 
                     {agentStatusError && <FormMessage $state="error">{agentStatusError}</FormMessage>}
@@ -58876,7 +58067,6 @@ export default function App() {
                   <AmbientPanel data-position="right">
                     <span>{displayName}</span>
                     <p>{cloudWorkspaceReady ? "Cloud connected" : "Cloud connecting"}</p>
-                    <p>{startupAgentGateState === "complete" ? "Terminals checked" : "Checking terminals"}</p>
                   </AmbientPanel>
                   <SplashCenter>
                     <SplashLogo src="/logo.webp" alt="" />
@@ -58885,80 +58075,43 @@ export default function App() {
                     <LoadingTrack aria-hidden="true">
                       <LoadingFill />
                     </LoadingTrack>
-                    {(shouldShowCloudWorkspaceSetup || shouldShowStartupAgentSetup) && (
-                      <WorkspaceStartupDetails data-phase={shouldShowStartupAgentSetup ? "agents" : "cloud"}>
-                        {shouldShowCloudWorkspaceSetup && (
-                          <>
-                            <LaunchStatusPanel data-state={cloudWorkspaceStatusState}>
-                              <LaunchStatusIcon aria-hidden="true" data-state={cloudWorkspaceStatusState}>
-                                {cloudWorkspaceReady ? (
-                                  <ConnectedIcon />
-                                ) : cloudWorkspaceStatusState === "warning" ? (
-                                  <ErrorIcon />
-                                ) : (
-                                  <PendingIcon />
-                                )}
-                              </LaunchStatusIcon>
-                              <LaunchStatusCopy>
-                                <LoadingText>{cloudWorkspaceTitle}</LoadingText>
-                                <LoadingDetail>{cloudWorkspaceDetail}</LoadingDetail>
-                              </LaunchStatusCopy>
-                            </LaunchStatusPanel>
-                            <AuthStepRail aria-label="Cloud workspace setup checkpoints" data-compact="true">
-                              {CLOUD_WORKSPACE_STEPS.map((step, index) => {
-                                const stepState = stepStateFor(
-                                  CLOUD_WORKSPACE_STEPS,
-                                  cloudWorkspaceProgress.stage,
-                                  cloudWorkspaceProgress.status,
-                                  index,
-                                );
-
-                                return (
-                                  <AuthStep data-state={stepState} key={step.id}>
-                                    <span>{stepState === "complete" ? <ButtonCheckIcon aria-hidden="true" /> : index + 1}</span>
-                                    <strong>{step.label}</strong>
-                                    <small>
-                                      {step.id === cloudWorkspaceProgress.stage ? cloudWorkspaceDetail : step.detail}
-                                    </small>
-                                  </AuthStep>
-                                );
-                              })}
-                            </AuthStepRail>
-                          </>
-                        )}
-                        {shouldShowStartupAgentSetup && (
-                          <>
-                            <LaunchStatusPanel data-state={startupAgentStatusState}>
-                              <LaunchStatusIcon aria-hidden="true" data-state={startupAgentStatusState}>
-                                {startupAgentGateState === "choice" ? (
-                                  <ButtonRefreshIcon />
-                                ) : startupAgentGateState === "checking" || startupAgentGateState === "updating" || startupAgentGateState === "idle" ? (
-                                  <PendingIcon />
-                                ) : connectedAgentCount > 0 ? (
-                                  <ConnectedIcon />
-                                ) : (
-                                  <ErrorIcon />
-                                )}
-                              </LaunchStatusIcon>
-                              <LaunchStatusCopy>
-                                <LoadingText>{startupAgentStatusTitle}</LoadingText>
-                                <LoadingDetail>{startupAgentStatusDetail}</LoadingDetail>
-                              </LaunchStatusCopy>
-                            </LaunchStatusPanel>
-                            {startupAgentGateState === "choice" && (
-                              <LaunchActions data-layout="split">
-                                <PrimaryButton onClick={updateStartupAgents} type="button">
-                                  <ButtonRefreshIcon aria-hidden="true" />
-                                  <span>Update first</span>
-                                </PrimaryButton>
-                                <SecondaryButton onClick={enterWorkspaceAfterAgentCheck} type="button">
-                                  <ConnectedIcon aria-hidden="true" />
-                                  <span>Enter workspace</span>
-                                </SecondaryButton>
-                              </LaunchActions>
+                    {shouldShowCloudWorkspaceSetup && (
+                      <WorkspaceStartupDetails data-phase="cloud">
+                        <LaunchStatusPanel data-state={cloudWorkspaceStatusState}>
+                          <LaunchStatusIcon aria-hidden="true" data-state={cloudWorkspaceStatusState}>
+                            {cloudWorkspaceReady ? (
+                              <ConnectedIcon />
+                            ) : cloudWorkspaceStatusState === "warning" ? (
+                              <ErrorIcon />
+                            ) : (
+                              <PendingIcon />
                             )}
-                          </>
-                        )}
+                          </LaunchStatusIcon>
+                          <LaunchStatusCopy>
+                            <LoadingText>{cloudWorkspaceTitle}</LoadingText>
+                            <LoadingDetail>{cloudWorkspaceDetail}</LoadingDetail>
+                          </LaunchStatusCopy>
+                        </LaunchStatusPanel>
+                        <AuthStepRail aria-label="Cloud workspace setup checkpoints" data-compact="true">
+                          {CLOUD_WORKSPACE_STEPS.map((step, index) => {
+                            const stepState = stepStateFor(
+                              CLOUD_WORKSPACE_STEPS,
+                              cloudWorkspaceProgress.stage,
+                              cloudWorkspaceProgress.status,
+                              index,
+                            );
+
+                            return (
+                              <AuthStep data-state={stepState} key={step.id}>
+                                <span>{stepState === "complete" ? <ButtonCheckIcon aria-hidden="true" /> : index + 1}</span>
+                                <strong>{step.label}</strong>
+                                <small>
+                                  {step.id === cloudWorkspaceProgress.stage ? cloudWorkspaceDetail : step.detail}
+                                </small>
+                              </AuthStep>
+                            );
+                          })}
+                        </AuthStepRail>
                       </WorkspaceStartupDetails>
                     )}
                   </SplashCenter>
