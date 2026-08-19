@@ -55346,124 +55346,136 @@ export default function App() {
                         />
                         <SettingsNavGroups>
                           {(settingsNavShow("General") || settingsNavShow("Notifications") || settingsNavShow("Permissions")) && (
-                            <SettingsNavGroupLabel>Personal</SettingsNavGroupLabel>
-                          )}
-                          {settingsNavShow("General") && (
-                            <RailActionButton
-                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_GENERAL ? "true" : undefined}
-                              onClick={() => showSettingsView(SETTINGS_TAB_GENERAL)}
-                              type="button"
-                            >
-                              <ButtonSettingsIcon aria-hidden="true" />
-                              <span>General</span>
-                            </RailActionButton>
-                          )}
-                          {settingsNavShow("Notifications") && (
-                            <RailActionButton
-                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_NOTIFICATIONS ? "true" : undefined}
-                              onClick={() => showSettingsView(SETTINGS_TAB_NOTIFICATIONS)}
-                              type="button"
-                            >
-                              <ButtonNotificationIcon aria-hidden="true" />
-                              <span>Notifications</span>
-                            </RailActionButton>
-                          )}
-                          {settingsNavShow("Permissions") && (
-                            <RailActionButton
-                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_PERMISSIONS ? "true" : undefined}
-                              onClick={() => showSettingsView(SETTINGS_TAB_PERMISSIONS)}
-                              type="button"
-                            >
-                              <ButtonSecurityIcon aria-hidden="true" />
-                              <span>Permissions</span>
-                            </RailActionButton>
+                            <>
+                              <SettingsNavGroupLabel>Personal</SettingsNavGroupLabel>
+                              <RailViewActions aria-label="Personal settings">
+                                {settingsNavShow("General") && (
+                                  <RailActionButton
+                                    data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_GENERAL ? "true" : undefined}
+                                    onClick={() => showSettingsView(SETTINGS_TAB_GENERAL)}
+                                    type="button"
+                                  >
+                                    <ButtonSettingsIcon aria-hidden="true" />
+                                    <span>General</span>
+                                  </RailActionButton>
+                                )}
+                                {settingsNavShow("Notifications") && (
+                                  <RailActionButton
+                                    data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_NOTIFICATIONS ? "true" : undefined}
+                                    onClick={() => showSettingsView(SETTINGS_TAB_NOTIFICATIONS)}
+                                    type="button"
+                                  >
+                                    <ButtonNotificationIcon aria-hidden="true" />
+                                    <span>Notifications</span>
+                                  </RailActionButton>
+                                )}
+                                {settingsNavShow("Permissions") && (
+                                  <RailActionButton
+                                    data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_PERMISSIONS ? "true" : undefined}
+                                    onClick={() => showSettingsView(SETTINGS_TAB_PERMISSIONS)}
+                                    type="button"
+                                  >
+                                    <ButtonSecurityIcon aria-hidden="true" />
+                                    <span>Permissions</span>
+                                  </RailActionButton>
+                                )}
+                              </RailViewActions>
+                            </>
                           )}
                           {(settingsNavShow("Tools") || settingsNavShow("Assets") || settingsNavShow("Snipping")
                             || settingsNavShow("Audio") || settingsNavShow("Tokenomics") || settingsNavShow("Communication")) && (
-                            <SettingsNavGroupLabel>App</SettingsNavGroupLabel>
-                          )}
-                          {settingsNavShow("Tools") && (
-                            <RailActionButton
-                              data-active={GLOBAL_TOOLS_VIEWS.has(activeView) ? "true" : undefined}
-                              onClick={() => showView("tools")}
-                              type="button"
-                            >
-                              <RailToolsIcon aria-hidden="true" />
-                              <span>Tools</span>
-                            </RailActionButton>
-                          )}
-                          {settingsNavShow("Assets") && (
-                            <RailActionButton
-                              data-active={activeView === "assets" ? "true" : undefined}
-                              onClick={() => showView("assets")}
-                              type="button"
-                            >
-                              <RailAssetsIcon aria-hidden="true" />
-                              <span>Assets</span>
-                            </RailActionButton>
-                          )}
-                          {settingsNavShow("Snipping") && (
-                            <RailActionButton
-                              data-active={activeView === "snipping" ? "true" : undefined}
-                              onClick={() => showView("snipping")}
-                              type="button"
-                            >
-                              <RailSnippingIcon aria-hidden="true" />
-                              <span>Snipping</span>
-                            </RailActionButton>
-                          )}
-                          {settingsNavShow("Audio") && (
-                            <RailActionButton
-                              data-active={activeView === "audio" ? "true" : undefined}
-                              onClick={() => showView("audio")}
-                              type="button"
-                            >
-                              <RailAudioIcon aria-hidden="true" />
-                              <span>Audio</span>
-                            </RailActionButton>
-                          )}
-                          {settingsNavShow("Tokenomics") && (
-                            <RailActionButton
-                              data-active={activeView === "tokenomics" ? "true" : undefined}
-                              onClick={() => showView("tokenomics")}
-                              type="button"
-                            >
-                              <RailTokenomicsIcon aria-hidden="true" />
-                              <span>Tokenomics</span>
-                            </RailActionButton>
-                          )}
-                          {settingsNavShow("Communication") && (
-                            <RailActionButton
-                              data-active={activeView === "devices" ? "true" : undefined}
-                              onClick={() => showView("devices")}
-                              type="button"
-                            >
-                              <RailDevicesIcon aria-hidden="true" />
-                              <span>Communication</span>
-                            </RailActionButton>
+                            <>
+                              <SettingsNavGroupLabel>App</SettingsNavGroupLabel>
+                              <RailViewActions aria-label="App views">
+                                {settingsNavShow("Tools") && (
+                                  <RailActionButton
+                                    data-active={GLOBAL_TOOLS_VIEWS.has(activeView) ? "true" : undefined}
+                                    onClick={() => showView("tools")}
+                                    type="button"
+                                  >
+                                    <RailToolsIcon aria-hidden="true" />
+                                    <span>Tools</span>
+                                  </RailActionButton>
+                                )}
+                                {settingsNavShow("Assets") && (
+                                  <RailActionButton
+                                    data-active={activeView === "assets" ? "true" : undefined}
+                                    onClick={() => showView("assets")}
+                                    type="button"
+                                  >
+                                    <RailAssetsIcon aria-hidden="true" />
+                                    <span>Assets</span>
+                                  </RailActionButton>
+                                )}
+                                {settingsNavShow("Snipping") && (
+                                  <RailActionButton
+                                    data-active={activeView === "snipping" ? "true" : undefined}
+                                    onClick={() => showView("snipping")}
+                                    type="button"
+                                  >
+                                    <RailSnippingIcon aria-hidden="true" />
+                                    <span>Snipping</span>
+                                  </RailActionButton>
+                                )}
+                                {settingsNavShow("Audio") && (
+                                  <RailActionButton
+                                    data-active={activeView === "audio" ? "true" : undefined}
+                                    onClick={() => showView("audio")}
+                                    type="button"
+                                  >
+                                    <RailAudioIcon aria-hidden="true" />
+                                    <span>Audio</span>
+                                  </RailActionButton>
+                                )}
+                                {settingsNavShow("Tokenomics") && (
+                                  <RailActionButton
+                                    data-active={activeView === "tokenomics" ? "true" : undefined}
+                                    onClick={() => showView("tokenomics")}
+                                    type="button"
+                                  >
+                                    <RailTokenomicsIcon aria-hidden="true" />
+                                    <span>Tokenomics</span>
+                                  </RailActionButton>
+                                )}
+                                {settingsNavShow("Communication") && (
+                                  <RailActionButton
+                                    data-active={activeView === "devices" ? "true" : undefined}
+                                    onClick={() => showView("devices")}
+                                    type="button"
+                                  >
+                                    <RailDevicesIcon aria-hidden="true" />
+                                    <span>Communication</span>
+                                  </RailActionButton>
+                                )}
+                              </RailViewActions>
+                            </>
                           )}
                           {(settingsNavShow("SSH clients") || settingsNavShow("Email delivery")) && (
-                            <SettingsNavGroupLabel>Connections</SettingsNavGroupLabel>
-                          )}
-                          {settingsNavShow("SSH clients") && (
-                            <RailActionButton
-                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_SSH ? "true" : undefined}
-                              onClick={() => showSettingsView(SETTINGS_TAB_SSH)}
-                              type="button"
-                            >
-                              <ButtonTerminalIcon aria-hidden="true" />
-                              <span>SSH clients</span>
-                            </RailActionButton>
-                          )}
-                          {settingsNavShow("Email delivery") && (
-                            <RailActionButton
-                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_EMAIL ? "true" : undefined}
-                              onClick={() => showSettingsView(SETTINGS_TAB_EMAIL)}
-                              type="button"
-                            >
-                              <ButtonMailIcon aria-hidden="true" />
-                              <span>Email delivery</span>
-                            </RailActionButton>
+                            <>
+                              <SettingsNavGroupLabel>Connections</SettingsNavGroupLabel>
+                              <RailViewActions aria-label="Connection settings">
+                                {settingsNavShow("SSH clients") && (
+                                  <RailActionButton
+                                    data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_SSH ? "true" : undefined}
+                                    onClick={() => showSettingsView(SETTINGS_TAB_SSH)}
+                                    type="button"
+                                  >
+                                    <ButtonTerminalIcon aria-hidden="true" />
+                                    <span>SSH clients</span>
+                                  </RailActionButton>
+                                )}
+                                {settingsNavShow("Email delivery") && (
+                                  <RailActionButton
+                                    data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_EMAIL ? "true" : undefined}
+                                    onClick={() => showSettingsView(SETTINGS_TAB_EMAIL)}
+                                    type="button"
+                                  >
+                                    <ButtonMailIcon aria-hidden="true" />
+                                    <span>Email delivery</span>
+                                  </RailActionButton>
+                                )}
+                              </RailViewActions>
+                            </>
                           )}
                         </SettingsNavGroups>
                       </SettingsRailNav>

@@ -25636,7 +25636,8 @@ export const SettingsRailNav = styled.div`
   flex: 1;
   flex-direction: column;
   gap: 7px;
-  padding: 2px 2px 8px;
+  padding: 2px 8px 10px;
+  overflow-y: auto;
 `;
 
 export const SettingsBackButton = styled.button`
@@ -25695,7 +25696,7 @@ export const SettingsNavGroups = styled.div`
 `;
 
 export const SettingsNavGroupLabel = styled.div`
-  margin: 8px 4px 2px;
+  margin: 8px 6px 3px;
   color: var(--forge-text-muted);
   font-size: 9px;
   font-weight: 700;
@@ -25824,7 +25825,7 @@ export const AccountMenuPop = styled.div`
   left: 10px;
   z-index: 900;
   display: grid;
-  width: 188px;
+  width: 178px;
   gap: 1px;
   padding: 4px;
   border: 1px solid var(--forge-border-strong);
@@ -25842,7 +25843,7 @@ export const AccountMenuHeader = styled.div`
   strong {
     overflow: hidden;
     color: var(--forge-text);
-    font-size: 11.5px;
+    font-size: 11px;
     font-weight: 700;
     white-space: nowrap;
     text-overflow: ellipsis;
@@ -25858,22 +25859,22 @@ export const AccountMenuDivider = styled.div`
 export const AccountMenuRow = styled.button`
   display: flex;
   width: 100%;
-  min-height: 26px;
+  min-height: 24px;
   align-items: center;
   gap: 6px;
-  padding: 0 8px;
+  padding: 0 7px;
   border: 0;
   border-radius: 6px;
   color: var(--forge-text-soft);
   background: transparent;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 550;
   cursor: pointer;
   text-align: left;
 
   svg {
-    width: 13px;
-    height: 13px;
+    width: 12px;
+    height: 12px;
     flex: 0 0 auto;
     opacity: 0.85;
   }
@@ -25885,7 +25886,7 @@ export const AccountMenuRow = styled.button`
 
   em {
     color: var(--forge-text-muted);
-    font-size: 10px;
+    font-size: 9.5px;
     font-style: normal;
   }
 
@@ -25902,8 +25903,8 @@ export const AccountMenuRow = styled.button`
 export const AccountUsageRow = styled(AccountMenuRow)`
   flex-direction: column;
   align-items: stretch;
-  gap: 4px;
-  padding: 5px 8px;
+  gap: 3px;
+  padding: 4px 7px;
 
   > div {
     display: flex;
@@ -25932,9 +25933,11 @@ export const AccountUsageTrack = styled.span`
 
 export const AccountUsageLegend = styled.span`
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  min-width: 0;
   color: var(--forge-text-muted);
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 550;
 
   && > span {
