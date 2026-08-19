@@ -42,6 +42,11 @@ export default function AuthFlow({
   onCancel,
   onBootDone,
   onLaunchComplete,
+  // Host-window integration (desktop shell): round the layer to match the
+  // frameless window's corner radius, and keep the window draggable while
+  // the ceremony covers the title bar.
+  rounded = false,
+  onTitleBarMouseDown = null,
 }) {
   const canvasRef = useRef(null);
   const anchorRef = useRef(null);
@@ -92,9 +97,12 @@ export default function AuthFlow({
   const [codeA = "", codeB = ""] = String(code || "").split("·");
 
   return (
-    <Stage $gone={launching}>
+    <Stage $gone={launching} $rounded={rounded}>
       <Backdrop $gone={launching} />
       <ParticleCanvas ref={canvasRef} $gone={launching} />
+      {onTitleBarMouseDown && !launching && (
+        <DragStrip aria-hidden="true" onMouseDown={onTitleBarMouseDown} />
+      )}
 
       <AuthLayer $leaving={launching}>
         <LogoAnchor ref={anchorRef} />
@@ -170,13 +178,33 @@ const Stage = styled.div`
   inset: 0;
   z-index: 1000;
   overflow: hidden;
+  /* Establishes the containing block for the fixed canvas AND clips it —
+     plain overflow:hidden cannot clip position:fixed children, which left
+     the layer painting square corners over the rounded frameless window. */
+  contain: paint;
   color: ${C.text};
   font-family: inherit;
+  ${(p) =>
+    p.$rounded &&
+    css`
+      border-radius: 12px;
+    `}
   ${(p) =>
     p.$gone &&
     css`
       pointer-events: none;
     `}
+`;
+
+/* Invisible title-bar-height strip so the frameless window stays draggable
+   while the ceremony covers the real title bar. */
+const DragStrip = styled.div`
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 44px;
+  z-index: 6;
 `;
 
 /* The mockup painted this on the stage itself; here it fades out with the

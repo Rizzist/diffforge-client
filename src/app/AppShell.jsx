@@ -58149,7 +58149,9 @@ export default function App() {
               onLaunchComplete={handleAuthFlowLaunchComplete}
               onRegister={handleAuthFlowRegister}
               onSignIn={handleAuthFlowSignIn}
+              onTitleBarMouseDown={handleTitleBarMouseDown}
               phase={authFlowPhase}
+              rounded={windowControlPlatform === "macos" && !isWindowFrameExpanded}
               statusMessage={authState === "exchanging" ? authMessage : ""}
             />
           )}
