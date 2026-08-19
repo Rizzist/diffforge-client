@@ -10477,15 +10477,6 @@ fn run_app(daemon: bool) {
                     );
                 }
             }
-            let app_control_bridge_app = app.handle().clone();
-            let app_control_bridge_state = app.state::<AppControlMcpState>().inner().clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = app_control_mcp_endpoint_for_state(
-                    app_control_bridge_app,
-                    &app_control_bridge_state,
-                )
-                .await;
-            });
             desktop_auth_start_renewal_loop(app.handle().clone(), cloud_mcp_state.clone());
             tauri::async_runtime::spawn(async move {
                 // Restore the persisted desktop session before the first
@@ -10577,21 +10568,12 @@ fn run_app(daemon: bool) {
                 app.handle().clone(),
                 app.state::<CloudMcpState>().inner().clone(),
             );
-            cloud_mcp_start_architecture_event_sync(
-                app.handle().clone(),
-                app.state::<CloudMcpState>().inner().clone(),
-            );
             energy_impact::energy_impact_start();
             video_cloud_generation_events_start(
                 app.handle().clone(),
                 app.state::<CloudMcpState>().inner().clone(),
             );
-            architecture_store_watcher_start(app.handle().clone());
             cloud_mcp_start_account_documents_watcher(app.handle().clone());
-            cloud_mcp_start_agent_inventory_watcher(
-                app.handle().clone(),
-                app.state::<CloudMcpState>().inner().clone(),
-            );
             // Background dispatcher: dormant while the webview heartbeats;
             // takes over queued-todo submission when the window goes away.
             todo_dispatch_start_background_dispatcher(app.handle().clone());
@@ -10607,7 +10589,6 @@ fn run_app(daemon: bool) {
                 background_tray_create(app.handle());
             }
             todo_store_orphan_sweep_start(app.handle().clone());
-            agent_accounts_capture_watch_start(app.handle().clone());
             // Startup todo recovery is bounded, not destructive: queued work
             // survives app startup, while ambiguous in-flight rows wait for
             // Rust terminal/workspace evidence or a 45s timeout before being
