@@ -439,9 +439,18 @@ fn haider_bridge_collect_sessions(
     }
 }
 
+/// Subagent sessions are daemon-marked by id convention ("session-child-…").
+/// They are real sessions but never DIRECT ones — the rail must not list
+/// them. (A typed kind/parent field on the summary is on the harness ask
+/// list; until then the id prefix is the daemon's own marker.)
+fn haider_bridge_is_subagent_session(id: &str) -> bool {
+    id.starts_with("session-child-")
+}
+
 fn haider_bridge_parse_session_list(value: &Value) -> Vec<HaiderBridgeSession> {
     let mut sessions = Vec::new();
     haider_bridge_collect_sessions(value, None, &mut sessions);
+    sessions.retain(|session| !haider_bridge_is_subagent_session(&session.id));
     sessions.sort_by(|left, right| left.id.cmp(&right.id));
     sessions.dedup_by(|left, right| left.id == right.id);
     sessions
@@ -1058,6 +1067,23 @@ mod haider_bridge_tests {
                 latest_at_ms: Some(1_777_777_777_123),
             }]
         );
+    }
+
+    #[test]
+    fn haider_bridge_subagent_sessions_never_reach_the_rail() {
+        let sample = json!({
+            "sessions": [
+                {"id": "session-abc123", "title": "Real work", "updated_at": 5_i64},
+                {"id": "session-child-deadbeef", "title": "Delegated task: pick", "updated_at": 6_i64},
+            ]
+        });
+        let parsed = haider_bridge_parse_session_list(&sample);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "session-abc123");
+        // Excluded from the parsed roster ⇒ the roster-absence prune removes
+        // any child row an older build already imported.
+        assert!(haider_bridge_is_subagent_session("session-child-deadbeef"));
+        assert!(!haider_bridge_is_subagent_session("session-abc123"));
     }
 
     #[test]
