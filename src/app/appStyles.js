@@ -25806,9 +25806,10 @@ export const RailAccountChipButton = styled.button`
 `;
 
 export const AccountMenuPop = styled.div`
-  position: absolute;
-  bottom: calc(100% + 10px);
-  left: 0;
+  /* Fixed so no rail scroll container or overflow can clip the menu. */
+  position: fixed;
+  bottom: 64px;
+  left: 14px;
   z-index: 500;
   display: grid;
   width: 248px;

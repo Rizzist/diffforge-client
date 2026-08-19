@@ -554,7 +554,6 @@ import {
   WorkspaceAccent,
   WorkspaceMuted,
   RailFooter,
-  RailTopActions,
   RailAccountBar,
   RailAccountAvatar,
   RailAccountChipButton,
@@ -55297,22 +55296,6 @@ export default function App() {
                         )}
                       </RailCollapseButton>
                     </RailHeader>
-                    <RailTopActions aria-label="App">
-                      <RailActionButton
-                        aria-label="Settings"
-                        data-active={activeView === "settings"}
-                        data-scope="global"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          showView("settings");
-                        }}
-                        title="Settings (⌘,)"
-                        type="button"
-                      >
-                        <RailSettingsIcon aria-hidden="true" />
-                        <span>Settings</span>
-                      </RailActionButton>
-                    </RailTopActions>
                     {/* Rows stay visible (and interactive) as centered icon
                         tiles when the rail is collapsed, so the list is never
                         aria-hidden. */}
