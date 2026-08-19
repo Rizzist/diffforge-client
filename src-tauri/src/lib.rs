@@ -2973,6 +2973,8 @@ include!("backend_cpu.rs");
 include!("workspace_files.rs");
 include!("sessions.rs");
 include!("haider_bridge.rs");
+include!("haider_projection.rs");
+include!("haider_run.rs");
 include!("architectures.rs");
 include!("pcb.rs");
 include!("video_editor.rs");
@@ -6249,6 +6251,12 @@ fn run_app(daemon: bool) {
             session_update,
             session_delete,
             sessions_home_dir,
+            session_projection_window,
+            session_projection_ensure,
+            session_projection_attach,
+            session_projection_detach,
+            session_start_with_prompt,
+            session_submit_prompt,
             haider_usage_snapshot,
             open_html_document_in_browser,
             app_local_state_load,
@@ -6700,6 +6708,8 @@ fn run_app(daemon: bool) {
     app.run(move |app, event| {
         if !daemon && matches!(&event, tauri::RunEvent::Exit) {
             haider_bridge_stop();
+            haider_projection_stop();
+            haider_run_stop();
         }
         if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
             let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
