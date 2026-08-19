@@ -36,6 +36,7 @@ export function sessionPaneId(sessionId) {
 
 export default function SessionTerminal({ session, active }) {
   const containerRef = useRef(null);
+  const mountRef = useRef(null);
   const xtermRef = useRef(null);
   const instanceIdRef = useRef(0);
   const activeRef = useRef(active);
@@ -43,8 +44,9 @@ export default function SessionTerminal({ session, active }) {
 
   /* One PTY per mount; the engine never re-runs for prop changes. */
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container || !session?.id) {
+    const container = mountRef.current;
+    const observedHost = containerRef.current;
+    if (!container || !observedHost || !session?.id) {
       return undefined;
     }
 
@@ -105,7 +107,7 @@ export default function SessionTerminal({ session, active }) {
         fastScrollModifier: "alt",
         fastScrollSensitivity: 5,
         fontFamily: "\"Cascadia Mono\", \"SFMono-Regular\", Consolas, monospace",
-        fontSize: 13,
+        fontSize: 12,
         lineHeight: 1.0,
         macOptionIsMeta: true,
         scrollback: 10000,
@@ -174,6 +176,16 @@ export default function SessionTerminal({ session, active }) {
       }
       touchSession();
       fitTerminal();
+      // Font metrics settle after the face loads and after xterm's first
+      // paint — refit on both so a full-screen TUI never keeps stale rows.
+      window.setTimeout(fitTerminal, 250);
+      if (typeof document !== "undefined" && document.fonts?.ready) {
+        void document.fonts.ready.then(() => {
+          if (!disposed) {
+            fitTerminal();
+          }
+        });
+      }
       if (activeRef.current) {
         term.focus();
       }
@@ -188,7 +200,7 @@ export default function SessionTerminal({ session, active }) {
     window.addEventListener("resize", scheduleFit);
     if (typeof ResizeObserver === "function") {
       resizeObserver = new ResizeObserver(scheduleFit);
-      resizeObserver.observe(container);
+      resizeObserver.observe(observedHost);
     }
 
     return () => {
@@ -222,7 +234,7 @@ export default function SessionTerminal({ session, active }) {
       return;
     }
     const term = xtermRef.current;
-    const container = containerRef.current;
+    const container = mountRef.current;
     if (!term || !container) {
       return;
     }
@@ -240,24 +252,39 @@ export default function SessionTerminal({ session, active }) {
     term.focus();
   }, [active, session?.id]);
 
-  return <TerminalHost ref={containerRef} />;
+  return (
+    <TerminalHost ref={containerRef}>
+      <TerminalMount ref={mountRef} />
+    </TerminalHost>
+  );
 }
 
 const TerminalHost = styled.div`
+  position: relative;
   width: 100%;
   height: 100%;
   min-height: 0;
-  /* No padding: measureTerminalGrid sizes rows from the container box, so
-     any inset makes the TUI draw rows that clip at the bottom edge. */
-  padding: 0;
   overflow: hidden;
   background: ${TERMINAL_DARK_THEME.background};
 
   html[data-forge-theme="light"] & {
     background: ${TERMINAL_LIGHT_THEME.background};
   }
+`;
+
+/* xterm mounts (and is measured) against this inset box: the 1px vertical
+   guard band means fractional cell metrics can only round rows DOWN, so a
+   full-screen TUI's first and last lines are never clipped. */
+const TerminalMount = styled.div`
+  position: absolute;
+  inset: 1px 0 1px 6px;
 
   .xterm {
+    width: 100%;
     height: 100%;
+  }
+
+  .xterm .xterm-viewport {
+    background: transparent;
   }
 `;
