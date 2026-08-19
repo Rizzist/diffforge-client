@@ -26,6 +26,9 @@ export function normalizeSessionRow(row) {
     latest_at_ms: Number(row.latest_at_ms) || Number(row.created_at_ms) || 0,
     status: String(row.status || "idle"),
     first_user_message: String(row.first_user_message || ""),
+    model: String(row.model || ""),
+    pinned: row.pinned === true || row.pinned === 1,
+    title_locked: row.title_locked === true || row.title_locked === 1,
   };
 }
 

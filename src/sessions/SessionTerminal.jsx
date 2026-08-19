@@ -254,7 +254,11 @@ export default function SessionTerminal({ session, active }) {
           agent_id: "haider",
           agent_kind: "haider",
           provider: "haider",
-          fresh_session: !session.provider_session_id,
+          /* Never fresh: with no provider session the haider launch args are
+             identical, and fresh_session=true would veto adopting the live
+             PTY — session shells must survive Chat/Shell toggles. */
+          fresh_session: false,
+          adopt_existing: true,
           provider_session_id: session.provider_session_id || "",
           plain_shell: false,
           session_mode: "",
@@ -336,13 +340,10 @@ export default function SessionTerminal({ session, active }) {
         window.cancelAnimationFrame(firstOutputFitFrame);
       }
       detachPushToTalk();
-      // The PTY intentionally outlives the component only when the whole
-      // app closes; unmounting a session host means the session was closed
-      // in the UI, so shut the PTY down with it.
-      invoke("terminal_close", {
-        pane_id: paneId,
-        instance_id: instanceIdRef.current || undefined,
-      }).catch(() => {});
+      // The PTY outlives the component: session shells persist across
+      // Chat/Shell toggles and session switches, and the next mount adopts
+      // the live instance (adopt_existing). terminal_close happens only when
+      // the session itself is deleted or the app shuts down.
       if (term) {
         term.dispose();
       }
