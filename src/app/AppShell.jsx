@@ -561,8 +561,9 @@ import {
   AccountMenuHeader,
   AccountMenuDivider,
   AccountMenuRow,
-  SettingsScreen,
-  SettingsSideRail,
+  AccountUsageRow,
+  AccountUsageTrack,
+  SettingsRailNav,
   SettingsBackButton,
   SettingsSearchInput,
   SettingsNavGroups,
@@ -23937,6 +23938,12 @@ export default function App() {
           : "General";
   const accountDisplayName = String(user?.name || user?.email || "Account").trim() || "Account";
   const accountInitial = accountDisplayName.charAt(0).toUpperCase();
+  // While settings (or a view re-homed under it) is active, the rail's list
+  // area shows the settings nav instead of workspaces, so switching between
+  // settings sections never loses the nav.
+  const settingsRailMode = activeView === "settings"
+    || GLOBAL_TOOLS_VIEWS.has(activeView)
+    || ["assets", "snipping", "audio", "tokenomics", "devices"].includes(activeView);
   const [nativeNotificationSettings, setNativeNotificationSettings] = useState(readNativeNotificationSettings);
   const [notificationSfxSettings, setNotificationSfxSettings] = useState(readNotificationSfxSettings);
   const [notificationPreferences, setNotificationPreferences] = useState(() => normalizeNotificationPreferences(null));
@@ -55300,9 +55307,149 @@ export default function App() {
                         )}
                       </RailCollapseButton>
                     </RailHeader>
-                    {/* Rows stay visible (and interactive) as centered icon
-                        tiles when the rail is collapsed, so the list is never
-                        aria-hidden. */}
+                    {settingsRailMode ? (
+                      <SettingsRailNav
+                        aria-label="Settings navigation"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <SettingsBackButton
+                          onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
+                          type="button"
+                        >
+                          <span aria-hidden="true">←</span>
+                          Back to app
+                        </SettingsBackButton>
+                        <SettingsSearchInput
+                          aria-label="Search settings"
+                          onChange={(event) => setSettingsSearch(event.target.value)}
+                          placeholder="Search settings..."
+                          type="search"
+                          value={settingsSearch}
+                        />
+                        <SettingsNavGroups>
+                          {(settingsNavShow("General") || settingsNavShow("Notifications") || settingsNavShow("Permissions")) && (
+                            <SettingsNavGroupLabel>Personal</SettingsNavGroupLabel>
+                          )}
+                          {settingsNavShow("General") && (
+                            <SettingsNavItem
+                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_GENERAL ? "true" : undefined}
+                              onClick={() => showSettingsView(SETTINGS_TAB_GENERAL)}
+                              type="button"
+                            >
+                              <ButtonSettingsIcon aria-hidden="true" />
+                              <span>General</span>
+                            </SettingsNavItem>
+                          )}
+                          {settingsNavShow("Notifications") && (
+                            <SettingsNavItem
+                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_NOTIFICATIONS ? "true" : undefined}
+                              onClick={() => showSettingsView(SETTINGS_TAB_NOTIFICATIONS)}
+                              type="button"
+                            >
+                              <ButtonNotificationIcon aria-hidden="true" />
+                              <span>Notifications</span>
+                            </SettingsNavItem>
+                          )}
+                          {settingsNavShow("Permissions") && (
+                            <SettingsNavItem
+                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_PERMISSIONS ? "true" : undefined}
+                              onClick={() => showSettingsView(SETTINGS_TAB_PERMISSIONS)}
+                              type="button"
+                            >
+                              <ButtonSecurityIcon aria-hidden="true" />
+                              <span>Permissions</span>
+                            </SettingsNavItem>
+                          )}
+                          {(settingsNavShow("SSH clients") || settingsNavShow("Email delivery")) && (
+                            <SettingsNavGroupLabel>Connections</SettingsNavGroupLabel>
+                          )}
+                          {settingsNavShow("SSH clients") && (
+                            <SettingsNavItem
+                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_SSH ? "true" : undefined}
+                              onClick={() => showSettingsView(SETTINGS_TAB_SSH)}
+                              type="button"
+                            >
+                              <ButtonTerminalIcon aria-hidden="true" />
+                              <span>SSH clients</span>
+                            </SettingsNavItem>
+                          )}
+                          {settingsNavShow("Email delivery") && (
+                            <SettingsNavItem
+                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_EMAIL ? "true" : undefined}
+                              onClick={() => showSettingsView(SETTINGS_TAB_EMAIL)}
+                              type="button"
+                            >
+                              <ButtonMailIcon aria-hidden="true" />
+                              <span>Email delivery</span>
+                            </SettingsNavItem>
+                          )}
+                          {(settingsNavShow("Tools") || settingsNavShow("Assets") || settingsNavShow("Snipping")
+                            || settingsNavShow("Audio") || settingsNavShow("Tokenomics") || settingsNavShow("Communication")) && (
+                            <SettingsNavGroupLabel>App</SettingsNavGroupLabel>
+                          )}
+                          {settingsNavShow("Tools") && (
+                            <SettingsNavItem
+                              data-active={GLOBAL_TOOLS_VIEWS.has(activeView) ? "true" : undefined}
+                              onClick={() => showView("tools")}
+                              type="button"
+                            >
+                              <RailToolsIcon aria-hidden="true" />
+                              <span>Tools</span>
+                            </SettingsNavItem>
+                          )}
+                          {settingsNavShow("Assets") && (
+                            <SettingsNavItem
+                              data-active={activeView === "assets" ? "true" : undefined}
+                              onClick={() => showView("assets")}
+                              type="button"
+                            >
+                              <RailAssetsIcon aria-hidden="true" />
+                              <span>Assets</span>
+                            </SettingsNavItem>
+                          )}
+                          {settingsNavShow("Snipping") && (
+                            <SettingsNavItem
+                              data-active={activeView === "snipping" ? "true" : undefined}
+                              onClick={() => showView("snipping")}
+                              type="button"
+                            >
+                              <RailSnippingIcon aria-hidden="true" />
+                              <span>Snipping</span>
+                            </SettingsNavItem>
+                          )}
+                          {settingsNavShow("Audio") && (
+                            <SettingsNavItem
+                              data-active={activeView === "audio" ? "true" : undefined}
+                              onClick={() => showView("audio")}
+                              type="button"
+                            >
+                              <RailAudioIcon aria-hidden="true" />
+                              <span>Audio</span>
+                            </SettingsNavItem>
+                          )}
+                          {settingsNavShow("Tokenomics") && (
+                            <SettingsNavItem
+                              data-active={activeView === "tokenomics" ? "true" : undefined}
+                              onClick={() => showView("tokenomics")}
+                              type="button"
+                            >
+                              <RailTokenomicsIcon aria-hidden="true" />
+                              <span>Tokenomics</span>
+                            </SettingsNavItem>
+                          )}
+                          {settingsNavShow("Communication") && (
+                            <SettingsNavItem
+                              data-active={activeView === "devices" ? "true" : undefined}
+                              onClick={() => showView("devices")}
+                              type="button"
+                            >
+                              <RailDevicesIcon aria-hidden="true" />
+                              <span>Communication</span>
+                            </SettingsNavItem>
+                          )}
+                        </SettingsNavGroups>
+                      </SettingsRailNav>
+                    ) : (
                     <WorkspaceList>
                       {loopspacesModeActive ? (
                         <>
@@ -55373,6 +55520,7 @@ export default function App() {
                         </>
                       )}
                     </WorkspaceList>
+                    )}
                   </RailTop>
 
                   <RailFooter>
@@ -55434,7 +55582,7 @@ export default function App() {
                             <strong>{accountDisplayName}</strong>
                           </AccountMenuHeader>
                           <AccountMenuDivider />
-                          <AccountMenuRow
+                          <AccountUsageRow
                             onClick={(event) => {
                               event.stopPropagation();
                               setAccountMenuOpen(false);
@@ -55443,10 +55591,15 @@ export default function App() {
                             role="menuitem"
                             type="button"
                           >
-                            <RailTokenomicsIcon aria-hidden="true" />
-                            <span>Usage</span>
-                            <em>{Number.isFinite(billingCreditPercent) ? `${Math.round(billingCreditPercent)}% left` : ""}</em>
-                          </AccountMenuRow>
+                            <div>
+                              <RailTokenomicsIcon aria-hidden="true" />
+                              <span>Usage</span>
+                              <em>{Number.isFinite(billingCreditPercent) ? `${Math.round(billingCreditPercent)}% left` : ""}</em>
+                            </div>
+                            <AccountUsageTrack aria-hidden="true">
+                              <i style={{ width: `${Math.max(0, Math.min(100, Math.round(billingCreditPercent) || 0))}%` }} />
+                            </AccountUsageTrack>
+                          </AccountUsageRow>
                           <AccountMenuRow
                             onClick={(event) => {
                               event.stopPropagation();
@@ -56243,126 +56396,6 @@ export default function App() {
                     aria-hidden={!settingsViewVisible}
                     data-visible={settingsViewVisible}
                   >
-                {createPortal(
-                  <SettingsScreen
-                    data-expanded={isWindowFrameExpanded ? "true" : "false"}
-                    data-motion={settingsViewVisible ? viewMotion : "entered"}
-                    data-visible={settingsViewVisible ? "true" : "false"}
-                  >
-                  <SettingsSideRail aria-label="Settings navigation">
-                    <SettingsBackButton
-                      onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
-                      type="button"
-                    >
-                      <span aria-hidden="true">←</span>
-                      Back to app
-                    </SettingsBackButton>
-                    <SettingsSearchInput
-                      aria-label="Search settings"
-                      onChange={(event) => setSettingsSearch(event.target.value)}
-                      placeholder="Search settings..."
-                      type="search"
-                      value={settingsSearch}
-                    />
-                    <SettingsNavGroups>
-                      {(settingsNavShow("General") || settingsNavShow("Notifications") || settingsNavShow("Permissions")) && (
-                        <SettingsNavGroupLabel>Personal</SettingsNavGroupLabel>
-                      )}
-                      {settingsNavShow("General") && (
-                        <SettingsNavItem
-                          data-active={settingsTab === SETTINGS_TAB_GENERAL ? "true" : undefined}
-                          onClick={() => setSettingsTab(SETTINGS_TAB_GENERAL)}
-                          type="button"
-                        >
-                          <ButtonSettingsIcon aria-hidden="true" />
-                          <span>General</span>
-                        </SettingsNavItem>
-                      )}
-                      {settingsNavShow("Notifications") && (
-                        <SettingsNavItem
-                          data-active={settingsTab === SETTINGS_TAB_NOTIFICATIONS ? "true" : undefined}
-                          onClick={() => setSettingsTab(SETTINGS_TAB_NOTIFICATIONS)}
-                          type="button"
-                        >
-                          <ButtonNotificationIcon aria-hidden="true" />
-                          <span>Notifications</span>
-                        </SettingsNavItem>
-                      )}
-                      {settingsNavShow("Permissions") && (
-                        <SettingsNavItem
-                          data-active={settingsTab === SETTINGS_TAB_PERMISSIONS ? "true" : undefined}
-                          onClick={() => setSettingsTab(SETTINGS_TAB_PERMISSIONS)}
-                          type="button"
-                        >
-                          <ButtonSecurityIcon aria-hidden="true" />
-                          <span>Permissions</span>
-                        </SettingsNavItem>
-                      )}
-                      {(settingsNavShow("SSH clients") || settingsNavShow("Email delivery")) && (
-                        <SettingsNavGroupLabel>Connections</SettingsNavGroupLabel>
-                      )}
-                      {settingsNavShow("SSH clients") && (
-                        <SettingsNavItem
-                          data-active={settingsTab === SETTINGS_TAB_SSH ? "true" : undefined}
-                          onClick={() => setSettingsTab(SETTINGS_TAB_SSH)}
-                          type="button"
-                        >
-                          <ButtonTerminalIcon aria-hidden="true" />
-                          <span>SSH clients</span>
-                        </SettingsNavItem>
-                      )}
-                      {settingsNavShow("Email delivery") && (
-                        <SettingsNavItem
-                          data-active={settingsTab === SETTINGS_TAB_EMAIL ? "true" : undefined}
-                          onClick={() => setSettingsTab(SETTINGS_TAB_EMAIL)}
-                          type="button"
-                        >
-                          <ButtonMailIcon aria-hidden="true" />
-                          <span>Email delivery</span>
-                        </SettingsNavItem>
-                      )}
-                      {(settingsNavShow("Tools") || settingsNavShow("Assets") || settingsNavShow("Snipping")
-                        || settingsNavShow("Audio") || settingsNavShow("Tokenomics") || settingsNavShow("Communication")) && (
-                        <SettingsNavGroupLabel>App</SettingsNavGroupLabel>
-                      )}
-                      {settingsNavShow("Tools") && (
-                        <SettingsNavItem onClick={() => showView("tools")} type="button">
-                          <RailToolsIcon aria-hidden="true" />
-                          <span>Tools</span>
-                        </SettingsNavItem>
-                      )}
-                      {settingsNavShow("Assets") && (
-                        <SettingsNavItem onClick={() => showView("assets")} type="button">
-                          <RailAssetsIcon aria-hidden="true" />
-                          <span>Assets</span>
-                        </SettingsNavItem>
-                      )}
-                      {settingsNavShow("Snipping") && (
-                        <SettingsNavItem onClick={() => showView("snipping")} type="button">
-                          <RailSnippingIcon aria-hidden="true" />
-                          <span>Snipping</span>
-                        </SettingsNavItem>
-                      )}
-                      {settingsNavShow("Audio") && (
-                        <SettingsNavItem onClick={() => showView("audio")} type="button">
-                          <RailAudioIcon aria-hidden="true" />
-                          <span>Audio</span>
-                        </SettingsNavItem>
-                      )}
-                      {settingsNavShow("Tokenomics") && (
-                        <SettingsNavItem onClick={() => showView("tokenomics")} type="button">
-                          <RailTokenomicsIcon aria-hidden="true" />
-                          <span>Tokenomics</span>
-                        </SettingsNavItem>
-                      )}
-                      {settingsNavShow("Communication") && (
-                        <SettingsNavItem onClick={() => showView("devices")} type="button">
-                          <RailDevicesIcon aria-hidden="true" />
-                          <span>Communication</span>
-                        </SettingsNavItem>
-                      )}
-                    </SettingsNavGroups>
-                  </SettingsSideRail>
                 <SettingsPage data-motion={settingsViewVisible ? viewMotion : "entered"}>
                   <SettingsContentTitle>{settingsActiveLabel}</SettingsContentTitle>
 
@@ -57460,9 +57493,6 @@ export default function App() {
                     </AccountSettingsPanel>
                   )}
                 </SettingsPage>
-                  </SettingsScreen>,
-                  document.body,
-                )}
                   </WorkspaceRuntimeLayer>
                   <WorkspaceRuntimeLayer
                     aria-hidden={!globalToolsViewVisible}

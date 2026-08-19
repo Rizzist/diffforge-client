@@ -25630,22 +25630,31 @@ export const SettingsSideRail = styled.aside`
   }
 `;
 
+export const SettingsRailNav = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 7px;
+  padding: 2px 2px 8px;
+`;
+
 export const SettingsBackButton = styled.button`
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
+  gap: 8px;
+  padding: 5px 8px;
   border: 0;
-  border-radius: 10px;
+  border-radius: 8px;
   color: var(--forge-text-soft);
   background: transparent;
-  font-size: 14px;
+  font-size: 12.5px;
   font-weight: 650;
   cursor: pointer;
   text-align: left;
 
   span {
-    font-size: 16px;
+    font-size: 14px;
     line-height: 1;
   }
 
@@ -25657,12 +25666,12 @@ export const SettingsBackButton = styled.button`
 
 export const SettingsSearchInput = styled.input`
   width: 100%;
-  padding: 9px 12px;
+  padding: 6px 10px;
   border: 1px solid var(--forge-border);
   border-radius: 999px;
   color: var(--forge-text);
   background: var(--forge-surface-control);
-  font-size: 13px;
+  font-size: 12px;
   outline: none;
 
   &::placeholder {
@@ -25685,31 +25694,31 @@ export const SettingsNavGroups = styled.div`
 `;
 
 export const SettingsNavGroupLabel = styled.div`
-  margin: 12px 10px 4px;
+  margin: 8px 8px 2px;
   color: var(--forge-text-muted);
-  font-size: 11.5px;
+  font-size: 10.5px;
   font-weight: 720;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.05em;
 `;
 
 export const SettingsNavItem = styled.button`
   display: flex;
   width: 100%;
   align-items: center;
-  gap: 10px;
-  padding: 9px 10px;
+  gap: 8px;
+  padding: 6px 8px;
   border: 0;
-  border-radius: 10px;
+  border-radius: 8px;
   color: var(--forge-text-soft);
   background: transparent;
-  font-size: 13.5px;
+  font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
   text-align: left;
 
   svg {
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
     flex: 0 0 auto;
     opacity: 0.85;
   }
@@ -25755,14 +25764,14 @@ export const RailAccountBar = styled.div`
 
 export const RailAccountAvatar = styled.span`
   display: grid;
-  width: 26px;
-  height: 26px;
+  width: 20px;
+  height: 20px;
   flex: 0 0 auto;
   place-items: center;
   border-radius: 50%;
   color: #fff;
   background: linear-gradient(135deg, var(--forge-blue), var(--forge-ember));
-  font-size: 12px;
+  font-size: 10px;
   font-weight: 760;
 `;
 
@@ -25771,13 +25780,13 @@ export const RailAccountChipButton = styled.button`
   width: 100%;
   min-width: 0;
   align-items: center;
-  gap: 10px;
-  padding: 7px 8px;
+  gap: 8px;
+  padding: 5px 6px;
   border: 0;
-  border-radius: 10px;
+  border-radius: 8px;
   color: var(--forge-text-soft);
   background: transparent;
-  font-size: 13.5px;
+  font-size: 12.5px;
   font-weight: 650;
   cursor: pointer;
   text-align: left;
@@ -25809,29 +25818,29 @@ export const AccountMenuPop = styled.div`
   /* Portaled to document.body and fixed: no rail overflow or stacking
      context can clip or bury the menu. */
   position: fixed;
-  bottom: 64px;
-  left: 14px;
+  bottom: 52px;
+  left: 10px;
   z-index: 900;
   display: grid;
-  width: 248px;
-  gap: 2px;
-  padding: 8px;
+  width: 208px;
+  gap: 1px;
+  padding: 5px;
   border: 1px solid var(--forge-border-strong);
-  border-radius: 16px;
+  border-radius: 12px;
   background: var(--forge-surface-raised);
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.5);
 `;
 
 export const AccountMenuHeader = styled.div`
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 6px 8px;
+  gap: 8px;
+  padding: 5px 7px;
 
   strong {
     overflow: hidden;
     color: var(--forge-text);
-    font-size: 14px;
+    font-size: 12.5px;
     font-weight: 700;
     white-space: nowrap;
     text-overflow: ellipsis;
@@ -25848,20 +25857,20 @@ export const AccountMenuRow = styled.button`
   display: flex;
   width: 100%;
   align-items: center;
-  gap: 10px;
-  padding: 9px 10px;
+  gap: 8px;
+  padding: 6px 8px;
   border: 0;
-  border-radius: 10px;
+  border-radius: 8px;
   color: var(--forge-text-soft);
   background: transparent;
-  font-size: 13.5px;
+  font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
   text-align: left;
 
   svg {
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
     flex: 0 0 auto;
     opacity: 0.85;
   }
@@ -25873,7 +25882,7 @@ export const AccountMenuRow = styled.button`
 
   em {
     color: var(--forge-text-muted);
-    font-size: 12px;
+    font-size: 11px;
     font-style: normal;
   }
 
@@ -25884,5 +25893,37 @@ export const AccountMenuRow = styled.button`
 
   &[data-variant="signout"]:hover {
     color: var(--forge-red);
+  }
+`;
+
+export const AccountUsageRow = styled(AccountMenuRow)`
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+
+  > div {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  > div span {
+    flex: 1;
+    min-width: 0;
+  }
+`;
+
+export const AccountUsageTrack = styled.span`
+  display: block;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(230, 236, 245, 0.1);
+
+  i {
+    display: block;
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--forge-blue), var(--forge-ember));
   }
 `;
