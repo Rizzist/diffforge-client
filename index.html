@@ -59,6 +59,13 @@
           if (window.location.hash === "#/background-monitor") {
             document.documentElement.dataset.backgroundMonitor = "true";
           }
+          // Main frameless window on macOS: stamp before first paint so the
+          // transparent+rounded shell CSS applies from frame one (the React
+          // effect that sets this later is idempotent). Utility windows all
+          // carry a #/ hash and keep their own treatments.
+          if (!window.location.hash && navigator.platform.toLowerCase().includes("mac")) {
+            document.documentElement.dataset.windowPlatform = "macos";
+          }
         } catch {
           document.documentElement.dataset.forgeTheme = THEME_DEFAULT;
           if (window.location.hash === "#/audio-widget") {
@@ -81,6 +88,9 @@
           if (window.location.hash === "#/background-monitor") {
             document.documentElement.dataset.backgroundMonitor = "true";
           }
+          if (!window.location.hash && navigator.platform.toLowerCase().includes("mac")) {
+            document.documentElement.dataset.windowPlatform = "macos";
+          }
         }
       })();
     </script>
@@ -96,6 +106,24 @@
 
       body {
         overflow: hidden;
+      }
+
+      /* Main frameless window on macOS: transparent from the very first
+         paint (the React shell owns the rounded 12px surface), with a
+         pre-React rounded placeholder so the opening frame is never a
+         square. */
+      html[data-window-platform="macos"],
+      html[data-window-platform="macos"] body,
+      html[data-window-platform="macos"] #app {
+        background: transparent !important;
+      }
+
+      html[data-window-platform="macos"] #app:empty::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        border-radius: 12px;
+        background: #030508;
       }
 
       html[data-audio-widget="true"],
