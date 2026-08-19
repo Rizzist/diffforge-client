@@ -570,6 +570,7 @@ import {
   SettingsNavGroups,
   SettingsNavGroupLabel,
   SettingsContentTitle,
+  TitleToolDockToggle,
   RailGlobalActions,
   RailViewActions,
   RailActionButton,
@@ -5493,6 +5494,7 @@ const CLOUD_WORKSPACE_STAGE_ORDER = Object.freeze({
   workspace_socket: 5,
 });
 const AGENT_PROVIDERS = [
+  { id: "haider", label: "Haider Agent", shortLabel: "Haider" },
   { id: "codex", label: "Codex", shortLabel: "Codex" },
   { id: "claude", label: "Claude Code", shortLabel: "Claude" },
   { id: "opencode", label: "OpenCode", shortLabel: "OpenCode" },
@@ -5523,6 +5525,11 @@ const GENERIC_TERMINAL_AGENT = {
   auth_message: "Plain terminal",
 };
 const AGENT_INSTALL_GUIDES = {
+  haider: {
+    native_install_url: "https://github.com/Rizzist/haider-agent/releases/latest",
+    native_install_label: "GitHub release binaries",
+    install_command: "",
+  },
   codex: {
     native_install_url: "https://github.com/openai/codex/releases/latest",
     native_install_label: "GitHub release binaries",
@@ -5556,18 +5563,20 @@ const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
   npm_latest_version: "Not checked",
   npm_update_available: false,
   recommend_native_install: true,
-  connect_command: provider.id === "codex"
-    ? "codex login --device-auth"
-    : provider.id === "opencode"
-      ? "opencode auth login"
-      : "claude",
-  image_input_supported: provider.id === "codex" || provider.id === "claude",
+  connect_command: provider.id === "haider"
+    ? "haider login"
+    : provider.id === "codex"
+      ? "codex login --device-auth"
+      : provider.id === "opencode"
+        ? "opencode auth login"
+        : "claude",
+  image_input_supported: provider.id !== "opencode",
   image_input_support: provider.id === "opencode" ? "conditional" : "supported",
   image_input_reason: provider.id === "opencode"
     ? "OpenCode image input depends on the selected model."
     : `${provider.label} supports image input.`,
   active_model: "",
-  active_model_supports_images: provider.id === "codex" || provider.id === "claude",
+  active_model_supports_images: provider.id !== "opencode",
 }));
 
 function getDefaultAgentStatus(providerId) {
@@ -38908,26 +38917,22 @@ export default function App() {
   const workspaceToolRestoredMinSize = workspaceToolLayoutWidth > 0
     ? Math.min(70, Math.max(20, (WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX / workspaceToolLayoutWidth) * 100))
     : 20;
-  const workspaceToolPanelSize = workspaceToolPaneVisible
-    ? workspaceToolPaneMinimized
-      ? workspaceToolMinimizedSize
-      : workspaceToolPaneFullscreen
-        ? 62
-        : Math.max(30, workspaceToolRestoredMinSize)
+  // Minimized takes ZERO width — the title-bar Tools toggle is the way back,
+  // so no vertical strip eats horizontal room.
+  const workspaceToolPanelSize = workspaceToolPaneVisible && !workspaceToolPaneMinimized
+    ? workspaceToolPaneFullscreen
+      ? 62
+      : Math.max(30, workspaceToolRestoredMinSize)
     : 0;
-  const workspaceMainPanelSize = workspaceToolPaneVisible ? 100 - workspaceToolPanelSize : 100;
-  const workspaceToolPanelMinSize = workspaceToolPaneVisible
-    ? workspaceToolPaneMinimized
-      ? `${workspaceToolMinimizedSize}%`
-      : `${WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX}px`
+  const workspaceMainPanelSize = 100 - workspaceToolPanelSize;
+  const workspaceToolPanelMinSize = workspaceToolPaneVisible && !workspaceToolPaneMinimized
+    ? `${WORKSPACE_TOOL_RESTORED_MIN_WIDTH_PX}px`
     : "0px";
-  const workspaceToolPanelMaxSize = workspaceToolPaneVisible
-    ? workspaceToolPaneMinimized
-      ? workspaceToolMinimizedSize
-      : 70
+  const workspaceToolPanelMaxSize = workspaceToolPaneVisible && !workspaceToolPaneMinimized
+    ? 70
     : 0;
-  const workspaceMainPanelMinSize = workspaceToolPaneVisible
-    ? workspaceToolPaneMinimized ? 72 : 30
+  const workspaceMainPanelMinSize = workspaceToolPaneVisible && !workspaceToolPaneMinimized
+    ? 30
     : 100;
   // Mount is app-level and view-independent: keep TodoQueuePanel mounted across
   // view switches (Tools/Settings/Assets/Audio/etc.) so the orchestrator /
@@ -55237,6 +55242,22 @@ export default function App() {
           </WindowControls>
         </WindowTitleBar>
 
+        {authState === "authenticated" && workspaceToolPaneVisible && (
+          <TitleToolDockToggle
+            aria-label={workspaceToolPaneMinimized ? "Show app tools" : "Hide app tools"}
+            aria-pressed={!workspaceToolPaneMinimized}
+            data-active={workspaceToolPaneMinimized ? undefined : "true"}
+            data-platform={windowControlPlatform}
+            onClick={() => (workspaceToolPaneMinimized ? restoreWorkspaceToolPane() : minimizeWorkspaceToolPane())}
+            onMouseDown={(event) => event.stopPropagation()}
+            title={workspaceToolPaneMinimized ? "Show app tools" : "Hide app tools"}
+            type="button"
+          >
+            <RailToolsIcon aria-hidden="true" />
+            <span>Tools</span>
+          </TitleToolDockToggle>
+        )}
+
         <WindowResizeEdges aria-hidden="true">
           {WINDOW_RESIZE_EDGES.map(({ placement, direction }) => (
             <WindowResizeHandle
@@ -55383,7 +55404,7 @@ export default function App() {
                             </>
                           )}
                           {(settingsNavShow("Tools") || settingsNavShow("Assets") || settingsNavShow("Snipping")
-                            || settingsNavShow("Audio") || settingsNavShow("Tokenomics") || settingsNavShow("Communication")) && (
+                            || settingsNavShow("Audio") || settingsNavShow("Tokenomics")) && (
                             <>
                               <SettingsNavGroupLabel>App</SettingsNavGroupLabel>
                               <RailViewActions aria-label="App views">
@@ -55437,20 +55458,10 @@ export default function App() {
                                     <span>Tokenomics</span>
                                   </RailActionButton>
                                 )}
-                                {settingsNavShow("Communication") && (
-                                  <RailActionButton
-                                    data-active={activeView === "devices" ? "true" : undefined}
-                                    onClick={() => showView("devices")}
-                                    type="button"
-                                  >
-                                    <RailDevicesIcon aria-hidden="true" />
-                                    <span>Communication</span>
-                                  </RailActionButton>
-                                )}
                               </RailViewActions>
                             </>
                           )}
-                          {(settingsNavShow("SSH clients") || settingsNavShow("Email delivery")) && (
+                          {(settingsNavShow("SSH clients") || settingsNavShow("Email delivery") || settingsNavShow("Communication")) && (
                             <>
                               <SettingsNavGroupLabel>Connections</SettingsNavGroupLabel>
                               <RailViewActions aria-label="Connection settings">
@@ -55472,6 +55483,16 @@ export default function App() {
                                   >
                                     <ButtonMailIcon aria-hidden="true" />
                                     <span>Email delivery</span>
+                                  </RailActionButton>
+                                )}
+                                {settingsNavShow("Communication") && (
+                                  <RailActionButton
+                                    data-active={activeView === "devices" ? "true" : undefined}
+                                    onClick={() => showView("devices")}
+                                    type="button"
+                                  >
+                                    <RailDevicesIcon aria-hidden="true" />
+                                    <span>Communication</span>
                                   </RailActionButton>
                                 )}
                               </RailViewActions>
@@ -56973,77 +56994,6 @@ export default function App() {
 
                   <AccountSettingsPanel>
                     <SettingsSectionHeader>
-                      <span>Workspaces · Auto-activate</span>
-                      <em data-tone={activatedWorkspace ? "green" : "orange"}>
-                        {activatedWorkspace ? "Active" : "Idle"}
-                      </em>
-                    </SettingsSectionHeader>
-
-                    <AccountCard data-tone={activatedWorkspace ? "blue" : "orange"}>
-                      <AccountCardHeader>
-                        <div>
-                          <SetupField>
-                            <SettingsLabel>Auto-activate</SettingsLabel>
-                            <AppSelect
-                              onChange={(value) => setDefaultWorkspace(value, "settings_page")}
-                              options={[{ value: "", label: "No auto-activate workspace" }, ...workspaces.map((workspace) => ({ value: workspace.id, label: workspace.name }))]}
-                              value={workspaceLifecycleSettings.default_workspace_id}
-                            />
-                            <SettingsHint>
-                              {defaultWorkspace
-                                ? `${defaultWorkspace.name} activates when the desktop workspace opens.`
-                                : "The app opens without starting terminals."}
-                            </SettingsHint>
-                          </SetupField>
-                        </div>
-                      </AccountCardHeader>
-
-                      <SettingsIdentityGrid>
-                        <SettingsIdentityItem>
-                          <span>Runtime</span>
-                          <strong>{activatedWorkspace?.name || "No workspace"}</strong>
-                        </SettingsIdentityItem>
-                        <SettingsIdentityItem>
-                          <span>Selected</span>
-                          <strong>{selectedWorkspace?.name || "None"}</strong>
-                        </SettingsIdentityItem>
-                        <SettingsIdentityItem>
-                          <span>Default</span>
-                          <strong>{defaultWorkspace?.name || "None"}</strong>
-                        </SettingsIdentityItem>
-                      </SettingsIdentityGrid>
-
-                      <AccountCardFooter>
-                        <SettingsHint>
-                          {activatedWorkspace
-                            ? "Terminal panes remain active while you move through dashboard tabs."
-                            : "No terminal runtime is currently active."}
-                        </SettingsHint>
-                        {activatedWorkspace ? (
-                          <PrimaryDangerButton
-                            disabled={workspaceDeactivationState.is_active}
-                            onClick={() => deactivateWorkspace(activatedWorkspace.id, "settings_page")}
-                            type="button"
-                          >
-                            <ButtonCloseIcon aria-hidden="true" />
-                            <span>{isActivatedWorkspaceDeactivating ? "Deactivating..." : "Deactivate workspace"}</span>
-                          </PrimaryDangerButton>
-                        ) : (
-                          <PrimaryButton
-                            disabled={!selectedWorkspace || workspaceDeactivationState.is_active}
-                            onClick={() => selectedWorkspace && requestWorkspaceActivation(selectedWorkspace.id, "settings_page")}
-                            type="button"
-                          >
-                            <ButtonTerminalIcon aria-hidden="true" />
-                            <span>Activate selected</span>
-                          </PrimaryButton>
-                        )}
-                        </AccountCardFooter>
-                      </AccountCard>
-
-                    </AccountSettingsPanel>
-                  <AccountSettingsPanel>
-                    <SettingsSectionHeader>
                       <span>Account · Signed-in desktop session</span>
                       <em data-tone={userIsPaid ? "blue" : "orange"}>{planLabel} plan</em>
                     </SettingsSectionHeader>
@@ -58039,21 +57989,6 @@ export default function App() {
                         >
                           {shouldRenderWorkspaceToolPanel ? (
                             <>
-                              {workspaceToolPaneMinimized ? (
-                                <WorkspaceAppToolMinimizedRail aria-label="App tools minimized">
-                                  <WorkspaceAppToolRailControls>
-                                    <WorkspaceAppToolRailButton
-                                      aria-label="Unminimize app tools"
-                                      onClick={restoreWorkspaceToolPane}
-                                      title="Unminimize"
-                                      type="button"
-                                    >
-                                      <TitleRestoreIcon aria-hidden="true" />
-                                    </WorkspaceAppToolRailButton>
-                                  </WorkspaceAppToolRailControls>
-                                  <WorkspaceAppToolRailLabel>Tools</WorkspaceAppToolRailLabel>
-                                </WorkspaceAppToolMinimizedRail>
-                              ) : null}
                               <div
                                 aria-hidden={workspaceToolPaneMinimized ? "true" : undefined}
                                 style={{

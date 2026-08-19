@@ -25955,3 +25955,47 @@ export const AccountUsageLegend = styled.span`
     border-radius: 50%;
   }
 `;
+
+/* Title-bar toggle for the right app-tools dock — replaces the vertical
+   minimized "TOOLS" strip so a collapsed dock takes zero room. */
+export const TitleToolDockToggle = styled.button`
+  position: absolute;
+  top: 0;
+  right: 148px;
+  z-index: 30;
+  display: inline-flex;
+  height: ${TITLE_BAR_HEIGHT};
+  align-items: center;
+  gap: 5px;
+  padding: 0 10px;
+  border: 0;
+  color: var(--forge-text-muted);
+  background: transparent;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  &[data-active="true"] {
+    color: var(--forge-text);
+  }
+
+  &[data-platform="macos"] {
+    right: 8px;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(0, 0, 0, 0.06);
+  }
+`;
