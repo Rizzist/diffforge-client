@@ -23923,6 +23923,7 @@ export default function App() {
   const [settingsSearch, setSettingsSearch] = useState("");
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const accountMenuRef = useRef(null);
+  const accountMenuPopRef = useRef(null);
   const settingsNavQuery = settingsSearch.trim().toLowerCase();
   const settingsNavShow = (label) => !settingsNavQuery || label.toLowerCase().includes(settingsNavQuery);
   const settingsActiveLabel = settingsTab === SETTINGS_TAB_NOTIFICATIONS
@@ -29054,7 +29055,10 @@ export default function App() {
       return undefined;
     }
     const onPointerDown = (event) => {
-      if (accountMenuRef.current && !accountMenuRef.current.contains(event.target)) {
+      // The menu itself is portaled to document.body, so check both trees.
+      const inChip = accountMenuRef.current?.contains(event.target);
+      const inMenu = accountMenuPopRef.current?.contains(event.target);
+      if (!inChip && !inMenu) {
         setAccountMenuOpen(false);
       }
     };
@@ -55423,8 +55427,8 @@ export default function App() {
                       </RailViewActions>
                     )}
                     <RailAccountBar ref={accountMenuRef}>
-                      {accountMenuOpen && (
-                        <AccountMenuPop aria-label="Account" role="menu">
+                      {accountMenuOpen && createPortal(
+                        <AccountMenuPop aria-label="Account" ref={accountMenuPopRef} role="menu">
                           <AccountMenuHeader>
                             <RailAccountAvatar aria-hidden="true">{accountInitial}</RailAccountAvatar>
                             <strong>{accountDisplayName}</strong>
@@ -55482,7 +55486,8 @@ export default function App() {
                             <RailSignOutIcon aria-hidden="true" />
                             <span>Log out</span>
                           </AccountMenuRow>
-                        </AccountMenuPop>
+                        </AccountMenuPop>,
+                        document.body,
                       )}
                       <RailAccountChipButton
                         aria-expanded={accountMenuOpen}
