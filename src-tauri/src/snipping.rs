@@ -112,6 +112,17 @@ static SNIPPING_MACOS_SPACE_CHANGED_AT_MS: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_MACOS_SPACE_CHANGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static SNIPPING_AREA_SNAPSHOT_SPACE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The first active overlay window that WindowServer reports visible after a
+/// Space change owns the event-driven recovery pass for that generation.
+/// Hiding/showing an overlay during that pass must not recursively schedule
+/// another capture.
+#[cfg(target_os = "macos")]
+static SNIPPING_MACOS_AREA_VISIBLE_RECOVERY_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Serializes the notification fallback and the later, authoritative
+/// occlusion-visible recovery. The latter deliberately runs second when the
+/// fallback raced the Space transition.
+#[cfg(target_os = "macos")]
+static SNIPPING_MACOS_SPACE_RECOVERY_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
 fn snipping_warm_frames_invalid_before_ms() -> u64 {
     SNIPPING_WARM_FRAMES_INVALID_BEFORE_MS.load(Ordering::Acquire)
@@ -175,6 +186,17 @@ fn snipping_area_recovery_ticket_is_current(
         expected_begin_generation,
         current_begin_generation,
     ) && expected_session_generation == current_session_generation
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn snipping_space_recovery_needs_refreeze(
+    freeze_screen: bool,
+    snapshot_space_generation: u64,
+    current_space_generation: u64,
+    force_refreeze: bool,
+) -> bool {
+    freeze_screen
+        && (force_refreeze || snapshot_space_generation != current_space_generation)
 }
 
 #[cfg(target_os = "macos")]
@@ -11008,7 +11030,12 @@ fn snipping_store_area_snapshot_backdrop(
 /// matching begin generation has completed. The Space generation cancels a
 /// stale worker if the user swipes again.
 #[cfg(target_os = "macos")]
-fn snipping_schedule_area_space_change_recovery(app: &AppHandle, space_generation: u64) {
+fn snipping_schedule_area_space_change_recovery(
+    app: &AppHandle,
+    space_generation: u64,
+    force_refreeze: bool,
+    trigger: &'static str,
+) {
     let begin_generation = SNIPPING_AREA_BEGIN_GENERATION.load(Ordering::Acquire);
     let app = app.clone();
     thread::spawn(move || {
@@ -11053,6 +11080,12 @@ fn snipping_schedule_area_space_change_recovery(app: &AppHandle, space_generatio
             ));
         };
 
+        let recovery_lock =
+            SNIPPING_MACOS_SPACE_RECOVERY_LOCK.get_or_init(|| StdMutex::new(()));
+        let _recovery_guard = match recovery_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let session_generation = SNIPPING_AREA_SESSION_GENERATION.load(Ordering::Acquire);
         let ticket_is_current = || {
             snipping_area_recovery_ticket_is_current(
@@ -11075,12 +11108,17 @@ fn snipping_schedule_area_space_change_recovery(app: &AppHandle, space_generatio
                 "begin_generation": begin_generation,
                 "session_generation": session_generation,
                 "overlay_labels": &labels,
+                "force_refreeze": force_refreeze,
+                "trigger": trigger,
             }),
         );
 
-        let needs_refreeze = snipping_freeze_screen_enabled(&app)
-            && SNIPPING_AREA_SNAPSHOT_SPACE_GENERATION.load(Ordering::Acquire)
-                != space_generation;
+        let needs_refreeze = snipping_space_recovery_needs_refreeze(
+            snipping_freeze_screen_enabled(&app),
+            SNIPPING_AREA_SNAPSHOT_SPACE_GENERATION.load(Ordering::Acquire),
+            space_generation,
+            force_refreeze,
+        );
         if needs_refreeze {
             let mut refreeze_succeeded = false;
             let mut refrozen_labels = HashSet::new();
@@ -11144,6 +11182,145 @@ fn snipping_schedule_area_space_change_recovery(app: &AppHandle, space_generatio
 }
 
 #[cfg(target_os = "macos")]
+fn snipping_refresh_preview_space_state_on_main_thread(
+    window: &tauri::WebviewWindow,
+    ns_window: &NSWindow,
+) {
+    snipping_convert_ns_window_to_panel(ns_window);
+    snipping_preview_apply_macos_space_style_to_ns_window(ns_window);
+    let monitor = window.current_monitor().ok().flatten();
+    let cached_bounds = monitor
+        .as_ref()
+        .and_then(snipping_preview_monitor_uses_full_bounds);
+    let use_full_monitor_bounds = cached_bounds.unwrap_or_else(|| {
+        ns_window
+            .screen()
+            .map(|screen| {
+                macos_refresh_active_space_uses_full_monitor_bounds_for_screen_on_main_thread(Some(
+                    screen.as_ref(),
+                ))
+            })
+            .unwrap_or_else(macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread)
+    });
+    if let Some(monitor) = monitor {
+        snipping_store_preview_monitor_space_bounds(&monitor, use_full_monitor_bounds);
+    }
+    ns_window.orderFrontRegardless();
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_refresh_visible_preview_space_state_on_main_thread(app: &AppHandle) {
+    for (label, window) in app.webview_windows() {
+        if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+            continue;
+        }
+        let Ok(ns_ptr) = window.ns_window() else {
+            continue;
+        };
+        if ns_ptr.is_null() {
+            continue;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+        if !ns_window
+            .occlusionState()
+            .contains(objc2_app_kit::NSWindowOcclusionState::Visible)
+        {
+            continue;
+        }
+        snipping_refresh_preview_space_state_on_main_thread(&window, ns_window);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_handle_macos_window_occlusion_changed(
+    app: &AppHandle,
+    notification: std::ptr::NonNull<objc2_foundation::NSNotification>,
+) {
+    let Some(notification_object) = (unsafe { notification.as_ref() }).object() else {
+        return;
+    };
+    let notification_object_ptr =
+        objc2::rc::Retained::as_ptr(&notification_object) as *const core::ffi::c_void;
+
+    for (label, window) in app.webview_windows() {
+        let preview = label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX);
+        let area_overlay = snipping_is_overlay_label(&label);
+        if !preview && !area_overlay {
+            continue;
+        }
+        let Ok(ns_ptr) = window.ns_window() else {
+            continue;
+        };
+        if ns_ptr.is_null() || ns_ptr.cast_const() != notification_object_ptr {
+            continue;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+        let visible = ns_window
+            .occlusionState()
+            .contains(objc2_app_kit::NSWindowOcclusionState::Visible);
+        log_snipping_area_cursor_debug_event(
+            "native.snipping_window_occlusion_changed",
+            json!({
+                "label": label,
+                "preview": preview,
+                "area_overlay": area_overlay,
+                "visible": visible,
+                "space_generation":
+                    SNIPPING_MACOS_SPACE_CHANGE_GENERATION.load(Ordering::Acquire),
+            }),
+        );
+        if !visible {
+            return;
+        }
+
+        if preview {
+            snipping_refresh_preview_space_state_on_main_thread(&window, ns_window);
+            snipping_reflow_preview_stack(
+                app,
+                SNIPPING_FLOAT_ANIMATE_MS,
+                SnippingTweenEasing::Track,
+            );
+            snipping_strip_reposition_if_visible(app, true);
+            return;
+        }
+
+        if !SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire)
+            || snipping_area_session_monitor(app, &label).is_err()
+            || SNIPPING_AREA_OVERLAY_CAPTURE_HIDE_DEPTH.load(Ordering::Acquire) > 0
+        {
+            return;
+        }
+        snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
+        ns_window.orderFrontRegardless();
+        if snipping_area_session_claims_crosshair() {
+            snipping_force_area_crosshair_for_ns_window(ns_window);
+        }
+
+        let space_generation =
+            SNIPPING_MACOS_SPACE_CHANGE_GENERATION.load(Ordering::Acquire);
+        if space_generation == 0
+            || SNIPPING_MACOS_AREA_VISIBLE_RECOVERY_GENERATION.swap(
+                space_generation,
+                Ordering::AcqRel,
+            ) == space_generation
+        {
+            return;
+        }
+        // The Space notification is early; this notification is the native
+        // proof that an overlay has actually joined the incoming Space. Force
+        // one serialized re-freeze even if the timer fallback already stamped
+        // this generation, because that earlier frame may still be old.
+        snipping_schedule_area_space_change_recovery(
+            app,
+            space_generation,
+            true,
+            "window_occlusion_visible",
+        );
+        return;
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn snipping_reflow_preview_stack_for_space_change(app: &AppHandle) {
     for delay_ms in SNIPPING_FLOAT_SPACE_REFLOW_DELAYS_MS {
         let app_for_thread = app.clone();
@@ -11153,6 +11330,10 @@ fn snipping_reflow_preview_stack_for_space_change(app: &AppHandle) {
             }
             let app_for_main = app_for_thread.clone();
             let _ = app_for_thread.run_on_main_thread(move || {
+                // Fallback for systems that coalesce an occlusion notification:
+                // re-resolve every currently visible preview's actual NSScreen
+                // on each retry instead of reusing the notification-time cache.
+                snipping_refresh_visible_preview_space_state_on_main_thread(&app_for_main);
                 snipping_reflow_preview_stack(
                     &app_for_main,
                     SNIPPING_FLOAT_ANIMATE_MS,
@@ -11188,11 +11369,17 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
                         // transaction, while the recovery worker must already
                         // be waiting for the matching quiet generation.
                         let space_generation = snipping_mark_macos_space_changed_now();
+                        macos_clear_active_space_full_monitor_sticky(
+                            "snipping_workspace_space_change",
+                        );
+                        snipping_clear_preview_monitor_space_bounds_cache();
                         let app = snipping_macos_event_tap_app();
                         if let Some(app) = app.as_ref() {
                             snipping_schedule_area_space_change_recovery(
                                 app,
                                 space_generation,
+                                false,
+                                "workspace_notification",
                             );
                         }
                         let use_full_monitor_bounds =
@@ -11233,8 +11420,27 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
                     &block,
                 )
             };
+            let app_center = objc2_foundation::NSNotificationCenter::defaultCenter();
+            let occlusion_block = block2::RcBlock::new(
+                move |notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                    snipping_catch_objc("snipping_window_occlusion_observer_callback", || {
+                        if let Some(app) = snipping_macos_event_tap_app() {
+                            snipping_handle_macos_window_occlusion_changed(&app, notification);
+                        }
+                    });
+                },
+            );
+            let occlusion_token = unsafe {
+                app_center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWindowDidChangeOcclusionStateNotification),
+                    None,
+                    None,
+                    &occlusion_block,
+                )
+            };
             // The observer lives for the app's lifetime.
             std::mem::forget(token);
+            std::mem::forget(occlusion_token);
             macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
         });
     });
@@ -12521,6 +12727,66 @@ struct SnippingPreviewStackMonitorKey {
     scale_micros: i64,
 }
 
+/// AppKit can put different displays on different kinds of Spaces at the same
+/// time ("Displays have separate Spaces"). The audio bar resolves one target
+/// NSScreen per placement; previews need the same per-monitor answer rather
+/// than the old process-wide fullscreen boolean.
+#[cfg(target_os = "macos")]
+static SNIPPING_PREVIEW_FULL_MONITOR_BOUNDS_BY_MONITOR: OnceLock<
+    StdMutex<HashMap<SnippingPreviewStackMonitorKey, bool>>,
+> = OnceLock::new();
+
+fn snipping_preview_stack_monitor_key(
+    monitor: &tauri::Monitor,
+) -> SnippingPreviewStackMonitorKey {
+    let position = monitor.position();
+    let size = monitor.size();
+    let scale = monitor.scale_factor().max(0.1);
+    SnippingPreviewStackMonitorKey {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        scale_micros: (scale * 1_000_000.0).round() as i64,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_clear_preview_monitor_space_bounds_cache() {
+    if let Some(cache) = SNIPPING_PREVIEW_FULL_MONITOR_BOUNDS_BY_MONITOR.get() {
+        if let Ok(mut cache) = cache.lock() {
+            cache.clear();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_store_preview_monitor_space_bounds(
+    monitor: &tauri::Monitor,
+    use_full_monitor_bounds: bool,
+) {
+    let cache = SNIPPING_PREVIEW_FULL_MONITOR_BOUNDS_BY_MONITOR
+        .get_or_init(|| StdMutex::new(HashMap::new()));
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(
+            snipping_preview_stack_monitor_key(monitor),
+            use_full_monitor_bounds,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_preview_monitor_uses_full_bounds(monitor: &tauri::Monitor) -> Option<bool> {
+    SNIPPING_PREVIEW_FULL_MONITOR_BOUNDS_BY_MONITOR
+        .get()
+        .and_then(|cache| cache.lock().ok())
+        .and_then(|cache| {
+            cache
+                .get(&snipping_preview_stack_monitor_key(monitor))
+                .copied()
+        })
+}
+
 #[derive(Clone, Copy)]
 struct SnippingPreviewStackMetrics {
     key: SnippingPreviewStackMonitorKey,
@@ -12544,13 +12810,7 @@ fn snipping_preview_stack_metrics_for_monitor(
     let width_physical = (width * scale).round().max(1.0) as i32;
     let height_physical = (height * scale).round().max(1.0) as i32;
     SnippingPreviewStackMetrics {
-        key: SnippingPreviewStackMonitorKey {
-            x: area_position.x,
-            y: area_position.y,
-            width: area_size.width,
-            height: area_size.height,
-            scale_micros: (scale * 1_000_000.0).round() as i64,
-        },
+        key: snipping_preview_stack_monitor_key(monitor),
         x: area_position.x + margin,
         top_limit: area_position.y + margin,
         bottom_edge: area_position.y + area_size.height as i32 - margin,
@@ -12563,6 +12823,15 @@ fn snipping_preview_stack_metrics_for_monitor(
 fn snipping_preview_stack_anchor_area_for_monitor(
     monitor: &tauri::Monitor,
 ) -> (tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>) {
+    #[cfg(target_os = "macos")]
+    if let Some(use_full_monitor_bounds) = snipping_preview_monitor_uses_full_bounds(monitor) {
+        if use_full_monitor_bounds {
+            return (*monitor.position(), *monitor.size());
+        }
+        let work_area = *monitor.work_area();
+        return (work_area.position, work_area.size);
+    }
+
     let (position, size, _) = floating_surface_anchor_area_for_monitor(monitor);
     (position, size)
 }
@@ -13698,20 +13967,25 @@ fn snipping_preview_apply_macos_space_style(window: &tauri::WebviewWindow) {
                 return;
             }
             let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            ns_window.setCollectionBehavior(
-                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
-                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
-            );
-            ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
-            // Hover must work without the window ever having been clicked: a
-            // non-key NSWindow drops mouse-moved events by default, which left
-            // the preview's hover chrome unreachable until a focusing click
-            // (and made every button cost two clicks).
-            ns_window.setAcceptsMouseMovedEvents(true);
+            snipping_preview_apply_macos_space_style_to_ns_window(ns_window);
         });
     });
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_preview_apply_macos_space_style_to_ns_window(ns_window: &NSWindow) {
+    ns_window.setCollectionBehavior(
+        objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+            | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
+            | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+            | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
+    );
+    ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+    ns_window.setHidesOnDeactivate(false);
+    // Hover must work without the window ever having been clicked: a non-key
+    // NSWindow drops mouse-moved events by default, which left the preview's
+    // hover chrome unreachable until a focusing click.
+    ns_window.setAcceptsMouseMovedEvents(true);
 }
 
 /// Orders a preview front even while Diff Forge is NOT the active app (a
@@ -16643,6 +16917,22 @@ mod snipping_recording_webm_tests {
         ));
         assert!(!snipping_area_recovery_ticket_is_current(
             7, 7, 11, 11, 13, 14,
+        ));
+    }
+
+    #[test]
+    fn visible_space_recovery_forces_a_second_frozen_frame() {
+        assert!(!snipping_space_recovery_needs_refreeze(
+            false, 7, 7, true,
+        ));
+        assert!(!snipping_space_recovery_needs_refreeze(
+            true, 7, 7, false,
+        ));
+        assert!(snipping_space_recovery_needs_refreeze(
+            true, 6, 7, false,
+        ));
+        assert!(snipping_space_recovery_needs_refreeze(
+            true, 7, 7, true,
         ));
     }
 
