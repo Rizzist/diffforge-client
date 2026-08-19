@@ -42,6 +42,15 @@ export const SUCCESS_CONVERGE_MS = 620; // tight converge before the flash
 export const SUCCESS_HOLD_MS = 950; // welcome beat before launch (host-driven)
 export const LAUNCH_STREAK_RATIO = 0.65; // share of particles that leave streaks
 
+/* Boot smoothness: the formation runs during app startup, the busiest
+   main-thread window. Its clock advances by at most one frame-step per
+   rendered frame (stalls become brief slow-motion instead of particle
+   teleports), and flight frames render at dpr 1 with a reduced particle
+   subset — full density and retina resolution snap in at settle. */
+export const BOOT_FRAME_STEP_MAX_MS = 17;
+export const BOOT_FLIGHT_DRAW_MODULO = 5; // draw indices where i % 5 < 3 (60%)
+export const BOOT_FLIGHT_DRAW_KEEP = 3;
+
 /* ---- sprites -------------------------------------------------------- */
 
 function spriteFor(cache, r, g, b, glowBucket) {
@@ -162,9 +171,12 @@ export function createParticleField({
   let launchInit = false;
   let successFired = false;
   let bootFired = false;
+  let bootClock = 0;
   const sprites = new Map();
 
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const fullDpr = Math.min(2, window.devicePixelRatio || 1);
+  // Flight frames render at 1x; settle snaps to full retina resolution.
+  let dpr = initialPhase === PHASES.BOOT && !reduced ? 1 : fullDpr;
 
   const layout = () => {
     canvas.width = Math.round(window.innerWidth * dpr);
@@ -197,6 +209,7 @@ export function createParticleField({
         sy: window.innerHeight / 2 + Math.sin(ang) * spawnR,
         delay: Math.random() * BOOT_STAGGER_MS,
         flight: BOOT_FLIGHT_MS + Math.random() * 500,
+        bootDraw: true,
         seed: Math.random() * 1000,
         size: 1.6 + Math.random() * 1.1,
         fade: 0.9 + Math.random() * 0.8,
@@ -210,6 +223,16 @@ export function createParticleField({
     // Dark body first, glow on top — with source-over compositing the
     // draw order decides whether the rim light survives.
     particles.sort((a, b) => a.lum - b.lum);
+    // Stable 60% subset drawn while in flight (post-sort so the thinning is
+    // spatially uniform); the full set renders from settle onward.
+    particles.forEach((particle, index) => {
+      particle.bootDraw = index % BOOT_FLIGHT_DRAW_MODULO < BOOT_FLIGHT_DRAW_KEEP;
+    });
+    // Pre-warm every sprite before the first frame so no gradient canvases
+    // are built mid-formation.
+    for (const particle of particles) {
+      spriteFor(sprites, particle.r, particle.g, particle.b, particle.gb);
+    }
     layout();
     // Reduced motion (or an engine started past boot) skips the flight:
     // particles begin formed at their home pixels.
@@ -235,10 +258,16 @@ export function createParticleField({
   const draw = (now) => {
     if (dead) return;
     raf = requestAnimationFrame(draw);
-    const dt = Math.min(0.04, lastTs ? (now - lastTs) / 1000 : 0.016);
+    const rawDeltaMs = lastTs ? now - lastTs : 16;
+    const dt = Math.min(0.04, rawDeltaMs / 1000);
     lastTs = now;
     const ph = phase;
-    const pt = now - phaseStart;
+    // Boot time is frame-stepped, not wall-clock: a stalled main thread
+    // yields brief slow-motion instead of teleporting particles.
+    if (ph === PHASES.BOOT && !reduced) {
+      bootClock += Math.min(rawDeltaMs, BOOT_FRAME_STEP_MAX_MS);
+    }
+    const pt = ph === PHASES.BOOT && !reduced ? bootClock : now - phaseStart;
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
@@ -255,6 +284,10 @@ export function createParticleField({
       const doneAt = reduced ? REDUCED_BOOT_TOTAL_MS : BOOT_TOTAL_MS;
       if (pt > doneAt) {
         bootFired = true;
+        if (dpr !== fullDpr) {
+          dpr = fullDpr;
+          layout();
+        }
         onBootDone?.();
       }
     }
@@ -273,7 +306,13 @@ export function createParticleField({
       }
     }
 
+    const bootInFlight = ph === PHASES.BOOT && !reduced && !bootFired;
     for (const p of particles) {
+      // Thinned draw while the formation is in motion — motion masks the
+      // density; the full set snaps in at settle.
+      if (bootInFlight && !p.bootDraw) {
+        continue;
+      }
       let px = p.x;
       let py = p.y;
       let alpha = p.alpha;
@@ -388,6 +427,11 @@ export function createParticleField({
       phaseStart = performance.now();
       if (next === PHASES.BOOT) {
         bootFired = false;
+        bootClock = 0;
+        if (!reduced && dpr !== 1) {
+          dpr = 1;
+          layout();
+        }
         scatterForBoot();
       }
     },

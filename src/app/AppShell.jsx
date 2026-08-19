@@ -15864,91 +15864,6 @@ export default function App() {
           : "General";
   const accountDisplayName = String(user?.name || user?.email || "Account").trim() || "Account";
   const accountInitial = accountDisplayName.charAt(0).toUpperCase();
-  // Codex-style Haider sessions: the rail lists them day-grouped; every
-  // opened session keeps its PTY alive in SessionSurface.
-  const [sessions, setSessions] = useState([]);
-  const [activeSessionId, setActiveSessionId] = useState("");
-  const [openSessionIds, setOpenSessionIds] = useState([]);
-  const openSessions = useMemo(
-    () => openSessionIds
-      .map((id) => sessions.find((session) => session.id === id))
-      .filter(Boolean),
-    [openSessionIds, sessions],
-  );
-  const activeSession = useMemo(
-    () => sessions.find((session) => session.id === activeSessionId) || null,
-    [activeSessionId, sessions],
-  );
-  const activeSessionFileWorkspace = useMemo(() => (
-    activeSession
-      ? { id: activeSession.id, name: activeSession.title }
-      : null
-  ), [activeSession]);
-  const activeSessionFileRoot = sessionWorkingDirectory(activeSession);
-  const refreshSessions = useCallback(async () => {
-    try {
-      setSessions(await listSessions());
-    } catch {
-      // Store not available yet (first boot before Rust lane) — rail stays empty.
-    }
-  }, []);
-  const openSessionFromRail = useCallback((session) => {
-    if (!session?.id) {
-      return;
-    }
-    setActiveSessionId(session.id);
-    setOpenSessionIds((ids) => (ids.includes(session.id) ? ids : [...ids, session.id]));
-    showView(DEFAULT_WORKSPACE_VIEW);
-  }, [showView]);
-  const startNewSessionChat = useCallback(async () => {
-    try {
-      const session = await createSession({});
-      if (session) {
-        setSessions((current) => [session, ...current.filter((row) => row.id !== session.id)]);
-        openSessionFromRail(session);
-      }
-    } catch (error) {
-      console.error("session create failed", error);
-    }
-  }, [openSessionFromRail]);
-
-  useEffect(() => {
-    if (authState !== "authenticated") {
-      return undefined;
-    }
-    void refreshSessions();
-    let disposed = false;
-    let unlisten = null;
-    void listen("sessions-changed", () => {
-      if (!disposed) {
-        void refreshSessions();
-      }
-    }).then((fn) => {
-      if (disposed) {
-        fn();
-      } else {
-        unlisten = fn;
-      }
-    });
-    return () => {
-      disposed = true;
-      if (unlisten) {
-        unlisten();
-      }
-    };
-  }, [authState, refreshSessions]);
-
-  // ⌘N / Ctrl+N starts a new chat.
-  useEffect(() => {
-    const onKeyDown = (event) => {
-      if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "n") {
-        event.preventDefault();
-        void startNewSessionChat();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [startNewSessionChat]);
   // Per-subscription remaining, averaged into the headline percent. Unknown
   // usage counts as full (100% left), matching the old single-number rule.
   // TODO: feed real rate-limit windows (haiderd) into pctLeft per account.
@@ -18442,6 +18357,94 @@ export default function App() {
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [accountMenuOpen]);
+
+  // Codex-style Haider sessions: the rail lists them day-grouped; every
+  // opened session keeps its PTY alive in SessionSurface. Declared after
+  // showView so the useCallback dep reads an initialized binding (a TDZ
+  // ReferenceError in the packaged app taught us the hard way).
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState("");
+  const [openSessionIds, setOpenSessionIds] = useState([]);
+  const openSessions = useMemo(
+    () => openSessionIds
+      .map((id) => sessions.find((session) => session.id === id))
+      .filter(Boolean),
+    [openSessionIds, sessions],
+  );
+  const activeSession = useMemo(
+    () => sessions.find((session) => session.id === activeSessionId) || null,
+    [activeSessionId, sessions],
+  );
+  const activeSessionFileWorkspace = useMemo(() => (
+    activeSession
+      ? { id: activeSession.id, name: activeSession.title }
+      : null
+  ), [activeSession]);
+  const activeSessionFileRoot = sessionWorkingDirectory(activeSession);
+  const refreshSessions = useCallback(async () => {
+    try {
+      setSessions(await listSessions());
+    } catch {
+      // Store not available yet (first boot before Rust lane) — rail stays empty.
+    }
+  }, []);
+  const openSessionFromRail = useCallback((session) => {
+    if (!session?.id) {
+      return;
+    }
+    setActiveSessionId(session.id);
+    setOpenSessionIds((ids) => (ids.includes(session.id) ? ids : [...ids, session.id]));
+    showView(DEFAULT_WORKSPACE_VIEW);
+  }, [showView]);
+  const startNewSessionChat = useCallback(async () => {
+    try {
+      const session = await createSession({});
+      if (session) {
+        setSessions((current) => [session, ...current.filter((row) => row.id !== session.id)]);
+        openSessionFromRail(session);
+      }
+    } catch (error) {
+      console.error("session create failed", error);
+    }
+  }, [openSessionFromRail]);
+
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      return undefined;
+    }
+    void refreshSessions();
+    let disposed = false;
+    let unlisten = null;
+    void listen("sessions-changed", () => {
+      if (!disposed) {
+        void refreshSessions();
+      }
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      disposed = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [authState, refreshSessions]);
+
+  // ⌘N / Ctrl+N starts a new chat.
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        void startNewSessionChat();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [startNewSessionChat]);
 
   useEffect(() => {
     if (visibleView !== "settings" || settingsTab !== SETTINGS_TAB_PERMISSIONS) {
