@@ -258,6 +258,7 @@ fn haider_run_spawn(
     provider_session_id: Option<String>,
     prompt: String,
     cwd: PathBuf,
+    attachments: Vec<String>,
     binding_sender: Option<std::sync::mpsc::SyncSender<Result<SessionRow, String>>>,
 ) -> Result<(), String> {
     if haider_run_is_active(&local_session_id)? {
@@ -274,6 +275,13 @@ fn haider_run_spawn(
         command.args(["--session", provider_session_id]);
     }
     command.args(["--output", "jsonl"]);
+    // `haider run --attach <path>` is repeatable; only existing files ride.
+    for attachment in &attachments {
+        let path = attachment.trim();
+        if !path.is_empty() && std::path::Path::new(path).exists() {
+            command.args(["--attach", path]);
+        }
+    }
     command
         .current_dir(&cwd)
         .stdin(Stdio::null())
@@ -425,6 +433,7 @@ async fn session_start_with_prompt(
     app: AppHandle,
     prompt: String,
     pinned_dir: Option<String>,
+    attachments: Option<Vec<String>>,
 ) -> Result<SessionRow, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let prompt = haider_run_prompt(prompt)?;
@@ -452,6 +461,7 @@ async fn session_start_with_prompt(
             None,
             prompt.clone(),
             cwd,
+            attachments.clone().unwrap_or_default(),
             Some(binding_sender),
         ) {
             discard_created(&app);
@@ -491,6 +501,7 @@ async fn session_submit_prompt(
     app: AppHandle,
     session_id: String,
     prompt: String,
+    attachments: Option<Vec<String>>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let prompt = haider_run_prompt(prompt)?;
@@ -520,6 +531,7 @@ async fn session_submit_prompt(
             Some(row.provider_session_id.clone()),
             prompt,
             cwd,
+            attachments.unwrap_or_default(),
             None,
         ) {
             let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);

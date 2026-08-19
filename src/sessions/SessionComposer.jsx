@@ -1,5 +1,8 @@
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
+import { Add } from "@styled-icons/material-rounded/Add";
+import { Close } from "@styled-icons/material-rounded/Close";
 import { KeyboardVoice } from "@styled-icons/material-rounded/KeyboardVoice";
 import { Send } from "@styled-icons/material-rounded/Send";
 
@@ -40,8 +43,26 @@ export default function SessionComposer({
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
   const [openMenu, setOpenMenu] = useState("");
+  const [attachments, setAttachments] = useState([]);
   const textareaRef = useRef(null);
   const rootRef = useRef(null);
+
+  const pickAttachments = useCallback(async () => {
+    try {
+      const picked = await openFileDialog({ multiple: true, title: "Attach files" });
+      const paths = (Array.isArray(picked) ? picked : picked ? [picked] : [])
+        .map((entry) => (typeof entry === "string" ? entry : entry?.path))
+        .filter(Boolean);
+      if (paths.length) {
+        setAttachments((current) => [
+          ...current,
+          ...paths.filter((path) => !current.includes(path)),
+        ]);
+      }
+    } catch {
+      // Dialog cancelled/unavailable — nothing to attach.
+    }
+  }, []);
 
   const commands = Array.isArray(slashCommands) && slashCommands.length
     ? slashCommands
@@ -75,15 +96,16 @@ export default function SessionComposer({
     }
     setBusy(true);
     try {
-      const accepted = await onSubmit(prompt);
+      const accepted = await onSubmit(prompt, attachments);
       if (accepted !== false) {
         setValue("");
+        setAttachments([]);
       }
     } finally {
       setBusy(false);
       textareaRef.current?.focus();
     }
-  }, [busy, disabled, onSubmit, value]);
+  }, [attachments, busy, disabled, onSubmit, value]);
 
   const chip = (key, label, fallbackOptions = []) => {
     const current = String(chipValues[key] || "default");
@@ -155,7 +177,32 @@ export default function SessionComposer({
             ))}
           </SlashPalette>
         )}
+        {attachments.length > 0 && (
+          <AttachmentChips>
+            {attachments.map((path) => (
+              <AttachmentChip key={path} title={path}>
+                <span>{path.split("/").pop()}</span>
+                <AttachmentRemove
+                  aria-label="Remove attachment"
+                  onClick={() => setAttachments((current) => current.filter((entry) => entry !== path))}
+                  type="button"
+                >
+                  <Close aria-hidden="true" />
+                </AttachmentRemove>
+              </AttachmentChip>
+            ))}
+          </AttachmentChips>
+        )}
         <ComposerField data-busy={busy ? "true" : undefined}>
+          <ComposerRoundButton
+            aria-label="Attach files"
+            data-variant="attach"
+            onClick={() => void pickAttachments()}
+            title="Attach files or images"
+            type="button"
+          >
+            <Add aria-hidden="true" />
+          </ComposerRoundButton>
           <ComposerInput
             autoFocus={autoFocus}
             disabled={disabled || busy}
@@ -311,6 +358,56 @@ const ComposerBarWrap = styled.div`
   position: relative;
 `;
 
+const AttachmentChips = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 6px 6px;
+`;
+
+const AttachmentChip = styled.span`
+  display: inline-flex;
+  max-width: 220px;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 5px 3px 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  color: var(--forge-text-soft);
+  background: var(--forge-surface-control);
+  font-size: 10.5px;
+  font-weight: 600;
+
+  span {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+`;
+
+const AttachmentRemove = styled.button`
+  display: grid;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  color: var(--forge-text-muted);
+  background: transparent;
+  cursor: pointer;
+
+  svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: rgba(255, 255, 255, 0.1);
+  }
+`;
+
 const SlashPalette = styled.div`
   position: absolute;
   bottom: calc(100% + 8px);
@@ -369,7 +466,7 @@ const ComposerInput = styled.textarea`
   min-height: 46px;
   max-height: min(150px, 32vh);
   resize: none;
-  padding: 13px 86px 13px 16px;
+  padding: 13px 86px 13px 48px;
   border: 1px solid var(--forge-border);
   border-radius: 24px;
   color: var(--forge-text);
@@ -409,6 +506,18 @@ const ComposerRoundButton = styled.button`
   svg {
     width: 14px;
     height: 14px;
+  }
+
+  &[data-variant="attach"] {
+    left: 8px;
+    border: 1px solid var(--forge-border);
+    color: var(--forge-text-muted);
+    background: transparent;
+  }
+
+  &[data-variant="attach"]:hover:not(:disabled) {
+    color: var(--forge-text);
+    border-color: var(--forge-border-strong);
   }
 
   &[data-variant="mic"] {

@@ -143,15 +143,23 @@ export default function SessionTerminal({ session, active }) {
       const channel = (value) => value.padEnd(4, value).slice(0, 2);
       return `#${channel(match[1])}${channel(match[2])}${channel(match[3])}`;
     };
+    /* Query forms ("?") must be swallowed: xterm's built-in responder would
+       write "\x1b]11;rgb:..\x1b\\" into the PTY, and the haider TUI renders
+       that reply as literal keystrokes in its input line. */
+    const isOscColorQuery = (data) => String(data || "").trim().startsWith("?");
+    const swallowOscColorQuery = (data) => isOscColorQuery(data);
     const applyHarnessBackground = (data) => {
       if (disposed) {
-        return false;
+        return isOscColorQuery(data);
+      }
+      if (isOscColorQuery(data)) {
+        return true;
       }
       const color = parseOscColor(data);
       if (color && observedHost) {
         observedHost.style.background = color;
       }
-      return false; // let xterm keep its own OSC handling (incl. queries)
+      return false; // let xterm keep its own OSC set handling
     };
 
     const fitTerminal = () => {
@@ -203,7 +211,9 @@ export default function SessionTerminal({ session, active }) {
       xtermRef.current = term;
       term.open(container);
       detachPushToTalk = guardXtermDuringPushToTalk(term);
+      term.parser.registerOscHandler(10, swallowOscColorQuery);
       term.parser.registerOscHandler(11, applyHarnessBackground);
+      term.parser.registerOscHandler(12, swallowOscColorQuery);
 
       term.onData((data) => {
         touchSession();

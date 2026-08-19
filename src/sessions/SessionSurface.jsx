@@ -136,7 +136,7 @@ export default function SessionSurface({
     }));
   }, [patchTabs]);
 
-  const submitDraft = useCallback(async (prompt) => {
+  const submitDraft = useCallback(async (prompt, attachments) => {
     if (submitBusyRef.current) {
       return false;
     }
@@ -146,6 +146,7 @@ export default function SessionSurface({
       const row = await invoke("session_start_with_prompt", {
         prompt,
         pinned_dir: null,
+        attachments: attachments?.length ? attachments : null,
       });
       if (row?.id) {
         onDraftMaterialized(row);
@@ -161,11 +162,12 @@ export default function SessionSurface({
     }
   }, [onDraftMaterialized]);
 
-  const submitIntoSession = useCallback(async (session, prompt) => {
+  const submitIntoSession = useCallback(async (session, prompt, attachments) => {
     try {
       await invoke("session_submit_prompt", {
         session_id: session.id,
         prompt,
+        attachments: attachments?.length ? attachments : null,
       });
       return true;
     } catch (error) {
@@ -406,7 +408,7 @@ export default function SessionSurface({
                   <SessionComposer
                     chipValues={chipValuesFor(session)}
                     onChipChange={(key, option) => handleChipChange(session.id, key, option)}
-                    onSubmit={(prompt) => submitIntoSession(session, prompt)}
+                    onSubmit={(prompt, attachments) => submitIntoSession(session, prompt, attachments)}
                   />
                 </>
               )}
