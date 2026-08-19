@@ -428,43 +428,56 @@ async fn session_start_with_prompt(
 ) -> Result<SessionRow, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let prompt = haider_run_prompt(prompt)?;
+        // Harness-first doctrine: the rail must never show an ADE-created
+        // session. The store row exists silently (create/delete emit nothing)
+        // until Haider reports the provider session id — the binding update
+        // is the first emit, so the first thing the rail sees is a real,
+        // bound harness session. Every failure path hard-deletes row + dir.
         let created = session_create_blocking(SessionCreateArgs {
             title: Some(haider_run_title(&prompt)),
             pinned_dir,
         })?;
-        let row = haider_run_update_session(
-            &app,
-            &created.id,
-            Some("running"),
-            None,
-            Some(prompt.clone()),
-        )?;
-        let cwd = haider_run_working_directory(&row);
+        let discard_created = |app: &AppHandle| {
+            let _ = app;
+            let _ = session_delete_blocking(SessionDeleteArgs {
+                id: created.id.clone(),
+                delete_dir: created.kind == "generated",
+            });
+        };
+        let cwd = haider_run_working_directory(&created);
         let (binding_sender, binding_receiver) = std::sync::mpsc::sync_channel(1);
         if let Err(error) = haider_run_spawn(
             app.clone(),
-            row.id.clone(),
+            created.id.clone(),
             None,
-            prompt,
+            prompt.clone(),
             cwd,
             Some(binding_sender),
         ) {
-            let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
+            discard_created(&app);
             return Err(error);
         }
         match binding_receiver.recv_timeout(HAIDER_RUN_BIND_TIMEOUT) {
-            Ok(Ok(bound_row)) => Ok(bound_row),
+            Ok(Ok(_bound_row)) => haider_run_update_session(
+                &app,
+                &created.id,
+                Some("running"),
+                None,
+                Some(prompt),
+            ),
             Ok(Err(error)) => {
-                haider_run_kill_active(&row.id);
-                let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
+                haider_run_kill_active(&created.id);
+                discard_created(&app);
                 Err(error)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                haider_run_kill_active(&row.id);
-                let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
+                haider_run_kill_active(&created.id);
+                discard_created(&app);
                 Err("Timed out waiting for Haider to create the provider session.".to_string())
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                haider_run_kill_active(&created.id);
+                discard_created(&app);
                 Err("Haider run ended before creating the provider session.".to_string())
             }
         }

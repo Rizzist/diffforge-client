@@ -155,7 +155,7 @@ export default function SessionComposer({
             ))}
           </SlashPalette>
         )}
-        <ComposerBar data-busy={busy ? "true" : undefined}>
+        <ComposerField data-busy={busy ? "true" : undefined}>
           <ComposerInput
             autoFocus={autoFocus}
             disabled={disabled || busy}
@@ -199,7 +199,7 @@ export default function SessionComposer({
           >
             {busy ? "…" : <Send aria-hidden="true" />}
           </ComposerRoundButton>
-        </ComposerBar>
+        </ComposerField>
       </ComposerBarWrap>
     </ComposerRoot>
   );
@@ -207,8 +207,8 @@ export default function SessionComposer({
 
 const ComposerRoot = styled.div`
   flex: 0 0 auto;
-  width: min(860px, calc(100% - 28px));
-  margin: 6px auto 14px;
+  width: min(48rem, calc(100% - 28px));
+  margin: 6px auto 12px;
 `;
 
 const ChipsRow = styled.div`
@@ -353,56 +353,68 @@ const SlashItem = styled.button`
   }
 `;
 
-const ComposerBar = styled.div`
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  padding: 10px 10px 10px 18px;
-  border: 1px solid var(--forge-border-strong);
-  border-radius: 22px;
-  background: var(--forge-surface-raised);
-  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.28);
-
-  &:focus-within {
-    border-color: rgba(var(--forge-tint-soft-rgb), 0.5);
-  }
+/* Dashboard structure: one pill textarea with the mic + send circles
+   absolutely positioned INSIDE its right end. */
+const ComposerField = styled.div`
+  position: relative;
+  width: 100%;
+  min-width: 0;
 `;
 
 const ComposerInput = styled.textarea`
-  flex: 1;
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
   min-width: 0;
-  max-height: 160px;
+  min-height: 46px;
+  max-height: min(150px, 32vh);
   resize: none;
-  border: 0;
-  outline: none;
+  padding: 13px 86px 13px 16px;
+  border: 1px solid var(--forge-border);
+  border-radius: 24px;
   color: var(--forge-text);
-  background: transparent;
+  background: var(--forge-surface-raised);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.04);
   font-family: inherit;
-  font-size: 12.5px;
-  line-height: 1.45;
+  font-size: 13px;
+  line-height: 1.4;
+  outline: none;
 
   &::placeholder {
     color: var(--forge-text-muted);
   }
+
+  &:focus {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.5);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.6;
+  }
 `;
 
 const ComposerRoundButton = styled.button`
+  position: absolute;
+  bottom: 8px;
   display: grid;
-  width: 32px;
-  height: 32px;
-  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
   place-items: center;
+  padding: 0;
   border-radius: 999px;
   cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
 
   svg {
-    width: 15px;
-    height: 15px;
+    width: 14px;
+    height: 14px;
   }
 
   &[data-variant="mic"] {
+    right: 44px;
     border: 1px solid var(--forge-border);
-    color: var(--forge-text-soft);
+    color: var(--forge-text-muted);
     background: transparent;
   }
 
@@ -412,17 +424,20 @@ const ComposerRoundButton = styled.button`
   }
 
   &[data-variant="send"] {
-    border: 0;
-    color: #fff;
-    background: var(--forge-accent);
+    right: 8px;
+    border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.45);
+    color: var(--forge-accent-soft);
+    background: rgba(var(--forge-tint-rgb), 0.22);
   }
 
   &[data-variant="send"]:hover:not(:disabled) {
-    filter: brightness(1.12);
+    color: #fff;
+    border-color: var(--forge-accent);
+    background: var(--forge-accent);
   }
 
   &:disabled {
-    opacity: 0.35;
+    opacity: 0.4;
     cursor: default;
   }
 `;

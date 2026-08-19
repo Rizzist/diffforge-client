@@ -22,6 +22,12 @@ const SESSION_TERMINAL_RESIZE_DEBOUNCE_MS = 120;
 const SESSION_TOUCH_DEBOUNCE_MS = 15_000;
 const SESSION_TERMINAL_GRID_GUARD_PX = 2;
 
+function getSessionTerminalTheme() {
+  return document.documentElement.dataset.forgeTheme === "light"
+    ? TERMINAL_LIGHT_THEME
+    : TERMINAL_DARK_THEME;
+}
+
 /* xterm's private cell dimensions can land on device-pixel fractions that
    differ slightly from the final canvas allocation. Reserve a tiny amount of
    the real mount box before flooring so the renderer can never gain a row or
@@ -100,6 +106,7 @@ export default function SessionTerminal({ session, active }) {
     let firstOutputFitFrame = 0;
     let firstOutputFitRequested = false;
     let resizeObserver = null;
+    let themeObserver = null;
     let detachPushToTalk = () => {};
     let lastTouchAt = 0;
 
@@ -109,7 +116,42 @@ export default function SessionTerminal({ session, active }) {
         return;
       }
       lastTouchAt = now;
-      void updateSession(session.id, { touch: true, status: "running" }).catch(() => {});
+      void updateSession(session.id, { touch: true }).catch(() => {});
+    };
+
+    const applyTerminalTheme = () => {
+      if (disposed || !term) {
+        return;
+      }
+      term.options.theme = getSessionTerminalTheme();
+      term.refresh(0, Math.max(0, term.rows - 1));
+    };
+
+    /* The frame must match the HARNESS's background, not the ADE theme:
+       haider emits OSC 11 (set terminal background) when its own theme
+       changes, so track it and paint the host frame with that exact color.
+       "rgb:RRRR/GGGG/BBBB" (X11, 8-16 bit per channel) and "#rrggbb" forms. */
+    const parseOscColor = (data) => {
+      const text = String(data || "").trim();
+      if (text.startsWith("#")) {
+        return text;
+      }
+      const match = text.match(/^rgb:([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})$/);
+      if (!match) {
+        return null;
+      }
+      const channel = (value) => value.padEnd(4, value).slice(0, 2);
+      return `#${channel(match[1])}${channel(match[2])}${channel(match[3])}`;
+    };
+    const applyHarnessBackground = (data) => {
+      if (disposed) {
+        return false;
+      }
+      const color = parseOscColor(data);
+      if (color && observedHost) {
+        observedHost.style.background = color;
+      }
+      return false; // let xterm keep its own OSC handling (incl. queries)
     };
 
     const fitTerminal = () => {
@@ -141,7 +183,6 @@ export default function SessionTerminal({ session, active }) {
     };
 
     const run = async () => {
-      const isLightTheme = document.documentElement.dataset.forgeTheme === "light";
       term = new XTerm({
         allowProposedApi: false,
         altClickMovesCursor: false,
@@ -157,11 +198,12 @@ export default function SessionTerminal({ session, active }) {
         macOptionIsMeta: true,
         scrollback: 10000,
         smoothScrollDuration: 0,
-        theme: isLightTheme ? TERMINAL_LIGHT_THEME : TERMINAL_DARK_THEME,
+        theme: getSessionTerminalTheme(),
       });
       xtermRef.current = term;
       term.open(container);
       detachPushToTalk = guardXtermDuringPushToTalk(term);
+      term.parser.registerOscHandler(11, applyHarnessBackground);
 
       term.onData((data) => {
         touchSession();
@@ -257,12 +299,22 @@ export default function SessionTerminal({ session, active }) {
       resizeObserver = new ResizeObserver(scheduleFit);
       resizeObserver.observe(observedHost);
     }
+    if (typeof MutationObserver === "function") {
+      themeObserver = new MutationObserver(applyTerminalTheme);
+      themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["data-forge-theme"],
+      });
+    }
 
     return () => {
       disposed = true;
       window.removeEventListener("resize", scheduleFit);
       if (resizeObserver) {
         resizeObserver.disconnect();
+      }
+      if (themeObserver) {
+        themeObserver.disconnect();
       }
       if (resizeTimer) {
         window.clearTimeout(resizeTimer);
@@ -326,7 +378,7 @@ const TerminalHost = styled.div`
   height: 100%;
   min-height: 0;
   box-sizing: border-box;
-  padding: 8px 10px;
+  padding: 3px;
   overflow: hidden;
   background: ${TERMINAL_DARK_THEME.background};
 

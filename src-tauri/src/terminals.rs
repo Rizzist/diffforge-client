@@ -820,13 +820,49 @@ fn terminal_recordable_provider_session_id_for_metadata(
     .then_some(provider_session_id)
 }
 
+/// haider tui gained `--session <id>` in 0.0.929; older installs get the
+/// plain launcher. Version parse is cached for the process lifetime.
+fn haider_tui_supports_session_flag() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let output = std::process::Command::new("haider")
+            .arg("--version")
+            .output();
+        let Ok(output) = output else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let version = text
+            .split_whitespace()
+            .find(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .unwrap_or("");
+        let mut parts = version.split('.').filter_map(|part| part.parse::<u64>().ok());
+        let (major, minor, patch) = (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        );
+        (major, minor, patch) >= (0, 0, 929)
+    })
+}
+
+fn haider_tui_launch_args(provider_session_id: Option<&str>) -> Vec<String> {
+    let mut args = vec!["tui".to_string()];
+    if let Some(session_id) = terminal_clean_provider_session_id(provider_session_id) {
+        if haider_tui_supports_session_flag() {
+            args.push("--session".to_string());
+            args.push(session_id);
+        }
+    }
+    args
+}
+
 fn terminal_provider_resume_args(
     provider: AgentProvider,
     provider_session_id: Option<&str>,
 ) -> Vec<String> {
     if matches!(provider, AgentProvider::Haider) {
-        // A future `--session` flag will slot in here once the daemon exposes it.
-        return vec!["tui".to_string()];
+        return haider_tui_launch_args(provider_session_id);
     }
     let Some(session_id) = terminal_clean_provider_session_id(provider_session_id) else {
         return Vec::new();
@@ -845,8 +881,7 @@ fn terminal_provider_fork_args(
     provider_session_id: Option<&str>,
 ) -> Vec<String> {
     if matches!(provider, AgentProvider::Haider) {
-        // A future `--session` flag will slot in here once the daemon exposes it.
-        return vec!["tui".to_string()];
+        return haider_tui_launch_args(provider_session_id);
     }
     let Some(session_id) = terminal_clean_provider_session_id(provider_session_id) else {
         return Vec::new();

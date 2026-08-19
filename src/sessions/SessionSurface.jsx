@@ -178,14 +178,14 @@ export default function SessionSurface({
     }
   }, [setModeFor]);
 
-  const floatingControls = (session) => (
+  const floatingControls = (session, { showToggle = true } = {}) => (
     <FloatingControls>
+      {showToggle && session && (
       <SessionViewToggle aria-label="Session view" role="tablist">
         <SessionViewButton
-          aria-selected={!session || modeFor(session.id) === "ui"}
-          data-active={!session || modeFor(session.id) === "ui" ? "true" : undefined}
-          disabled={!session}
-          onClick={() => session && setModeFor(session.id, "ui")}
+          aria-selected={modeFor(session.id) === "ui"}
+          data-active={modeFor(session.id) === "ui" ? "true" : undefined}
+          onClick={() => setModeFor(session.id, "ui")}
           role="tab"
           type="button"
         >
@@ -193,10 +193,9 @@ export default function SessionSurface({
           <span>Chat</span>
         </SessionViewButton>
         <SessionViewButton
-          aria-selected={Boolean(session) && modeFor(session.id) === "terminal"}
-          data-active={session && modeFor(session.id) === "terminal" ? "true" : undefined}
-          disabled={!session}
-          onClick={() => session && setModeFor(session.id, "terminal")}
+          aria-selected={modeFor(session.id) === "terminal"}
+          data-active={modeFor(session.id) === "terminal" ? "true" : undefined}
+          onClick={() => setModeFor(session.id, "terminal")}
           role="tab"
           type="button"
         >
@@ -204,7 +203,8 @@ export default function SessionSurface({
           <span>Shell</span>
         </SessionViewButton>
       </SessionViewToggle>
-      {session && (
+      )}
+      {session && session.id !== "draft" && (
         <StatusPill data-status={session.status}>
           <i aria-hidden="true" />
           <span>
@@ -240,6 +240,20 @@ export default function SessionSurface({
   );
 
   if (draftOpen) {
+    // Draft = the harness itself. Default view is the plain haider TUI at
+    // its main menu (the harness creates the session when the user acts);
+    // the Chat toggle offers the composer path, which also defers creation
+    // to the harness (session_start_with_prompt only surfaces bound rows).
+    const draftSession = {
+      id: "draft",
+      title: "New chat",
+      dir: "",
+      kind: "pinned",
+      provider: "haider",
+      provider_session_id: "",
+      status: "idle",
+    };
+    const draftMode = viewModes.draft || "terminal";
     return (
       <SessionSurfaceRoot>
         <SessionPane data-active="true">
@@ -248,26 +262,34 @@ export default function SessionSurface({
               <Forum aria-hidden="true" size={12} />
               <span>New chat</span>
             </TabChip>
+            {floatingControls(draftSession)}
           </SessionTabBar>
           <PaneContent>
-            {floatingControls(null)}
-            <DraftBody>
-              <EmptyState>
-                <EmptyStateIcon aria-hidden="true">
-                  <TerminalGlyph size={22} />
-                </EmptyStateIcon>
-                <h2>No session yet.</h2>
-                <p>Send a message below — the Haider harness creates the session and its folder on your first message. Nothing runs until then.</p>
-                {draftError && <DraftError>{draftError}</DraftError>}
-              </EmptyState>
-            </DraftBody>
-            <SessionComposer
-              autoFocus
-              chipValues={chipValuesFor(null)}
-              onChipChange={(key, option) => handleChipChange("draft", key, option)}
-              onSubmit={submitDraft}
-              placeholder="Message Haider…"
-            />
+            {draftMode === "ui" ? (
+              <>
+                <DraftBody>
+                  <EmptyState>
+                    <EmptyStateIcon aria-hidden="true">
+                      <TerminalGlyph size={22} />
+                    </EmptyStateIcon>
+                    <h2>No session yet.</h2>
+                    <p>Send a message below — the Haider harness creates the session and its folder on your first message. Nothing runs until then.</p>
+                    {draftError && <DraftError>{draftError}</DraftError>}
+                  </EmptyState>
+                </DraftBody>
+                <SessionComposer
+                  autoFocus
+                  chipValues={chipValuesFor(null)}
+                  onChipChange={(key, option) => handleChipChange("draft", key, option)}
+                  onSubmit={submitDraft}
+                  placeholder="Message Haider…"
+                />
+              </>
+            ) : (
+              <TerminalHostLayer data-visible="true">
+                <SessionTerminal active session={draftSession} />
+              </TerminalHostLayer>
+            )}
           </PaneContent>
         </SessionPane>
       </SessionSurfaceRoot>
@@ -278,16 +300,17 @@ export default function SessionSurface({
     // Home: the flame hero with the plan tiers, plus recent sessions to
     // continue — including ones created directly in the haider CLI once the
     // bridge imports them.
-    const recentSessions = sessions.slice(0, 6);
+    // Max 3 recents, like the CLI's own launcher list.
+    const recentSessions = sessions.slice(0, 3);
     return (
       <SessionSurfaceRoot>
         <SessionPane data-active="true">
+          <SessionTabBar>
+            {floatingControls(null, { showToggle: false })}
+          </SessionTabBar>
           <PaneContent>
-            {floatingControls(null)}
             <HomeBody>
-              <HomeFlame>
-                <PlanFlame active plan={planKey} showControls />
-              </HomeFlame>
+              <HomeLogo alt="" src="/logo.webp" />
               <HomeContinue>
                 <HomeContinueTitle>
                   {recentSessions.length ? "Continue" : "Start your first session"}
@@ -298,6 +321,7 @@ export default function SessionSurface({
                     onClick={() => onOpenSession?.(session)}
                     type="button"
                   >
+                    <HomeContinueDot aria-hidden="true" data-status={session.status} />
                     <span>{session.title}</span>
                     <em>{formatSessionRelativeTime(session.latest_at_ms)}</em>
                   </HomeContinueRow>
@@ -307,6 +331,9 @@ export default function SessionSurface({
                   <span>New chat</span>
                 </HomeNewChat>
               </HomeContinue>
+              <HomeFlame>
+                <PlanFlame active plan={planKey} showControls />
+              </HomeFlame>
             </HomeBody>
           </PaneContent>
         </SessionPane>
@@ -368,11 +395,10 @@ export default function SessionSurface({
               >
                 <ButtonAddIcon aria-hidden="true" />
               </TabAddButton>
+              {floatingControls(session)}
             </SessionTabBar>
 
             <PaneContent>
-              {chatTabActive && floatingControls(session)}
-
               {/* Chat tab: transcript + composer, or the lazy Shell PTY. */}
               {chatTabActive && mode === "ui" && active && (
                 <>
@@ -557,11 +583,9 @@ const PaneContent = styled.div`
 `;
 
 const FloatingControls = styled.div`
-  position: absolute;
-  top: 10px;
-  right: 12px;
-  z-index: 6;
   display: inline-flex;
+  flex: 0 0 auto;
+  margin-left: auto;
   align-items: center;
   gap: 8px;
 `;
@@ -573,8 +597,7 @@ const SessionViewToggle = styled.div`
   padding: 2px;
   border: 1px solid var(--forge-border);
   border-radius: 999px;
-  background: var(--forge-surface-raised);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+  background: var(--forge-surface-control);
 `;
 
 const SessionViewButton = styled.button`
@@ -618,8 +641,7 @@ const StatusPill = styled.span`
   border: 1px solid var(--forge-border);
   border-radius: 999px;
   color: var(--forge-text-soft);
-  background: var(--forge-surface-raised);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+  background: var(--forge-surface-control);
   font-size: 10px;
   font-weight: 700;
 
@@ -651,8 +673,7 @@ const HeaderIconButton = styled.button`
   border: 1px solid var(--forge-border);
   border-radius: 999px;
   color: var(--forge-text-soft);
-  background: var(--forge-surface-raised);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+  background: var(--forge-surface-control);
   cursor: pointer;
 
   svg {
@@ -695,6 +716,38 @@ const HomeBody = styled.div`
 
 const HomeFlame = styled.div`
   width: min(560px, 90%);
+`;
+
+const HomeLogo = styled.img`
+  width: 84px;
+  height: 84px;
+  margin-bottom: 4px;
+  filter: drop-shadow(0 10px 30px rgba(47, 128, 255, 0.25));
+`;
+
+const HomeContinueDot = styled.i`
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--forge-green);
+
+  &[data-status="running"],
+  &[data-status="waiting"] {
+    background: var(--forge-amber);
+    animation: home-dot-work 1.1s ease-in-out infinite;
+  }
+
+  &[data-status="error"] {
+    background: var(--forge-red);
+    animation: none;
+  }
+
+  @keyframes home-dot-work {
+    50% {
+      opacity: 0.35;
+    }
+  }
 `;
 
 const HomeContinue = styled.div`

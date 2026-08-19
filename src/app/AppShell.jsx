@@ -18439,6 +18439,26 @@ export default function App() {
     };
   }, [authState, refreshSessions]);
 
+  // Harness-created sessions auto-select: when the draft (composer or its
+  // plain haider TUI) causes the harness to mint a session, the bridge
+  // imports/binds it and it appears here — select it and retire the draft.
+  const knownSessionIdsRef = useRef(null);
+  useEffect(() => {
+    const ids = new Set(sessions.map((session) => session.id));
+    const previous = knownSessionIdsRef.current;
+    knownSessionIdsRef.current = ids;
+    if (!previous) {
+      return;
+    }
+    if (!sessionDraftOpen) {
+      return;
+    }
+    const fresh = sessions.find((session) => !previous.has(session.id));
+    if (fresh) {
+      openSessionFromRail(fresh);
+    }
+  }, [openSessionFromRail, sessionDraftOpen, sessions]);
+
   // ⌘N / Ctrl+N starts a new chat.
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -24307,7 +24327,9 @@ export default function App() {
                     )}
                   </RailTop>
 
-                  <RailFooter>
+                  {/* Footer nav (Terminals/Files, account) must never deselect
+                      the active session — swallow the rail's deselect click. */}
+                  <RailFooter onClick={(event) => event.stopPropagation()}>
                     {activeSessionId && !loopspacesModeActive && (
                       <RailViewActions aria-label="Session views">
                         <RailActionButton
