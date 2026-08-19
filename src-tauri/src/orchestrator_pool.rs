@@ -384,6 +384,7 @@ async fn orchestrator_pool_spawn_entry(
         permission_mode: orchestrator_pool_permission_mode(&agent_id),
         plain_shell: Some(plain_shell),
         fresh_session: Some(false),
+        adopt_existing: None,
         preserve_coordination_session: Some(true),
         session_mode: Some(orchestrator_pool_session_mode(&agent_id).to_string()),
         slot_key: Some((usize::from(index) + 1).to_string()),

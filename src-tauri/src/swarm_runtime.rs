@@ -3177,6 +3177,7 @@ async fn swarm_open_member(
             permission_mode: Some(TERMINAL_PERMISSION_MODE_BYPASS.to_string()),
             plain_shell: Some(false),
             fresh_session: Some(true),
+            adopt_existing: None,
             preserve_coordination_session: Some(false),
             session_mode: Some(TerminalSessionMode::General.as_str().to_string()),
             slot_key: Some(spec.pane_id.clone()),

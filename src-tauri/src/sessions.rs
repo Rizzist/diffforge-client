@@ -14,6 +14,9 @@ struct SessionRow {
     latest_at_ms: i64,
     status: String,
     first_user_message: String,
+    model: String,
+    pinned: bool,
+    title_locked: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,13 +194,19 @@ fn sessions_database_path() -> Result<PathBuf, String> {
     Ok(root.join("sessions.sqlite"))
 }
 
-fn sessions_open_database() -> Result<rusqlite::Connection, String> {
-    let path = sessions_database_path()?;
-    let connection = rusqlite::Connection::open(&path)
-        .map_err(|error| format!("Unable to open sessions SQLite store: {error}"))?;
-    connection
-        .busy_timeout(Duration::from_secs(5))
-        .map_err(|error| format!("Unable to configure sessions SQLite timeout: {error}"))?;
+fn sessions_table_columns(connection: &rusqlite::Connection) -> Result<HashSet<String>, String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(sessions)")
+        .map_err(|error| format!("Unable to inspect sessions SQLite schema: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("Unable to query sessions SQLite schema: {error}"))?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| format!("Unable to decode sessions SQLite schema: {error}"))?;
+    Ok(columns)
+}
+
+fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -212,12 +221,55 @@ fn sessions_open_database() -> Result<rusqlite::Connection, String> {
                 created_at_ms INTEGER NOT NULL,
                 latest_at_ms INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'idle',
-                first_user_message TEXT NOT NULL DEFAULT ''
+                first_user_message TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                pinned INTEGER NOT NULL DEFAULT 0,
+                title_locked INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS idx_sessions_latest_at_ms
                 ON sessions(latest_at_ms DESC);",
         )
         .map_err(|error| format!("Unable to initialize sessions SQLite store: {error}"))?;
+    let migrations = [
+        ("model", "TEXT NOT NULL DEFAULT ''"),
+        ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+        ("title_locked", "INTEGER NOT NULL DEFAULT 0"),
+    ];
+    let columns = sessions_table_columns(connection)?;
+    if migrations
+        .iter()
+        .all(|(column, _)| columns.contains(*column))
+    {
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("Unable to begin sessions SQLite migration: {error}"))?;
+    let columns = sessions_table_columns(&transaction)?;
+    for (column, definition) in migrations {
+        if !columns.contains(column) {
+            transaction
+                .execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"),
+                    [],
+                )
+                .map_err(|error| format!("Unable to migrate sessions SQLite schema: {error}"))?;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("Unable to commit sessions SQLite migration: {error}"))?;
+    Ok(())
+}
+
+fn sessions_open_database() -> Result<rusqlite::Connection, String> {
+    let path = sessions_database_path()?;
+    let mut connection = rusqlite::Connection::open(&path)
+        .map_err(|error| format!("Unable to open sessions SQLite store: {error}"))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("Unable to configure sessions SQLite timeout: {error}"))?;
+    sessions_initialize_database(&mut connection)?;
     Ok(connection)
 }
 
@@ -234,11 +286,14 @@ fn sessions_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> 
         latest_at_ms: row.get(8)?,
         status: row.get(9)?,
         first_user_message: row.get(10)?,
+        model: row.get(11)?,
+        pinned: row.get(12)?,
+        title_locked: row.get(13)?,
     })
 }
 
 const SESSIONS_SELECT_COLUMNS: &str =
-    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, first_user_message";
+    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, first_user_message, model, pinned, title_locked";
 
 fn sessions_row_by_id(connection: &rusqlite::Connection, id: &str) -> Result<SessionRow, String> {
     let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions WHERE id = ?1");
@@ -306,14 +361,18 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
         latest_at_ms: now_ms,
         status: "idle".to_string(),
         first_user_message: String::new(),
+        model: String::new(),
+        pinned: false,
+        title_locked: false,
     };
     let connection = sessions_open_database()?;
     connection
         .execute(
             "INSERT INTO sessions (
                 id, title, slug, dir, kind, provider, provider_session_id,
-                created_at_ms, latest_at_ms, status, first_user_message
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                created_at_ms, latest_at_ms, status, first_user_message, model,
+                pinned, title_locked
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 row.id,
                 row.title,
@@ -326,6 +385,9 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
                 row.latest_at_ms,
                 row.status,
                 row.first_user_message,
+                row.model,
+                row.pinned,
+                row.title_locked,
             ],
         )
         .map_err(|error| format!("Unable to store session: {error}"))?;
@@ -339,8 +401,10 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
     let connection = sessions_open_database()?;
     let mut row = sessions_row_by_id(&connection, args.id.trim())?;
 
-    if let Some(title) = args.title {
-        row.title = title;
+    if !row.title_locked {
+        if let Some(title) = args.title {
+            row.title = title;
+        }
     }
     if let Some(status) = args.status {
         row.status = status;
@@ -350,6 +414,7 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
     }
     if let Some(first_user_message) = args.first_user_message {
         let should_reslug = row.kind == "generated"
+            && !row.title_locked
             && row.first_user_message.trim().is_empty()
             && !first_user_message.trim().is_empty();
         if should_reslug {
@@ -377,7 +442,8 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
             "UPDATE sessions SET
                 title = ?2, slug = ?3, dir = ?4, kind = ?5, provider = ?6,
                 provider_session_id = ?7, created_at_ms = ?8, latest_at_ms = ?9,
-                status = ?10, first_user_message = ?11
+                status = ?10, first_user_message = ?11, model = ?12, pinned = ?13,
+                title_locked = ?14
              WHERE id = ?1",
             rusqlite::params![
                 row.id,
@@ -391,10 +457,46 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
                 row.latest_at_ms,
                 row.status,
                 row.first_user_message,
+                row.model,
+                row.pinned,
+                row.title_locked,
             ],
         )
         .map_err(|error| format!("Unable to update session: {error}"))?;
     Ok(row)
+}
+
+fn session_rename_blocking(session_id: String, title: String) -> Result<SessionRow, String> {
+    if title.trim().is_empty() {
+        return Err("Session title must not be empty.".to_string());
+    }
+    let _write_guard = sessions_write_lock()
+        .lock()
+        .map_err(|_| "Sessions write lock is unavailable.".to_string())?;
+    let connection = sessions_open_database()?;
+    let row = sessions_row_by_id(&connection, session_id.trim())?;
+    connection
+        .execute(
+            "UPDATE sessions SET title = ?2, title_locked = 1 WHERE id = ?1",
+            rusqlite::params![row.id, title],
+        )
+        .map_err(|error| format!("Unable to rename session: {error}"))?;
+    sessions_row_by_id(&connection, &row.id)
+}
+
+fn session_set_pinned_blocking(session_id: String, pinned: bool) -> Result<SessionRow, String> {
+    let _write_guard = sessions_write_lock()
+        .lock()
+        .map_err(|_| "Sessions write lock is unavailable.".to_string())?;
+    let connection = sessions_open_database()?;
+    let row = sessions_row_by_id(&connection, session_id.trim())?;
+    connection
+        .execute(
+            "UPDATE sessions SET pinned = ?2 WHERE id = ?1",
+            rusqlite::params![row.id, pinned],
+        )
+        .map_err(|error| format!("Unable to update session pin: {error}"))?;
+    sessions_row_by_id(&connection, &row.id)
 }
 
 fn session_delete_blocking(args: SessionDeleteArgs) -> Result<(), String> {
@@ -454,6 +556,35 @@ async fn session_update(app: AppHandle, args: SessionUpdateArgs) -> Result<Sessi
 }
 
 #[tauri::command]
+async fn session_rename(
+    app: AppHandle,
+    session_id: String,
+    title: String,
+) -> Result<SessionRow, String> {
+    let row =
+        tauri::async_runtime::spawn_blocking(move || session_rename_blocking(session_id, title))
+            .await
+            .map_err(|error| format!("Session rename worker failed: {error}"))??;
+    sessions_emit_changed(&app);
+    Ok(row)
+}
+
+#[tauri::command]
+async fn session_set_pinned(
+    app: AppHandle,
+    session_id: String,
+    pinned: bool,
+) -> Result<SessionRow, String> {
+    let row = tauri::async_runtime::spawn_blocking(move || {
+        session_set_pinned_blocking(session_id, pinned)
+    })
+    .await
+    .map_err(|error| format!("Session pin worker failed: {error}"))??;
+    sessions_emit_changed(&app);
+    Ok(row)
+}
+
+#[tauri::command]
 async fn session_delete(app: AppHandle, args: SessionDeleteArgs) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || session_delete_blocking(args))
         .await
@@ -476,22 +607,27 @@ mod sessions_tests {
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct SessionsEnvGuard {
+        key: &'static str,
         previous: Option<std::ffi::OsString>,
     }
 
     impl Drop for SessionsEnvGuard {
         fn drop(&mut self) {
             match self.previous.as_ref() {
-                Some(value) => env::set_var(SESSIONS_HOME_ENV, value),
-                None => env::remove_var(SESSIONS_HOME_ENV),
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
             }
         }
     }
 
+    fn set_sessions_env(key: &'static str, path: &Path) -> SessionsEnvGuard {
+        let previous = env::var_os(key);
+        env::set_var(key, path);
+        SessionsEnvGuard { key, previous }
+    }
+
     fn set_sessions_home(path: &Path) -> SessionsEnvGuard {
-        let previous = env::var_os(SESSIONS_HOME_ENV);
-        env::set_var(SESSIONS_HOME_ENV, path);
-        SessionsEnvGuard { previous }
+        set_sessions_env(SESSIONS_HOME_ENV, path)
     }
 
     fn sessions_test_directory(label: &str) -> PathBuf {
@@ -499,6 +635,53 @@ mod sessions_tests {
             "diffforge-sessions-{label}-{}",
             uuid::Uuid::new_v4().simple()
         ))
+    }
+
+    fn sessions_test_row(id: &str, dir: &Path, kind: &str) -> SessionRow {
+        SessionRow {
+            id: id.to_string(),
+            title: "Original title".to_string(),
+            slug: "original-title".to_string(),
+            dir: dir.to_string_lossy().to_string(),
+            kind: kind.to_string(),
+            provider: "haider".to_string(),
+            provider_session_id: format!("provider-{id}"),
+            created_at_ms: 10,
+            latest_at_ms: 10,
+            status: "idle".to_string(),
+            first_user_message: String::new(),
+            model: String::new(),
+            pinned: false,
+            title_locked: false,
+        }
+    }
+
+    fn sessions_test_insert_row(connection: &rusqlite::Connection, row: &SessionRow) {
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                    id, title, slug, dir, kind, provider, provider_session_id,
+                    created_at_ms, latest_at_ms, status, first_user_message, model,
+                    pinned, title_locked
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    row.id,
+                    row.title,
+                    row.slug,
+                    row.dir,
+                    row.kind,
+                    row.provider,
+                    row.provider_session_id,
+                    row.created_at_ms,
+                    row.latest_at_ms,
+                    row.status,
+                    row.first_user_message,
+                    row.model,
+                    row.pinned,
+                    row.title_locked,
+                ],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -542,6 +725,163 @@ mod sessions_tests {
         fs::create_dir_all(&directory).unwrap();
         let _guard = set_sessions_home(&directory);
         assert_eq!(sessions_home_path().unwrap(), directory);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sessions_database_migration_is_idempotent_for_existing_store() {
+        let directory = sessions_test_directory("migration");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sessions.sqlite");
+        let mut connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    dir TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('generated', 'pinned')),
+                    provider TEXT NOT NULL DEFAULT 'haider',
+                    provider_session_id TEXT NOT NULL DEFAULT '',
+                    created_at_ms INTEGER NOT NULL,
+                    latest_at_ms INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    first_user_message TEXT NOT NULL DEFAULT ''
+                 );
+                 INSERT INTO sessions (
+                    id, title, slug, dir, kind, provider_session_id,
+                    created_at_ms, latest_at_ms
+                 ) VALUES ('old-row', 'Old row', 'old-row', '', 'pinned', 'provider-old', 1, 2);",
+            )
+            .unwrap();
+
+        sessions_initialize_database(&mut connection).unwrap();
+        sessions_initialize_database(&mut connection).unwrap();
+
+        let columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(sessions)").unwrap();
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            columns
+        };
+        for column in ["model", "pinned", "title_locked"] {
+            assert_eq!(columns.iter().filter(|name| *name == column).count(), 1);
+        }
+        let row = sessions_row_by_id(&connection, "old-row").unwrap();
+        assert_eq!(row.model, "");
+        assert!(!row.pinned);
+        assert!(!row.title_locked);
+
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_rename_locks_title_against_reconcile() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("rename");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let row = sessions_test_row("rename", Path::new(""), "pinned");
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        assert!(session_rename_blocking("rename".to_string(), "  \n".to_string()).is_err());
+        let renamed =
+            session_rename_blocking("rename".to_string(), "User title".to_string()).unwrap();
+        assert_eq!(renamed.title, "User title");
+        assert_eq!(renamed.slug, "original-title");
+        assert_eq!(renamed.dir, "");
+        assert!(renamed.title_locked);
+
+        assert!(haider_bridge_reconcile(&[HaiderBridgeSession {
+            id: "provider-rename".to_string(),
+            title: Some("Daemon title".to_string()),
+            model: Some("daemon-model".to_string()),
+            cwd: None,
+            state: Some("running".to_string()),
+            latest_at_ms: Some(20),
+        }])
+        .unwrap());
+        let connection = sessions_open_database().unwrap();
+        let reconciled = sessions_row_by_id(&connection, "rename").unwrap();
+        assert_eq!(reconciled.title, "User title");
+        assert!(reconciled.title_locked);
+        assert_eq!(reconciled.model, "daemon-model");
+        assert_eq!(reconciled.status, "running");
+        assert_eq!(reconciled.latest_at_ms, 20);
+        drop(connection);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_pinned_toggle_round_trips() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("pinned");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let row = sessions_test_row("pinned", Path::new(""), "pinned");
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        assert!(
+            session_set_pinned_blocking("pinned".to_string(), true)
+                .unwrap()
+                .pinned
+        );
+        assert!(
+            !session_set_pinned_blocking("pinned".to_string(), false)
+                .unwrap()
+                .pinned
+        );
+        let connection = sessions_open_database().unwrap();
+        assert!(!sessions_row_by_id(&connection, "pinned").unwrap().pinned);
+        drop(connection);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn first_user_message_reslug_skips_locked_rows() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("locked-reslug");
+        let session_directory = directory.join("home").join("original-title");
+        fs::create_dir_all(session_directory.join("work")).unwrap();
+        let session_directory = session_directory.canonicalize().unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let row = sessions_test_row("locked-reslug", &session_directory, "generated");
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        session_rename_blocking("locked-reslug".to_string(), "User title".to_string()).unwrap();
+        let updated = session_update_blocking(SessionUpdateArgs {
+            id: "locked-reslug".to_string(),
+            title: Some("Automatic title".to_string()),
+            status: None,
+            provider_session_id: None,
+            first_user_message: Some("Automatic title".to_string()),
+            touch: None,
+        })
+        .unwrap();
+        assert_eq!(updated.title, "User title");
+        assert_eq!(updated.slug, "original-title");
+        assert_eq!(updated.dir, session_directory.to_string_lossy());
+        assert_eq!(updated.first_user_message, "Automatic title");
+        assert!(session_directory.exists());
+        assert!(!session_directory
+            .parent()
+            .unwrap()
+            .join("automatic-title")
+            .exists());
+
         fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -46,6 +46,93 @@ const TERMINAL_RESTART_INTENT_MAX_DEADLINE_MS: u64 = 15 * 60_000;
 const TERMINAL_RESTART_INTENT_EVENT: &str = "forge-terminal-restart-intent";
 const TERMINAL_DAEMON_RESPAWN_WINDOW_MS: u64 = 5 * 60_000;
 const TERMINAL_DAEMON_RESPAWN_MAX_PER_WINDOW: usize = 3;
+const TERMINAL_ADOPTABLE_OUTPUT_RING_CAPACITY_BYTES: usize = 512 * 1024;
+
+struct TerminalAdoptableOutputSlot {
+    output_channel: Option<Channel<InvokeResponseBody>>,
+    detached: bool,
+    closed: bool,
+    ring: VecDeque<u8>,
+}
+
+impl TerminalAdoptableOutputSlot {
+    fn new(output_channel: Channel<InvokeResponseBody>) -> Self {
+        Self {
+            output_channel: Some(output_channel),
+            detached: false,
+            closed: false,
+            ring: VecDeque::with_capacity(TERMINAL_ADOPTABLE_OUTPUT_RING_CAPACITY_BYTES),
+        }
+    }
+
+    fn append_ring(&mut self, chunk: &[u8]) {
+        if chunk.len() >= TERMINAL_ADOPTABLE_OUTPUT_RING_CAPACITY_BYTES {
+            self.ring.clear();
+            self.ring.extend(
+                chunk[chunk.len() - TERMINAL_ADOPTABLE_OUTPUT_RING_CAPACITY_BYTES..]
+                    .iter()
+                    .copied(),
+            );
+            return;
+        }
+
+        let overflow = self
+            .ring
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(TERMINAL_ADOPTABLE_OUTPUT_RING_CAPACITY_BYTES);
+        if overflow > 0 {
+            self.ring.drain(..overflow);
+        }
+        self.ring.extend(chunk.iter().copied());
+    }
+
+    fn append_and_send(&mut self, chunk: &[u8]) -> bool {
+        if self.closed {
+            return false;
+        }
+        self.append_ring(chunk);
+        if self.detached {
+            return false;
+        }
+
+        let sent = self.output_channel.as_ref().is_some_and(|output_channel| {
+            output_channel
+                .send(InvokeResponseBody::Raw(chunk.to_vec()))
+                .is_ok()
+        });
+        if !sent {
+            self.output_channel = None;
+            self.detached = true;
+        }
+        sent
+    }
+
+    fn replay_and_swap(
+        &mut self,
+        output_channel: Channel<InvokeResponseBody>,
+    ) -> Result<(), String> {
+        if self.closed {
+            return Err("Terminal session is closing.".to_string());
+        }
+        if !self.ring.is_empty() {
+            let replay = self.ring.iter().copied().collect::<Vec<_>>();
+            output_channel
+                .send(InvokeResponseBody::Raw(replay))
+                .map_err(|error| format!("Unable to replay terminal output: {error}"))?;
+        }
+        self.output_channel = Some(output_channel);
+        self.detached = false;
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        self.output_channel = None;
+        self.detached = true;
+        self.closed = true;
+        self.ring.clear();
+    }
+}
 // A resume binding is captured before a busy restart is queued. Keep it past
 // the longest admission deadline so the ready event can still reopen against
 // the pane's frozen account instead of falling back to the mutable active one.
@@ -5078,6 +5165,8 @@ fn cleanup_terminal_instance_with_context(
         writer,
         size,
         headless_output: _,
+        adopt_tolerant: _,
+        adoptable_output,
         working_directory,
         agent_started,
         input_gate,
@@ -5093,6 +5182,12 @@ fn cleanup_terminal_instance_with_context(
         launch_account_binding: _,
         app_control_mcp_requested: _,
     } = instance;
+    if let Some(adoptable_output) = adoptable_output {
+        let mut output = adoptable_output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        output.close();
+    }
     terminal_codex_hook_trust_discovery_clear(&metadata.pane_id, id);
     terminal_structured_interaction_clear_superseded(&metadata.pane_id, id);
     if let Ok(mut gateway) = codex_gateway.lock() {
@@ -6933,6 +7028,7 @@ fn spawn_terminal_reader(
     headless_output: Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
     cloud_mcp_state: CloudMcpState,
     output_channel: Channel<InvokeResponseBody>,
+    adoptable_output: Option<Arc<StdMutex<TerminalAdoptableOutputSlot>>>,
     prefer_output_transport: bool,
     cloud_output_observer_enabled: bool,
     rust_readiness_observer_enabled: bool,
@@ -7087,6 +7183,7 @@ fn spawn_terminal_reader(
         instance_id: u64,
         cloud_mcp_state: &CloudMcpState,
         output_channel: &Channel<InvokeResponseBody>,
+        adoptable_output: Option<&Arc<StdMutex<TerminalAdoptableOutputSlot>>>,
         output_subscribers: &Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
         prefer_output_transport: bool,
         cloud_output_observer_enabled: bool,
@@ -7099,12 +7196,17 @@ fn spawn_terminal_reader(
         let observer_chunk = cloud_output_observer_enabled.then(|| chunk.clone());
         let transport_sent =
             send_terminal_output_transport_frame(output_subscribers, pane_id, instance_id, &chunk);
-        let channel_sent = if prefer_output_transport && transport_sent {
+        let channel_sent = if let Some(adoptable_output) = adoptable_output {
+            let mut output = adoptable_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            output.append_and_send(&chunk)
+        } else if prefer_output_transport && transport_sent {
             true
         } else {
             output_channel.send(InvokeResponseBody::Raw(chunk)).is_ok()
         };
-        let sent = transport_sent || channel_sent;
+        let sent = adoptable_output.is_some() || transport_sent || channel_sent;
         // Native rendering is the latency-critical consumer. Provider/output
         // observers are scheduled only after the frame has reached xterm.
         let observe_started_at = Instant::now();
@@ -7261,6 +7363,7 @@ fn spawn_terminal_reader(
                     instance_id,
                     &output_cloud_mcp_state,
                     &output_channel,
+                    adoptable_output.as_ref(),
                     &output_subscribers,
                     prefer_output_transport,
                     cloud_output_observer_enabled,
@@ -9718,18 +9821,19 @@ fn terminal_slot_key_from_request(
 }
 
 
-/// Daemon-mode idempotent open: a plain re-open of a pane whose current
-/// instance is alive and already matches the requested shape adopts that
-/// instance instead of replacing it. Returns None when the request must go
-/// through the normal (replace) path.
-///
-/// The replace path closes the live PTY before spawning, and on a daemon
-/// device no webview exists to relaunch a pane afterwards — so a redundant
-/// open (an activation replay or pane reconcile arriving moments after a
-/// session goes live) would kill the very session it meant to ensure
-/// (observed on BYOC: claude closed ~1s after its first SessionStart).
-/// GUI keeps replace semantics: the webview binds its output channel through
-/// the spawn path, and adoption would leave that channel unbound.
+fn terminal_open_adoption_allowed(
+    daemon_mode_active: bool,
+    adopt_existing_requested: bool,
+    is_prewarm_pty: bool,
+    requested_fresh_session: bool,
+) -> bool {
+    (daemon_mode_active || adopt_existing_requested)
+        && !is_prewarm_pty
+        && !requested_fresh_session
+}
+
+/// A live instance whose requested shape still matches can be adopted when
+/// its lifecycle owner preserves the PTY across repeated opens.
 async fn terminal_open_adopt_existing_instance(
     instance: &TerminalInstance,
     kind: &str,
@@ -9877,6 +9981,7 @@ async fn terminal_open(
     let pane_id = request.pane_id;
     let requested_cols = request.cols;
     let requested_rows = request.rows;
+    let adopt_existing_requested = request.adopt_existing.unwrap_or(false);
     let kind = request.kind;
     let requested_agent_id = terminal_normalize_agent_kind(request.agent_id.as_deref())
         .or_else(|| terminal_normalize_agent_kind(request.agent_kind.as_deref()));
@@ -10060,20 +10165,22 @@ async fn terminal_open(
         )?;
     }
 
-    // Daemon devices adopt a live, shape-matching instance instead of
-    // replacing it; see terminal_open_adopt_existing_instance for why. The
-    // check runs AFTER launch resolution so option comparison is
-    // resolved-vs-stored (both normalized the same way) — comparing the raw
-    // request against normalized stored metadata would mismatch cosmetically
-    // and silently fall through to the replace path. Gated on the REQUESTED
-    // fresh_session: a resume that fell back to fresh is not an instruction
-    // to replace a live pane.
-    if crate::daemon_mode_active() && !is_prewarm_pty && !requested_fresh_session {
+    // Resolve before matching so both request and stored launch options use
+    // the same normalization. A resume fallback is not a fresh-session
+    // request and therefore does not replace a live pane.
+    if terminal_open_adoption_allowed(
+        crate::daemon_mode_active(),
+        adopt_existing_requested,
+        is_prewarm_pty,
+        requested_fresh_session,
+    ) {
         let existing_instance = {
             let terminals = state.terminals.read().await;
             terminals.get(&pane_id).cloned()
         };
-        if let Some(existing_instance) = existing_instance {
+        if let Some(existing_instance) = existing_instance
+            .filter(|instance| !adopt_existing_requested || instance.adopt_tolerant)
+        {
             if let Some(adopted) = terminal_open_adopt_existing_instance(
                 &existing_instance,
                 &kind,
@@ -10087,6 +10194,33 @@ async fn terminal_open(
             )
             .await
             {
+                if adopt_existing_requested {
+                    let size = terminal_size_from_request(requested_cols, requested_rows)?;
+                    let adoptable_output = existing_instance
+                        .adoptable_output
+                        .as_ref()
+                        .ok_or_else(|| "Terminal output cannot be adopted.".to_string())?;
+                    {
+                        let mut output = adoptable_output
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        output.replay_and_swap(output_channel.clone())?;
+                    }
+                    if size.rows >= 2 {
+                        resize_terminal_instance(
+                            Some(&app),
+                            &existing_instance,
+                            PtySize {
+                                rows: size.rows - 1,
+                                ..size
+                            },
+                            true,
+                        )
+                        .await?;
+                        resize_terminal_instance(Some(&app), &existing_instance, size, true)
+                            .await?;
+                    }
+                }
                 // A requested resume session differing from the live one is
                 // logged, not honored: daemon catalog bindings lag the live
                 // session, and no interactive daemon flow resumes a specific
@@ -10495,7 +10629,7 @@ async fn terminal_open(
     let terminal_metadata_for_log = terminal_metadata.clone();
     let launch_metadata = terminal_launch_runtime_metadata_from_resolved(&resolved_launch);
 
-    let (instance, reader) = TerminalInstance::from_warm_shell(
+    let (mut instance, reader) = TerminalInstance::from_warm_shell(
         instance_id,
         warm_pty,
         process_working_directory.clone(),
@@ -10509,6 +10643,13 @@ async fn terminal_open(
             .map(|_| launch_account_binding.clone()),
         app_control_mcp_requested,
     );
+    let adoptable_output = adopt_existing_requested.then(|| {
+        Arc::new(StdMutex::new(TerminalAdoptableOutputSlot::new(
+            output_channel.clone(),
+        )))
+    });
+    instance.adopt_tolerant = adopt_existing_requested;
+    instance.adoptable_output = adoptable_output.clone();
     if let Some(gateway) = codex_gateway_for_instance.take() {
         terminal_replace_codex_gateway(&instance, gateway)?;
     }
@@ -10612,6 +10753,7 @@ async fn terminal_open(
         headless_output,
         cloud_mcp_state.inner().clone(),
         output_channel,
+        adoptable_output,
         prefer_output_transport,
         cloud_output_observer_enabled,
         rust_readiness_observer_enabled,
@@ -28359,6 +28501,65 @@ mod terminal_tests {
     fn remote_terminal_output_uses_low_latency_coalesce_window() {
         assert_eq!(terminal_output_coalesce_window_ms(true), 4);
         assert_eq!(terminal_output_coalesce_window_ms(false), 16);
+    }
+
+    #[test]
+    fn terminal_open_adoption_gate_allows_explicit_request_outside_daemon_mode() {
+        assert!(terminal_open_adoption_allowed(false, true, false, false));
+        assert!(terminal_open_adoption_allowed(true, false, false, false));
+        assert!(!terminal_open_adoption_allowed(false, false, false, false));
+        assert!(!terminal_open_adoption_allowed(false, true, true, false));
+        assert!(!terminal_open_adoption_allowed(false, true, false, true));
+    }
+
+    #[test]
+    fn terminal_open_adoption_ring_caps_at_512_kib_and_keeps_newest_bytes() {
+        let channel = Channel::new(|_body: InvokeResponseBody| Ok(()));
+        let mut output = TerminalAdoptableOutputSlot::new(channel);
+        let bytes = (0..TERMINAL_ADOPTABLE_OUTPUT_RING_CAPACITY_BYTES + 257)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let split = TERMINAL_ADOPTABLE_OUTPUT_RING_CAPACITY_BYTES - 128;
+
+        output.append_ring(&bytes[..split]);
+        output.append_ring(&bytes[split..]);
+
+        let retained = output.ring.iter().copied().collect::<Vec<_>>();
+        assert_eq!(
+            retained,
+            bytes[bytes.len() - TERMINAL_ADOPTABLE_OUTPUT_RING_CAPACITY_BYTES..]
+        );
+    }
+
+    #[test]
+    fn terminal_open_adoption_slot_swap_replays_ring_exactly_once() {
+        let old_frames = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let old_frames_for_channel = Arc::clone(&old_frames);
+        let old_channel = Channel::new(move |body: InvokeResponseBody| {
+            if let InvokeResponseBody::Raw(bytes) = body {
+                old_frames_for_channel.lock().unwrap().push(bytes);
+            }
+            Ok(())
+        });
+        let new_frames = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+        let new_frames_for_channel = Arc::clone(&new_frames);
+        let new_channel = Channel::new(move |body: InvokeResponseBody| {
+            if let InvokeResponseBody::Raw(bytes) = body {
+                new_frames_for_channel.lock().unwrap().push(bytes);
+            }
+            Ok(())
+        });
+        let mut output = TerminalAdoptableOutputSlot::new(old_channel);
+
+        assert!(output.append_and_send(b"before"));
+        output.replay_and_swap(new_channel).unwrap();
+        assert!(output.append_and_send(b"after"));
+
+        assert_eq!(*old_frames.lock().unwrap(), vec![b"before".to_vec()]);
+        assert_eq!(
+            *new_frames.lock().unwrap(),
+            vec![b"before".to_vec(), b"after".to_vec()]
+        );
     }
 
     #[test]

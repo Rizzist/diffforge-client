@@ -10,6 +10,7 @@ const HAIDER_BRIDGE_MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 struct HaiderBridgeSession {
     id: String,
     title: Option<String>,
+    model: Option<String>,
     cwd: Option<PathBuf>,
     state: Option<String>,
     latest_at_ms: Option<i64>,
@@ -148,6 +149,12 @@ fn haider_bridge_parse_session(
         &["metadata", "session", "summary"],
     )
     .and_then(haider_bridge_text);
+    let model = haider_bridge_object_value(object, &["model"], &["summary", "metadata", "session"])
+        .and_then(haider_bridge_text)
+        .or_else(|| {
+            haider_bridge_object_value(object, &["last_model"], &["summary", "metadata", "session"])
+                .and_then(haider_bridge_text)
+        });
     let cwd = haider_bridge_object_value(
         object,
         &[
@@ -204,6 +211,7 @@ fn haider_bridge_parse_session(
         .max();
 
     let has_session_shape = title.is_some()
+        || model.is_some()
         || cwd.is_some()
         || state.is_some()
         || latest_at_ms.is_some()
@@ -212,6 +220,7 @@ fn haider_bridge_parse_session(
     has_session_shape.then_some(HaiderBridgeSession {
         id,
         title,
+        model,
         cwd,
         state,
         latest_at_ms,
@@ -373,7 +382,8 @@ fn haider_bridge_reconcile(sessions: &[HaiderBridgeSession]) -> Result<bool, Str
             row.provider_session_id = session.id.clone();
             row_changed = true;
         }
-        if (row.first_user_message.trim().is_empty() || row.title == "New session")
+        if !row.title_locked
+            && (row.first_user_message.trim().is_empty() || row.title == "New session")
             && session
                 .title
                 .as_ref()
@@ -381,6 +391,11 @@ fn haider_bridge_reconcile(sessions: &[HaiderBridgeSession]) -> Result<bool, Str
             && session.title.as_deref() != Some(row.title.as_str())
         {
             row.title = session.title.clone().unwrap_or_default();
+            row_changed = true;
+        }
+        let model = session.model.clone().unwrap_or_default();
+        if row.model != model {
+            row.model = model;
             row_changed = true;
         }
         let status = haider_bridge_store_status(session.state.as_deref());
@@ -401,13 +416,14 @@ fn haider_bridge_reconcile(sessions: &[HaiderBridgeSession]) -> Result<bool, Str
 
         transaction
             .execute(
-                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5 WHERE id = ?1",
+                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5, model = ?6 WHERE id = ?1",
                 rusqlite::params![
                     row.id,
                     row.title,
                     row.provider_session_id,
                     row.latest_at_ms,
                     row.status,
+                    row.model,
                 ],
             )
             .map_err(|error| format!("Unable to reconcile Haider session: {error}"))?;
@@ -438,8 +454,8 @@ fn haider_bridge_reconcile(sessions: &[HaiderBridgeSession]) -> Result<bool, Str
             .execute(
                 "INSERT INTO sessions (
                     id, title, slug, dir, kind, provider, provider_session_id,
-                    created_at_ms, latest_at_ms, status, first_user_message
-                 ) VALUES (?1, ?2, '', '', 'pinned', 'haider', ?3, ?4, ?5, ?6, '')",
+                    created_at_ms, latest_at_ms, status, first_user_message, model
+                 ) VALUES (?1, ?2, '', '', 'pinned', 'haider', ?3, ?4, ?5, ?6, '', ?7)",
                 rusqlite::params![
                     sessions_new_id(now_ms),
                     title,
@@ -447,6 +463,7 @@ fn haider_bridge_reconcile(sessions: &[HaiderBridgeSession]) -> Result<bool, Str
                     latest,
                     latest,
                     status,
+                    session.model.clone().unwrap_or_default(),
                 ],
             )
             .map_err(|error| format!("Unable to import Haider session: {error}"))?;
@@ -649,6 +666,7 @@ mod haider_bridge_tests {
             vec![HaiderBridgeSession {
                 id: "sess_01JTEST".to_string(),
                 title: Some("Review the parser".to_string()),
+                model: Some("test-model".to_string()),
                 cwd: Some(PathBuf::from("/tmp/diffforge-project/work")),
                 state: Some("running_tool".to_string()),
                 latest_at_ms: Some(1_777_777_777_123),
@@ -665,7 +683,8 @@ mod haider_bridge_tests {
                         "metadata": { "name": "Nested session" },
                         "summary": {
                             "workspace_cwd": "/tmp/nested",
-                            "updated_at": 1_776_582_489
+                            "updated_at": 1_776_582_489,
+                            "model": "current-model"
                         },
                         "runtime": { "state": "input-required" }
                     }
@@ -676,6 +695,7 @@ mod haider_bridge_tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "session-from-map-key");
         assert_eq!(parsed[0].title.as_deref(), Some("Nested session"));
+        assert_eq!(parsed[0].model.as_deref(), Some("current-model"));
         assert_eq!(parsed[0].state.as_deref(), Some("input-required"));
         assert_eq!(parsed[0].latest_at_ms, Some(1_776_582_489_000));
     }
