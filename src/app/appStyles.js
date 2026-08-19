@@ -25578,3 +25578,297 @@ export const TerminalPaneInlineRailControls = styled(TerminalRailControls)`
     grid-row: 1;
   }
 `;
+
+/* ---- Full-page settings surface (settings-revamp chrome) ---- */
+
+export const SettingsScreen = styled.section`
+  position: fixed;
+  top: ${TITLE_BAR_HEIGHT};
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 60;
+  display: flex;
+  background: var(--forge-bg);
+  animation: ${panelEnter} ${VIEW_TRANSITION_MS + 90}ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+
+  &:not([data-visible="true"]) {
+    display: none;
+  }
+
+  &[data-motion="exiting"] {
+    animation: ${panelExit} ${VIEW_TRANSITION_MS}ms ease both;
+    pointer-events: none;
+  }
+
+  > section {
+    flex: 1;
+    min-width: 0;
+  }
+
+  html[data-window-platform="macos"] &[data-expanded="false"] {
+    overflow: hidden;
+    border-bottom-right-radius: 12px;
+    border-bottom-left-radius: 12px;
+  }
+`;
+
+export const SettingsSideRail = styled.aside`
+  display: flex;
+  width: 264px;
+  flex: 0 0 264px;
+  min-height: 0;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 10px;
+  border-right: 1px solid var(--forge-border);
+  background: var(--forge-shell-rail-bg);
+
+  @media (max-width: 760px) {
+    width: 200px;
+    flex-basis: 200px;
+  }
+`;
+
+export const SettingsBackButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 10px;
+  color: var(--forge-text-soft);
+  background: transparent;
+  font-size: 14px;
+  font-weight: 650;
+  cursor: pointer;
+  text-align: left;
+
+  span {
+    font-size: 16px;
+    line-height: 1;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: var(--forge-surface-hover);
+  }
+`;
+
+export const SettingsSearchInput = styled.input`
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  color: var(--forge-text);
+  background: var(--forge-surface-control);
+  font-size: 13px;
+  outline: none;
+
+  &::placeholder {
+    color: var(--forge-text-muted);
+  }
+
+  &:focus {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.5);
+  }
+`;
+
+export const SettingsNavGroups = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+  padding-bottom: 8px;
+`;
+
+export const SettingsNavGroupLabel = styled.div`
+  margin: 12px 10px 4px;
+  color: var(--forge-text-muted);
+  font-size: 11.5px;
+  font-weight: 720;
+  letter-spacing: 0.04em;
+`;
+
+export const SettingsNavItem = styled.button`
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 10px;
+  color: var(--forge-text-soft);
+  background: transparent;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+
+  svg {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    opacity: 0.85;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: var(--forge-surface-hover);
+  }
+
+  &[data-active="true"] {
+    color: var(--forge-text);
+    background: var(--forge-surface-selected);
+  }
+`;
+
+export const SettingsContentTitle = styled.h1`
+  margin: 10px 0 6px;
+  color: var(--forge-text);
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+`;
+
+/* ---- Rail settings tab + account chip/menu ---- */
+
+export const RailTopActions = styled.div`
+  display: grid;
+  gap: 2px;
+  margin-bottom: 6px;
+  padding: 2px 0 6px;
+  border-bottom: 1px solid var(--forge-border);
+`;
+
+export const RailAccountBar = styled.div`
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--forge-border);
+`;
+
+export const RailAccountAvatar = styled.span`
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: linear-gradient(135deg, var(--forge-blue), var(--forge-ember));
+  font-size: 12px;
+  font-weight: 760;
+`;
+
+export const RailAccountChipButton = styled.button`
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 10px;
+  color: var(--forge-text-soft);
+  background: transparent;
+  font-size: 13.5px;
+  font-weight: 650;
+  cursor: pointer;
+  text-align: left;
+
+  span:last-child {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: var(--forge-surface-hover);
+  }
+`;
+
+export const AccountMenuPop = styled.div`
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 0;
+  z-index: 500;
+  display: grid;
+  width: 248px;
+  gap: 2px;
+  padding: 8px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 16px;
+  background: var(--forge-surface-raised);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+`;
+
+export const AccountMenuHeader = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+
+  strong {
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 14px;
+    font-weight: 700;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+`;
+
+export const AccountMenuDivider = styled.div`
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--forge-border);
+`;
+
+export const AccountMenuRow = styled.button`
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 10px;
+  color: var(--forge-text-soft);
+  background: transparent;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+
+  svg {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    opacity: 0.85;
+  }
+
+  span {
+    flex: 1;
+    min-width: 0;
+  }
+
+  em {
+    color: var(--forge-text-muted);
+    font-size: 12px;
+    font-style: normal;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: var(--forge-surface-hover);
+  }
+
+  &[data-variant="signout"]:hover {
+    color: var(--forge-red);
+  }
+`;

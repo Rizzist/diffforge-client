@@ -554,6 +554,22 @@ import {
   WorkspaceAccent,
   WorkspaceMuted,
   RailFooter,
+  RailTopActions,
+  RailAccountBar,
+  RailAccountAvatar,
+  RailAccountChipButton,
+  AccountMenuPop,
+  AccountMenuHeader,
+  AccountMenuDivider,
+  AccountMenuRow,
+  SettingsScreen,
+  SettingsSideRail,
+  SettingsBackButton,
+  SettingsSearchInput,
+  SettingsNavGroups,
+  SettingsNavGroupLabel,
+  SettingsNavItem,
+  SettingsContentTitle,
   RailGlobalActions,
   RailViewActions,
   RailActionButton,
@@ -23905,6 +23921,22 @@ export default function App() {
   const [snippingCaptureAttention, setSnippingCaptureAttention] = useState(null);
   const [audioHotkeyAttention, setAudioHotkeyAttention] = useState(null);
   const [settingsTab, setSettingsTab] = useState(SETTINGS_TAB_GENERAL);
+  const [settingsSearch, setSettingsSearch] = useState("");
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const accountMenuRef = useRef(null);
+  const settingsNavQuery = settingsSearch.trim().toLowerCase();
+  const settingsNavShow = (label) => !settingsNavQuery || label.toLowerCase().includes(settingsNavQuery);
+  const settingsActiveLabel = settingsTab === SETTINGS_TAB_NOTIFICATIONS
+    ? "Notifications"
+    : settingsTab === SETTINGS_TAB_PERMISSIONS
+      ? "Permissions"
+      : settingsTab === SETTINGS_TAB_SSH
+        ? "SSH clients"
+        : settingsTab === SETTINGS_TAB_EMAIL
+          ? "Email delivery"
+          : "General";
+  const accountDisplayName = String(user?.name || user?.email || "Account").trim() || "Account";
+  const accountInitial = accountDisplayName.charAt(0).toUpperCase();
   const [nativeNotificationSettings, setNativeNotificationSettings] = useState(readNativeNotificationSettings);
   const [notificationSfxSettings, setNotificationSfxSettings] = useState(readNotificationSfxSettings);
   const [notificationPreferences, setNotificationPreferences] = useState(() => normalizeNotificationPreferences(null));
@@ -29004,6 +29036,41 @@ export default function App() {
     );
     showView("settings");
   }, [showView]);
+
+  // ⌘,/Ctrl+, opens Settings, matching the account-menu hint.
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === ",") {
+        event.preventDefault();
+        showSettingsView();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [showSettingsView]);
+
+  // Account menu closes on outside click or Escape.
+  useEffect(() => {
+    if (!accountMenuOpen) {
+      return undefined;
+    }
+    const onPointerDown = (event) => {
+      if (accountMenuRef.current && !accountMenuRef.current.contains(event.target)) {
+        setAccountMenuOpen(false);
+      }
+    };
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setAccountMenuOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [accountMenuOpen]);
 
   useEffect(() => {
     if (visibleView !== "settings" || settingsTab !== SETTINGS_TAB_PERMISSIONS) {
@@ -55230,6 +55297,22 @@ export default function App() {
                         )}
                       </RailCollapseButton>
                     </RailHeader>
+                    <RailTopActions aria-label="App">
+                      <RailActionButton
+                        aria-label="Settings"
+                        data-active={activeView === "settings"}
+                        data-scope="global"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          showView("settings");
+                        }}
+                        title="Settings (⌘,)"
+                        type="button"
+                      >
+                        <RailSettingsIcon aria-hidden="true" />
+                        <span>Settings</span>
+                      </RailActionButton>
+                    </RailTopActions>
                     {/* Rows stay visible (and interactive) as centered icon
                         tiles when the rail is collapsed, so the list is never
                         aria-hidden. */}
@@ -55423,39 +55506,82 @@ export default function App() {
                         <RailDevicesIcon aria-hidden="true" />
                         <span>Communication</span>
                       </RailActionButton>
-                      <RailActionButton
-                        aria-label="Settings"
-                        data-active={activeView === "settings"}
-                        data-scope="global"
-                        onClick={() => showView("settings")}
-                        title="Settings"
-                        type="button"
-                      >
-                        <RailSettingsIcon aria-hidden="true" />
-                        <span>Settings</span>
-                      </RailActionButton>
-                      <RailActionButton
-                        aria-label="Help"
-                        data-scope="global"
-                        onClick={openHelpCenter}
-                        title="Help"
-                        type="button"
-                      >
-                        <RailHelpIcon aria-hidden="true" />
-                        <span>Help</span>
-                      </RailActionButton>
-                      <RailActionButton
-                        aria-label="Sign out"
-                        data-scope="global"
-                        data-variant="signout"
-                        onClick={logout}
-                        title="Sign out"
-                        type="button"
-                      >
-                        <RailSignOutIcon aria-hidden="true" />
-                        <span>Sign out</span>
-                      </RailActionButton>
                     </RailGlobalActions>
+                    <RailAccountBar ref={accountMenuRef}>
+                      {accountMenuOpen && (
+                        <AccountMenuPop aria-label="Account" role="menu">
+                          <AccountMenuHeader>
+                            <RailAccountAvatar aria-hidden="true">{accountInitial}</RailAccountAvatar>
+                            <strong>{accountDisplayName}</strong>
+                          </AccountMenuHeader>
+                          <AccountMenuDivider />
+                          <AccountMenuRow
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setAccountMenuOpen(false);
+                              showView("tokenomics");
+                            }}
+                            role="menuitem"
+                            type="button"
+                          >
+                            <RailTokenomicsIcon aria-hidden="true" />
+                            <span>Usage</span>
+                            <em>{Number.isFinite(billingCreditPercent) ? `${Math.round(billingCreditPercent)}% left` : ""}</em>
+                          </AccountMenuRow>
+                          <AccountMenuRow
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setAccountMenuOpen(false);
+                              showView("settings");
+                            }}
+                            role="menuitem"
+                            type="button"
+                          >
+                            <RailSettingsIcon aria-hidden="true" />
+                            <span>Settings</span>
+                            <em>⌘,</em>
+                          </AccountMenuRow>
+                          <AccountMenuRow
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setAccountMenuOpen(false);
+                              openHelpCenter();
+                            }}
+                            role="menuitem"
+                            type="button"
+                          >
+                            <RailHelpIcon aria-hidden="true" />
+                            <span>Help</span>
+                          </AccountMenuRow>
+                          <AccountMenuDivider />
+                          <AccountMenuRow
+                            data-variant="signout"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setAccountMenuOpen(false);
+                              logout();
+                            }}
+                            role="menuitem"
+                            type="button"
+                          >
+                            <RailSignOutIcon aria-hidden="true" />
+                            <span>Log out</span>
+                          </AccountMenuRow>
+                        </AccountMenuPop>
+                      )}
+                      <RailAccountChipButton
+                        aria-expanded={accountMenuOpen}
+                        aria-haspopup="menu"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setAccountMenuOpen((open) => !open);
+                        }}
+                        type="button"
+                      >
+                        <RailAccountAvatar aria-hidden="true">{accountInitial}</RailAccountAvatar>
+                        <span>{accountDisplayName}</span>
+                      </RailAccountChipButton>
+                    </RailAccountBar>
                   </RailFooter>
                 </WorkspaceRail>
 
@@ -56197,49 +56323,88 @@ export default function App() {
                     aria-hidden={!settingsViewVisible}
                     data-visible={settingsViewVisible}
                   >
+                {createPortal(
+                  <SettingsScreen
+                    data-expanded={isWindowFrameExpanded ? "true" : "false"}
+                    data-motion={settingsViewVisible ? viewMotion : "entered"}
+                    data-visible={settingsViewVisible ? "true" : "false"}
+                  >
+                  <SettingsSideRail aria-label="Settings navigation">
+                    <SettingsBackButton
+                      onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
+                      type="button"
+                    >
+                      <span aria-hidden="true">←</span>
+                      Back to app
+                    </SettingsBackButton>
+                    <SettingsSearchInput
+                      aria-label="Search settings"
+                      onChange={(event) => setSettingsSearch(event.target.value)}
+                      placeholder="Search settings..."
+                      type="search"
+                      value={settingsSearch}
+                    />
+                    <SettingsNavGroups>
+                      {(settingsNavShow("General") || settingsNavShow("Notifications") || settingsNavShow("Permissions")) && (
+                        <SettingsNavGroupLabel>Personal</SettingsNavGroupLabel>
+                      )}
+                      {settingsNavShow("General") && (
+                        <SettingsNavItem
+                          data-active={settingsTab === SETTINGS_TAB_GENERAL ? "true" : undefined}
+                          onClick={() => setSettingsTab(SETTINGS_TAB_GENERAL)}
+                          type="button"
+                        >
+                          <ButtonSettingsIcon aria-hidden="true" />
+                          <span>General</span>
+                        </SettingsNavItem>
+                      )}
+                      {settingsNavShow("Notifications") && (
+                        <SettingsNavItem
+                          data-active={settingsTab === SETTINGS_TAB_NOTIFICATIONS ? "true" : undefined}
+                          onClick={() => setSettingsTab(SETTINGS_TAB_NOTIFICATIONS)}
+                          type="button"
+                        >
+                          <ButtonNotificationIcon aria-hidden="true" />
+                          <span>Notifications</span>
+                        </SettingsNavItem>
+                      )}
+                      {settingsNavShow("Permissions") && (
+                        <SettingsNavItem
+                          data-active={settingsTab === SETTINGS_TAB_PERMISSIONS ? "true" : undefined}
+                          onClick={() => setSettingsTab(SETTINGS_TAB_PERMISSIONS)}
+                          type="button"
+                        >
+                          <ButtonSecurityIcon aria-hidden="true" />
+                          <span>Permissions</span>
+                        </SettingsNavItem>
+                      )}
+                      {(settingsNavShow("SSH clients") || settingsNavShow("Email delivery")) && (
+                        <SettingsNavGroupLabel>Connections</SettingsNavGroupLabel>
+                      )}
+                      {settingsNavShow("SSH clients") && (
+                        <SettingsNavItem
+                          data-active={settingsTab === SETTINGS_TAB_SSH ? "true" : undefined}
+                          onClick={() => setSettingsTab(SETTINGS_TAB_SSH)}
+                          type="button"
+                        >
+                          <ButtonTerminalIcon aria-hidden="true" />
+                          <span>SSH clients</span>
+                        </SettingsNavItem>
+                      )}
+                      {settingsNavShow("Email delivery") && (
+                        <SettingsNavItem
+                          data-active={settingsTab === SETTINGS_TAB_EMAIL ? "true" : undefined}
+                          onClick={() => setSettingsTab(SETTINGS_TAB_EMAIL)}
+                          type="button"
+                        >
+                          <ButtonMailIcon aria-hidden="true" />
+                          <span>Email delivery</span>
+                        </SettingsNavItem>
+                      )}
+                    </SettingsNavGroups>
+                  </SettingsSideRail>
                 <SettingsPage data-motion={settingsViewVisible ? viewMotion : "entered"}>
-                  <SettingsTabNav aria-label="Settings sections">
-                    <SettingsTabButton
-                      data-active={settingsTab === SETTINGS_TAB_GENERAL ? "true" : undefined}
-                      onClick={() => setSettingsTab(SETTINGS_TAB_GENERAL)}
-                      type="button"
-                    >
-                      <ButtonSettingsIcon aria-hidden="true" />
-                      <span>General</span>
-                    </SettingsTabButton>
-                    <SettingsTabButton
-                      data-active={settingsTab === SETTINGS_TAB_NOTIFICATIONS ? "true" : undefined}
-                      onClick={() => setSettingsTab(SETTINGS_TAB_NOTIFICATIONS)}
-                      type="button"
-                    >
-                      <ButtonNotificationIcon aria-hidden="true" />
-                      <span>Notifications</span>
-                    </SettingsTabButton>
-                    <SettingsTabButton
-                      data-active={settingsTab === SETTINGS_TAB_PERMISSIONS ? "true" : undefined}
-                      onClick={() => setSettingsTab(SETTINGS_TAB_PERMISSIONS)}
-                      type="button"
-                    >
-                      <ButtonSecurityIcon aria-hidden="true" />
-                      <span>Permissions</span>
-                    </SettingsTabButton>
-                    <SettingsTabButton
-                      data-active={settingsTab === SETTINGS_TAB_SSH ? "true" : undefined}
-                      onClick={() => setSettingsTab(SETTINGS_TAB_SSH)}
-                      type="button"
-                    >
-                      <ButtonTerminalIcon aria-hidden="true" />
-                      <span>SSH clients</span>
-                    </SettingsTabButton>
-                    <SettingsTabButton
-                      data-active={settingsTab === SETTINGS_TAB_EMAIL ? "true" : undefined}
-                      onClick={() => setSettingsTab(SETTINGS_TAB_EMAIL)}
-                      type="button"
-                    >
-                      <ButtonMailIcon aria-hidden="true" />
-                      <span>Email Delivery</span>
-                    </SettingsTabButton>
-                  </SettingsTabNav>
+                  <SettingsContentTitle>{settingsActiveLabel}</SettingsContentTitle>
 
                   {settingsTab === SETTINGS_TAB_GENERAL ? (
                     <>
@@ -57335,6 +57500,9 @@ export default function App() {
                     </AccountSettingsPanel>
                   )}
                 </SettingsPage>
+                  </SettingsScreen>,
+                  document.body,
+                )}
                   </WorkspaceRuntimeLayer>
                   <WorkspaceRuntimeLayer
                     aria-hidden={!globalToolsViewVisible}
