@@ -16,6 +16,31 @@ struct HaiderBridgeSession {
     latest_at_ms: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HaiderBridgeReconcileStamp {
+    head_seq: Option<i64>,
+    state: Option<String>,
+    title: Option<String>,
+    model: Option<String>,
+}
+
+impl HaiderBridgeReconcileStamp {
+    fn new(session: &HaiderBridgeSession, head_seq: Option<i64>) -> Self {
+        Self {
+            head_seq,
+            state: session.state.clone(),
+            title: session.title.clone(),
+            model: session.model.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct HaiderBridgeReconcileTracker {
+    initialized: bool,
+    sessions: HashMap<String, HaiderBridgeReconcileStamp>,
+}
+
 static HAIDER_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
 static HAIDER_BRIDGE_STOPPING: AtomicBool = AtomicBool::new(false);
 
@@ -41,6 +66,16 @@ fn haider_bridge_head_seq(session_id: &str) -> Option<i64> {
         .lock()
         .ok()
         .and_then(|heads| heads.get(session_id).copied())
+}
+
+fn haider_bridge_reconcile_tracker() -> &'static StdMutex<HaiderBridgeReconcileTracker> {
+    static TRACKER: OnceLock<StdMutex<HaiderBridgeReconcileTracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| StdMutex::new(HaiderBridgeReconcileTracker::default()))
+}
+
+fn haider_bridge_sync_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
 }
 
 fn haider_bridge_child_slot() -> &'static StdMutex<Option<Arc<StdMutex<std::process::Child>>>> {
@@ -263,11 +298,19 @@ fn haider_bridge_parse_session(
     })
 }
 
-fn haider_bridge_collect_head_sequences(value: &Value) {
+fn haider_bridge_collect_head_sequences(
+    value: &Value,
+    inherited_id: Option<&str>,
+    observed: &mut HashMap<String, i64>,
+) {
     match value {
         Value::Array(values) => {
-            for value in values {
-                haider_bridge_collect_head_sequences(value);
+            if let [Value::String(id), session] = values.as_slice() {
+                haider_bridge_collect_head_sequences(session, Some(id), observed);
+            } else {
+                for value in values {
+                    haider_bridge_collect_head_sequences(value, inherited_id, observed);
+                }
             }
         }
         Value::Object(object) => {
@@ -276,7 +319,8 @@ fn haider_bridge_collect_head_sequences(value: &Value) {
                 &["session_id", "sessionId", "id"],
                 &["session", "summary"],
             )
-            .and_then(haider_bridge_text);
+            .and_then(haider_bridge_text)
+            .or_else(|| inherited_id.map(str::to_string));
             let head_seq = haider_bridge_object_value(
                 object,
                 &["head_seq", "headSeq"],
@@ -285,9 +329,29 @@ fn haider_bridge_collect_head_sequences(value: &Value) {
             .and_then(haider_bridge_sequence);
             if let (Some(session_id), Some(head_seq)) = (session_id, head_seq) {
                 haider_bridge_note_head_seq(&session_id, head_seq);
+                let head_seq =
+                    head_seq.max(haider_bridge_head_seq(&session_id).unwrap_or(head_seq));
+                observed
+                    .entry(session_id)
+                    .and_modify(|head| *head = (*head).max(head_seq))
+                    .or_insert(head_seq);
             }
-            for value in object.values() {
-                haider_bridge_collect_head_sequences(value);
+            for key in ["sessions", "items", "entries"] {
+                let Some(container) = object.get(key) else {
+                    continue;
+                };
+                if let Value::Object(keyed_sessions) = container {
+                    for (id, value) in keyed_sessions {
+                        haider_bridge_collect_head_sequences(value, Some(id), observed);
+                    }
+                } else {
+                    haider_bridge_collect_head_sequences(container, None, observed);
+                }
+            }
+            for key in ["data", "result", "response", "body"] {
+                if let Some(container) = object.get(key) {
+                    haider_bridge_collect_head_sequences(container, None, observed);
+                }
             }
         }
         _ => {}
@@ -405,7 +469,7 @@ fn haider_bridge_session_matches_dir(session: &HaiderBridgeSession, row: &Sessio
         || haider_bridge_canonical_path(&directory.join("work")).is_some_and(|path| path == cwd)
 }
 
-fn haider_bridge_reconcile(sessions: &[HaiderBridgeSession]) -> Result<bool, String> {
+fn haider_bridge_reconcile_store(sessions: &[HaiderBridgeSession]) -> Result<bool, String> {
     if sessions.is_empty() {
         return Ok(false);
     }
@@ -542,14 +606,76 @@ fn haider_bridge_reconcile(sessions: &[HaiderBridgeSession]) -> Result<bool, Str
     Ok(changed)
 }
 
+fn haider_bridge_reconcile_tracked(
+    tracker: &mut HaiderBridgeReconcileTracker,
+    sessions: &[HaiderBridgeSession],
+    head_sequences: &HashMap<String, i64>,
+    reconcile: impl FnOnce(&[HaiderBridgeSession]) -> Result<bool, String>,
+) -> Result<bool, String> {
+    let snapshot = sessions
+        .iter()
+        .map(|session| {
+            (
+                session.id.clone(),
+                HaiderBridgeReconcileStamp::new(session, head_sequences.get(&session.id).copied()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let candidates = if tracker.initialized {
+        sessions
+            .iter()
+            .filter(|session| {
+                !head_sequences.contains_key(&session.id)
+                    || snapshot.get(&session.id) != tracker.sessions.get(&session.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        sessions.to_vec()
+    };
+    if candidates.is_empty() {
+        tracker.initialized = true;
+        tracker.sessions = snapshot;
+        return Ok(false);
+    }
+    let changed = reconcile(&candidates)?;
+    tracker.initialized = true;
+    tracker.sessions = snapshot;
+    Ok(changed)
+}
+
+#[cfg(test)]
+fn haider_bridge_reconcile(sessions: &[HaiderBridgeSession]) -> Result<bool, String> {
+    haider_bridge_reconcile_store(sessions)
+}
+
+fn haider_bridge_reconcile_snapshot(
+    sessions: &[HaiderBridgeSession],
+    head_sequences: &HashMap<String, i64>,
+) -> Result<bool, String> {
+    let mut tracker = haider_bridge_reconcile_tracker()
+        .lock()
+        .map_err(|_| "Haider reconciliation tracker is unavailable.".to_string())?;
+    haider_bridge_reconcile_tracked(
+        &mut tracker,
+        sessions,
+        head_sequences,
+        haider_bridge_reconcile_store,
+    )
+}
+
 async fn haider_bridge_sync_once(app: &AppHandle) {
     let changed = tauri::async_runtime::spawn_blocking(|| {
+        let _sync_guard = haider_bridge_sync_lock()
+            .lock()
+            .map_err(|_| "Haider bridge sync lock is unavailable.".to_string())?;
         let Some(value) = haider_bridge_json_command("sessions") else {
             return Ok(false);
         };
-        haider_bridge_collect_head_sequences(&value);
+        let mut head_sequences = HashMap::new();
+        haider_bridge_collect_head_sequences(&value, None, &mut head_sequences);
         let sessions = haider_bridge_parse_session_list(&value);
-        haider_bridge_reconcile(&sessions)
+        haider_bridge_reconcile_snapshot(&sessions, &head_sequences)
     })
     .await;
     match changed {
@@ -629,6 +755,9 @@ fn haider_bridge_start(app: AppHandle) {
         return;
     }
     HAIDER_BRIDGE_STOPPING.store(false, Ordering::Release);
+    if let Ok(mut tracker) = haider_bridge_reconcile_tracker().lock() {
+        *tracker = HaiderBridgeReconcileTracker::default();
+    }
     let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
 
     let sync_app = app.clone();
@@ -753,7 +882,8 @@ mod haider_bridge_tests {
                         "summary": {
                             "workspace_cwd": "/tmp/nested",
                             "updated_at": 1_776_582_489,
-                            "model": "current-model"
+                            "model": "current-model",
+                            "head_seq": 12
                         },
                         "runtime": { "state": "input-required" }
                     }
@@ -767,5 +897,66 @@ mod haider_bridge_tests {
         assert_eq!(parsed[0].model.as_deref(), Some("current-model"));
         assert_eq!(parsed[0].state.as_deref(), Some("input-required"));
         assert_eq!(parsed[0].latest_at_ms, Some(1_776_582_489_000));
+        let mut heads = HashMap::new();
+        haider_bridge_collect_head_sequences(&sample, None, &mut heads);
+        assert_eq!(heads.get("session-from-map-key"), Some(&12));
+    }
+
+    #[test]
+    fn haider_bridge_unchanged_head_skips_store_reconcile() {
+        let session = HaiderBridgeSession {
+            id: "session-test".to_string(),
+            title: Some("Test".to_string()),
+            model: Some("model".to_string()),
+            cwd: None,
+            state: Some("idle".to_string()),
+            latest_at_ms: Some(100),
+        };
+        let mut tracker = HaiderBridgeReconcileTracker::default();
+        let mut heads = HashMap::from([(session.id.clone(), 7)]);
+        let writes = std::cell::Cell::new(0);
+        let mut reconcile = |_: &[HaiderBridgeSession]| {
+            writes.set(writes.get() + 1);
+            Ok(false)
+        };
+
+        assert!(!haider_bridge_reconcile_tracked(
+            &mut tracker,
+            std::slice::from_ref(&session),
+            &heads,
+            &mut reconcile,
+        )
+        .unwrap());
+        assert_eq!(writes.get(), 1);
+        assert!(!haider_bridge_reconcile_tracked(
+            &mut tracker,
+            std::slice::from_ref(&session),
+            &heads,
+            &mut reconcile,
+        )
+        .unwrap());
+        assert_eq!(writes.get(), 1);
+
+        heads.insert(session.id.clone(), 8);
+        haider_bridge_reconcile_tracked(
+            &mut tracker,
+            std::slice::from_ref(&session),
+            &heads,
+            &mut reconcile,
+        )
+        .unwrap();
+        assert_eq!(writes.get(), 2);
+
+        heads.clear();
+        for _ in 0..2 {
+            haider_bridge_reconcile_tracked(
+                &mut tracker,
+                std::slice::from_ref(&session),
+                &heads,
+                &mut reconcile,
+            )
+            .unwrap();
+        }
+        assert_eq!(writes.get(), 4);
     }
 }

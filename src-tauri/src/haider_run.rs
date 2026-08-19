@@ -95,6 +95,17 @@ fn haider_run_accepted(value: &Value) -> Option<HaiderRunAccepted> {
     })
 }
 
+fn haider_run_accepts_session(
+    accepted: &HaiderRunAccepted,
+    expected_session_id: &str,
+) -> Result<(), String> {
+    if accepted.session_id == expected_session_id {
+        Ok(())
+    } else {
+        Err("Haider accepted a different provider session than requested.".to_string())
+    }
+}
+
 fn haider_run_fallback_provider_session_id(value: &Value) -> Option<String> {
     // Announcement-like records may arrive before identity refinement. Older
     // harness envelopes may use an object-valued event, so those remain scrapeable.
@@ -225,8 +236,12 @@ fn haider_run_supports_session() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
         let status_support = haider_run_status_supports_session();
-        haider_run_parser_supports_session().unwrap_or(status_support)
+        haider_run_selects_session_submit(status_support, haider_run_parser_supports_session())
     })
+}
+
+fn haider_run_selects_session_submit(status_support: bool, parser_support: Option<bool>) -> bool {
+    status_support || parser_support.unwrap_or(false)
 }
 
 fn haider_run_is_active(session_id: &str) -> Result<bool, String> {
@@ -377,6 +392,35 @@ fn haider_run_spawn(
                     let accepted = haider_run_accepted(&value);
                     if let Some(accepted) = accepted.as_ref() {
                         haider_bridge_note_head_seq(&accepted.session_id, accepted.head_seq);
+                        if let Some(expected_session_id) = bound_provider_session_id.as_deref() {
+                            if !accepted_bound {
+                                accepted_bound = true;
+                                match haider_run_accepts_session(accepted, expected_session_id) {
+                                    Ok(()) => {
+                                        let row = pending_bound_row.take().map(Ok).or_else(|| {
+                                            binding_sender.as_ref()?;
+                                            Some(haider_run_update_session(
+                                                &app,
+                                                &local_session_id,
+                                                Some("running"),
+                                                Some(accepted.session_id.clone()),
+                                                None,
+                                            ))
+                                        });
+                                        if let (Some(sender), Some(row)) =
+                                            (binding_sender.take(), row)
+                                        {
+                                            let _ = sender.send(row);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        if let Some(sender) = binding_sender.take() {
+                                            let _ = sender.send(Err(error));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     if bound_provider_session_id.is_none() {
                         let provider_id = accepted
@@ -412,8 +456,6 @@ fn haider_run_spawn(
                                 }
                             }
                         }
-                    } else if accepted.is_some() && !accepted_bound {
-                        accepted_bound = true;
                     }
                     haider_projection_ingest_and_emit(&app, &local_session_id, &value);
                     let projection_started = haider_projection_database_stats(&local_session_id)
@@ -571,8 +613,8 @@ async fn session_submit_prompt(
         if active {
             return Err("A Haider run is already active for this session.".to_string());
         }
-        let row = haider_run_update_session(&app, &row.id, Some("running"), None, None)?;
         let cwd = haider_run_working_directory(&row);
+        let (binding_sender, binding_receiver) = std::sync::mpsc::sync_channel(1);
         if let Err(error) = haider_run_spawn(
             app.clone(),
             row.id.clone(),
@@ -580,12 +622,29 @@ async fn session_submit_prompt(
             prompt,
             cwd,
             attachments.unwrap_or_default(),
-            None,
+            Some(binding_sender),
         ) {
             let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
             return Err(error);
         }
-        Ok(())
+        match binding_receiver.recv_timeout(HAIDER_RUN_BIND_TIMEOUT) {
+            Ok(Ok(_bound_row)) => Ok(()),
+            Ok(Err(error)) => {
+                haider_run_kill_active(&row.id);
+                let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
+                Err(error)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                haider_run_kill_active(&row.id);
+                let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
+                Err("Timed out waiting for Haider to accept the session prompt.".to_string())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                haider_run_kill_active(&row.id);
+                let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
+                Err("Haider run ended before accepting the session prompt.".to_string())
+            }
+        }
     })
     .await
     .map_err(|error| format!("Session submit worker failed: {error}"))?
@@ -664,5 +723,27 @@ mod haider_run_tests {
         assert!(!haider_run_status_has_session_feature(&json!({
             "features": ["session_observe_v1", "turn_control_v1"]
         })));
+        assert!(!haider_run_status_has_session_feature(&json!({
+            "features": ["session_observe_v1", "session_mutation_v1"]
+        })));
+    }
+
+    #[test]
+    fn haider_run_selects_modern_session_submit_over_legacy_parser_sniff() {
+        assert!(haider_run_selects_session_submit(true, Some(false)));
+        assert!(haider_run_selects_session_submit(true, None));
+        assert!(haider_run_selects_session_submit(false, Some(true)));
+        assert!(!haider_run_selects_session_submit(false, Some(false)));
+        assert!(!haider_run_selects_session_submit(false, None));
+    }
+
+    #[test]
+    fn haider_run_binds_submit_to_the_accepted_session() {
+        let accepted = HaiderRunAccepted {
+            session_id: "session-requested".to_string(),
+            head_seq: 8,
+        };
+        assert!(haider_run_accepts_session(&accepted, "session-requested").is_ok());
+        assert!(haider_run_accepts_session(&accepted, "session-other").is_err());
     }
 }

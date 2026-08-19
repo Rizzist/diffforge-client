@@ -187,6 +187,11 @@ fn haider_projection_ensure_lock() -> &'static StdMutex<()> {
     LOCK.get_or_init(|| StdMutex::new(()))
 }
 
+fn haider_projection_attach_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
 fn haider_projection_migrate_database(connection: &mut rusqlite::Connection) -> Result<(), String> {
     connection
         .execute_batch(
@@ -577,6 +582,7 @@ fn haider_projection_export_row(
                 .and_then(haider_projection_extract_text)
                 .unwrap_or_else(|| "Haider run failed".to_string()),
         ),
+        "usage" => ("usage", "meta", String::new()),
         _ => return None,
     };
     let seq = haider_projection_seq(state, item, item);
@@ -756,6 +762,28 @@ fn haider_projection_fold_value_locked(
     }
     let payload = haider_projection_payload(value);
     let payload_object = payload.as_object();
+
+    if haider_projection_pipe_usage_value(value)
+        && payload_object.is_some_and(|object| {
+            object.get("type").and_then(Value::as_str) != Some("usage")
+                && object.get("role").and_then(Value::as_str) != Some("usage")
+        })
+    {
+        let seq = haider_projection_seq(state, value, payload);
+        state.metadata.insert("usage".to_string(), payload.clone());
+        step.rows.push(haider_projection_row(
+            session_id,
+            seq,
+            haider_projection_ordinal(value, payload),
+            haider_projection_branch_id(value, payload),
+            "usage",
+            "meta",
+            String::new(),
+            payload.clone(),
+            haider_projection_at_ms(value, payload),
+        ));
+        return step;
+    }
 
     if payload_object.is_some_and(|object| object.contains_key("role")) {
         if let Some(row) = haider_projection_export_row(state, session_id, payload) {
@@ -1274,6 +1302,82 @@ fn haider_projection_pipe_supported() -> bool {
     })
 }
 
+fn haider_projection_pipe_usage_capability() -> &'static OnceLock<bool> {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    &SUPPORTED
+}
+
+fn haider_projection_cached_pipe_usage(
+    cache: &OnceLock<bool>,
+    probe: impl FnOnce() -> bool,
+) -> bool {
+    *cache.get_or_init(probe)
+}
+
+fn haider_projection_pipe_usage_value(value: &Value) -> bool {
+    let payload = haider_projection_payload(value);
+    let Some(object) = payload.as_object() else {
+        return false;
+    };
+    if object.get("type").and_then(Value::as_str) == Some("usage")
+        || object.get("role").and_then(Value::as_str) == Some("usage")
+    {
+        return true;
+    }
+    if object.contains_key("role") {
+        return false;
+    }
+    object.get("usage").is_some_and(Value::is_object)
+        || object.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "input_tokens"
+                    | "output_tokens"
+                    | "prompt_tokens"
+                    | "completion_tokens"
+                    | "cached_tokens"
+                    | "cache_read"
+                    | "cache_read_input_tokens"
+                    | "cached_input_tokens"
+            )
+        })
+}
+
+fn haider_projection_probe_pipe_usage(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        match haider_projection_read_pipe_line(&mut reader, &mut line) {
+            Ok(HaiderProjectionPipeLine::Complete {
+                within_limit: true, ..
+            }) => {
+                if serde_json::from_slice::<Value>(&line)
+                    .ok()
+                    .is_some_and(|value| haider_projection_pipe_usage_value(&value))
+                {
+                    return true;
+                }
+            }
+            Ok(HaiderProjectionPipeLine::Complete {
+                within_limit: false,
+                ..
+            }) => {}
+            Ok(HaiderProjectionPipeLine::Torn | HaiderProjectionPipeLine::Eof) | Err(_) => {
+                return false;
+            }
+        }
+    }
+}
+
+fn haider_projection_pipe_has_usage(path: &Path) -> bool {
+    haider_projection_cached_pipe_usage(haider_projection_pipe_usage_capability(), || {
+        haider_projection_probe_pipe_usage(path)
+    })
+}
+
 fn haider_projection_ready_endpoint(output: &str) -> Option<PathBuf> {
     let (_, suffix) = output.trim().split_once(" at ")?;
     let (path, _) = suffix.split_once(" (daemon v")?;
@@ -1554,10 +1658,11 @@ fn haider_projection_pipe_row_identity(value: &Value) -> Result<Option<(i64, i64
     let Some(object) = value.as_object() else {
         return Ok(None);
     };
-    let Some(role) = object.get("role").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    if !matches!(role, "user" | "assistant" | "tool" | "error") {
+    let projected_role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .is_some_and(|role| matches!(role, "user" | "assistant" | "tool" | "error"));
+    if !projected_role && !haider_projection_pipe_usage_value(value) {
         return Ok(None);
     }
     let seq = haider_projection_json_i64(object.get("seq"))
@@ -1794,6 +1899,21 @@ fn haider_projection_watch_finished(session_id: &str, generation: u64) {
     }
 }
 
+fn haider_projection_stop_session_watch(session_id: &str) -> Result<(), String> {
+    let child = haider_projection_watch_manager()
+        .lock()
+        .map_err(|_| "Haider projection watch manager is unavailable.".to_string())?
+        .watches
+        .remove(session_id)
+        .map(|watch| watch.child);
+    if let Some(child) = child {
+        if let Ok(mut child) = child.lock() {
+            let _ = child.kill();
+        }
+    }
+    Ok(())
+}
+
 fn haider_projection_watch_metadata(value: &Value) -> bool {
     let payload = haider_projection_payload(value);
     payload
@@ -1809,6 +1929,16 @@ fn haider_projection_start_watch(
     baseline_seq: i64,
     metadata_only: bool,
 ) -> Result<(), String> {
+    if haider_projection_pipe_usage_capability()
+        .get()
+        .copied()
+        .unwrap_or(false)
+        && haider_projection_pipe_manager()
+            .lock()
+            .is_ok_and(|manager| manager.tails.contains_key(&session_id))
+    {
+        return Ok(());
+    }
     if let Ok(mut manager) = haider_projection_watch_manager().lock() {
         manager.clock = manager.clock.saturating_add(1);
         let touched = manager.clock;
@@ -1986,6 +2116,9 @@ fn haider_projection_start_pipe_tail(
 }
 
 fn haider_projection_attach_blocking(app: AppHandle, session_id: String) -> Result<(), String> {
+    let _attach_guard = haider_projection_attach_lock()
+        .lock()
+        .map_err(|_| "Haider projection attach lock is unavailable.".to_string())?;
     let (_, provider_session_id) = haider_projection_resolve_provider_session(&session_id)?;
     let (_, baseline_seq) = haider_projection_database_stats(&session_id)?;
     HAIDER_PROJECTION_STOPPING.store(false, Ordering::Release);
@@ -1993,6 +2126,14 @@ fn haider_projection_attach_blocking(app: AppHandle, session_id: String) -> Resu
     if let Ok(manager) = haider_projection_pipe_manager().lock() {
         if manager.tails.contains_key(&session_id) {
             drop(manager);
+            if haider_projection_pipe_usage_capability()
+                .get()
+                .copied()
+                .unwrap_or(false)
+            {
+                haider_projection_stop_session_watch(&session_id)?;
+                return Ok(());
+            }
             return haider_projection_start_watch(
                 app,
                 session_id,
@@ -2003,6 +2144,7 @@ fn haider_projection_attach_blocking(app: AppHandle, session_id: String) -> Resu
         }
     }
     if let Ok(route) = haider_projection_resolve_pipe_route(&provider_session_id) {
+        let pipe_has_usage = haider_projection_pipe_has_usage(&route.path);
         if let Ok(frame) = haider_projection_ingest_pipe(&session_id, &provider_session_id, &route)
         {
             if frame.appended > 0 || frame.tail_changed || frame.sync_changed {
@@ -2014,6 +2156,10 @@ fn haider_projection_attach_blocking(app: AppHandle, session_id: String) -> Resu
                 provider_session_id.clone(),
                 route,
             )?;
+            if pipe_has_usage {
+                haider_projection_stop_session_watch(&session_id)?;
+                return Ok(());
+            }
             // v2 sidecars have no usage/run-state rows. Keep one filtered watch
             // for trajectory lanes and status, never transcript projection.
             return haider_projection_start_watch(
@@ -2276,18 +2422,7 @@ async fn session_projection_detach(session_id: String) -> Result<(), String> {
     {
         tail.stop.store(true, Ordering::Release);
     }
-    let child = haider_projection_watch_manager()
-        .lock()
-        .map_err(|_| "Haider projection watch manager is unavailable.".to_string())?
-        .watches
-        .remove(session_id.trim())
-        .map(|watch| watch.child);
-    if let Some(child) = child {
-        if let Ok(mut child) = child.lock() {
-            let _ = child.kill();
-        }
-    }
-    Ok(())
+    haider_projection_stop_session_watch(session_id.trim())
 }
 
 #[cfg(test)]
@@ -2387,6 +2522,49 @@ mod haider_projection_tests {
         assert!(state.metadata.contains_key("usage"));
         assert!(state.metadata.contains_key("run_state"));
         assert!(state.metadata.contains_key("session_state"));
+    }
+
+    #[test]
+    fn haider_projection_pipe_usage_probe_is_cached() {
+        let cache = OnceLock::new();
+        let probes = AtomicUsize::new(0);
+        for _ in 0..2 {
+            assert!(!haider_projection_cached_pipe_usage(&cache, || {
+                probes.fetch_add(1, Ordering::Relaxed);
+                false
+            }));
+        }
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+        assert!(haider_projection_pipe_usage_value(&json!({
+            "payload": {"type":"usage", "input":10, "output":3, "cached":2}
+        })));
+        assert!(!haider_projection_pipe_usage_value(&json!({
+            "role":"assistant", "text":"done", "seq":4, "ordinal":0
+        })));
+        let pipe_usage = json!({
+            "seq":5, "ordinal":0,
+            "usage":{"input_tokens":10, "output_tokens":3, "cached_tokens":2}
+        });
+        assert_eq!(
+            haider_projection_pipe_row_identity(&pipe_usage).unwrap(),
+            Some((5, 0))
+        );
+        let mut state = HaiderProjectionFoldState::default();
+        let folded = haider_projection_fold_value_locked(&mut state, "local", &pipe_usage);
+        assert_eq!(folded.rows.len(), 1);
+        assert_eq!(folded.rows[0].kind, "usage");
+    }
+
+    #[test]
+    fn haider_projection_boot_paths_do_not_cold_fold() {
+        for source in [
+            include_str!("haider_bridge.rs"),
+            include_str!("haider_run.rs"),
+        ] {
+            assert!(!source.contains("session_projection_ensure("));
+            assert!(!source.contains("haider_projection_export_json("));
+        }
+        assert!(!include_str!("lib.rs").contains("session_projection_ensure("));
     }
 
     #[test]
