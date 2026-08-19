@@ -5267,6 +5267,44 @@ fn present_main_window(app: &AppHandle) {
     }
 }
 
+/// Keeps the system titlebar out of macOS native fullscreen. The main window
+/// is borderless, but tao adds the Titled style mask while a window is in
+/// native fullscreen, which resurrects the system titlebar + traffic lights
+/// over our custom bar. Making the titlebar transparent/hidden with a
+/// full-size content view (and hiding the standard buttons) is idempotent
+/// and survives the transition; re-applied on every resize event because the
+/// fullscreen transition rebuilds the style mask.
+#[cfg(target_os = "macos")]
+fn main_window_apply_macos_frameless_titlebar(window: &tauri::Window) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("main_window_apply_frameless_titlebar", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &objc2_app_kit::NSWindow =
+                unsafe { &*ns_window.cast::<objc2_app_kit::NSWindow>() };
+            ns_window.setTitlebarAppearsTransparent(true);
+            ns_window.setTitleVisibility(objc2_app_kit::NSWindowTitleVisibility::Hidden);
+            ns_window.setStyleMask(
+                ns_window.styleMask() | objc2_app_kit::NSWindowStyleMask::FullSizeContentView,
+            );
+            for button_kind in [
+                objc2_app_kit::NSWindowButton::CloseButton,
+                objc2_app_kit::NSWindowButton::MiniaturizeButton,
+                objc2_app_kit::NSWindowButton::ZoomButton,
+            ] {
+                if let Some(button) = ns_window.standardWindowButton(button_kind) {
+                    button.setHidden(true);
+                }
+            }
+        });
+    });
+}
+
 #[cfg(target_os = "macos")]
 fn main_window_apply_macos_mouse_moved_style(window: &tauri::Window) {
     let window_for_main = window.clone();
@@ -6200,6 +6238,13 @@ fn run_app(daemon: bool) {
                     if let Some(window) = app.get_window("main") {
                         let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
                         main_window_apply_macos_mouse_moved_style(&window);
+                        main_window_apply_macos_frameless_titlebar(&window);
+                        let titlebar_window = window.clone();
+                        window.on_window_event(move |event| {
+                            if matches!(event, tauri::WindowEvent::Resized(_)) {
+                                main_window_apply_macos_frameless_titlebar(&titlebar_window);
+                            }
+                        });
                     }
                 }
             }
