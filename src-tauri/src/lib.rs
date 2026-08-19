@@ -3024,6 +3024,7 @@ include!("backend_cpu.rs");
 include!("workspace_files.rs");
 include!("workspace_threads_store.rs");
 include!("sessions.rs");
+include!("haider_bridge.rs");
 include!("architectures.rs");
 include!("pcb.rs");
 include!("video_editor.rs");
@@ -10638,6 +10639,7 @@ fn run_app(daemon: bool) {
                 }
             }
             if !daemon {
+                haider_bridge_start(app.handle().clone());
                 start_main_window_cursor_watcher(app.handle());
                 if background_startup_requested {
                     app_enter_background_internal(app.handle());
@@ -10687,6 +10689,7 @@ fn run_app(daemon: bool) {
             session_update,
             session_delete,
             sessions_home_dir,
+            haider_usage_snapshot,
             open_html_document_in_browser,
             workspace_webview_open,
             workspace_webview_adopt,
@@ -11250,6 +11253,9 @@ fn run_app(daemon: bool) {
         .expect("error while building Diff Forge AI desktop");
 
     app.run(move |app, event| {
+        if !daemon && matches!(&event, tauri::RunEvent::Exit) {
+            haider_bridge_stop();
+        }
         if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
             let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
 
