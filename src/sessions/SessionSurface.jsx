@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { openPath } from "@tauri-apps/plugin-opener";
 import { useCallback, useRef, useState } from "react";
 import styled from "styled-components";
 
@@ -143,24 +142,6 @@ export default function SessionSurface({
                   Terminal
                 </SessionViewButton>
               </SessionViewToggle>
-              <SessionHeaderActions>
-                <SessionHeaderButton
-                  onClick={() => void openPath(session.dir).catch(() => {})}
-                  title={session.dir}
-                  type="button"
-                >
-                  Open folder
-                </SessionHeaderButton>
-                {session.kind === "generated" && (
-                  <SessionHeaderButton
-                    onClick={() => void openPath(`${session.dir}/outputs`).catch(() => {})}
-                    title={`${session.dir}/outputs`}
-                    type="button"
-                  >
-                    Outputs
-                  </SessionHeaderButton>
-                )}
-              </SessionHeaderActions>
             </SessionHeader>
 
             {/* UI view: projection transcript + composer; mounted only while
@@ -257,29 +238,6 @@ const SessionViewButton = styled.button`
 
   &:hover:not([data-active="true"]) {
     color: var(--forge-text-soft);
-  }
-`;
-
-const SessionHeaderActions = styled.div`
-  display: inline-flex;
-  flex: 0 0 auto;
-  margin-left: auto;
-  gap: 6px;
-`;
-
-const SessionHeaderButton = styled.button`
-  padding: 3px 9px;
-  border: 1px solid var(--forge-border);
-  border-radius: 6px;
-  color: var(--forge-text-soft);
-  background: transparent;
-  font-size: 10.5px;
-  font-weight: 600;
-  cursor: pointer;
-
-  &:hover {
-    color: var(--forge-text);
-    border-color: var(--forge-border-strong);
   }
 `;
 

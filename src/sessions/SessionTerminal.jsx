@@ -247,7 +247,10 @@ const TerminalHost = styled.div`
   width: 100%;
   height: 100%;
   min-height: 0;
-  padding: 6px 2px 6px 8px;
+  /* No padding: measureTerminalGrid sizes rows from the container box, so
+     any inset makes the TUI draw rows that clip at the bottom edge. */
+  padding: 0;
+  overflow: hidden;
   background: ${TERMINAL_DARK_THEME.background};
 
   html[data-forge-theme="light"] & {
