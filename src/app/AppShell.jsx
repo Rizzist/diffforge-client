@@ -34,6 +34,7 @@ import { Fragment, lazy, memo, Profiler, startTransition, Suspense, useCallback,
 import { createPortal } from "react-dom";
 import { onRuntimeProfilerRender } from "../diagnostics/commitProfiler.js";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
+import { AuthFlow, SUCCESS_HOLD_MS as AUTH_SUCCESS_HOLD_MS } from "../auth";
 import { listenShared, waitSharedListenerReady } from "./sharedTauriEvents.js";
 import {
   normalizeLoopspaceTodoWorkspaceIds,
@@ -23984,6 +23985,10 @@ export default function App() {
   const [isLaunchScreenVisible, setLaunchScreenVisible] = useState(true);
   const [workspaceState, setWorkspaceState] = useState("idle");
   const [hasEnteredWorkspaceShell, setHasEnteredWorkspaceShell] = useState(false);
+  // Auth ceremony state for the particle AuthFlow overlay (src/auth).
+  const [authBootDone, setAuthBootDone] = useState(false);
+  const [authCeremony, setAuthCeremony] = useState("idle"); // idle | success | launch | done
+  const [authUiMode, setAuthUiMode] = useState("signin");
   const [workspaceAgentLaunchEpoch, setWorkspaceAgentLaunchEpoch] = useState(0);
   const [preparedTerminalVersion, setPreparedTerminalVersion] = useState(0);
   const [workspaceAgentBatchSentKey, setWorkspaceAgentBatchSentKey] = useState("");
@@ -31423,6 +31428,34 @@ export default function App() {
     }
   }, [setSignedOut]);
 
+  const handleAuthFlowSignIn = useCallback(() => {
+    setAuthUiMode("signin");
+    void startWebLogin();
+  }, [startWebLogin]);
+
+  const handleAuthFlowRegister = useCallback(() => {
+    // No dedicated register flow yet: the web login page offers account
+    // creation; the mode only changes the waiting-card copy.
+    setAuthUiMode("register");
+    void startWebLogin();
+  }, [startWebLogin]);
+
+  const handleAuthFlowCancel = useCallback(() => {
+    // Same path as a failed browser handoff: drop the pending attempt (a
+    // late deep-link callback is ignored via the flow id bump) but keep any
+    // saved session on disk.
+    authFlowIdRef.current += 1;
+    setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearSession: false, clearPending: true });
+  }, [setSignedOut]);
+
+  const handleAuthFlowBootDone = useCallback(() => {
+    setAuthBootDone(true);
+  }, []);
+
+  const handleAuthFlowLaunchComplete = useCallback(() => {
+    setAuthCeremony("done");
+  }, []);
+
   const openHelpCenter = useCallback(() => {
     openUrl("https://diffforge.ai/docs").catch((error) => {
       authStore.setError(getErrorMessage(error, "Unable to open help."));
@@ -35909,6 +35942,27 @@ export default function App() {
     workspaceListHydrated,
     workspaceState,
   ]);
+
+  // Auth ceremony: once authenticated and the particle logo has formed,
+  // hold the success beat; when the workspace is ready, detonate into the
+  // shell after SUCCESS_HOLD_MS. Real auth events drive every other phase.
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      setAuthCeremony("idle");
+      return undefined;
+    }
+    if (!authBootDone || authCeremony === "launch" || authCeremony === "done") {
+      return undefined;
+    }
+    if (authCeremony !== "success") {
+      setAuthCeremony("success");
+    }
+    if (workspaceState !== "ready") {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setAuthCeremony("launch"), AUTH_SUCCESS_HOLD_MS);
+    return () => window.clearTimeout(timer);
+  }, [authBootDone, authCeremony, authState, workspaceState]);
 
   useEffect(() => {
     if (authState !== "authenticated") {
@@ -54558,7 +54612,6 @@ export default function App() {
     updateArchitectureHubSelection,
     workspaceTerminalDispatchTargets,
   ]);
-  const shouldHoldWorkspaceShellForStartup = authState === "authenticated" && userIsPaid && workspaceState !== "ready";
   const cloudSyncConnection = String(cloudSyncStatus?.connection || "local").toLowerCase();
   const cloudSyncPendingCount = normalizeCloudSyncCount(cloudSyncStatus?.pending_count);
   const cloudSyncUpCount = normalizeCloudSyncCount(cloudSyncStatus?.up_count ?? cloudSyncPendingCount);
@@ -54631,19 +54684,17 @@ export default function App() {
     upgrade: "Upgrade to a paid plan to unlock cloud sync and Live Sync.",
   }[cloudSyncPillState] || "";
   const shouldShowStartupPhases = !hasEnteredWorkspaceShell;
-  const shouldShowLaunchScreen = shouldShowStartupPhases && (
-    isLaunchScreenVisible
-    || shouldHoldWorkspaceShellForStartup
-  );
-  const launchState = "loading";
-  const launchStatus = !authInitialized
-    ? "Checking secure session..."
-    : authState === "authenticated"
-      ? "Preparing workspace..."
-      : "Opening sign in...";
-  const launchDetail = !authInitialized
-    ? "Validating this device before showing your workspace."
-    : "Finishing the desktop handoff.";
+  // The particle AuthFlow overlay (src/auth) owns splash + login + launch.
+  const authFlowActive = authCeremony !== "done";
+  const authFlowPhase = !authBootDone
+    ? "boot"
+    : authState === "signedOut"
+      ? "entry"
+      : authState === "waiting" || authState === "exchanging"
+        ? "waiting"
+        : authState === "authenticated"
+          ? (authCeremony === "launch" ? "launch" : "success")
+          : "boot";
   const windowControlPlatform = getWindowControlPlatform();
   const isWindowFrameExpanded = windowFrameState.isFullscreen || windowFrameState.isMaximized;
   const windowResizeActive = windowFrameState.isFullscreen
@@ -55104,37 +55155,7 @@ export default function App() {
         </WindowResizeEdges>
 
         <AppContent>
-          {shouldShowLaunchScreen ? (
-            <SplashScreen aria-label={`${BRAND_NAME} is launching`} data-state={launchState}>
-              <AmbientPanel data-position="left">
-                <span>&gt; codex</span>
-                <p>Analyzing codebase...</p>
-                <p>Generating changes...</p>
-              </AmbientPanel>
-              <AmbientPanel data-position="right">
-                <span>src/engine/runner.ts</span>
-                <p>+ return output</p>
-                <p>- return result</p>
-              </AmbientPanel>
-              <SplashCenter>
-                <SplashLogo src="/logo.webp" alt="" />
-                <SplashTitle>{BRAND_NAME}</SplashTitle>
-                <SplashTagline>Your agentic development environment.</SplashTagline>
-                <LoadingTrack aria-hidden="true" data-state={launchState}>
-                  <LoadingFill />
-                </LoadingTrack>
-                <LaunchStatusPanel data-state={launchState}>
-                  <LaunchStatusIcon aria-hidden="true" data-state={launchState}>
-                    <ConnectedIcon />
-                  </LaunchStatusIcon>
-                  <LaunchStatusCopy>
-                    <LoadingText>{launchStatus}</LoadingText>
-                    <LoadingDetail>{launchDetail}</LoadingDetail>
-                  </LaunchStatusCopy>
-                </LaunchStatusPanel>
-              </SplashCenter>
-            </SplashScreen>
-          ) : authState === "authenticated" ? (
+          {authState === "authenticated" ? (
             <AuthenticatedWorkspaceFrame>
               <DashboardShell
                 aria-hidden={isWorkspaceStartupOverlayVisible}
@@ -58118,91 +58139,19 @@ export default function App() {
                 </WorkspaceStartupOverlay>
               )}
             </AuthenticatedWorkspaceFrame>
-          ) : (
-            <LoginScreen>
-              <AuthSquareBackdrop />
-              <LoginLayout>
-                <BrandPanel aria-labelledby="desktop-title">
-                  <BrandMark href="#" aria-label={BRAND_NAME}>
-                    <img src="/logo.webp" alt="" />
-                    <strong>{BRAND_NAME}</strong>
-                  </BrandMark>
+          ) : null}
 
-                  <IntroCopy>
-                    <Kicker>The Agentic Development Environment</Kicker>
-                    <Headline id="desktop-title">
-                      Your agents.
-                      <br />
-                      <HeadlineAccent>Your forge.</HeadlineAccent>
-                    </Headline>
-                    <Lede>
-                      Run Codex, Claude Code, and OpenCode side by side — coordinated by
-                      file leases, steered by voice, synced to every device. Sign in with
-                      your browser to light the forge.
-                    </Lede>
-                    <IntroFeatureList aria-label="What Diff Forge coordinates">
-                      <IntroFeature data-tone="blue">
-                        <span />
-                        Codex · Claude Code · OpenCode terminals
-                      </IntroFeature>
-                      <IntroFeature data-tone="orange">
-                        <span />
-                        Voice orchestrator + local dictation
-                      </IntroFeature>
-                      <IntroFeature data-tone="green">
-                        <span />
-                        Merge-safe coordination kernel
-                      </IntroFeature>
-                    </IntroFeatureList>
-                  </IntroCopy>
-                </BrandPanel>
-
-                <LoginCard aria-label="Desktop sign in">
-                  <LoginPanel>
-                    <LoginCardTop>
-                      <PanelKicker>Native app access</PanelKicker>
-                      <LoginCardBadge data-state={authState}>{authStateLabel}</LoginCardBadge>
-                    </LoginCardTop>
-                    <LoginIconWrap aria-hidden="true">
-                      {isAuthBusy ? <PendingIcon /> : <ButtonLoginIcon />}
-                    </LoginIconWrap>
-                    <SessionTitle>{authPanelTitle}</SessionTitle>
-                    <SessionText>{authMessage}</SessionText>
-                    {authError && <FormMessage $state="error">{authError}</FormMessage>}
-                    <AuthStepRail aria-label="Desktop sign in checkpoints">
-                      {AUTH_STEPS.map((step, index) => {
-                        const stepState = stepStateFor(
-                          AUTH_STEPS,
-                          authCurrentStage,
-                          authError ? "error" : "active",
-                          index,
-                        );
-
-                        return (
-                          <AuthStep data-state={stepState} key={step.id}>
-                            <span>{stepState === "complete" ? <ButtonCheckIcon aria-hidden="true" /> : index + 1}</span>
-                            <strong>{step.label}</strong>
-                            <small>{step.id === authCurrentStage ? authMessage : step.detail}</small>
-                          </AuthStep>
-                        );
-                      })}
-                    </AuthStepRail>
-                    <PrimaryButton data-login-cta="true" disabled={isAuthBusy} onClick={startWebLogin} type="button">
-                      <ButtonBrowserIcon aria-hidden="true" />
-                      <span>{authButtonLabel}</span>
-                    </PrimaryButton>
-                    {authStore.hasSavedOfflineSession() ? (
-                      <SignInOfflineButton onClick={continueOfflineFromSignIn} type="button">
-                        Continue offline
-                      </SignInOfflineButton>
-                    ) : null}
-                    <SignInOfflineButton onClick={openHelpCenter} type="button">
-                      Help
-                    </SignInOfflineButton>
-                  </LoginPanel>
-                </LoginCard>
-              </LoginLayout>
-            </LoginScreen>
+          {authFlowActive && (
+            <AuthFlow
+              mode={authUiMode}
+              onBootDone={handleAuthFlowBootDone}
+              onCancel={handleAuthFlowCancel}
+              onLaunchComplete={handleAuthFlowLaunchComplete}
+              onRegister={handleAuthFlowRegister}
+              onSignIn={handleAuthFlowSignIn}
+              phase={authFlowPhase}
+              statusMessage={authState === "exchanging" ? authMessage : ""}
+            />
           )}
 	        </AppContent>
 
