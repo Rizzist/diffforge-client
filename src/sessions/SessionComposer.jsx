@@ -37,6 +37,7 @@ export default function SessionComposer({
   autoFocus = false,
   chipValues = {},
   chipOptions = {},
+  chipCapabilities = {},
   onChipChange = null,
   slashCommands = null,
 }) {
@@ -113,6 +114,9 @@ export default function SessionComposer({
       ? chipOptions[key]
       : fallbackOptions;
     const display = current === "default" ? "Default" : current;
+    /* Switching is gated per chip by the harness capability sniff; until the
+       daemon exposes a headless door, menus browse the library read-only. */
+    const switchable = chipCapabilities[`${key}_switch`] === true;
     return (
       <ChipWrap key={key}>
         <Chip
@@ -129,8 +133,12 @@ export default function SessionComposer({
             {options.length ? options.map((option) => (
               <ChipMenuItem
                 data-active={option === current ? "true" : undefined}
+                data-readonly={switchable ? undefined : "true"}
                 key={option}
                 onClick={() => {
+                  if (!switchable) {
+                    return;
+                  }
                   setOpenMenu("");
                   onChipChange?.(key, option);
                 }}
@@ -141,6 +149,9 @@ export default function SessionComposer({
               </ChipMenuItem>
             )) : (
               <ChipMenuEmpty>Harness-managed — options arrive with the daemon integration.</ChipMenuEmpty>
+            )}
+            {!switchable && options.length > 0 && (
+              <ChipMenuEmpty>Read-only — switching lands with the next harness update.</ChipMenuEmpty>
             )}
           </ChipMenu>
         )}
@@ -343,6 +354,11 @@ const ChipMenuItem = styled.button`
   &[data-active="true"] {
     color: var(--forge-text);
     background: var(--forge-surface-selected);
+  }
+
+  &[data-readonly="true"] {
+    opacity: 0.55;
+    cursor: default;
   }
 `;
 

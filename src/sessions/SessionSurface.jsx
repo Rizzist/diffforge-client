@@ -58,10 +58,11 @@ export default function SessionSurface({
   const [sessionTabs, setSessionTabs] = useState({});
   const [composerPrefs, setComposerPrefs] = useState({});
   const [usageMeta, setUsageMeta] = useState(null);
+  const [library, setLibrary] = useState(null);
   const [draftError, setDraftError] = useState("");
   const submitBusyRef = useRef(false);
 
-  /* Current provider/account context from the harness (haider status). */
+  /* Current provider/account context + model library from the harness. */
   useEffect(() => {
     let disposed = false;
     void invoke("haider_usage_snapshot").then((snapshot) => {
@@ -69,19 +70,32 @@ export default function SessionSurface({
         setUsageMeta(snapshot);
       }
     }).catch(() => {});
+    void invoke("haider_library_snapshot").then((snapshot) => {
+      if (!disposed && snapshot && typeof snapshot === "object") {
+        setLibrary(snapshot);
+      }
+    }).catch(() => {});
     return () => {
       disposed = true;
     };
   }, []);
 
-  const chipValuesFor = (session) => {
-    const prefs = composerPrefs[session?.id || "draft"] || {};
+  /* Chips show REALITY (the session's actual model/provider, the harness's
+     actual account), never an unapplied local preference — switching stays
+     read-only until the harness exposes a headless door for it. */
+  const chipValuesFor = (session) => ({
+    model: session?.model || "default",
+    effort: "default",
+    speed: "default",
+    provider: session?.provider || usageMeta?.account?.provider || "default",
+    account: usageMeta?.account?.alias || "default",
+  });
+  const chipOptionsFor = () => {
+    const models = Array.isArray(library?.models) ? library.models : [];
     return {
-      model: prefs.model || "default",
-      effort: prefs.effort || "default",
-      speed: prefs.speed || "default",
-      provider: prefs.provider || session?.provider || usageMeta?.account?.provider || "default",
-      account: prefs.account || usageMeta?.account?.alias || "default",
+      model: [...new Set(models.map((entry) => entry?.model).filter(Boolean))],
+      provider: [...new Set(models.map((entry) => entry?.provider).filter(Boolean))],
+      account: library?.account?.alias ? [library.account.alias] : [],
     };
   };
   const handleChipChange = useCallback((sessionId, key, option) => {
@@ -224,14 +238,17 @@ export default function SessionSurface({
       {session && session.id !== "draft" && (
         <StatusPill data-status={session.status}>
           <i aria-hidden="true" />
+          {/* The pill mirrors the HARNESS's own state word (the TUI status
+              bar), falling back to the bucket only when raw is absent. */}
           <span>
-            {session.status === "running"
-              ? "Running"
-              : session.status === "waiting"
-                ? "Waiting"
-                : session.status === "error"
-                  ? "Error"
-                  : "Idle"}
+            {(session.state_raw || "").trim()
+              || (session.status === "running"
+                ? "Running"
+                : session.status === "waiting"
+                  ? "Waiting"
+                  : session.status === "error"
+                    ? "Error"
+                    : "Idle")}
           </span>
         </StatusPill>
       )}
@@ -296,6 +313,8 @@ export default function SessionSurface({
                 </DraftBody>
                 <SessionComposer
                   autoFocus
+                  chipCapabilities={library?.capabilities || {}}
+                  chipOptions={chipOptionsFor()}
                   chipValues={chipValuesFor(null)}
                   onChipChange={(key, option) => handleChipChange("draft", key, option)}
                   onSubmit={submitDraft}
@@ -421,6 +440,8 @@ export default function SessionSurface({
                 <>
                   <SessionTranscript session={session} />
                   <SessionComposer
+                    chipCapabilities={library?.capabilities || {}}
+                    chipOptions={chipOptionsFor()}
                     chipValues={chipValuesFor(session)}
                     onChipChange={(key, option) => handleChipChange(session.id, key, option)}
                     onSubmit={(prompt, attachments) => submitIntoSession(session, prompt, attachments)}

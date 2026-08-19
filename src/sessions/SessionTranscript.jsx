@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import styled from "styled-components";
 
 /* Virtualized transcript for the session UI view, fed by the Rust
@@ -174,6 +176,10 @@ export default function SessionTranscript({ session }) {
                 <ToolChipTag>tool</ToolChipTag>
                 <span>{row.text}</span>
               </ToolChipRow>
+            ) : row.role === "assistant" && row.kind !== "error" ? (
+              <MarkdownBody>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{row.text}</ReactMarkdown>
+              </MarkdownBody>
             ) : (
               <RowText>{row.text}</RowText>
             )}
@@ -183,10 +189,10 @@ export default function SessionTranscript({ session }) {
       {liveTail && (
         <TranscriptRow data-kind="live" data-role={liveTail.role || "assistant"}>
           <RowBody data-kind="message" data-role={liveTail.role || "assistant"}>
-            <RowText>
-              {liveTail.text}
+            <MarkdownBody>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{liveTail.text}</ReactMarkdown>
               <LiveCaret aria-hidden="true" />
-            </RowText>
+            </MarkdownBody>
           </RowBody>
         </TranscriptRow>
       )}
@@ -199,15 +205,16 @@ const TranscriptScroller = styled.div`
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 14px 14px 6px;
+  padding: 18px 20px 8px;
 `;
 
 const TranscriptRow = styled.div`
   display: flex;
-  padding: 3px 0;
+  padding: 5px 0;
 
   &[data-role="user"] {
     justify-content: flex-end;
+    padding-top: 14px;
   }
 `;
 
@@ -216,18 +223,108 @@ const RowBody = styled.div`
   min-width: 0;
 
   &[data-role="user"] {
-    padding: 7px 11px;
+    padding: 7px 12px;
     border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.28);
     border-radius: 12px 12px 4px 12px;
     background: rgba(var(--forge-tint-rgb), 0.12);
   }
 
   &[data-role="assistant"] {
-    padding: 2px 0;
+    max-width: min(76%, 72ch);
+    padding: 2px 0 6px;
   }
 
   &[data-kind="tool"] {
     max-width: 100%;
+  }
+`;
+
+/* Assistant messages render as markdown — readable measure, calm rhythm. */
+const MarkdownBody = styled.div`
+  color: var(--forge-text);
+  font-size: 13px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+
+  > *:first-child { margin-top: 0; }
+  > *:last-child { margin-bottom: 0; }
+
+  p { margin: 0 0 10px; }
+  ul, ol { margin: 6px 0 12px; padding-left: 22px; }
+  li { margin: 3px 0; }
+  li > p { margin: 0; }
+
+  h1, h2, h3, h4, h5, h6 {
+    margin: 16px 0 7px;
+    font-weight: 700;
+    line-height: 1.3;
+  }
+  h1 { font-size: 16px; }
+  h2 { font-size: 15px; }
+  h3 { font-size: 14px; }
+  h4, h5, h6 { font-size: 13px; }
+
+  strong { font-weight: 680; }
+
+  code {
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--forge-surface-control, rgba(128, 128, 128, 0.14));
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11.5px;
+  }
+
+  pre {
+    margin: 8px 0 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--forge-border);
+    border-radius: 8px;
+    background: var(--forge-surface);
+    overflow-x: auto;
+
+    code {
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+      font-size: 11.5px;
+      line-height: 1.55;
+    }
+  }
+
+  blockquote {
+    margin: 8px 0 12px;
+    padding: 2px 0 2px 12px;
+    border-left: 2px solid var(--forge-border-strong);
+    color: var(--forge-text-soft);
+  }
+
+  a {
+    color: var(--forge-ember);
+    text-decoration: none;
+  }
+  a:hover { text-decoration: underline; }
+
+  table {
+    margin: 8px 0 12px;
+    border-collapse: collapse;
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    font-size: 12px;
+  }
+  th, td {
+    padding: 4px 10px;
+    border: 1px solid var(--forge-border);
+  }
+  th {
+    background: var(--forge-surface);
+    font-weight: 650;
+  }
+
+  hr {
+    margin: 12px 0;
+    border: 0;
+    border-top: 1px solid var(--forge-border);
   }
 `;
 

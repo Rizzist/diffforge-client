@@ -10,7 +10,7 @@ import {
   TERMINAL_DARK_THEME,
   TERMINAL_LIGHT_THEME,
 } from "../terminals/WorkspaceTerminal/terminalCore.js";
-import { sessionWorkingDirectory, updateSession } from "./sessionsModel.js";
+import { sessionWorkingDirectory } from "./sessionsModel.js";
 
 /* Lean single-PTY host for a Haider session pane. Deliberately NOT the
    19k-line WorkspaceTerminal: one terminal, one PTY, no thread overlay, no
@@ -19,7 +19,6 @@ import { sessionWorkingDirectory, updateSession } from "./sessionsModel.js";
    back is instant and scrollback survives. */
 
 const SESSION_TERMINAL_RESIZE_DEBOUNCE_MS = 120;
-const SESSION_TOUCH_DEBOUNCE_MS = 15_000;
 const SESSION_TERMINAL_GRID_GUARD_PX = 2;
 
 function getSessionTerminalTheme() {
@@ -108,16 +107,11 @@ export default function SessionTerminal({ session, active }) {
     let resizeObserver = null;
     let themeObserver = null;
     let detachPushToTalk = () => {};
-    let lastTouchAt = 0;
 
-    const touchSession = () => {
-      const now = Date.now();
-      if (now - lastTouchAt < SESSION_TOUCH_DEBOUNCE_MS) {
-        return;
-      }
-      lastTouchAt = now;
-      void updateSession(session.id, { touch: true }).catch(() => {});
-    };
+    // Recency is DAEMON-owned: reconcile syncs latest_at_ms from the
+    // harness's updated_at. Local touches on open/keystrokes made merely
+    // OPENING a session jump to the top of Recent — bad UX, and redundant
+    // because real activity bumps the daemon clock anyway.
 
     const applyTerminalTheme = () => {
       if (disposed || !term) {
@@ -192,7 +186,8 @@ export default function SessionTerminal({ session, active }) {
 
     const run = async () => {
       term = new XTerm({
-        allowProposedApi: false,
+        // Proposed API is required by the Unicode 11 addon (emoji widths).
+        allowProposedApi: true,
         altClickMovesCursor: false,
         convertEol: false,
         cursorBlink: true,
@@ -209,6 +204,15 @@ export default function SessionTerminal({ session, active }) {
         theme: getSessionTerminalTheme(),
       });
       xtermRef.current = term;
+      // Unicode 11 widths: without this, emoji measure 1 cell but paint 2 —
+      // the harness TUI assumes standard wide emoji, so glyphs render halved.
+      try {
+        const { Unicode11Addon } = await import("@xterm/addon-unicode11");
+        term.loadAddon(new Unicode11Addon());
+        term.unicode.activeVersion = "11";
+      } catch {
+        // Addon missing — widths fall back to xterm defaults.
+      }
       term.open(container);
       detachPushToTalk = guardXtermDuringPushToTalk(term);
       term.parser.registerOscHandler(10, swallowOscColorQuery);
@@ -216,7 +220,6 @@ export default function SessionTerminal({ session, active }) {
       term.parser.registerOscHandler(12, swallowOscColorQuery);
 
       term.onData((data) => {
-        touchSession();
         invoke("terminal_write", { pane_id: paneId, data }).catch(() => {});
       });
 
@@ -282,7 +285,6 @@ export default function SessionTerminal({ session, active }) {
       if (result && Number(result.instance_id)) {
         instanceIdRef.current = Number(result.instance_id);
       }
-      touchSession();
       fitTerminal();
       // Font metrics settle after the face loads and after xterm's first
       // paint — refit on both so a full-screen TUI never keeps stale rows.

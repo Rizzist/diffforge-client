@@ -29,6 +29,7 @@ export function normalizeSessionRow(row) {
     model: String(row.model || ""),
     pinned: row.pinned === true || row.pinned === 1,
     title_locked: row.title_locked === true || row.title_locked === 1,
+    state_raw: String(row.state_raw || ""),
   };
 }
 
