@@ -20,6 +20,48 @@ import { sessionWorkingDirectory, updateSession } from "./sessionsModel.js";
 
 const SESSION_TERMINAL_RESIZE_DEBOUNCE_MS = 120;
 const SESSION_TOUCH_DEBOUNCE_MS = 15_000;
+const SESSION_TERMINAL_GRID_GUARD_PX = 2;
+
+/* xterm's private cell dimensions can land on device-pixel fractions that
+   differ slightly from the final canvas allocation. Reserve a tiny amount of
+   the real mount box before flooring so the renderer can never gain a row or
+   column that does not quite fit. */
+function measureSessionTerminalGrid({ container, term }) {
+  const measurement = measureTerminalGrid({
+    container,
+    term,
+    minCols: 1,
+    minRows: 1,
+  });
+  if (!measurement.ok) {
+    return measurement;
+  }
+
+  const safeCols = Math.floor(
+    Math.max(0, measurement.containerWidth - SESSION_TERMINAL_GRID_GUARD_PX)
+      / measurement.actualCellWidth,
+  );
+  const safeRows = Math.floor(
+    Math.max(0, measurement.containerHeight - SESSION_TERMINAL_GRID_GUARD_PX)
+      / measurement.actualCellHeight,
+  );
+
+  if (safeCols < 1 || safeRows < 1) {
+    return {
+      ...measurement,
+      ok: false,
+      reason: "terminal_mount_too_small",
+    };
+  }
+
+  return {
+    ...measurement,
+    cols: Math.min(measurement.cols, safeCols),
+    rows: Math.min(measurement.rows, safeRows),
+    safeCols,
+    safeRows,
+  };
+}
 
 export function sessionPaneToken(sessionId) {
   return String(sessionId || "")
@@ -54,6 +96,9 @@ export default function SessionTerminal({ session, active }) {
     let disposed = false;
     let term = null;
     let resizeTimer = 0;
+    let lateFitTimer = 0;
+    let firstOutputFitFrame = 0;
+    let firstOutputFitRequested = false;
     let resizeObserver = null;
     let detachPushToTalk = () => {};
     let lastTouchAt = 0;
@@ -71,7 +116,7 @@ export default function SessionTerminal({ session, active }) {
       if (disposed || !term) {
         return;
       }
-      const measurement = measureTerminalGrid({ container, term });
+      const measurement = measureSessionTerminalGrid({ container, term });
       if (!measurement.ok) {
         return;
       }
@@ -134,10 +179,17 @@ export default function SessionTerminal({ session, active }) {
             : null;
         if (bytes?.byteLength) {
           term.write(bytes);
+          if (!firstOutputFitRequested) {
+            firstOutputFitRequested = true;
+            firstOutputFitFrame = window.requestAnimationFrame(() => {
+              firstOutputFitFrame = 0;
+              fitTerminal();
+            });
+          }
         }
       });
 
-      const initial = measureTerminalGrid({ container, term });
+      const initial = measureSessionTerminalGrid({ container, term });
       const workingDirectory = sessionWorkingDirectory(session);
       const instanceId = Date.now() % 2_000_000_000;
       instanceIdRef.current = instanceId;
@@ -178,11 +230,14 @@ export default function SessionTerminal({ session, active }) {
       fitTerminal();
       // Font metrics settle after the face loads and after xterm's first
       // paint — refit on both so a full-screen TUI never keeps stale rows.
-      window.setTimeout(fitTerminal, 250);
+      lateFitTimer = window.setTimeout(() => {
+        lateFitTimer = 0;
+        fitTerminal();
+      }, 250);
       if (typeof document !== "undefined" && document.fonts?.ready) {
         void document.fonts.ready.then(() => {
           if (!disposed) {
-            fitTerminal();
+            window.requestAnimationFrame(fitTerminal);
           }
         });
       }
@@ -212,6 +267,12 @@ export default function SessionTerminal({ session, active }) {
       if (resizeTimer) {
         window.clearTimeout(resizeTimer);
       }
+      if (lateFitTimer) {
+        window.clearTimeout(lateFitTimer);
+      }
+      if (firstOutputFitFrame) {
+        window.cancelAnimationFrame(firstOutputFitFrame);
+      }
       detachPushToTalk();
       // The PTY intentionally outlives the component only when the whole
       // app closes; unmounting a session host means the session was closed
@@ -238,7 +299,7 @@ export default function SessionTerminal({ session, active }) {
     if (!term || !container) {
       return;
     }
-    const measurement = measureTerminalGrid({ container, term });
+    const measurement = measureSessionTerminalGrid({ container, term });
     if (measurement.ok) {
       if (term.cols !== measurement.cols || term.rows !== measurement.rows) {
         term.resize(measurement.cols, measurement.rows);
@@ -264,6 +325,8 @@ const TerminalHost = styled.div`
   width: 100%;
   height: 100%;
   min-height: 0;
+  box-sizing: border-box;
+  padding: 8px 10px;
   overflow: hidden;
   background: ${TERMINAL_DARK_THEME.background};
 
@@ -272,19 +335,24 @@ const TerminalHost = styled.div`
   }
 `;
 
-/* xterm mounts (and is measured) against this inset box: the 1px vertical
-   guard band means fractional cell metrics can only round rows DOWN, so a
-   full-screen TUI's first and last lines are never clipped. */
+/* The frame belongs to TerminalHost. This padding-free box is both xterm's
+   mount and the resize measurement target, so its client size is the exact
+   renderer area rather than the renderer area plus CSS padding. */
 const TerminalMount = styled.div`
-  position: absolute;
-  inset: 1px 0 1px 6px;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 
   .xterm {
     width: 100%;
     height: 100%;
+    overflow: hidden;
   }
 
   .xterm .xterm-viewport {
-    background: transparent;
+    background: transparent !important;
   }
 `;
