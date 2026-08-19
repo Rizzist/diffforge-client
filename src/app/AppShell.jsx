@@ -33,7 +33,7 @@ import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import { AuthFlow, SUCCESS_HOLD_MS as AUTH_SUCCESS_HOLD_MS } from "../auth";
 import SessionsRail from "../sessions/SessionsRail.jsx";
 import SessionSurface from "../sessions/SessionSurface.jsx";
-import { createSession, listSessions, sessionWorkingDirectory } from "../sessions/sessionsModel.js";
+import { listSessions, sessionWorkingDirectory } from "../sessions/sessionsModel.js";
 import { listenShared, waitSharedListenerReady } from "./sharedTauriEvents.js";
 import { resolveLoopspaceTodoTerminalSelectors } from "./loopspaceTodoDispatchTargets.js";
 import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
@@ -18365,6 +18365,9 @@ export default function App() {
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [openSessionIds, setOpenSessionIds] = useState([]);
+  // A draft is pure UI state: no store row, no directory, no process. The
+  // first submitted prompt materializes it into a real harness session.
+  const [sessionDraftOpen, setSessionDraftOpen] = useState(false);
   const openSessions = useMemo(
     () => openSessionIds
       .map((id) => sessions.find((session) => session.id === id))
@@ -18392,20 +18395,22 @@ export default function App() {
     if (!session?.id) {
       return;
     }
+    setSessionDraftOpen(false);
     setActiveSessionId(session.id);
     setOpenSessionIds((ids) => (ids.includes(session.id) ? ids : [...ids, session.id]));
     showView(DEFAULT_WORKSPACE_VIEW);
   }, [showView]);
-  const startNewSessionChat = useCallback(async () => {
-    try {
-      const session = await createSession({});
-      if (session) {
-        setSessions((current) => [session, ...current.filter((row) => row.id !== session.id)]);
-        openSessionFromRail(session);
-      }
-    } catch (error) {
-      console.error("session create failed", error);
+  const startNewSessionChat = useCallback(() => {
+    setSessionDraftOpen(true);
+    setActiveSessionId("");
+    showView(DEFAULT_WORKSPACE_VIEW);
+  }, [showView]);
+  const handleDraftMaterialized = useCallback((session) => {
+    if (!session?.id) {
+      return;
     }
+    setSessions((current) => [session, ...current.filter((row) => row.id !== session.id)]);
+    openSessionFromRail(session);
   }, [openSessionFromRail]);
 
   useEffect(() => {
@@ -24629,6 +24634,8 @@ export default function App() {
                   {!loopspacesModeActive && (
                     <SessionSurface
                       activeSessionId={activeSessionId}
+                      draftOpen={sessionDraftOpen}
+                      onDraftMaterialized={handleDraftMaterialized}
                       openSessions={openSessions}
                     />
                   )}

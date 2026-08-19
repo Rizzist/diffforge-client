@@ -2,20 +2,19 @@ import { useEffect, useState } from "react";
 import styled from "styled-components";
 
 import {
-  RailActionButton,
-  RailViewActions,
   SettingsNavGroupLabel,
-  ButtonAddIcon,
+  ButtonEditIcon,
 } from "../app/appStyles.js";
 import {
   formatSessionRelativeTime,
   groupSessionsByDay,
 } from "./sessionsModel.js";
 
-/* Codex-style session rail: New chat on top, then day-grouped session rows.
-   Rendered inside the workspace rail's list area; visual language reuses the
-   existing rail components (RailActionButton rows inside RailViewActions
-   boxes, 9px uppercase day labels). */
+/* Codex-style session rail: a compact compose "New chat" on top, then
+   day-grouped session rows. Collapsed rail shows ONLY the compose button —
+   no rows, no labels — for a clean icon strip; the expanded list is
+   unchanged. New chat opens a zero-cost draft (no session is created until
+   the first prompt is submitted). */
 
 export default function SessionsRail({
   sessions,
@@ -34,23 +33,20 @@ export default function SessionsRail({
 
   return (
     <SessionsRailRoot onClick={(event) => event.stopPropagation()}>
-      <RailViewActions aria-label="New session">
-        <RailActionButton
-          aria-label="New chat"
-          data-scope="global"
-          onClick={onNewChat}
-          title="New chat (⌘N)"
-          type="button"
-        >
-          <ButtonAddIcon aria-hidden="true" />
-          <span>New chat</span>
-        </RailActionButton>
-      </RailViewActions>
+      <NewChatButton
+        aria-label="New chat"
+        onClick={onNewChat}
+        title="New chat (⌘N)"
+        type="button"
+      >
+        <ButtonEditIcon aria-hidden="true" />
+        <span>New chat</span>
+      </NewChatButton>
 
-      {groups.map((group) => (
-        <SessionDayGroup key={group.key}>
-          <SettingsNavGroupLabel>{group.label}</SettingsNavGroupLabel>
-          <RailViewActions aria-label={`Sessions from ${group.label}`}>
+      <SessionListArea>
+        {groups.map((group) => (
+          <SessionDayGroup key={group.key}>
+            <SettingsNavGroupLabel>{group.label}</SettingsNavGroupLabel>
             {group.sessions.map((session) => (
               <SessionRowButton
                 data-active={session.id === activeSessionId ? "true" : undefined}
@@ -69,15 +65,15 @@ export default function SessionsRail({
                 </SessionRowMeta>
               </SessionRowButton>
             ))}
-          </RailViewActions>
-        </SessionDayGroup>
-      ))}
+          </SessionDayGroup>
+        ))}
 
-      {!groups.length && (
-        <SessionsEmptyHint>
-          No sessions yet. Start with New chat.
-        </SessionsEmptyHint>
-      )}
+        {!groups.length && (
+          <SessionsEmptyHint>
+            No sessions yet. Start with New chat.
+          </SessionsEmptyHint>
+        )}
+      </SessionListArea>
     </SessionsRailRoot>
   );
 }
@@ -87,9 +83,72 @@ const SessionsRailRoot = styled.div`
   min-height: 0;
   flex: 1;
   flex-direction: column;
-  gap: 7px;
+  gap: 8px;
   overflow-y: auto;
   padding: 2px 8px 10px;
+
+  [data-collapsed="true"] & {
+    align-items: center;
+    padding: 2px 4px 10px;
+    overflow: hidden;
+  }
+`;
+
+const NewChatButton = styled.button`
+  display: inline-flex;
+  min-height: 26px;
+  align-items: center;
+  gap: 7px;
+  align-self: stretch;
+  padding: 0 8px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text-soft);
+  background: var(--forge-surface);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+
+  svg {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 auto;
+    opacity: 0.85;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    border-color: var(--forge-border-strong);
+    background: var(--forge-surface-hover);
+  }
+
+  /* Collapsed rail: icon-only square. */
+  [data-collapsed="true"] & {
+    width: 30px;
+    min-height: 30px;
+    align-self: center;
+    justify-content: center;
+    gap: 0;
+    padding: 0;
+  }
+
+  [data-collapsed="true"] & span {
+    display: none;
+  }
+`;
+
+/* The whole list disappears when the rail is collapsed — clean icon strip. */
+const SessionListArea = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 7px;
+
+  [data-collapsed="true"] & {
+    display: none;
+  }
 `;
 
 const SessionDayGroup = styled.div`
@@ -97,9 +156,8 @@ const SessionDayGroup = styled.div`
   gap: 2px;
 `;
 
-/* Dedicated row: RailActionButton's internal span sizing wraps a
-   three-part row (dot · title · meta) onto two lines; this keeps the
-   same 26px/11px metrics and active pill on a plain flex row. */
+/* Dedicated row: shared rail buttons wrap a three-part row (dot · title ·
+   meta); this keeps 26px/11px metrics and the active pill on a flex row. */
 const SessionRowButton = styled.button`
   display: flex;
   width: 100%;
@@ -138,6 +196,10 @@ const SessionStatusDot = styled.span`
 
   &[data-status="running"] {
     background: var(--forge-green);
+  }
+
+  &[data-status="waiting"] {
+    background: var(--forge-amber);
   }
 
   &[data-status="error"] {
