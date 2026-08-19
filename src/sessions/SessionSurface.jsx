@@ -6,6 +6,7 @@ import { Language } from "@styled-icons/material-rounded/Language";
 import { Memory } from "@styled-icons/material-rounded/Memory";
 import { Movie } from "@styled-icons/material-rounded/Movie";
 import { Terminal as TerminalGlyph } from "@styled-icons/material-rounded/Terminal";
+import { Timeline } from "@styled-icons/material-rounded/Timeline";
 
 import {
   ButtonDarkModeIcon,
@@ -17,6 +18,7 @@ import {
 import { PlanFlame } from "../app/PlanFlame.jsx";
 import SessionComposer from "./SessionComposer.jsx";
 import SessionTerminal from "./SessionTerminal.jsx";
+import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
 import { formatSessionRelativeTime } from "./sessionsModel.js";
 
@@ -204,6 +206,18 @@ export default function SessionSurface({
           <TerminalGlyph aria-hidden="true" size={13} />
           <span>Shell</span>
         </SessionViewButton>
+        {session.id !== "draft" && (
+          <SessionViewButton
+            aria-selected={modeFor(session.id) === "trajectory"}
+            data-active={modeFor(session.id) === "trajectory" ? "true" : undefined}
+            onClick={() => setModeFor(session.id, "trajectory")}
+            role="tab"
+            type="button"
+          >
+            <Timeline aria-hidden="true" size={13} />
+            <span>Trajectory</span>
+          </SessionViewButton>
+        )}
       </SessionViewToggle>
       )}
       {session && session.id !== "draft" && (
@@ -411,6 +425,9 @@ export default function SessionSurface({
                     onSubmit={(prompt, attachments) => submitIntoSession(session, prompt, attachments)}
                   />
                 </>
+              )}
+              {chatTabActive && mode === "trajectory" && active && (
+                <SessionTrajectory session={session} />
               )}
               {chatTabActive && terminalEverStarted && (
                 <TerminalHostLayer data-visible={mode === "terminal" ? "true" : "false"}>

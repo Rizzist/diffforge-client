@@ -694,6 +694,20 @@ fn haider_projection_fold_value_locked(
         }
         "usage" | "run_state" | "session_state" => {
             state.metadata.insert(payload_type.clone(), payload.clone());
+            if payload_type == "usage" {
+                // Usage snapshots become rows so the trajectory view gets
+                // per-turn token/cache points; the transcript skips the kind.
+                let seq = haider_projection_seq(state, value, payload);
+                step.rows.push(haider_projection_row(
+                    session_id,
+                    seq,
+                    "usage",
+                    "meta",
+                    String::new(),
+                    payload.clone(),
+                    haider_projection_at_ms(value, payload),
+                ));
+            }
             if matches!(payload_type.as_str(), "run_state" | "session_state") {
                 let state_text = payload_object
                     .and_then(|object| object.get("state"))
@@ -1207,6 +1221,106 @@ async fn session_projection_window(
     })
     .await
     .map_err(|error| format!("Session projection window worker failed: {error}"))?
+}
+
+/// Alias-tolerant token count: usage payload shapes differ across harness
+/// versions and providers; nested "usage" objects are searched too.
+fn haider_projection_usage_number(meta: &Value, keys: &[&str]) -> Option<i64> {
+    let object = meta.as_object()?;
+    for key in keys {
+        if let Some(value) = object.get(*key).and_then(haider_projection_json_i64_value) {
+            return Some(value);
+        }
+    }
+    let nested = object.get("usage")?;
+    let nested_object = nested.as_object()?;
+    for key in keys {
+        if let Some(value) = nested_object
+            .get(*key)
+            .and_then(haider_projection_json_i64_value)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn haider_projection_json_i64_value(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|number| number as i64))
+}
+
+/// Lean full-session feed for the trajectory strip: one small point per row,
+/// token/cache stats extracted server-side so the wire never carries payloads.
+#[tauri::command]
+async fn session_projection_trajectory(session_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let session_id = session_id.trim().to_string();
+        let connection = haider_projection_open_database()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT seq, kind, role, text, meta, at_ms
+                 FROM session_projection_rows WHERE session_id = ?1
+                 ORDER BY seq",
+            )
+            .map_err(|error| format!("Unable to prepare session trajectory read: {error}"))?;
+        let points = statement
+            .query_map([&session_id], |row| {
+                let seq: i64 = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let role: String = row.get(2)?;
+                let text: String = row.get(3)?;
+                let meta_text: String = row.get(4)?;
+                let at_ms: i64 = row.get(5)?;
+                Ok((seq, kind, role, text, meta_text, at_ms))
+            })
+            .map_err(|error| format!("Unable to read session trajectory rows: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to decode session trajectory row: {error}"))?
+            .into_iter()
+            .map(|(seq, kind, role, text, meta_text, at_ms)| {
+                let mut point = json!({
+                    "seq": seq,
+                    "kind": kind,
+                    "role": role,
+                    "at_ms": at_ms,
+                    "label": haider_projection_compact(&text, 140),
+                });
+                if kind == "usage" {
+                    let meta: Value = serde_json::from_str(&meta_text).unwrap_or(Value::Null);
+                    let input = haider_projection_usage_number(
+                        &meta,
+                        &["input", "input_tokens", "prompt_tokens"],
+                    );
+                    let output = haider_projection_usage_number(
+                        &meta,
+                        &["output", "output_tokens", "completion_tokens"],
+                    );
+                    let cached = haider_projection_usage_number(
+                        &meta,
+                        &[
+                            "cached",
+                            "cached_tokens",
+                            "cache_read",
+                            "cache_read_input_tokens",
+                            "cached_input",
+                            "cached_input_tokens",
+                        ],
+                    );
+                    if let Some(object) = point.as_object_mut() {
+                        object.insert("input".to_string(), json!(input));
+                        object.insert("output".to_string(), json!(output));
+                        object.insert("cached".to_string(), json!(cached));
+                    }
+                }
+                point
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({ "points": points }))
+    })
+    .await
+    .map_err(|error| format!("Session trajectory worker failed: {error}"))?
 }
 
 #[tauri::command]

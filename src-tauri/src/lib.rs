@@ -6305,6 +6305,7 @@ fn run_app(daemon: bool) {
             session_delete,
             sessions_home_dir,
             session_projection_window,
+            session_projection_trajectory,
             session_projection_ensure,
             session_projection_attach,
             session_projection_detach,

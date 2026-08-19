@@ -150,7 +150,7 @@ export default function SessionTranscript({ session }) {
   return (
     <TranscriptScroller onScroll={onScroll} ref={scrollerRef}>
       {topSpacer > 0 && <div aria-hidden="true" style={{ height: topSpacer }} />}
-      {windowState.rows.map((row) => (
+      {windowState.rows.filter((row) => row.kind !== "usage").map((row) => (
         <TranscriptRow
           data-kind={row.kind || "message"}
           data-role={row.role || ""}
