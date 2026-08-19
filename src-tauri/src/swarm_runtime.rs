@@ -365,6 +365,7 @@ fn swarm_member_score(stats: &MemberStats) -> i64 {
 fn swarm_provider_cost_rank(provider: &str) -> u8 {
     match provider {
         "opencode" => 0,
+        "haider" => 1,
         "codex" => 1,
         "claude" => 2,
         _ => 9,
@@ -377,8 +378,8 @@ fn swarm_normalize_provider(provider: &str) -> Result<String, String> {
         .to_ascii_lowercase()
         .replace([' ', '-'], "_");
     match normalized.as_str() {
-        "codex" | "claude" | "opencode" => Ok(normalized),
-        _ => Err("Swarm member provider must be codex, claude, or opencode.".to_string()),
+        "codex" | "claude" | "haider" | "opencode" => Ok(normalized),
+        _ => Err("Swarm member provider must be codex, claude, haider, or opencode.".to_string()),
     }
 }
 
@@ -386,6 +387,7 @@ fn swarm_default_member_label(provider: &str) -> String {
     match provider {
         "codex" => "Codex",
         "claude" => "Claude",
+        "haider" => "Haider",
         "opencode" => "OpenCode",
         _ => "Agent",
     }

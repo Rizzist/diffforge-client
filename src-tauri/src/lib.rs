@@ -1962,6 +1962,7 @@ enum AgentProvider {
     Codex,
     Claude,
     OpenCode,
+    Haider,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3022,6 +3023,7 @@ include!("process.rs");
 include!("backend_cpu.rs");
 include!("workspace_files.rs");
 include!("workspace_threads_store.rs");
+include!("sessions.rs");
 include!("architectures.rs");
 include!("pcb.rs");
 include!("video_editor.rs");
@@ -4154,7 +4156,7 @@ fn workspace_activation_clean_role(value: Option<&str>) -> String {
         "claude-code" | "claudecode" => "claude".to_string(),
         "open-code" | "open-code-ai" | "opencode-ai" => "opencode".to_string(),
         "terminal" | "shell" | "plain-shell" | "plain_shell" => "generic".to_string(),
-        "claude" | "codex" | "generic" | "opencode" => normalized,
+        "claude" | "codex" | "generic" | "haider" | "opencode" => normalized,
         _ => "codex".to_string(),
     }
 }
@@ -4172,6 +4174,7 @@ fn workspace_activation_agent_label(role: &str) -> String {
         "claude" => "Claude Code".to_string(),
         "codex" => "Codex".to_string(),
         "generic" => "Terminal".to_string(),
+        "haider" => "Haider".to_string(),
         "opencode" => "OpenCode".to_string(),
         other => other.to_string(),
     }
@@ -10679,6 +10682,11 @@ fn run_app(daemon: bool) {
             local_workspaces_load,
             local_workspaces_store,
             local_workspace_reusable_id_for_root,
+            sessions_list,
+            session_create,
+            session_update,
+            session_delete,
+            sessions_home_dir,
             open_html_document_in_browser,
             workspace_webview_open,
             workspace_webview_adopt,

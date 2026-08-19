@@ -28670,6 +28670,7 @@ async fn cloud_mcp_execute_agent_update(
     provider: AgentProvider,
     execution: AgentUpdateExecution,
 ) -> Result<AgentInstallResult, String> {
+    ensure_npm_managed_agent_provider(provider)?;
     let use_interactive_elevation =
         agent_update_should_use_interactive_elevation(execution, event.is_some());
     if execution == AgentUpdateExecution::ManualElevated && !use_interactive_elevation {

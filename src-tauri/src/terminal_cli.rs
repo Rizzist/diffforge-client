@@ -3,6 +3,7 @@ fn parse_agent_provider(provider: &str) -> Result<AgentProvider, String> {
         "codex" => Ok(AgentProvider::Codex),
         "claude" | "claude-code" | "claude_code" => Ok(AgentProvider::Claude),
         "opencode" | "open-code" | "open_code" => Ok(AgentProvider::OpenCode),
+        "haider" => Ok(AgentProvider::Haider),
         _ => Err("Unknown terminal provider.".to_string()),
     }
 }
@@ -39,6 +40,24 @@ fn agent_definition(provider: AgentProvider) -> AgentDefinition {
             native_install_label: "Install script / package guide",
             connect_command: "opencode auth login",
         },
+        AgentProvider::Haider => AgentDefinition {
+            id: "haider",
+            label: "Haider",
+            binary: "haider",
+            install_package: "",
+            install_command: "",
+            native_install_url: "",
+            native_install_label: "GitHub release binaries",
+            connect_command: "haider tui",
+        },
+    }
+}
+
+fn ensure_npm_managed_agent_provider(provider: AgentProvider) -> Result<(), String> {
+    if matches!(provider, AgentProvider::Haider) {
+        Err("Haider is installed from GitHub releases and is not managed by npm.".to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -438,6 +457,10 @@ fn agent_auth_status_for(provider: AgentProvider, definition: AgentDefinition) -
                 Err(error) => (false, error),
             }
         }
+        AgentProvider::Haider => (
+            false,
+            "Haider authentication is managed by its local daemon.".to_string(),
+        ),
     }
 }
 
@@ -490,6 +513,9 @@ fn npm_global_prefix() -> Option<PathBuf> {
 }
 
 fn npm_global_executable_path(definition: AgentDefinition) -> Option<PathBuf> {
+    if definition.id == "haider" {
+        return None;
+    }
     let prefix = npm_global_prefix()?;
 
     #[cfg(windows)]
@@ -12713,6 +12739,9 @@ fn agent_runtime_status_for(provider: AgentProvider) -> AgentRuntimeStatus {
                 None,
             )
         }
+        AgentProvider::Haider => {
+            Err("Haider runtime status is not managed by DiffForge.".to_string())
+        }
     };
     let Ok(version_capture) = version_result else {
         let _ = auth_check.join();
@@ -12849,6 +12878,13 @@ fn agent_image_input_status(provider: AgentProvider) -> AgentImageInputStatus {
                 },
             }
         }
+        AgentProvider::Haider => AgentImageInputStatus {
+            supported: false,
+            support: "unknown",
+            reason: "Haider image input is managed by its local daemon.".to_string(),
+            active_model: String::new(),
+            active_model_supports_images: false,
+        },
     }
 }
 
@@ -13321,6 +13357,9 @@ pub fn run_agent_update_elevated_helper(args: &[String]) -> i32 {
         Ok(provider) => provider,
         Err(_) => return 2,
     };
+    if ensure_npm_managed_agent_provider(provider).is_err() {
+        return 2;
+    }
     let Some(output_path) = elevated_agent_update_helper_output_path(&args[1]) else {
         return 2;
     };
@@ -13896,6 +13935,7 @@ fn launch_login_terminal(provider: AgentProvider) -> Result<(), String> {
         AgentProvider::OpenCode => {
             run_login_terminal(definition.label, &binary, &["auth", "login"])
         }
+        AgentProvider::Haider => Err("Haider login is managed by its local daemon.".to_string()),
     }
 }
 
@@ -13921,6 +13961,7 @@ fn launch_account_login_terminal(provider: AgentProvider) -> Result<(), String> 
         AgentProvider::OpenCode => {
             run_login_terminal(definition.label, &binary, &["auth", "login"])
         }
+        AgentProvider::Haider => Err("Haider login is managed by its local daemon.".to_string()),
     }
 }
 
@@ -13930,6 +13971,9 @@ fn logout_agent_credentials(provider: AgentProvider) -> Result<AgentLogoutResult
         AgentProvider::Codex => vec!["logout"],
         AgentProvider::Claude => vec!["auth", "logout"],
         AgentProvider::OpenCode => vec!["auth", "logout"],
+        AgentProvider::Haider => {
+            return Err("Haider logout is managed by its local daemon.".to_string())
+        }
     };
     let capture = run_agent_command_capture(
         definition,
@@ -15758,6 +15802,9 @@ fn run_agent_thread_turn_for_context(
             ),
             None,
         ),
+        AgentProvider::Haider => {
+            return Err("Haider non-interactive turns are managed by its local daemon.".to_string())
+        }
     };
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
 
@@ -15959,6 +16006,9 @@ fn run_forge_prompt_for(request: ForgePromptRequest) -> Result<ForgeRunResult, S
                 Duration::from_secs(AGENT_RUN_TIMEOUT_SECS),
                 Some(&working_directory),
             )
+        }
+        AgentProvider::Haider => {
+            return Err("Haider Forge prompts are managed by its local daemon.".to_string())
         }
     };
 

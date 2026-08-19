@@ -975,6 +975,7 @@ fn jsonl_record_authoritative_model(provider: AgentProvider, value: &Value) -> O
         AgentProvider::Codex => codex_jsonl_record_authoritative_model(value),
         AgentProvider::Claude => claude_jsonl_record_authoritative_model(value),
         AgentProvider::OpenCode => None,
+        AgentProvider::Haider => None,
     }
 }
 
@@ -1057,6 +1058,7 @@ pub(crate) fn agent_session_last_model(
         // OpenCode stores its session in opencode.db rather than a JSONL
         // transcript, so the tail-scan above does not apply.
         AgentProvider::OpenCode => return opencode_session_last_model(session_id),
+        AgentProvider::Haider => return None,
     };
     jsonl_tail_last_model(provider, &transcript)
 }

@@ -1351,13 +1351,19 @@ fn workspace_root_rejection_reason_for_home(
         return Some("Workspace root directory cannot be a cloud storage root.");
     }
 
-    if workspace_root_is_common_user_folder(root, home) {
+    let is_sessions_directory = sessions_home_path()
+        .ok()
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .is_some_and(|sessions_home| workspace_path_is_same_or_child(root, &sessions_home));
+
+    if !is_sessions_directory && workspace_root_is_common_user_folder(root, home) {
         return Some(
             "Workspace root directory is too broad; choose a specific project folder inside it.",
         );
     }
 
-    if !workspace_root_has_selected_project_signal(root)
+    if !is_sessions_directory
+        && !workspace_root_has_selected_project_signal(root)
         && workspace_root_immediate_entry_count_exceeds(
             root,
             MAX_SAFE_WORKSPACE_ROOT_IMMEDIATE_ENTRIES,

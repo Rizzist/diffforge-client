@@ -620,6 +620,7 @@ fn terminal_launch_provider(kind: &str, provider: Option<&str>) -> Result<AgentP
         "codex" => AgentProvider::Codex,
         "claude" => AgentProvider::Claude,
         "opencode" => AgentProvider::OpenCode,
+        "haider" => AgentProvider::Haider,
         _ => {
             if let Some(provider) = provider {
                 parse_agent_provider(provider)?
@@ -640,6 +641,9 @@ fn terminal_normalize_agent_kind(value: Option<&str>) -> Option<String> {
     }
     if normalized.contains("opencode") || normalized.contains("open-code") {
         return Some("opencode".to_string());
+    }
+    if normalized.contains("haider") {
+        return Some("haider".to_string());
     }
     if normalized.contains("codex") || normalized == "console" {
         return Some("codex".to_string());
@@ -698,6 +702,9 @@ fn terminal_provider_session_exists_on_device(
         AgentProvider::OpenCode => {
             resolve_opencode_resume_session(&provider_session_id, working_directory).is_ok()
         }
+        // Haider's daemon owns session selection until its CLI exposes a
+        // stable session lookup contract.
+        AgentProvider::Haider => true,
     })
 }
 
@@ -817,6 +824,10 @@ fn terminal_provider_resume_args(
     provider: AgentProvider,
     provider_session_id: Option<&str>,
 ) -> Vec<String> {
+    if matches!(provider, AgentProvider::Haider) {
+        // A future `--session` flag will slot in here once the daemon exposes it.
+        return vec!["tui".to_string()];
+    }
     let Some(session_id) = terminal_clean_provider_session_id(provider_session_id) else {
         return Vec::new();
     };
@@ -825,6 +836,7 @@ fn terminal_provider_resume_args(
         AgentProvider::Codex => vec!["resume".to_string(), session_id],
         AgentProvider::Claude => vec!["--resume".to_string(), session_id],
         AgentProvider::OpenCode => vec!["--session".to_string(), session_id],
+        AgentProvider::Haider => vec!["tui".to_string()],
     }
 }
 
@@ -832,6 +844,10 @@ fn terminal_provider_fork_args(
     provider: AgentProvider,
     provider_session_id: Option<&str>,
 ) -> Vec<String> {
+    if matches!(provider, AgentProvider::Haider) {
+        // A future `--session` flag will slot in here once the daemon exposes it.
+        return vec!["tui".to_string()];
+    }
     let Some(session_id) = terminal_clean_provider_session_id(provider_session_id) else {
         return Vec::new();
     };
@@ -846,6 +862,7 @@ fn terminal_provider_fork_args(
             ]
         }
         AgentProvider::OpenCode => vec!["--session".to_string(), session_id, "--fork".to_string()],
+        AgentProvider::Haider => vec!["tui".to_string()],
     }
 }
 
@@ -1034,6 +1051,7 @@ impl TerminalProviderLaunchAccountBinding {
             AgentProvider::Codex => Self::Unmanaged {
                 account: agent_accounts_capture_launch_account_binding("codex"),
             },
+            AgentProvider::Haider => Self::Unmanaged { account: None },
         }
     }
 
@@ -1069,7 +1087,7 @@ impl TerminalProviderLaunchAccountBinding {
         provider: AgentProvider,
         resume_requires_auth_store: bool,
     ) -> Result<(), String> {
-        if !resume_requires_auth_store {
+        if !resume_requires_auth_store || matches!(provider, AgentProvider::Haider) {
             return Ok(());
         }
         let definition = agent_definition(provider);
@@ -1101,6 +1119,7 @@ impl TerminalProviderLaunchAccountBinding {
                 .selected_profile_dir
                 .as_deref()
                 .map(|home| home.join("opencode").join("auth.json")),
+            AgentProvider::Haider => None,
         }
         .ok_or_else(|| {
             format!(
@@ -1233,6 +1252,9 @@ fn terminal_resolve_provider_resume_session_for_binding(
             .map(|(session_id, home)| {
                 (session_id, Some(home.to_string_lossy().to_string()))
             }),
+        // The daemon selects the concrete Haider session today. Preserve the
+        // requested id as pane metadata until a CLI `--session` flag exists.
+        (AgentProvider::Haider, _) => Ok((requested_session_id, None)),
         _ => Err("Provider launch binding does not match the requested provider.".to_string()),
     };
 
@@ -1333,6 +1355,9 @@ fn terminal_normalize_launch_reasoning_effort(
     provider: AgentProvider,
     effort: Option<String>,
 ) -> Result<Option<String>, String> {
+    if matches!(provider, AgentProvider::Haider) {
+        return Ok(None);
+    }
     let Some(effort) = terminal_normalize_launch_keyword(effort) else {
         return Ok(None);
     };
@@ -1343,6 +1368,7 @@ fn terminal_normalize_launch_reasoning_effort(
             matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
         }
         AgentProvider::OpenCode => false,
+        AgentProvider::Haider => false,
     };
 
     if valid {
@@ -1362,6 +1388,9 @@ fn terminal_normalize_launch_speed(
     model: Option<&str>,
     speed: Option<String>,
 ) -> Result<Option<String>, String> {
+    if matches!(provider, AgentProvider::Haider) {
+        return Ok(None);
+    }
     let Some(speed) = speed.map(|value| value.trim().to_ascii_lowercase()) else {
         return Ok(None);
     };
@@ -1379,6 +1408,7 @@ fn terminal_normalize_launch_speed(
         AgentProvider::Codex => terminal_provider_model_supports_codex_fast(model),
         AgentProvider::Claude => terminal_provider_model_supports_claude_fast(model),
         AgentProvider::OpenCode => false,
+        AgentProvider::Haider => false,
     };
 
     if supported {
@@ -1393,6 +1423,12 @@ fn terminal_append_provider_launch_args(
     args: &mut Vec<String>,
     launch: &TerminalProviderResolvedLaunchOptions,
 ) {
+    if matches!(provider, AgentProvider::Haider) {
+        if args.is_empty() {
+            args.push("tui".to_string());
+        }
+        return;
+    }
     if matches!(provider, AgentProvider::Codex) {
         args.push("-c".to_string());
         args.push("check_for_update_on_startup=false".to_string());
@@ -1427,6 +1463,7 @@ fn terminal_append_provider_launch_args(
             }
         }
         AgentProvider::OpenCode => {}
+        AgentProvider::Haider => {}
     }
 }
 
@@ -8611,7 +8648,7 @@ fn terminal_restart_role(value: Option<&str>, instance: &TerminalInstance) -> Op
         .to_ascii_lowercase()
         .replace([' ', '_'], "-");
     match requested.as_str() {
-        "codex" | "claude" | "opencode" => Some(requested),
+        "codex" | "claude" | "haider" | "opencode" => Some(requested),
         "generic" | "shell" | "terminal" | "plain-shell" => Some("generic".to_string()),
         _ => None,
     }
@@ -8714,9 +8751,9 @@ fn terminal_daemon_reader_exit_respawn_candidate(
         "generic".to_string()
     } else {
         let kind = terminal_normalize_agent_kind(Some(metadata.agent_kind.as_str()))?;
-        // Only hook-managed agent panes qualify; generic-shaped metadata on a
+        // Only supported agent panes qualify; generic-shaped metadata on a
         // non-generic-shell instance (login shells, misc panes) stays out.
-        if !matches!(kind.as_str(), "claude" | "codex" | "opencode") {
+        if !matches!(kind.as_str(), "claude" | "codex" | "haider" | "opencode") {
             return None;
         }
         kind

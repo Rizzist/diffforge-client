@@ -4862,6 +4862,7 @@ async fn disconnect_agent(provider: String) -> Result<AgentLogoutResult, String>
 async fn install_agent(provider: String) -> Result<AgentInstallResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;
+        ensure_npm_managed_agent_provider(provider)?;
         let result = install_agent_with_npm(provider);
 
         if result.ok && result.installed {
@@ -4881,6 +4882,7 @@ async fn update_agent(
     provider: String,
 ) -> Result<AgentInstallResult, String> {
     let provider = parse_agent_provider(&provider)?;
+    ensure_npm_managed_agent_provider(provider)?;
     cloud_mcp_execute_agent_update(
         &app,
         state.inner(),
@@ -4900,6 +4902,7 @@ async fn retry_update_agent_as_administrator(
     provider: String,
 ) -> Result<AgentInstallResult, String> {
     let provider = parse_agent_provider(&provider)?;
+    ensure_npm_managed_agent_provider(provider)?;
     cloud_mcp_execute_agent_update(
         &app,
         state.inner(),
@@ -4913,6 +4916,7 @@ async fn retry_update_agent_as_administrator(
 #[tauri::command(rename_all = "snake_case")]
 fn cancel_agent_update(provider: String) -> Result<bool, String> {
     let provider = parse_agent_provider(&provider)?;
+    ensure_npm_managed_agent_provider(provider)?;
     Ok(cloud_mcp_request_agent_update_cancel(
         agent_definition(provider).id,
     ))
@@ -4922,6 +4926,7 @@ fn cancel_agent_update(provider: String) -> Result<bool, String> {
 async fn uninstall_agent(provider: String) -> Result<AgentInstallResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = parse_agent_provider(&provider)?;
+        ensure_npm_managed_agent_provider(provider)?;
         let result = uninstall_agent_with_npm(provider);
 
         if result.ok && !result.installed {

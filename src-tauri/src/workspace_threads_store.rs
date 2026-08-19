@@ -239,6 +239,8 @@ fn workspace_threads_clean_agent_id(value: &str) -> Option<String> {
     let normalized = value.trim().to_ascii_lowercase().replace(['_', ' '], "-");
     let agent_id = if normalized.contains("claude") {
         "claude"
+    } else if normalized.contains("haider") {
+        "haider"
     } else if normalized.contains("opencode") || normalized.contains("open-code") {
         "opencode"
     } else if normalized.contains("codex")
@@ -249,7 +251,7 @@ fn workspace_threads_clean_agent_id(value: &str) -> Option<String> {
     } else {
         normalized.as_str()
     };
-    if matches!(agent_id, "codex" | "claude" | "opencode") {
+    if matches!(agent_id, "codex" | "claude" | "haider" | "opencode") {
         Some(agent_id.to_string())
     } else {
         None
