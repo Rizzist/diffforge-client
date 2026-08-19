@@ -282,6 +282,14 @@ fn haider_run_kill_active(session_id: &str) {
     }
 }
 
+fn haider_run_state_raw(status: &str) -> &str {
+    if status == "running" {
+        "streaming"
+    } else {
+        status
+    }
+}
+
 fn haider_run_update_session(
     app: &AppHandle,
     session_id: &str,
@@ -293,6 +301,7 @@ fn haider_run_update_session(
         id: session_id.to_string(),
         title: None,
         status: status.map(str::to_string),
+        state_raw: status.map(haider_run_state_raw).map(str::to_string),
         provider_session_id,
         first_user_message,
         touch: Some(true),
@@ -658,6 +667,13 @@ mod haider_run_tests {
     fn haider_run_title_is_whitespace_compacted_and_bounded() {
         assert_eq!(haider_run_title("  hello\n  world  "), "hello world");
         assert_eq!(haider_run_title(&"x".repeat(80)).chars().count(), 48);
+    }
+
+    #[test]
+    fn haider_run_records_raw_lifecycle_state() {
+        assert_eq!(haider_run_state_raw("running"), "streaming");
+        assert_eq!(haider_run_state_raw("idle"), "idle");
+        assert_eq!(haider_run_state_raw("error"), "error");
     }
 
     #[test]

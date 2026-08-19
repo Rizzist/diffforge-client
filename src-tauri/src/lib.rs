@@ -6311,6 +6311,7 @@ fn run_app(daemon: bool) {
             session_projection_detach,
             session_start_with_prompt,
             session_submit_prompt,
+            haider_library_snapshot,
             haider_usage_snapshot,
             open_html_document_in_browser,
             app_local_state_load,

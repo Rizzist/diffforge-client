@@ -13,6 +13,7 @@ struct SessionRow {
     created_at_ms: i64,
     latest_at_ms: i64,
     status: String,
+    state_raw: String,
     first_user_message: String,
     model: String,
     pinned: bool,
@@ -30,6 +31,7 @@ struct SessionUpdateArgs {
     id: String,
     title: Option<String>,
     status: Option<String>,
+    state_raw: Option<String>,
     provider_session_id: Option<String>,
     first_user_message: Option<String>,
     touch: Option<bool>,
@@ -221,6 +223,7 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
                 created_at_ms INTEGER NOT NULL,
                 latest_at_ms INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'idle',
+                state_raw TEXT NOT NULL DEFAULT '',
                 first_user_message TEXT NOT NULL DEFAULT '',
                 model TEXT NOT NULL DEFAULT '',
                 pinned INTEGER NOT NULL DEFAULT 0,
@@ -234,6 +237,7 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
         ("model", "TEXT NOT NULL DEFAULT ''"),
         ("pinned", "INTEGER NOT NULL DEFAULT 0"),
         ("title_locked", "INTEGER NOT NULL DEFAULT 0"),
+        ("state_raw", "TEXT NOT NULL DEFAULT ''"),
     ];
     let columns = sessions_table_columns(connection)?;
     if migrations
@@ -285,15 +289,16 @@ fn sessions_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> 
         created_at_ms: row.get(7)?,
         latest_at_ms: row.get(8)?,
         status: row.get(9)?,
-        first_user_message: row.get(10)?,
-        model: row.get(11)?,
-        pinned: row.get(12)?,
-        title_locked: row.get(13)?,
+        state_raw: row.get(10)?,
+        first_user_message: row.get(11)?,
+        model: row.get(12)?,
+        pinned: row.get(13)?,
+        title_locked: row.get(14)?,
     })
 }
 
 const SESSIONS_SELECT_COLUMNS: &str =
-    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, first_user_message, model, pinned, title_locked";
+    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, state_raw, first_user_message, model, pinned, title_locked";
 
 fn sessions_row_by_id(connection: &rusqlite::Connection, id: &str) -> Result<SessionRow, String> {
     let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions WHERE id = ?1");
@@ -360,6 +365,7 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
         created_at_ms: now_ms,
         latest_at_ms: now_ms,
         status: "idle".to_string(),
+        state_raw: String::new(),
         first_user_message: String::new(),
         model: String::new(),
         pinned: false,
@@ -370,9 +376,9 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
         .execute(
             "INSERT INTO sessions (
                 id, title, slug, dir, kind, provider, provider_session_id,
-                created_at_ms, latest_at_ms, status, first_user_message, model,
-                pinned, title_locked
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                created_at_ms, latest_at_ms, status, state_raw, first_user_message,
+                model, pinned, title_locked
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 row.id,
                 row.title,
@@ -384,6 +390,7 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
                 row.created_at_ms,
                 row.latest_at_ms,
                 row.status,
+                row.state_raw,
                 row.first_user_message,
                 row.model,
                 row.pinned,
@@ -408,6 +415,9 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
     }
     if let Some(status) = args.status {
         row.status = status;
+    }
+    if let Some(state_raw) = args.state_raw {
+        row.state_raw = state_raw;
     }
     if let Some(provider_session_id) = args.provider_session_id {
         row.provider_session_id = provider_session_id;
@@ -442,8 +452,8 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
             "UPDATE sessions SET
                 title = ?2, slug = ?3, dir = ?4, kind = ?5, provider = ?6,
                 provider_session_id = ?7, created_at_ms = ?8, latest_at_ms = ?9,
-                status = ?10, first_user_message = ?11, model = ?12, pinned = ?13,
-                title_locked = ?14
+                status = ?10, state_raw = ?11, first_user_message = ?12,
+                model = ?13, pinned = ?14, title_locked = ?15
              WHERE id = ?1",
             rusqlite::params![
                 row.id,
@@ -456,6 +466,7 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
                 row.created_at_ms,
                 row.latest_at_ms,
                 row.status,
+                row.state_raw,
                 row.first_user_message,
                 row.model,
                 row.pinned,
@@ -649,6 +660,7 @@ mod sessions_tests {
             created_at_ms: 10,
             latest_at_ms: 10,
             status: "idle".to_string(),
+            state_raw: "idle".to_string(),
             first_user_message: String::new(),
             model: String::new(),
             pinned: false,
@@ -661,9 +673,9 @@ mod sessions_tests {
             .execute(
                 "INSERT INTO sessions (
                     id, title, slug, dir, kind, provider, provider_session_id,
-                    created_at_ms, latest_at_ms, status, first_user_message, model,
-                    pinned, title_locked
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    created_at_ms, latest_at_ms, status, state_raw,
+                    first_user_message, model, pinned, title_locked
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     row.id,
                     row.title,
@@ -675,6 +687,7 @@ mod sessions_tests {
                     row.created_at_ms,
                     row.latest_at_ms,
                     row.status,
+                    row.state_raw,
                     row.first_user_message,
                     row.model,
                     row.pinned,
@@ -768,11 +781,12 @@ mod sessions_tests {
                 .unwrap();
             columns
         };
-        for column in ["model", "pinned", "title_locked"] {
+        for column in ["model", "pinned", "title_locked", "state_raw"] {
             assert_eq!(columns.iter().filter(|name| *name == column).count(), 1);
         }
         let row = sessions_row_by_id(&connection, "old-row").unwrap();
         assert_eq!(row.model, "");
+        assert_eq!(row.state_raw, "");
         assert!(!row.pinned);
         assert!(!row.title_locked);
 
@@ -803,8 +817,9 @@ mod sessions_tests {
             id: "provider-rename".to_string(),
             title: Some("Daemon title".to_string()),
             model: Some("daemon-model".to_string()),
+            provider: Some("openai".to_string()),
             cwd: None,
-            state: Some("running".to_string()),
+            state_raw: Some("running".to_string()),
             latest_at_ms: Some(20),
         }])
         .unwrap());
@@ -814,6 +829,7 @@ mod sessions_tests {
         assert!(reconciled.title_locked);
         assert_eq!(reconciled.model, "daemon-model");
         assert_eq!(reconciled.status, "running");
+        assert_eq!(reconciled.state_raw, "running");
         assert_eq!(reconciled.latest_at_ms, 20);
         drop(connection);
 
@@ -866,6 +882,7 @@ mod sessions_tests {
             id: "locked-reslug".to_string(),
             title: Some("Automatic title".to_string()),
             status: None,
+            state_raw: None,
             provider_session_id: None,
             first_user_message: Some("Automatic title".to_string()),
             touch: None,
@@ -881,6 +898,90 @@ mod sessions_tests {
             .unwrap()
             .join("automatic-title")
             .exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn haider_bridge_test_roster(id: &str) -> HaiderBridgeSession {
+        HaiderBridgeSession {
+            id: id.to_string(),
+            title: Some("Daemon session".to_string()),
+            model: Some("model".to_string()),
+            provider: Some("openai".to_string()),
+            cwd: None,
+            state_raw: Some("idle".to_string()),
+            latest_at_ms: Some(sessions_now_ms()),
+        }
+    }
+
+    #[test]
+    fn haider_bridge_empty_roster_does_not_prune() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("empty-roster");
+        let session_directory = directory.join("kept-session");
+        fs::create_dir_all(&session_directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let row = sessions_test_row("kept", &session_directory, "generated");
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        assert!(!haider_bridge_reconcile(&[]).unwrap());
+        let connection = sessions_open_database().unwrap();
+        assert!(sessions_row_by_id(&connection, "kept").is_ok());
+        assert!(session_directory.exists());
+        drop(connection);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn haider_bridge_ghost_prune_observes_age_guard() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("ghost-age");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let mut old = sessions_test_row("old-ghost", Path::new(""), "pinned");
+        old.provider_session_id.clear();
+        old.created_at_ms = sessions_now_ms().saturating_sub(HAIDER_BRIDGE_GHOST_MAX_AGE_MS + 1);
+        let mut young = sessions_test_row("young-draft", Path::new(""), "pinned");
+        young.provider_session_id.clear();
+        young.created_at_ms = sessions_now_ms().saturating_sub(60_000);
+        sessions_test_insert_row(&connection, &old);
+        sessions_test_insert_row(&connection, &young);
+        drop(connection);
+
+        assert!(haider_bridge_reconcile(&[haider_bridge_test_roster("live")]).unwrap());
+        let connection = sessions_open_database().unwrap();
+        assert!(sessions_row_by_id(&connection, "old-ghost").is_err());
+        assert!(sessions_row_by_id(&connection, "young-draft").is_ok());
+        drop(connection);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn haider_bridge_absent_id_prune_keeps_directory() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("absent-id");
+        let session_directory = directory.join("generated-session");
+        fs::create_dir_all(&session_directory).unwrap();
+        fs::write(session_directory.join("marker.txt"), b"keep").unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let row = sessions_test_row("absent", &session_directory, "generated");
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        assert!(haider_bridge_reconcile(&[haider_bridge_test_roster("live")]).unwrap());
+        let connection = sessions_open_database().unwrap();
+        assert!(sessions_row_by_id(&connection, "absent").is_err());
+        assert_eq!(
+            fs::read(session_directory.join("marker.txt")).unwrap(),
+            b"keep"
+        );
+        drop(connection);
 
         fs::remove_dir_all(directory).unwrap();
     }

@@ -53,6 +53,7 @@ struct HaiderProjectionFoldState {
     metadata: serde_json::Map<String, Value>,
     effect_summaries: HashMap<String, String>,
     seen_sequences: HashSet<(i64, i64)>,
+    pipe_eof_max_seq: Option<i64>,
 }
 
 impl Default for HaiderProjectionFoldState {
@@ -64,6 +65,7 @@ impl Default for HaiderProjectionFoldState {
             metadata: serde_json::Map::new(),
             effect_summaries: HashMap::new(),
             seen_sequences: HashSet::new(),
+            pipe_eof_max_seq: None,
         }
     }
 }
@@ -72,6 +74,7 @@ impl Default for HaiderProjectionFoldState {
 struct HaiderProjectionFoldStep {
     rows: Vec<SessionProjectionRow>,
     status: Option<String>,
+    state_raw: Option<String>,
     tail_changed: bool,
 }
 
@@ -138,6 +141,7 @@ struct HaiderProjectionPipeCursor {
     last_ordinal: i64,
     generation: i64,
     covered_through_seq: i64,
+    coverage_known: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -249,10 +253,30 @@ fn haider_projection_migrate_database(connection: &mut rusqlite::Connection) -> 
                 last_seq INTEGER NOT NULL,
                 last_ordinal INTEGER NOT NULL,
                 generation INTEGER NOT NULL,
-                covered_through_seq INTEGER NOT NULL
+                covered_through_seq INTEGER NOT NULL,
+                coverage_known INTEGER NOT NULL DEFAULT 0
              );",
         )
         .map_err(|error| format!("Unable to initialize session projection store: {error}"))?;
+    let cursor_columns = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(session_pipe_cursors)")
+            .map_err(|error| format!("Unable to inspect session pipe cursor schema: {error}"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| format!("Unable to query session pipe cursor schema: {error}"))?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| format!("Unable to decode session pipe cursor schema: {error}"))?;
+        columns
+    };
+    if !cursor_columns.contains("coverage_known") {
+        connection
+            .execute(
+                "ALTER TABLE session_pipe_cursors ADD COLUMN coverage_known INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| format!("Unable to migrate session pipe cursor schema: {error}"))?;
+    }
     Ok(())
 }
 
@@ -904,10 +928,11 @@ fn haider_projection_fold_value_locked(
                 ));
             }
             if matches!(payload_type.as_str(), "run_state" | "session_state") {
-                let state_text = payload_object
+                let state_raw = payload_object
                     .and_then(|object| object.get("state"))
-                    .and_then(haider_bridge_state_text);
-                step.status = Some(haider_bridge_store_status(state_text.as_deref()).to_string());
+                    .and_then(haider_bridge_state_raw);
+                step.status = Some(haider_bridge_store_status(state_raw.as_deref()).to_string());
+                step.state_raw = state_raw;
             }
         }
         _ => {
@@ -980,14 +1005,15 @@ fn haider_projection_persist_batch(
             .execute(
                 "INSERT INTO session_pipe_cursors (
                     session_id, byte_offset, last_seq, last_ordinal, generation,
-                    covered_through_seq
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    covered_through_seq, coverage_known
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(session_id) DO UPDATE SET
                     byte_offset = excluded.byte_offset,
                     last_seq = excluded.last_seq,
                     last_ordinal = excluded.last_ordinal,
                     generation = excluded.generation,
-                    covered_through_seq = excluded.covered_through_seq",
+                    covered_through_seq = excluded.covered_through_seq,
+                    coverage_known = excluded.coverage_known",
                 rusqlite::params![
                     cursor.session_id,
                     cursor.byte_offset,
@@ -995,6 +1021,7 @@ fn haider_projection_persist_batch(
                     cursor.last_ordinal,
                     cursor.generation,
                     cursor.covered_through_seq,
+                    cursor.coverage_known,
                 ],
             )
             .map_err(|error| format!("Unable to persist session pipe cursor: {error}"))?;
@@ -1025,7 +1052,7 @@ fn haider_projection_load_pipe_cursor(
     let connection = haider_projection_open_database()?;
     match connection.query_row(
         "SELECT session_id, byte_offset, last_seq, last_ordinal, generation,
-                covered_through_seq
+                covered_through_seq, coverage_known
          FROM session_pipe_cursors WHERE session_id = ?1",
         [session_id],
         |row| {
@@ -1036,6 +1063,7 @@ fn haider_projection_load_pipe_cursor(
                 last_ordinal: row.get(3)?,
                 generation: row.get(4)?,
                 covered_through_seq: row.get(5)?,
+                coverage_known: row.get(6)?,
             })
         },
     ) {
@@ -1072,8 +1100,8 @@ fn haider_projection_reset_pipe_session(
         .execute(
             "INSERT INTO session_pipe_cursors (
                 session_id, byte_offset, last_seq, last_ordinal, generation,
-                covered_through_seq
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                covered_through_seq, coverage_known
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 cursor.session_id,
                 cursor.byte_offset,
@@ -1081,6 +1109,7 @@ fn haider_projection_reset_pipe_session(
                 cursor.last_ordinal,
                 cursor.generation,
                 cursor.covered_through_seq,
+                cursor.coverage_known,
             ],
         )
         .map_err(|error| format!("Unable to initialize session pipe cursor: {error}"))?;
@@ -1093,19 +1122,39 @@ fn haider_projection_reset_pipe_session(
     Ok(())
 }
 
+fn haider_projection_caught_up(
+    head_seq: Option<i64>,
+    covered_through_seq: Option<i64>,
+    pipe_eof_max_seq: Option<i64>,
+) -> bool {
+    let Some(head_seq) = head_seq else {
+        return true;
+    };
+    if let Some(covered_through_seq) = covered_through_seq {
+        return covered_through_seq >= head_seq;
+    }
+    pipe_eof_max_seq.is_none_or(|max_seq| max_seq >= head_seq)
+}
+
 fn haider_projection_sync(
     session_id: &str,
     provider_session_id: Option<&str>,
 ) -> Result<HaiderProjectionSync, String> {
     let cursor = haider_projection_load_pipe_cursor(session_id)?;
-    let covered_through_seq = cursor.as_ref().map(|cursor| cursor.covered_through_seq);
+    let covered_through_seq = cursor
+        .as_ref()
+        .filter(|cursor| cursor.coverage_known)
+        .map(|cursor| cursor.covered_through_seq);
     let head_seq = provider_session_id.and_then(haider_bridge_head_seq);
+    let pipe_eof_max_seq = haider_projection_states().lock().ok().and_then(|states| {
+        states
+            .get(session_id)
+            .and_then(|state| state.pipe_eof_max_seq)
+    });
     Ok(HaiderProjectionSync {
         covered_through_seq,
         head_seq,
-        caught_up: covered_through_seq
-            .zip(head_seq)
-            .is_some_and(|(covered, head)| covered >= head),
+        caught_up: haider_projection_caught_up(head_seq, covered_through_seq, pipe_eof_max_seq),
     })
 }
 
@@ -1113,14 +1162,16 @@ fn haider_projection_apply_status(
     app: Option<&AppHandle>,
     session_id: &str,
     status: Option<String>,
+    state_raw: Option<String>,
 ) {
-    let Some(status) = status else {
+    if status.is_none() && state_raw.is_none() {
         return;
-    };
+    }
     let result = session_update_blocking(SessionUpdateArgs {
         id: session_id.to_string(),
         title: None,
-        status: Some(status),
+        status,
+        state_raw,
         provider_session_id: None,
         first_user_message: None,
         touch: Some(true),
@@ -1140,6 +1191,7 @@ fn haider_projection_ingest_value(
     haider_projection_initialize_state(session_id)?;
     let mut all_rows = Vec::new();
     let mut status = None;
+    let mut state_raw = None;
     let mut tail_changed = false;
     {
         let mut states = haider_projection_states()
@@ -1152,6 +1204,7 @@ fn haider_projection_ingest_value(
             let step = haider_projection_fold_value_locked(state, session_id, item);
             all_rows.extend(step.rows);
             status = step.status.or(status);
+            state_raw = step.state_raw.or(state_raw);
             tail_changed |= step.tail_changed;
         }
     }
@@ -1168,7 +1221,16 @@ fn haider_projection_ingest_value(
     let live_tail = state.tail.as_ref().map(|tail| tail.row.clone());
     let total_rows = state.total_rows;
     drop(states);
-    haider_projection_apply_status(app, session_id, status);
+    haider_projection_apply_status(app, session_id, status, state_raw);
+    let provider_session_id = haider_projection_resolve_provider_session(session_id)
+        .ok()
+        .map(|(_, provider_session_id)| provider_session_id);
+    let sync = haider_projection_sync(session_id, provider_session_id.as_deref()).unwrap_or(
+        HaiderProjectionSync {
+            caught_up: true,
+            ..HaiderProjectionSync::default()
+        },
+    );
     let from_seq = (appended > 0)
         .then(|| all_rows.iter().map(|row| row.seq).min())
         .flatten();
@@ -1179,9 +1241,9 @@ fn haider_projection_ingest_value(
         total_rows,
         live_tail,
         tail_changed,
-        covered_through_seq: None,
-        head_seq: None,
-        caught_up: false,
+        covered_through_seq: sync.covered_through_seq,
+        head_seq: sync.head_seq,
+        caught_up: sync.caught_up,
         sync_changed: false,
     })
 }
@@ -1729,6 +1791,7 @@ fn haider_projection_ingest_pipe(
     let mut total_rows = haider_projection_database_stats(session_id)?.0;
     let mut from_seq = None;
     let mut advanced = false;
+    let mut consumed_to_eof = false;
 
     loop {
         let consumed = match haider_projection_read_pipe_line(&mut reader, &mut line)
@@ -1742,7 +1805,11 @@ fn haider_projection_ingest_pipe(
                 within_limit: false,
                 ..
             } => return Err("Haider pipe line exceeded the projection read cap.".to_string()),
-            HaiderProjectionPipeLine::Torn | HaiderProjectionPipeLine::Eof => break,
+            HaiderProjectionPipeLine::Torn => break,
+            HaiderProjectionPipeLine::Eof => {
+                consumed_to_eof = true;
+                break;
+            }
         };
         let value: Value = serde_json::from_slice(&line)
             .map_err(|error| format!("Unable to decode Haider pipe line: {error}"))?;
@@ -1750,6 +1817,7 @@ fn haider_projection_ingest_pipe(
             haider_projection_pipe_coverage(cursor.covered_through_seq, &value, header.generation)?
         {
             cursor.covered_through_seq = coverage;
+            cursor.coverage_known = true;
         } else if let Some((seq, ordinal)) = haider_projection_pipe_row_identity(&value)? {
             // Observed v2: text rows carry role/text/at_ms/seq/ordinal;
             // tool rows use name/summary; branch_id is present only off-main.
@@ -1763,7 +1831,7 @@ fn haider_projection_ingest_pipe(
                 haider_projection_fold_value_locked(state, session_id, &value)
             };
             rows.extend(step.rows);
-            cursor.last_seq = seq;
+            cursor.last_seq = cursor.last_seq.max(seq);
             cursor.last_ordinal = ordinal;
         }
         cursor.byte_offset = cursor.byte_offset.saturating_add(consumed);
@@ -1799,6 +1867,7 @@ fn haider_projection_ingest_pipe(
     if let Ok(mut states) = haider_projection_states().lock() {
         if let Some(state) = states.get_mut(session_id) {
             state.total_rows = total_rows;
+            state.pipe_eof_max_seq = consumed_to_eof.then_some(cursor.last_seq);
         }
     }
     let sync = haider_projection_sync(session_id, Some(provider_session_id))?;
@@ -2430,6 +2499,24 @@ mod haider_projection_tests {
     use super::*;
 
     #[test]
+    fn haider_projection_unknown_head_is_caught_up() {
+        assert!(haider_projection_caught_up(None, Some(0), Some(0)));
+    }
+
+    #[test]
+    fn haider_projection_unknown_coverage_is_honest() {
+        assert!(haider_projection_caught_up(Some(9), None, None));
+        assert!(haider_projection_caught_up(Some(9), None, Some(9)));
+        assert!(!haider_projection_caught_up(Some(9), None, Some(8)));
+    }
+
+    #[test]
+    fn haider_projection_known_coverage_reports_only_real_gaps() {
+        assert!(haider_projection_caught_up(Some(9), Some(9), None));
+        assert!(!haider_projection_caught_up(Some(9), Some(8), None));
+    }
+
+    #[test]
     fn haider_projection_folds_observed_export_shape_and_missing_seq() {
         // Shape captured from `haider export <id> --format json` v1. The
         // sandboxed test runner cannot connect to the user's daemon, so the
@@ -2522,6 +2609,19 @@ mod haider_projection_tests {
         assert!(state.metadata.contains_key("usage"));
         assert!(state.metadata.contains_key("run_state"));
         assert!(state.metadata.contains_key("session_state"));
+
+        let object_state = haider_projection_fold_value_locked(
+            &mut state,
+            "local",
+            &json!({"payload":{"type":"run_state", "state":{
+                "status":"running_tool", "tool":"cargo"
+            }}}),
+        );
+        assert_eq!(object_state.status.as_deref(), Some("running"));
+        assert_eq!(
+            object_state.state_raw.as_deref(),
+            Some("running_tool: cargo")
+        );
     }
 
     #[test]
