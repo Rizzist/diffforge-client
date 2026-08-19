@@ -25641,20 +25641,21 @@ export const SettingsRailNav = styled.div`
 
 export const SettingsBackButton = styled.button`
   display: inline-flex;
+  min-height: 26px;
   align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
+  gap: 6px;
+  padding: 0 8px 0 4px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 6px;
   color: var(--forge-text-soft);
   background: transparent;
-  font-size: 12.5px;
-  font-weight: 650;
+  font-size: 11px;
+  font-weight: 550;
   cursor: pointer;
   text-align: left;
 
   span {
-    font-size: 14px;
+    font-size: 12px;
     line-height: 1;
   }
 
@@ -25666,12 +25667,12 @@ export const SettingsBackButton = styled.button`
 
 export const SettingsSearchInput = styled.input`
   width: 100%;
-  padding: 6px 10px;
+  padding: 4px 9px;
   border: 1px solid var(--forge-border);
   border-radius: 999px;
   color: var(--forge-text);
   background: var(--forge-surface-control);
-  font-size: 12px;
+  font-size: 11px;
   outline: none;
 
   &::placeholder {
@@ -25694,11 +25695,12 @@ export const SettingsNavGroups = styled.div`
 `;
 
 export const SettingsNavGroupLabel = styled.div`
-  margin: 8px 8px 2px;
+  margin: 8px 4px 2px;
   color: var(--forge-text-muted);
-  font-size: 10.5px;
-  font-weight: 720;
-  letter-spacing: 0.05em;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 `;
 
 export const SettingsNavItem = styled.button`
@@ -25764,14 +25766,14 @@ export const RailAccountBar = styled.div`
 
 export const RailAccountAvatar = styled.span`
   display: grid;
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   flex: 0 0 auto;
   place-items: center;
   border-radius: 50%;
   color: #fff;
   background: linear-gradient(135deg, var(--forge-blue), var(--forge-ember));
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 760;
 `;
 
@@ -25780,14 +25782,14 @@ export const RailAccountChipButton = styled.button`
   width: 100%;
   min-width: 0;
   align-items: center;
-  gap: 8px;
-  padding: 5px 6px;
+  gap: 6px;
+  padding: 4px 6px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 6px;
   color: var(--forge-text-soft);
   background: transparent;
-  font-size: 12.5px;
-  font-weight: 650;
+  font-size: 11px;
+  font-weight: 550;
   cursor: pointer;
   text-align: left;
 
@@ -25818,15 +25820,15 @@ export const AccountMenuPop = styled.div`
   /* Portaled to document.body and fixed: no rail overflow or stacking
      context can clip or bury the menu. */
   position: fixed;
-  bottom: 52px;
+  bottom: 46px;
   left: 10px;
   z-index: 900;
   display: grid;
-  width: 208px;
+  width: 188px;
   gap: 1px;
-  padding: 5px;
+  padding: 4px;
   border: 1px solid var(--forge-border-strong);
-  border-radius: 12px;
+  border-radius: 10px;
   background: var(--forge-surface-raised);
   box-shadow: 0 20px 56px rgba(0, 0, 0, 0.5);
 `;
@@ -25834,13 +25836,13 @@ export const AccountMenuPop = styled.div`
 export const AccountMenuHeader = styled.div`
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 5px 7px;
+  gap: 6px;
+  padding: 4px 6px;
 
   strong {
     overflow: hidden;
     color: var(--forge-text);
-    font-size: 12.5px;
+    font-size: 11.5px;
     font-weight: 700;
     white-space: nowrap;
     text-overflow: ellipsis;
@@ -25856,21 +25858,22 @@ export const AccountMenuDivider = styled.div`
 export const AccountMenuRow = styled.button`
   display: flex;
   width: 100%;
+  min-height: 26px;
   align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
+  gap: 6px;
+  padding: 0 8px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 6px;
   color: var(--forge-text-soft);
   background: transparent;
-  font-size: 12.5px;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 550;
   cursor: pointer;
   text-align: left;
 
   svg {
-    width: 14px;
-    height: 14px;
+    width: 13px;
+    height: 13px;
     flex: 0 0 auto;
     opacity: 0.85;
   }
@@ -25882,7 +25885,7 @@ export const AccountMenuRow = styled.button`
 
   em {
     color: var(--forge-text-muted);
-    font-size: 11px;
+    font-size: 10px;
     font-style: normal;
   }
 
@@ -25899,12 +25902,13 @@ export const AccountMenuRow = styled.button`
 export const AccountUsageRow = styled(AccountMenuRow)`
   flex-direction: column;
   align-items: stretch;
-  gap: 5px;
+  gap: 4px;
+  padding: 5px 8px;
 
   > div {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
   }
 
   > div span {
@@ -25914,7 +25918,7 @@ export const AccountUsageRow = styled(AccountMenuRow)`
 `;
 
 export const AccountUsageTrack = styled.span`
-  display: block;
+  display: flex;
   height: 3px;
   overflow: hidden;
   border-radius: 999px;
@@ -25923,7 +25927,28 @@ export const AccountUsageTrack = styled.span`
   i {
     display: block;
     height: 100%;
-    border-radius: 999px;
-    background: linear-gradient(90deg, var(--forge-blue), var(--forge-ember));
+  }
+`;
+
+export const AccountUsageLegend = styled.span`
+  display: flex;
+  gap: 8px;
+  color: var(--forge-text-muted);
+  font-size: 10px;
+  font-weight: 550;
+
+  && > span {
+    display: inline-flex;
+    flex: 0 0 auto;
+    min-width: auto;
+    align-items: center;
+    gap: 4px;
+  }
+
+  i {
+    width: 5px;
+    height: 5px;
+    flex: 0 0 auto;
+    border-radius: 50%;
   }
 `;

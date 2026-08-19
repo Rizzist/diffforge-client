@@ -563,12 +563,12 @@ import {
   AccountMenuRow,
   AccountUsageRow,
   AccountUsageTrack,
+  AccountUsageLegend,
   SettingsRailNav,
   SettingsBackButton,
   SettingsSearchInput,
   SettingsNavGroups,
   SettingsNavGroupLabel,
-  SettingsNavItem,
   SettingsContentTitle,
   RailGlobalActions,
   RailViewActions,
@@ -23938,6 +23938,24 @@ export default function App() {
           : "General";
   const accountDisplayName = String(user?.name || user?.email || "Account").trim() || "Account";
   const accountInitial = accountDisplayName.charAt(0).toUpperCase();
+  // Per-subscription remaining, averaged into the headline percent. Unknown
+  // usage counts as full (100% left), matching the old single-number rule.
+  // TODO: feed real rate-limit windows (haiderd) into pctLeft per account.
+  const accountUsageBreakdown = useMemo(() => {
+    const accounts = [
+      { id: "codex", label: "Codex", color: "#62a0ff", pctLeft: null },
+      { id: "claude", label: "Claude Code", color: "#ff9a3d", pctLeft: null },
+    ].map((account) => ({
+      ...account,
+      pct: Number.isFinite(account.pctLeft)
+        ? Math.max(0, Math.min(100, Math.round(account.pctLeft)))
+        : 100,
+    }));
+    const total = Math.round(
+      accounts.reduce((sum, account) => sum + account.pct, 0) / accounts.length,
+    );
+    return { accounts, total };
+  }, []);
   // While settings (or a view re-homed under it) is active, the rail's list
   // area shows the settings nav instead of workspaces, so switching between
   // settings sections never loses the nav.
@@ -55331,121 +55349,121 @@ export default function App() {
                             <SettingsNavGroupLabel>Personal</SettingsNavGroupLabel>
                           )}
                           {settingsNavShow("General") && (
-                            <SettingsNavItem
+                            <RailActionButton
                               data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_GENERAL ? "true" : undefined}
                               onClick={() => showSettingsView(SETTINGS_TAB_GENERAL)}
                               type="button"
                             >
                               <ButtonSettingsIcon aria-hidden="true" />
                               <span>General</span>
-                            </SettingsNavItem>
+                            </RailActionButton>
                           )}
                           {settingsNavShow("Notifications") && (
-                            <SettingsNavItem
+                            <RailActionButton
                               data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_NOTIFICATIONS ? "true" : undefined}
                               onClick={() => showSettingsView(SETTINGS_TAB_NOTIFICATIONS)}
                               type="button"
                             >
                               <ButtonNotificationIcon aria-hidden="true" />
                               <span>Notifications</span>
-                            </SettingsNavItem>
+                            </RailActionButton>
                           )}
                           {settingsNavShow("Permissions") && (
-                            <SettingsNavItem
+                            <RailActionButton
                               data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_PERMISSIONS ? "true" : undefined}
                               onClick={() => showSettingsView(SETTINGS_TAB_PERMISSIONS)}
                               type="button"
                             >
                               <ButtonSecurityIcon aria-hidden="true" />
                               <span>Permissions</span>
-                            </SettingsNavItem>
-                          )}
-                          {(settingsNavShow("SSH clients") || settingsNavShow("Email delivery")) && (
-                            <SettingsNavGroupLabel>Connections</SettingsNavGroupLabel>
-                          )}
-                          {settingsNavShow("SSH clients") && (
-                            <SettingsNavItem
-                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_SSH ? "true" : undefined}
-                              onClick={() => showSettingsView(SETTINGS_TAB_SSH)}
-                              type="button"
-                            >
-                              <ButtonTerminalIcon aria-hidden="true" />
-                              <span>SSH clients</span>
-                            </SettingsNavItem>
-                          )}
-                          {settingsNavShow("Email delivery") && (
-                            <SettingsNavItem
-                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_EMAIL ? "true" : undefined}
-                              onClick={() => showSettingsView(SETTINGS_TAB_EMAIL)}
-                              type="button"
-                            >
-                              <ButtonMailIcon aria-hidden="true" />
-                              <span>Email delivery</span>
-                            </SettingsNavItem>
+                            </RailActionButton>
                           )}
                           {(settingsNavShow("Tools") || settingsNavShow("Assets") || settingsNavShow("Snipping")
                             || settingsNavShow("Audio") || settingsNavShow("Tokenomics") || settingsNavShow("Communication")) && (
                             <SettingsNavGroupLabel>App</SettingsNavGroupLabel>
                           )}
                           {settingsNavShow("Tools") && (
-                            <SettingsNavItem
+                            <RailActionButton
                               data-active={GLOBAL_TOOLS_VIEWS.has(activeView) ? "true" : undefined}
                               onClick={() => showView("tools")}
                               type="button"
                             >
                               <RailToolsIcon aria-hidden="true" />
                               <span>Tools</span>
-                            </SettingsNavItem>
+                            </RailActionButton>
                           )}
                           {settingsNavShow("Assets") && (
-                            <SettingsNavItem
+                            <RailActionButton
                               data-active={activeView === "assets" ? "true" : undefined}
                               onClick={() => showView("assets")}
                               type="button"
                             >
                               <RailAssetsIcon aria-hidden="true" />
                               <span>Assets</span>
-                            </SettingsNavItem>
+                            </RailActionButton>
                           )}
                           {settingsNavShow("Snipping") && (
-                            <SettingsNavItem
+                            <RailActionButton
                               data-active={activeView === "snipping" ? "true" : undefined}
                               onClick={() => showView("snipping")}
                               type="button"
                             >
                               <RailSnippingIcon aria-hidden="true" />
                               <span>Snipping</span>
-                            </SettingsNavItem>
+                            </RailActionButton>
                           )}
                           {settingsNavShow("Audio") && (
-                            <SettingsNavItem
+                            <RailActionButton
                               data-active={activeView === "audio" ? "true" : undefined}
                               onClick={() => showView("audio")}
                               type="button"
                             >
                               <RailAudioIcon aria-hidden="true" />
                               <span>Audio</span>
-                            </SettingsNavItem>
+                            </RailActionButton>
                           )}
                           {settingsNavShow("Tokenomics") && (
-                            <SettingsNavItem
+                            <RailActionButton
                               data-active={activeView === "tokenomics" ? "true" : undefined}
                               onClick={() => showView("tokenomics")}
                               type="button"
                             >
                               <RailTokenomicsIcon aria-hidden="true" />
                               <span>Tokenomics</span>
-                            </SettingsNavItem>
+                            </RailActionButton>
                           )}
                           {settingsNavShow("Communication") && (
-                            <SettingsNavItem
+                            <RailActionButton
                               data-active={activeView === "devices" ? "true" : undefined}
                               onClick={() => showView("devices")}
                               type="button"
                             >
                               <RailDevicesIcon aria-hidden="true" />
                               <span>Communication</span>
-                            </SettingsNavItem>
+                            </RailActionButton>
+                          )}
+                          {(settingsNavShow("SSH clients") || settingsNavShow("Email delivery")) && (
+                            <SettingsNavGroupLabel>Connections</SettingsNavGroupLabel>
+                          )}
+                          {settingsNavShow("SSH clients") && (
+                            <RailActionButton
+                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_SSH ? "true" : undefined}
+                              onClick={() => showSettingsView(SETTINGS_TAB_SSH)}
+                              type="button"
+                            >
+                              <ButtonTerminalIcon aria-hidden="true" />
+                              <span>SSH clients</span>
+                            </RailActionButton>
+                          )}
+                          {settingsNavShow("Email delivery") && (
+                            <RailActionButton
+                              data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_EMAIL ? "true" : undefined}
+                              onClick={() => showSettingsView(SETTINGS_TAB_EMAIL)}
+                              type="button"
+                            >
+                              <ButtonMailIcon aria-hidden="true" />
+                              <span>Email delivery</span>
+                            </RailActionButton>
                           )}
                         </SettingsNavGroups>
                       </SettingsRailNav>
@@ -55594,11 +55612,27 @@ export default function App() {
                             <div>
                               <RailTokenomicsIcon aria-hidden="true" />
                               <span>Usage</span>
-                              <em>{Number.isFinite(billingCreditPercent) ? `${Math.round(billingCreditPercent)}% left` : ""}</em>
+                              <em>{accountUsageBreakdown.total}% left</em>
                             </div>
                             <AccountUsageTrack aria-hidden="true">
-                              <i style={{ width: `${Math.max(0, Math.min(100, Math.round(billingCreditPercent) || 0))}%` }} />
+                              {accountUsageBreakdown.accounts.map((account) => (
+                                <i
+                                  key={account.id}
+                                  style={{
+                                    width: `${account.pct / accountUsageBreakdown.accounts.length}%`,
+                                    background: account.color,
+                                  }}
+                                />
+                              ))}
                             </AccountUsageTrack>
+                            <AccountUsageLegend>
+                              {accountUsageBreakdown.accounts.map((account) => (
+                                <span key={account.id}>
+                                  <i aria-hidden="true" style={{ background: account.color }} />
+                                  {account.label} {account.pct}%
+                                </span>
+                              ))}
+                            </AccountUsageLegend>
                           </AccountUsageRow>
                           <AccountMenuRow
                             onClick={(event) => {
