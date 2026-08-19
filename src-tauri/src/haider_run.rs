@@ -13,6 +13,12 @@ struct HaiderRunChild {
 static HAIDER_RUN_STOPPING: AtomicBool = AtomicBool::new(false);
 static HAIDER_RUN_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HaiderRunAccepted {
+    session_id: String,
+    head_seq: i64,
+}
+
 fn haider_run_children() -> &'static StdMutex<HashMap<String, HaiderRunChild>> {
     static CHILDREN: OnceLock<StdMutex<HashMap<String, HaiderRunChild>>> = OnceLock::new();
     CHILDREN.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -72,6 +78,34 @@ fn haider_run_extract_provider_session_id(value: &Value) -> Option<String> {
         .as_object()
         .and_then(from_object)
         .filter(|id| !id.trim().is_empty())
+}
+
+fn haider_run_accepted(value: &Value) -> Option<HaiderRunAccepted> {
+    let object = value.as_object()?;
+    (object.get("event").and_then(Value::as_str) == Some("accepted")).then_some(())?;
+    let session_id = object
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.trim().is_empty())?
+        .to_string();
+    let head_seq = haider_projection_json_i64(object.get("head_seq"))?;
+    Some(HaiderRunAccepted {
+        session_id,
+        head_seq,
+    })
+}
+
+fn haider_run_fallback_provider_session_id(value: &Value) -> Option<String> {
+    // Announcement-like records may arrive before identity refinement. Older
+    // harness envelopes may use an object-valued event, so those remain scrapeable.
+    if value
+        .as_object()
+        .and_then(|object| object.get("event"))
+        .is_some_and(Value::is_string)
+    {
+        return None;
+    }
+    haider_run_extract_provider_session_id(value)
 }
 
 fn haider_run_capture(mut command: Command) -> Option<(bool, Vec<u8>, Vec<u8>)> {
@@ -333,14 +367,23 @@ fn haider_run_spawn(
         let mut bound_provider_session_id = provider_session_id;
         let mut binding_sender = binding_sender;
         let mut pending_bound_row = None;
+        let mut accepted_bound = false;
         while !HAIDER_RUN_STOPPING.load(Ordering::Acquire) {
             match haider_projection_read_capped_line(&mut reader, &mut line) {
                 Ok(Some(true)) => {
                     let Ok(value) = serde_json::from_slice::<Value>(&line) else {
                         continue;
                     };
+                    let accepted = haider_run_accepted(&value);
+                    if let Some(accepted) = accepted.as_ref() {
+                        haider_bridge_note_head_seq(&accepted.session_id, accepted.head_seq);
+                    }
                     if bound_provider_session_id.is_none() {
-                        if let Some(provider_id) = haider_run_extract_provider_session_id(&value) {
+                        let provider_id = accepted
+                            .as_ref()
+                            .map(|accepted| accepted.session_id.clone())
+                            .or_else(|| haider_run_fallback_provider_session_id(&value));
+                        if let Some(provider_id) = provider_id {
                             if haider_run_is_current(&local_session_id, generation) {
                                 match haider_run_update_session(
                                     &app,
@@ -351,7 +394,14 @@ fn haider_run_spawn(
                                 ) {
                                     Ok(row) => {
                                         bound_provider_session_id = Some(provider_id);
-                                        pending_bound_row = Some(row);
+                                        if accepted.is_some() {
+                                            accepted_bound = true;
+                                            if let Some(sender) = binding_sender.take() {
+                                                let _ = sender.send(Ok(row));
+                                            }
+                                        } else {
+                                            pending_bound_row = Some(row);
+                                        }
                                     }
                                     Err(error) => {
                                         if let Some(sender) = binding_sender.take() {
@@ -362,6 +412,8 @@ fn haider_run_spawn(
                                 }
                             }
                         }
+                    } else if accepted.is_some() && !accepted_bound {
+                        accepted_bound = true;
                     }
                     haider_projection_ingest_and_emit(&app, &local_session_id, &value);
                     let projection_started = haider_projection_database_stats(&local_session_id)
@@ -428,7 +480,7 @@ fn haider_run_stop() {
     }
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn session_start_with_prompt(
     app: AppHandle,
     prompt: String,
@@ -468,13 +520,9 @@ async fn session_start_with_prompt(
             return Err(error);
         }
         match binding_receiver.recv_timeout(HAIDER_RUN_BIND_TIMEOUT) {
-            Ok(Ok(_bound_row)) => haider_run_update_session(
-                &app,
-                &created.id,
-                Some("running"),
-                None,
-                Some(prompt),
-            ),
+            Ok(Ok(_bound_row)) => {
+                haider_run_update_session(&app, &created.id, Some("running"), None, Some(prompt))
+            }
             Ok(Err(error)) => {
                 haider_run_kill_active(&created.id);
                 discard_created(&app);
@@ -496,7 +544,7 @@ async fn session_start_with_prompt(
     .map_err(|error| format!("Session start worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn session_submit_prompt(
     app: AppHandle,
     session_id: String,
@@ -561,6 +609,50 @@ mod haider_run_tests {
             }))
             .as_deref(),
             Some("session-observed")
+        );
+    }
+
+    #[test]
+    fn haider_run_parses_first_accepted_announce() {
+        assert_eq!(
+            haider_run_accepted(&json!({
+                "event":"accepted",
+                "session_id":"session-observed",
+                "head_seq":17
+            })),
+            Some(HaiderRunAccepted {
+                session_id: "session-observed".to_string(),
+                head_seq: 17,
+            })
+        );
+        assert!(haider_run_accepted(&json!({
+            "event":"accepted",
+            "session_id":"session-observed"
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn haider_run_out_of_order_refinement_cannot_win_fallback_binding() {
+        let refinement = json!({
+            "event":"accepted_refinement",
+            "session_id":"session-refinement",
+            "head_seq":29
+        });
+        let accepted = json!({
+            "event":"accepted",
+            "session_id":"session-identity",
+            "head_seq":4
+        });
+        assert!(haider_run_accepted(&refinement).is_none());
+        assert!(haider_run_fallback_provider_session_id(&refinement).is_none());
+        assert_eq!(
+            [refinement, accepted]
+                .iter()
+                .find_map(haider_run_accepted)
+                .unwrap()
+                .session_id,
+            "session-identity"
         );
     }
 

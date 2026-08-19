@@ -537,7 +537,7 @@ async fn sessions_list() -> Result<Vec<SessionRow>, String> {
         .map_err(|error| format!("Sessions list worker failed: {error}"))?
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn session_create(app: AppHandle, args: SessionCreateArgs) -> Result<SessionRow, String> {
     let row = tauri::async_runtime::spawn_blocking(move || session_create_blocking(args))
         .await
@@ -546,7 +546,7 @@ async fn session_create(app: AppHandle, args: SessionCreateArgs) -> Result<Sessi
     Ok(row)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn session_update(app: AppHandle, args: SessionUpdateArgs) -> Result<SessionRow, String> {
     let row = tauri::async_runtime::spawn_blocking(move || session_update_blocking(args))
         .await
@@ -555,7 +555,7 @@ async fn session_update(app: AppHandle, args: SessionUpdateArgs) -> Result<Sessi
     Ok(row)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn session_rename(
     app: AppHandle,
     session_id: String,
@@ -569,7 +569,7 @@ async fn session_rename(
     Ok(row)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn session_set_pinned(
     app: AppHandle,
     session_id: String,
@@ -584,7 +584,7 @@ async fn session_set_pinned(
     Ok(row)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn session_delete(app: AppHandle, args: SessionDeleteArgs) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || session_delete_blocking(args))
         .await

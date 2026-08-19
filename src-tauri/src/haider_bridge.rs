@@ -19,6 +19,30 @@ struct HaiderBridgeSession {
 static HAIDER_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
 static HAIDER_BRIDGE_STOPPING: AtomicBool = AtomicBool::new(false);
 
+fn haider_bridge_head_sequences() -> &'static StdMutex<HashMap<String, i64>> {
+    static HEADS: OnceLock<StdMutex<HashMap<String, i64>>> = OnceLock::new();
+    HEADS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn haider_bridge_note_head_seq(session_id: &str, head_seq: i64) {
+    if session_id.trim().is_empty() || head_seq < 0 {
+        return;
+    }
+    if let Ok(mut heads) = haider_bridge_head_sequences().lock() {
+        heads
+            .entry(session_id.to_string())
+            .and_modify(|head| *head = (*head).max(head_seq))
+            .or_insert(head_seq);
+    }
+}
+
+fn haider_bridge_head_seq(session_id: &str) -> Option<i64> {
+    haider_bridge_head_sequences()
+        .lock()
+        .ok()
+        .and_then(|heads| heads.get(session_id).copied())
+}
+
 fn haider_bridge_child_slot() -> &'static StdMutex<Option<Arc<StdMutex<std::process::Child>>>> {
     static CHILD: OnceLock<StdMutex<Option<Arc<StdMutex<std::process::Child>>>>> = OnceLock::new();
     CHILD.get_or_init(|| StdMutex::new(None))
@@ -127,6 +151,19 @@ fn haider_bridge_timestamp(value: &Value) -> Option<i64> {
     })
 }
 
+fn haider_bridge_sequence(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64().or_else(|| {
+            number
+                .as_u64()
+                .map(|value| value.min(i64::MAX as u64) as i64)
+        }),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+    .map(|value| value.max(0))
+}
+
 fn haider_bridge_parse_session(
     value: &Value,
     inherited_id: Option<&str>,
@@ -209,7 +246,6 @@ fn haider_bridge_parse_session(
                 .max()
         })
         .max();
-
     let has_session_shape = title.is_some()
         || model.is_some()
         || cwd.is_some()
@@ -225,6 +261,37 @@ fn haider_bridge_parse_session(
         state,
         latest_at_ms,
     })
+}
+
+fn haider_bridge_collect_head_sequences(value: &Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                haider_bridge_collect_head_sequences(value);
+            }
+        }
+        Value::Object(object) => {
+            let session_id = haider_bridge_object_value(
+                object,
+                &["session_id", "sessionId", "id"],
+                &["session", "summary"],
+            )
+            .and_then(haider_bridge_text);
+            let head_seq = haider_bridge_object_value(
+                object,
+                &["head_seq", "headSeq"],
+                &["session", "summary"],
+            )
+            .and_then(haider_bridge_sequence);
+            if let (Some(session_id), Some(head_seq)) = (session_id, head_seq) {
+                haider_bridge_note_head_seq(&session_id, head_seq);
+            }
+            for value in object.values() {
+                haider_bridge_collect_head_sequences(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn haider_bridge_collect_sessions(
@@ -480,7 +547,9 @@ async fn haider_bridge_sync_once(app: &AppHandle) {
         let Some(value) = haider_bridge_json_command("sessions") else {
             return Ok(false);
         };
-        haider_bridge_reconcile(&haider_bridge_parse_session_list(&value))
+        haider_bridge_collect_head_sequences(&value);
+        let sessions = haider_bridge_parse_session_list(&value);
+        haider_bridge_reconcile(&sessions)
     })
     .await;
     match changed {
