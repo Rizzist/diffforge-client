@@ -1,6 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import {
   availableMonitors,
   currentMonitor,
@@ -35,6 +35,9 @@ import { createPortal } from "react-dom";
 import { onRuntimeProfilerRender } from "../diagnostics/commitProfiler.js";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import { AuthFlow, SUCCESS_HOLD_MS as AUTH_SUCCESS_HOLD_MS } from "../auth";
+import SessionsRail from "../sessions/SessionsRail.jsx";
+import SessionSurface from "../sessions/SessionSurface.jsx";
+import { createSession, listSessions } from "../sessions/sessionsModel.js";
 import { listenShared, waitSharedListenerReady } from "./sharedTauriEvents.js";
 import {
   normalizeLoopspaceTodoWorkspaceIds,
@@ -23947,6 +23950,81 @@ export default function App() {
           : "General";
   const accountDisplayName = String(user?.name || user?.email || "Account").trim() || "Account";
   const accountInitial = accountDisplayName.charAt(0).toUpperCase();
+  // Codex-style Haider sessions: the rail lists them day-grouped; every
+  // opened session keeps its PTY alive in SessionSurface.
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState("");
+  const [openSessionIds, setOpenSessionIds] = useState([]);
+  const openSessions = useMemo(
+    () => openSessionIds
+      .map((id) => sessions.find((session) => session.id === id))
+      .filter(Boolean),
+    [openSessionIds, sessions],
+  );
+  const refreshSessions = useCallback(async () => {
+    try {
+      setSessions(await listSessions());
+    } catch {
+      // Store not available yet (first boot before Rust lane) — rail stays empty.
+    }
+  }, []);
+  const openSessionFromRail = useCallback((session) => {
+    if (!session?.id) {
+      return;
+    }
+    setActiveSessionId(session.id);
+    setOpenSessionIds((ids) => (ids.includes(session.id) ? ids : [...ids, session.id]));
+    showView(DEFAULT_WORKSPACE_VIEW);
+  }, [showView]);
+  const startNewSessionChat = useCallback(async () => {
+    try {
+      const session = await createSession({});
+      if (session) {
+        setSessions((current) => [session, ...current.filter((row) => row.id !== session.id)]);
+        openSessionFromRail(session);
+      }
+    } catch (error) {
+      console.error("session create failed", error);
+    }
+  }, [openSessionFromRail]);
+
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      return undefined;
+    }
+    void refreshSessions();
+    let disposed = false;
+    let unlisten = null;
+    void listen("sessions-changed", () => {
+      if (!disposed) {
+        void refreshSessions();
+      }
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      disposed = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [authState, refreshSessions]);
+
+  // ⌘N / Ctrl+N starts a new chat.
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        void startNewSessionChat();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [startNewSessionChat]);
   // Per-subscription remaining, averaged into the headline percent. Unknown
   // usage counts as full (100% left), matching the old single-number rule.
   // TODO: feed real rate-limit windows (haiderd) into pctLeft per account.
@@ -55318,16 +55396,16 @@ export default function App() {
                         </RailSpaceModeSwitchButton>
                       </RailTitleGroup>
                       <RailCreateWorkspaceButton
-                        aria-label={loopspacesModeActive ? "Create loop" : "Create workspace"}
+                        aria-label={loopspacesModeActive ? "Create loop" : "New chat"}
                         onClick={(event) => {
                           event.stopPropagation();
                           if (loopspacesModeActive) {
                             openCreateLoopspacePanel();
                             return;
                           }
-                          openCreateWorkspaceModal();
+                          void startNewSessionChat();
                         }}
-                        title={loopspacesModeActive ? "Create loop" : "Create workspace"}
+                        title={loopspacesModeActive ? "Create loop" : "New chat (⌘N)"}
                         type="button"
                       >
                         <ButtonAddIcon aria-hidden="true" />
@@ -55533,42 +55611,12 @@ export default function App() {
                           )}
                         </>
                       ) : (
-                        <>
-                          {workspaces.map((workspace) => {
-                            const workspaceIsRuntimeEnabled = enabledRuntimeWorkspaceIds.includes(workspace.id);
-                            const workspaceIsPendingActivation = workspacePendingActivationId === workspace.id;
-                            const notificationSummary = workspaceNotificationSummaries[workspace.id] || EMPTY_OBJECT;
-                            const workspaceRootDirectory = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
-
-                            return (
-                              <WorkspaceRailWorkspaceRow
-                                activatedWorkspaceId={activatedWorkspaceId}
-                                default_working_directory={defaultWorkingDirectory}
-                                deactivationActive={workspaceDeactivationState.is_active}
-                                deactivationWorkspaceId={workspaceDeactivationState.workspace_id}
-                                enabled={workspaceIsRuntimeEnabled}
-                                key={workspace.id}
-                                notificationBadgeCount={notificationSummary.badgeCount}
-                                notificationBadgeVariant={notificationSummary.badgeVariant}
-                                notificationHighlighted={Boolean(workspaceNotificationHighlights[workspace.id])}
-                                notificationPendingActionCount={notificationSummary.pendingActionCount}
-                                notificationUnreadCount={notificationSummary.unreadCount}
-                                onLifecycle={toggleWorkspaceLifecycleFromRail}
-                                onSelect={selectWorkspaceFromRail}
-                                onSettings={openWorkspaceSettings}
-                                pendingActivation={workspaceIsPendingActivation}
-                                selected={workspace.id === selectedWorkspaceId}
-                                workspace_id={workspace.id}
-                                workspace_name={workspace.name}
-                                workspaceRootDirectory={workspaceRootDirectory}
-                                workspaceState={workspaceState}
-                              />
-                            );
-                          })}
-                          {workspaceSyncState === "loading" && (
-                            <WorkspaceMuted>Loading...</WorkspaceMuted>
-                          )}
-                        </>
+                        <SessionsRail
+                          activeSessionId={activeSessionId}
+                          onNewChat={startNewSessionChat}
+                          onSelectSession={openSessionFromRail}
+                          sessions={sessions}
+                        />
                       )}
                     </WorkspaceList>
                     )}
@@ -56453,6 +56501,12 @@ export default function App() {
                       </WorkspaceSettingsBusyOverlay>
                     )}
                   </WorkspaceCreateLayer>
+                  {!loopspacesModeActive && (
+                    <SessionSurface
+                      activeSessionId={activeSessionId}
+                      openSessions={openSessions}
+                    />
+                  )}
                 </WorkspaceViewPane>
 
                 <WorkspaceViewPane
