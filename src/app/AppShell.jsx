@@ -55439,74 +55439,6 @@ export default function App() {
                         )}
                       </RailViewActions>
                     )}
-                    <RailGlobalActions aria-label="Global controls">
-                      <RailActionButton
-                        aria-label="Tools"
-                        data-active={GLOBAL_TOOLS_VIEWS.has(activeView)}
-                        data-scope="global"
-                        onClick={() => showView("tools")}
-                        title="Docs, MCPs, CLIs & Scripts"
-                        type="button"
-                      >
-                        <RailToolsIcon aria-hidden="true" />
-                        <span>Tools</span>
-                      </RailActionButton>
-                      <RailActionButton
-                        aria-label="Assets"
-                        data-active={activeView === "assets"}
-                        data-scope="global"
-                        onClick={() => showView("assets")}
-                        title="Assets"
-                        type="button"
-                      >
-                        <RailAssetsIcon aria-hidden="true" />
-                        <span>Assets</span>
-                      </RailActionButton>
-                      <RailActionButton
-                        aria-label="Snipping"
-                        data-active={activeView === "snipping"}
-                        data-scope="global"
-                        onClick={() => showView("snipping")}
-                        title="Snipping"
-                        type="button"
-                      >
-                        <RailSnippingIcon aria-hidden="true" />
-                        <span>Snipping</span>
-                      </RailActionButton>
-                      <RailActionButton
-                        aria-label="Audio"
-                        data-active={activeView === "audio"}
-                        data-scope="global"
-                        onClick={() => showView("audio")}
-                        title="Audio"
-                        type="button"
-                      >
-                        <RailAudioIcon aria-hidden="true" />
-                        <span>Audio</span>
-                      </RailActionButton>
-                      <RailActionButton
-                        aria-label="Tokenomics"
-                        data-active={activeView === "tokenomics"}
-                        data-scope="global"
-                        onClick={() => showView("tokenomics")}
-                        title="Tokenomics"
-                        type="button"
-                      >
-                        <RailTokenomicsIcon aria-hidden="true" />
-                        <span>Tokenomics</span>
-                      </RailActionButton>
-                      <RailActionButton
-                        aria-label="Communication"
-                        data-active={activeView === "devices"}
-                        data-scope="global"
-                        onClick={() => showView("devices")}
-                        title="Communication — devices & email"
-                        type="button"
-                      >
-                        <RailDevicesIcon aria-hidden="true" />
-                        <span>Communication</span>
-                      </RailActionButton>
-                    </RailGlobalActions>
                     <RailAccountBar ref={accountMenuRef}>
                       {accountMenuOpen && (
                         <AccountMenuPop aria-label="Account" role="menu">
@@ -56399,6 +56331,46 @@ export default function App() {
                         >
                           <ButtonMailIcon aria-hidden="true" />
                           <span>Email delivery</span>
+                        </SettingsNavItem>
+                      )}
+                      {(settingsNavShow("Tools") || settingsNavShow("Assets") || settingsNavShow("Snipping")
+                        || settingsNavShow("Audio") || settingsNavShow("Tokenomics") || settingsNavShow("Communication")) && (
+                        <SettingsNavGroupLabel>App</SettingsNavGroupLabel>
+                      )}
+                      {settingsNavShow("Tools") && (
+                        <SettingsNavItem onClick={() => showView("tools")} type="button">
+                          <RailToolsIcon aria-hidden="true" />
+                          <span>Tools</span>
+                        </SettingsNavItem>
+                      )}
+                      {settingsNavShow("Assets") && (
+                        <SettingsNavItem onClick={() => showView("assets")} type="button">
+                          <RailAssetsIcon aria-hidden="true" />
+                          <span>Assets</span>
+                        </SettingsNavItem>
+                      )}
+                      {settingsNavShow("Snipping") && (
+                        <SettingsNavItem onClick={() => showView("snipping")} type="button">
+                          <RailSnippingIcon aria-hidden="true" />
+                          <span>Snipping</span>
+                        </SettingsNavItem>
+                      )}
+                      {settingsNavShow("Audio") && (
+                        <SettingsNavItem onClick={() => showView("audio")} type="button">
+                          <RailAudioIcon aria-hidden="true" />
+                          <span>Audio</span>
+                        </SettingsNavItem>
+                      )}
+                      {settingsNavShow("Tokenomics") && (
+                        <SettingsNavItem onClick={() => showView("tokenomics")} type="button">
+                          <RailTokenomicsIcon aria-hidden="true" />
+                          <span>Tokenomics</span>
+                        </SettingsNavItem>
+                      )}
+                      {settingsNavShow("Communication") && (
+                        <SettingsNavItem onClick={() => showView("devices")} type="button">
+                          <RailDevicesIcon aria-hidden="true" />
+                          <span>Communication</span>
                         </SettingsNavItem>
                       )}
                     </SettingsNavGroups>

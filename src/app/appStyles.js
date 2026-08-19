@@ -25746,6 +25746,7 @@ export const RailTopActions = styled.div`
 export const RailAccountBar = styled.div`
   position: relative;
   display: flex;
+  min-width: 0;
   align-items: center;
   margin-top: 6px;
   padding-top: 8px;
@@ -25782,6 +25783,8 @@ export const RailAccountChipButton = styled.button`
   text-align: left;
 
   span:last-child {
+    flex: 1;
+    min-width: 0;
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
@@ -25790,6 +25793,15 @@ export const RailAccountChipButton = styled.button`
   &:hover {
     color: var(--forge-text);
     background: var(--forge-surface-hover);
+  }
+
+  [data-collapsed="true"] & {
+    justify-content: center;
+    padding: 7px 0;
+  }
+
+  [data-collapsed="true"] & span:last-child {
+    display: none;
   }
 `;
 
