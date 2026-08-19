@@ -24,6 +24,7 @@ export default function SessionTranscript({ session }) {
   const [liveTail, setLiveTail] = useState(null);
   const [windowState, setWindowState] = useState({ start: 0, rows: [] });
   const [loadState, setLoadState] = useState("loading"); // loading | ready | empty | error
+  const [caughtUp, setCaughtUp] = useState(true);
   const heightsRef = useRef(new Map()); // seq -> measured px
   const stickBottomRef = useRef(true);
   const fetchInFlightRef = useRef(false);
@@ -41,6 +42,7 @@ export default function SessionTranscript({ session }) {
       });
       setTotalRows(Number(result?.total_rows) || 0);
       setLiveTail(result?.live_tail || null);
+      setCaughtUp(result?.caught_up !== false);
       setWindowState({
         start: Number(result?.start_index) || 0,
         rows: Array.isArray(result?.rows) ? result.rows : [],
@@ -155,6 +157,9 @@ export default function SessionTranscript({ session }) {
 
   return (
     <TranscriptScroller onScroll={onScroll} ref={scrollerRef}>
+      {!caughtUp && (
+        <SyncHint aria-live="polite">syncing history…</SyncHint>
+      )}
       {topSpacer > 0 && <div aria-hidden="true" style={{ height: topSpacer }} />}
       {windowState.rows.filter((row) => row.kind !== "usage").map((row) => (
         <TranscriptRow
@@ -278,6 +283,21 @@ const LiveCaret = styled.span`
       opacity: 0;
     }
   }
+`;
+
+const SyncHint = styled.div`
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  width: fit-content;
+  margin: 0 auto 4px;
+  padding: 2px 9px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: var(--forge-surface);
+  font-size: 9.5px;
+  font-weight: 600;
 `;
 
 const TranscriptNotice = styled.div`
