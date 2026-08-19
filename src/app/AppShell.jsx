@@ -24043,6 +24043,11 @@ export default function App() {
                   aria-label="Workspace navigation"
                   data-collapsed={workspaceRailCollapsed}
                   data-space-mode={spaceMode}
+                  onClick={() => {
+                    // Clicking empty rail space deselects → the flame home view.
+                    setSessionDraftOpen(false);
+                    setActiveSessionId("");
+                  }}
                   ref={workspaceRailRef}
                 >
                   <RailTop>
@@ -24634,9 +24639,17 @@ export default function App() {
                   {!loopspacesModeActive && (
                     <SessionSurface
                       activeSessionId={activeSessionId}
+                      appThemeIsLight={activeAppTheme === APP_THEME_LIGHT}
                       draftOpen={sessionDraftOpen}
                       onDraftMaterialized={handleDraftMaterialized}
+                      onOpenSession={openSessionFromRail}
+                      onResetToDraft={startNewSessionChat}
+                      onToggleTheme={() => updateAppTheme(
+                        activeAppTheme === APP_THEME_LIGHT ? APP_THEME_DARK : APP_THEME_LIGHT,
+                      )}
                       openSessions={openSessions}
+                      planKey={String(planLabel || "free").toLowerCase()}
+                      sessions={sessions}
                     />
                   )}
                 </WorkspaceViewPane>

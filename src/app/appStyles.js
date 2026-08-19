@@ -2582,7 +2582,7 @@ export const WorkspaceStartupDetails = styled.div`
 
 export const DashboardShell = styled.main`
   --workspace-rail-width: 160px;
-  --workspace-rail-collapsed-width: 56px;
+  --workspace-rail-collapsed-width: 44px;
   --workspace-rail-target-width: var(--workspace-rail-width);
 
   position: relative;
@@ -2673,7 +2673,7 @@ export const WorkspaceRail = styled.aside`
   /* Collapsing only narrows the rail: vertical metrics (gap, top/bottom
      padding) stay identical so icons never shift vertically between states. */
   &[data-collapsed="true"] {
-    padding: 8px 6px;
+    padding: 8px 4px;
   }
 
   @media (max-width: 760px) {

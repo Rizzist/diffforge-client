@@ -413,6 +413,45 @@ fn haider_bridge_reconcile(sessions: &[HaiderBridgeSession]) -> Result<bool, Str
             .map_err(|error| format!("Unable to reconcile Haider session: {error}"))?;
         changed = true;
     }
+    // Import daemon sessions the store doesn't know (created directly in the
+    // haider CLI/TUI) so the home view can continue them. No directory is
+    // known until the harness exposes cwd, so they land as pinned rows with
+    // an empty dir and attach at the default working directory.
+    let bound: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|row| !row.provider_session_id.trim().is_empty())
+        .map(|row| row.provider_session_id.as_str())
+        .collect();
+    for session in sessions {
+        if session.id.trim().is_empty() || bound.contains(session.id.as_str()) {
+            continue;
+        }
+        let now_ms = sessions_now_ms();
+        let latest = session.latest_at_ms.unwrap_or(now_ms);
+        let title = session
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| "Haider session".to_string());
+        let status = haider_bridge_store_status(session.state.as_deref());
+        transaction
+            .execute(
+                "INSERT INTO sessions (
+                    id, title, slug, dir, kind, provider, provider_session_id,
+                    created_at_ms, latest_at_ms, status, first_user_message
+                 ) VALUES (?1, ?2, '', '', 'pinned', 'haider', ?3, ?4, ?5, ?6, '')",
+                rusqlite::params![
+                    sessions_new_id(now_ms),
+                    title,
+                    session.id,
+                    latest,
+                    latest,
+                    status,
+                ],
+            )
+            .map_err(|error| format!("Unable to import Haider session: {error}"))?;
+        changed = true;
+    }
     transaction
         .commit()
         .map_err(|error| format!("Unable to commit Haider reconciliation: {error}"))?;

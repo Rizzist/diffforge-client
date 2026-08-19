@@ -137,11 +137,14 @@ export default function SessionTranscript({ session }) {
   const rowsBelow = Math.max(0, totalRows - windowState.start - windowState.rows.length);
   const bottomSpacer = rowsBelow * ROW_ESTIMATE_PX;
 
-  if (loadState === "error") {
-    return <TranscriptNotice>Unable to load this session's transcript.</TranscriptNotice>;
-  }
-  if (loadState === "empty" && !liveTail) {
-    return <TranscriptNotice data-quiet="true">No messages yet.</TranscriptNotice>;
+  if ((loadState === "error" || loadState === "empty") && !liveTail && !windowState.rows.length) {
+    // A missing/empty projection is a normal state for young or unbound
+    // sessions — show a quiet empty chat, never a hard error wall.
+    return (
+      <TranscriptNotice data-quiet="true">
+        No messages here yet — send one below, or open the Shell view.
+      </TranscriptNotice>
+    );
   }
 
   return (
