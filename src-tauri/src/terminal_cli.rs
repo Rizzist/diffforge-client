@@ -2682,6 +2682,11 @@ fn prepare_terminal_launch_account(
     provider_id: &str,
     launch_account_binding: &TerminalProviderLaunchAccountBinding,
 ) -> Result<Option<Value>, String> {
+    // Haider accounts live in the daemon and switch in realtime; no frozen
+    // per-launch capture applies, so launches must not require one.
+    if provider_id == "haider" {
+        return Ok(None);
+    }
     let account_binding = launch_account_binding
         .matches_provider_id(provider_id)
         .then(|| launch_account_binding.captured_account())

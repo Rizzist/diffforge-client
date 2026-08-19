@@ -20875,7 +20875,7 @@ export default function App() {
   const assetWorkspaceOptions = EMPTY_ARRAY;
   const workspaceTerminalDispatchTargets = EMPTY_ARRAY;
   const loopspacesModeActive = spaceMode === APP_SPACE_MODE_LOOPSPACES;
-  const railSpaceModeLabel = loopspacesModeActive ? "Loopspaces" : "Workspaces";
+  const railSpaceModeLabel = loopspacesModeActive ? "Loopspaces" : "Sessions";
   const railSpaceModeTitle = loopspacesModeActive ? "Show workspaces" : "Enter Loopspaces";
   const loopspaceSettingsLoop = loopspaceSettingsPanelId
     ? loopspaceById.get(loopspaceSettingsPanelId) || null

@@ -1782,58 +1782,10 @@ const TERMINAL_SESSION_MODE_ACTIVITY = "activity";
 const TERMINAL_SESSION_MODE_FREE = "free";
 const TERMINAL_SESSION_MODE_REMOTE_OPS = "remote_ops";
 const FORGE_LIGHT_THEME_ID = "light";
-export const TERMINAL_DARK_THEME = {
-  background: TERMINAL_THEME_BACKGROUND,
-  foreground: "#e8eef8",
-  cursor: "#ff9a3d",
-  cursorAccent: "#030508",
-  selectionBackground: "#2f80ff55",
-  black: "#030508",
-  brightBlack: "#687386",
-  blue: "#62a0ff",
-  brightBlue: "#8bb9ff",
-  cyan: "#6fd7ff",
-  brightCyan: "#a7e8ff",
-  green: "#7ee787",
-  brightGreen: "#9dffad",
-  magenta: "#d2a8ff",
-  brightMagenta: "#e1c7ff",
-  red: "#ff6b6b",
-  brightRed: "#ff9a9a",
-  white: "#e8eef8",
-  brightWhite: "#ffffff",
-  yellow: "#ffb269",
-  brightYellow: "#ffd08a",
-  scrollbarSliderBackground: "rgba(172, 185, 207, 0.46)",
-  scrollbarSliderHoverBackground: "rgba(192, 204, 224, 0.62)",
-  scrollbarSliderActiveBackground: "rgba(210, 221, 238, 0.78)",
-};
-export const TERMINAL_LIGHT_THEME = {
-  background: "#ffffff",
-  foreground: "#1d1d1f",
-  cursor: "#0066cc",
-  cursorAccent: "#ffffff",
-  selectionBackground: "#0066cc26",
-  black: "#1d1d1f",
-  brightBlack: "#7a7a7a",
-  blue: "#0066cc",
-  brightBlue: "#0071e3",
-  cyan: "#0066cc",
-  brightCyan: "#0071e3",
-  green: "#0a7f45",
-  brightGreen: "#0a7f45",
-  magenta: "#5e5ce6",
-  brightMagenta: "#5e5ce6",
-  red: "#b42318",
-  brightRed: "#d92d20",
-  white: "#f5f5f7",
-  brightWhite: "#ffffff",
-  yellow: "#8b5a00",
-  brightYellow: "#8b5a00",
-  scrollbarSliderBackground: "rgba(0, 102, 204, 0.24)",
-  scrollbarSliderHoverBackground: "rgba(0, 102, 204, 0.34)",
-  scrollbarSliderActiveBackground: "rgba(0, 102, 204, 0.46)",
-};
+// Themes moved to ./terminalCore so light hosts (SessionTerminal, the
+// detached window) don't have to import this whole module for two objects.
+export { TERMINAL_DARK_THEME, TERMINAL_LIGHT_THEME } from "./terminalCore";
+import { TERMINAL_DARK_THEME, TERMINAL_LIGHT_THEME } from "./terminalCore";
 
 function getCurrentForgeThemeId() {
   if (typeof document === "undefined") {

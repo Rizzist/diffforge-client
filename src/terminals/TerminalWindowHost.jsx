@@ -46,7 +46,7 @@ import {
   TERMINAL_WINDOW_META_EVENT,
   TERMINAL_WINDOW_META_REQUEST_EVENT,
 } from "./terminalWindowBridge.js";
-import { TERMINAL_DARK_THEME, TERMINAL_LIGHT_THEME } from "./WorkspaceTerminal/index.jsx";
+import { TERMINAL_DARK_THEME, TERMINAL_LIGHT_THEME } from "./WorkspaceTerminal/terminalCore";
 
 export const TERMINAL_WINDOW_HASH = "#/terminal-window";
 export const TERMINAL_WINDOW_CLOSED_EVENT = "forge-terminal-window-closed";

@@ -9,7 +9,7 @@ import { guardXtermDuringPushToTalk } from "../terminals/xtermPushToTalkGuard.js
 import {
   TERMINAL_DARK_THEME,
   TERMINAL_LIGHT_THEME,
-} from "../terminals/WorkspaceTerminal/index.jsx";
+} from "../terminals/WorkspaceTerminal/terminalCore.js";
 import { sessionWorkingDirectory, updateSession } from "./sessionsModel.js";
 
 /* Lean single-PTY host for a Haider session pane. Deliberately NOT the

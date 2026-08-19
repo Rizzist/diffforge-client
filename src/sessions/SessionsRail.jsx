@@ -52,7 +52,7 @@ export default function SessionsRail({
           <SettingsNavGroupLabel>{group.label}</SettingsNavGroupLabel>
           <RailViewActions aria-label={`Sessions from ${group.label}`}>
             {group.sessions.map((session) => (
-              <RailActionButton
+              <SessionRowButton
                 data-active={session.id === activeSessionId ? "true" : undefined}
                 key={session.id}
                 onClick={() => onSelectSession(session)}
@@ -67,7 +67,7 @@ export default function SessionsRail({
                 <SessionRowMeta>
                   {formatSessionRelativeTime(session.latest_at_ms, nowMs)}
                 </SessionRowMeta>
-              </RailActionButton>
+              </SessionRowButton>
             ))}
           </RailViewActions>
         </SessionDayGroup>
@@ -97,6 +97,38 @@ const SessionDayGroup = styled.div`
   gap: 2px;
 `;
 
+/* Dedicated row: RailActionButton's internal span sizing wraps a
+   three-part row (dot · title · meta) onto two lines; this keeps the
+   same 26px/11px metrics and active pill on a plain flex row. */
+const SessionRowButton = styled.button`
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  min-height: 26px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--forge-text-soft);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 550;
+  cursor: pointer;
+  text-align: left;
+
+  &:hover {
+    color: var(--forge-text);
+    background: var(--forge-surface-hover);
+  }
+
+  &[data-active="true"] {
+    color: var(--forge-text);
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.52);
+    background: var(--forge-surface-selected);
+  }
+`;
+
 const SessionStatusDot = styled.span`
   width: 6px;
   height: 6px;
@@ -114,6 +146,8 @@ const SessionStatusDot = styled.span`
 `;
 
 const SessionRowTitle = styled.span`
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;

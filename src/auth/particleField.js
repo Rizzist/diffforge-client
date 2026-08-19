@@ -174,15 +174,32 @@ export function createParticleField({
   let bootClock = 0;
   const sprites = new Map();
 
-  const fullDpr = Math.min(2, window.devicePixelRatio || 1);
+  const readFullDpr = () => Math.min(2, window.devicePixelRatio || 1);
+  let fullDpr = readFullDpr();
   // Flight frames render at 1x; settle snaps to full retina resolution.
   let dpr = initialPhase === PHASES.BOOT && !reduced ? 1 : fullDpr;
+  let viewportWidth = window.innerWidth;
+  let viewportHeight = window.innerHeight;
+
+  const sizeCanvas = () => {
+    viewportWidth = window.innerWidth;
+    viewportHeight = window.innerHeight;
+    const backingWidth = Math.round(viewportWidth * dpr);
+    const backingHeight = Math.round(viewportHeight * dpr);
+
+    // Assigning either backing-store dimension resets every bit of 2d context
+    // state, including the transform. Keep all canvas resizing here and always
+    // restore CSS-pixel coordinates before returning, even when layout() is
+    // called re-entrantly from a phase callback.
+    if (canvas.width !== backingWidth) canvas.width = backingWidth;
+    if (canvas.height !== backingHeight) canvas.height = backingHeight;
+    canvas.style.width = `${viewportWidth}px`;
+    canvas.style.height = `${viewportHeight}px`;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  };
 
   const layout = () => {
-    canvas.width = Math.round(window.innerWidth * dpr);
-    canvas.height = Math.round(window.innerHeight * dpr);
-    canvas.style.width = `${window.innerWidth}px`;
-    canvas.style.height = `${window.innerHeight}px`;
+    sizeCanvas();
     const rect = anchor.getBoundingClientRect();
     center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
     maxDist = 1;
@@ -269,8 +286,21 @@ export function createParticleField({
     }
     const pt = ph === PHASES.BOOT && !reduced ? bootClock : now - phaseStart;
 
+    // Switch resolution only at the frame boundary. layout() both refreshes
+    // the anchor geometry and restores the transform reset by the resize.
+    if (ph === PHASES.BOOT && !bootFired) {
+      const doneAt = reduced ? REDUCED_BOOT_TOTAL_MS : BOOT_TOTAL_MS;
+      if (pt > doneAt) {
+        bootFired = true;
+        fullDpr = readFullDpr();
+        dpr = fullDpr;
+        layout();
+        onBootDone?.();
+      }
+    }
+
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    ctx.clearRect(0, 0, viewportWidth, viewportHeight);
     // Additive blending only for the tail of the windup and the
     // detonation itself; switching at success start blooms the whole
     // logo white in one frame, which is harsh on the eyes.
@@ -280,17 +310,6 @@ export function createParticleField({
         ? "lighter"
         : "source-over";
 
-    if (ph === PHASES.BOOT && !bootFired) {
-      const doneAt = reduced ? REDUCED_BOOT_TOTAL_MS : BOOT_TOTAL_MS;
-      if (pt > doneAt) {
-        bootFired = true;
-        if (dpr !== fullDpr) {
-          dpr = fullDpr;
-          layout();
-        }
-        onBootDone?.();
-      }
-    }
     if (ph !== PHASES.LAUNCH) launchInit = false;
     if (ph !== PHASES.SUCCESS) successFired = false;
 
@@ -417,7 +436,13 @@ export function createParticleField({
     .then(() => start(sampleLogo(img)))
     .catch(() => start(fallbackPoints()));
 
-  const onResize = () => layout();
+  const onResize = () => {
+    fullDpr = readFullDpr();
+    // Keep boot flight at its intentional 1x setting; every other state,
+    // including a settled boot hold and a fading launch, tracks display DPR.
+    dpr = phase === PHASES.BOOT && !reduced && !bootFired ? 1 : fullDpr;
+    layout();
+  };
   window.addEventListener("resize", onResize);
 
   return {
@@ -425,13 +450,14 @@ export function createParticleField({
       if (dead || next === phase) return;
       phase = next;
       phaseStart = performance.now();
+      fullDpr = readFullDpr();
+      dpr = next === PHASES.BOOT && !reduced ? 1 : fullDpr;
+      // Re-read the anchor at every semantic transition. This covers host
+      // layout settling (fonts/late styles) even when no window resize fired.
+      layout();
       if (next === PHASES.BOOT) {
         bootFired = false;
         bootClock = 0;
-        if (!reduced && dpr !== 1) {
-          dpr = 1;
-          layout();
-        }
         scatterForBoot();
       }
     },
