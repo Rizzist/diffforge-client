@@ -158,6 +158,7 @@ export const GlobalStyle = createGlobalStyle`
     --forge-amber: #dfa55a;
     --forge-ember: #d97935;
     --forge-green: #3ccb7f;
+    --forge-trajectory-model: #8b7cf6;
     --forge-red: #ef6b6b;
     --forge-color-scheme: dark;
     /* Architecture diagram (default/dark fallback) */
@@ -231,6 +232,7 @@ export const GlobalStyle = createGlobalStyle`
     --forge-amber: #dfa55a;
     --forge-ember: #d97935;
     --forge-green: #3ccb7f;
+    --forge-trajectory-model: #8b7cf6;
     --forge-red: #ef6b6b;
     --forge-color-scheme: dark;
     /* Architecture diagram (dark) */
@@ -290,6 +292,7 @@ export const GlobalStyle = createGlobalStyle`
     --forge-amber: #8b5a00;
     --forge-ember: #0066cc;
     --forge-green: #0a7f45;
+    --forge-trajectory-model: #5b3fd4;
     --forge-red: #b42318;
     --forge-color-scheme: light;
     --forge-light-canvas: #ffffff;

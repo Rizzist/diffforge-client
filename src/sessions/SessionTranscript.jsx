@@ -73,7 +73,13 @@ export default function SessionTranscript({ session }) {
         setTotalRows(total);
         setLoadState(total > 0 ? "ready" : "empty");
         await fetchWindow(Math.max(0, total - WINDOW_FETCH_SIZE));
+        // A quick view switch during the awaits above must not spawn a live
+        // feed nobody owns — re-check, and compensate if attach raced close.
+        if (disposed) return;
         await invoke("session_projection_attach", { session_id: sessionId });
+        if (disposed) {
+          void invoke("session_projection_detach", { session_id: sessionId }).catch(() => {});
+        }
       } catch {
         if (!disposed) setLoadState("error");
       }
@@ -154,8 +160,8 @@ export default function SessionTranscript({ session }) {
         <TranscriptRow
           data-kind={row.kind || "message"}
           data-role={row.role || ""}
-          key={row.seq}
-          ref={(element) => measureRow(row.seq, element)}
+          key={`${row.seq}:${row.ordinal || 0}`}
+          ref={(element) => measureRow(`${row.seq}:${row.ordinal || 0}`, element)}
         >
           <RowBody data-kind={row.kind || "message"} data-role={row.role || ""}>
             {row.kind === "tool" ? (

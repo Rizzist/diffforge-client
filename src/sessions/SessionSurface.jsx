@@ -212,10 +212,11 @@ export default function SessionSurface({
             data-active={modeFor(session.id) === "trajectory" ? "true" : undefined}
             onClick={() => setModeFor(session.id, "trajectory")}
             role="tab"
+            title="Trajectory"
             type="button"
           >
             <Timeline aria-hidden="true" size={13} />
-            <span>Trajectory</span>
+            <span>Traj</span>
           </SessionViewButton>
         )}
       </SessionViewToggle>

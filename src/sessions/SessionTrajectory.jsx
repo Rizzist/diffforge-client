@@ -8,7 +8,12 @@ import styled from "styled-components";
    detail list. Fed by session_projection_trajectory — lean points only,
    payloads never cross the wire. Usage rows fold into per-turn token/cache
    stats anchored to the preceding assistant event; cache-miss shading only
-   appears when the harness actually reported cache counts. */
+   appears when the harness actually reported cache counts.
+
+   The canvas is viewport-sized and sticky inside the scroller (a spacer div
+   carries the logical width): browser canvases cap at ~32k device px, so a
+   long session must never size the backing store — the visible x-window is
+   repainted on scroll instead, which also keeps the lane labels pinned. */
 
 const STEP_PX = 11;
 const TURN_GAP_PX = 9;
@@ -17,8 +22,11 @@ const LANE_TOP = 8;
 const LANE_H = 17;
 const TOKEN_LANE_H = 22;
 const STRIP_PAD = 10;
+const LABEL_GUTTER = 54;
+const STRIP_H = LANE_TOP + LANE_H * 3 + TOKEN_LANE_H + 8;
 const LIST_ROW_PX = 26;
 const CACHE_MISS_MIN_INPUT = 1000;
+const TOOLTIP_CLAMP_PX = 150;
 
 function formatDuration(ms) {
   if (!ms || ms < 1000) {
@@ -72,16 +80,19 @@ function eventClass(point) {
   return { lane: 1, color: "model" };
 }
 
-/* Usage snapshots may be per-turn or cumulative running totals; a
-   nondecreasing input series reads as cumulative and gets differenced. */
+/* Usage snapshots may be per-turn or cumulative running totals. Growing
+   context makes per-turn INPUT nondecreasing too, so input alone proves
+   nothing — only treat the series as cumulative when input AND output are
+   both nondecreasing over 3+ points. (The real fix is a fold-side tag once
+   the harness marks its usage semantics; this heuristic then retires.) */
 function usageDeltas(usagePoints) {
   const known = usagePoints.filter((p) => p.input != null || p.output != null);
-  if (known.length < 2) {
+  if (known.length < 3) {
     return known.map((p) => ({ ...p }));
   }
-  const inputs = known.map((p) => p.input ?? 0);
-  const cumulative = inputs.every((v, i) => i === 0 || v >= inputs[i - 1]);
-  if (!cumulative) {
+  const nondecreasing = (field) =>
+    known.every((p, i) => i === 0 || (p[field] ?? 0) >= (known[i - 1][field] ?? 0));
+  if (!nondecreasing("input") || !nondecreasing("output")) {
     return known.map((p) => ({ ...p }));
   }
   return known.map((p, i) => {
@@ -98,9 +109,9 @@ export default function SessionTrajectory({ session }) {
   const sessionId = session?.id || "";
   const [points, setPoints] = useState([]);
   const [loadState, setLoadState] = useState("loading");
-  const [selectedSeq, setSelectedSeq] = useState(null);
-  const [hover, setHover] = useState(null); // { x, y, point }
-  const [themeTick, setThemeTick] = useState(0);
+  const [selectedKey, setSelectedKey] = useState(null);
+  const [hover, setHover] = useState(null); // { x, point } — x in content coords
+  const [paintTick, setPaintTick] = useState(0);
   const [listScrollTop, setListScrollTop] = useState(0);
   const [listHeight, setListHeight] = useState(300);
   const canvasRef = useRef(null);
@@ -108,8 +119,10 @@ export default function SessionTrajectory({ session }) {
   const listRef = useRef(null);
   const stickRightRef = useRef(true);
   const listStickRef = useRef(true);
-  const geometryRef = useRef({ events: [], width: 0 });
+  const scrollFrameRef = useRef(0);
   const refreshTimerRef = useRef(0);
+
+  const repaint = useCallback(() => setPaintTick((t) => t + 1), []);
 
   const fetchTrajectory = useCallback(async () => {
     if (!sessionId) return;
@@ -126,12 +139,14 @@ export default function SessionTrajectory({ session }) {
   }, [sessionId]);
 
   /* Lifecycle mirrors the transcript: ensure cold fold, attach live feed,
-     refetch (debounced) on appends. */
+     refetch (debounced) on appends. The disposed re-checks around attach
+     matter: a quick view switch during the initial awaits would otherwise
+     spawn a live feed nobody owns. */
   useEffect(() => {
     if (!sessionId) return undefined;
     let disposed = false;
     setPoints([]);
-    setSelectedSeq(null);
+    setSelectedKey(null);
     setLoadState("loading");
     stickRightRef.current = true;
     listStickRef.current = true;
@@ -141,7 +156,11 @@ export default function SessionTrajectory({ session }) {
         await invoke("session_projection_ensure", { session_id: sessionId });
         if (disposed) return;
         await fetchTrajectory();
+        if (disposed) return;
         await invoke("session_projection_attach", { session_id: sessionId });
+        if (disposed) {
+          void invoke("session_projection_detach", { session_id: sessionId }).catch(() => {});
+        }
       } catch {
         if (!disposed) setLoadState("error");
       }
@@ -168,16 +187,36 @@ export default function SessionTrajectory({ session }) {
     };
   }, [sessionId, fetchTrajectory]);
 
-  /* Repaint when the app theme flips — canvas reads CSS variables. */
+  /* Repaint when the app theme flips (canvas reads CSS variables) and when
+     the window moves to a display with a different pixel ratio. */
   useEffect(() => {
     if (typeof MutationObserver !== "function") return undefined;
-    const observer = new MutationObserver(() => setThemeTick((t) => t + 1));
+    const observer = new MutationObserver(repaint);
     observer.observe(document.documentElement, {
       attributes: true,
       attributeFilter: ["data-forge-theme"],
     });
     return () => observer.disconnect();
-  }, []);
+  }, [repaint]);
+
+  useEffect(() => {
+    let disposed = false;
+    let media = null;
+    const arm = () => {
+      if (disposed || typeof window.matchMedia !== "function") return;
+      media = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      const onChange = () => {
+        media.removeEventListener("change", onChange);
+        repaint();
+        arm();
+      };
+      media.addEventListener("change", onChange);
+    };
+    arm();
+    return () => {
+      disposed = true;
+    };
+  }, [repaint]);
 
   const derived = useMemo(() => {
     const events = [];
@@ -185,23 +224,24 @@ export default function SessionTrajectory({ session }) {
     let lastAssistant = null;
     for (const point of points) {
       if (point.kind === "usage") {
-        usageRaw.push({ ...point, anchorSeq: lastAssistant?.seq ?? null });
+        usageRaw.push({ ...point, anchorKey: lastAssistant?.key ?? null });
         continue;
       }
-      const entry = { ...point, tokens: null };
+      /* Row identity is (seq, ordinal); ordinal defaults to 0 pre-pipe. */
+      const entry = { ...point, key: `${point.seq}:${point.ordinal || 0}`, tokens: null };
       events.push(entry);
       if (point.kind === "message" && point.role === "assistant") {
         lastAssistant = entry;
       }
     }
     const deltas = usageDeltas(usageRaw);
-    const bySeq = new Map(events.map((entry) => [entry.seq, entry]));
+    const byKey = new Map(events.map((entry) => [entry.key, entry]));
     let tokenTotal = 0;
     let cachedTotal = 0;
     let inputTotal = 0;
     let cacheKnown = false;
     for (const usage of deltas) {
-      const anchor = usage.anchorSeq != null ? bySeq.get(usage.anchorSeq) : null;
+      const anchor = usage.anchorKey != null ? byKey.get(usage.anchorKey) : null;
       const input = usage.input ?? 0;
       const output = usage.output ?? 0;
       tokenTotal += input + output;
@@ -218,6 +258,11 @@ export default function SessionTrajectory({ session }) {
         };
       }
     }
+    /* Anthropic-shaped usage reports cache reads OUTSIDE input_tokens; when
+       cached exceeds input, the true share is cached / (input + cached). */
+    const cacheDenominator = cachedTotal > inputTotal
+      ? inputTotal + cachedTotal
+      : inputTotal;
     const stamps = events.map((e) => e.at_ms).filter((t) => t > 0);
     return {
       events,
@@ -225,29 +270,16 @@ export default function SessionTrajectory({ session }) {
       calls: events.filter((e) => e.kind === "tool").length,
       durationMs: stamps.length ? Math.max(...stamps) - Math.min(...stamps) : 0,
       tokenTotal,
-      cachePct: cacheKnown && inputTotal > 0
-        ? Math.round((cachedTotal / inputTotal) * 100)
+      cachePct: cacheKnown && cacheDenominator > 0
+        ? Math.min(100, Math.round((cachedTotal / cacheDenominator) * 100))
         : null,
       cacheKnown,
     };
   }, [points]);
 
-  /* Layout + paint. Geometry (per-event x) is kept for hit-testing. */
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const colors = {
-      input: cssColor("--forge-green", "#34d27b"),
-      model: cssColor("--forge-trajectory-model", "#8b7cf6"),
-      tool: cssColor("--forge-amber", "#e8a33d"),
-      error: cssColor("--forge-red", "#e5534b"),
-      grid: cssColor("--forge-border", "rgba(128,128,128,0.25)"),
-      label: cssColor("--forge-text-muted", "#8a919c"),
-      hit: cssColor("--forge-green", "#34d27b"),
-      ring: cssColor("--forge-text", "#e8ecf1"),
-    };
-
-    let x = STRIP_PAD + 44;
+  /* Layout geometry is pure data — the draw effect and hit-testing share it. */
+  const geometry = useMemo(() => {
+    let x = LABEL_GUTTER + STRIP_PAD;
     const separators = [];
     const placed = derived.events.map((event, index) => {
       if (event.role === "user" && index > 0) {
@@ -258,44 +290,59 @@ export default function SessionTrajectory({ session }) {
       x += STEP_PX;
       return at;
     });
-    const width = Math.max(x + STRIP_PAD, 320);
-    const height = LANE_TOP + LANE_H * 3 + TOKEN_LANE_H + 8;
-    geometryRef.current = { events: placed, width };
+    const maxTokens = placed.reduce((max, event) => {
+      const total = (event.tokens?.input ?? 0) + (event.tokens?.output ?? 0);
+      return Math.max(max, total);
+    }, 0);
+    return { placed, separators, width: Math.max(x + STRIP_PAD, 320), maxTokens };
+  }, [derived]);
+
+  /* Paint the visible x-window onto the viewport-sized sticky canvas. */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const scroller = stripScrollRef.current;
+    if (!canvas || !scroller) return;
+    const viewWidth = Math.max(scroller.clientWidth, 60);
+    const scrollLeft = scroller.scrollLeft;
+    const colors = {
+      input: cssColor("--forge-green", "#34d27b"),
+      model: cssColor("--forge-trajectory-model", "#8b7cf6"),
+      tool: cssColor("--forge-amber", "#e8a33d"),
+      error: cssColor("--forge-red", "#e5534b"),
+      grid: cssColor("--forge-border", "rgba(128,128,128,0.25)"),
+      label: cssColor("--forge-text-muted", "#8a919c"),
+      surface: cssColor("--forge-surface", "#101418"),
+      hit: cssColor("--forge-green", "#34d27b"),
+      ring: cssColor("--forge-text", "#e8ecf1"),
+    };
 
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(width * dpr);
-    canvas.height = Math.floor(height * dpr);
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
+    canvas.width = Math.floor(viewWidth * dpr);
+    canvas.height = Math.floor(STRIP_H * dpr);
+    canvas.style.width = `${viewWidth}px`;
+    canvas.style.height = `${STRIP_H}px`;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, width, height);
+    ctx.clearRect(0, 0, viewWidth, STRIP_H);
+    ctx.save();
+    ctx.translate(-scrollLeft, 0);
 
-    ctx.font = "600 9px ui-sans-serif, system-ui";
-    ctx.fillStyle = colors.label;
-    ctx.textBaseline = "middle";
-    const laneNames = ["Input", "Model", "Tools"];
-    laneNames.forEach((name, lane) => {
-      ctx.fillText(name, STRIP_PAD, LANE_TOP + lane * LANE_H + SQUARE_PX / 2 + 1);
-    });
-    ctx.fillText("Tokens", STRIP_PAD, LANE_TOP + 3 * LANE_H + TOKEN_LANE_H / 2);
+    const minX = scrollLeft - STEP_PX * 2;
+    const maxX = scrollLeft + viewWidth + STEP_PX * 2;
 
     ctx.strokeStyle = colors.grid;
     ctx.lineWidth = 1;
-    for (const sx of separators) {
+    for (const sx of geometry.separators) {
+      if (sx < minX || sx > maxX) continue;
       ctx.beginPath();
       ctx.moveTo(sx + 0.5, LANE_TOP - 3);
       ctx.lineTo(sx + 0.5, LANE_TOP + 3 * LANE_H + 2);
       ctx.stroke();
     }
 
-    const maxTokens = placed.reduce((max, event) => {
-      const total = (event.tokens?.input ?? 0) + (event.tokens?.output ?? 0);
-      return Math.max(max, total);
-    }, 0);
-
-    for (const event of placed) {
+    for (const event of geometry.placed) {
+      if (event.x < minX || event.x > maxX) continue;
       const { lane, color } = eventClass(event);
       const y = LANE_TOP + lane * LANE_H;
       ctx.fillStyle = colors[color];
@@ -307,7 +354,7 @@ export default function SessionTrajectory({ session }) {
       }
       ctx.fill();
 
-      if (event.seq === selectedSeq) {
+      if (event.key === selectedKey) {
         ctx.strokeStyle = colors.ring;
         ctx.lineWidth = 1.5;
         ctx.strokeRect(event.x - 2, y - 2, SQUARE_PX + 4, SQUARE_PX + 4);
@@ -322,18 +369,20 @@ export default function SessionTrajectory({ session }) {
       }
 
       /* Tokens bar: log-scaled, cached share tinted green from the top. */
-      if (tokens && maxTokens > 0) {
+      if (tokens && geometry.maxTokens > 0) {
         const total = (tokens.input ?? 0) + (tokens.output ?? 0);
         if (total > 0) {
           const h = Math.max(
             2,
-            Math.round((Math.log10(total + 1) / Math.log10(maxTokens + 1)) * (TOKEN_LANE_H - 6)),
+            Math.round(
+              (Math.log10(total + 1) / Math.log10(geometry.maxTokens + 1)) * (TOKEN_LANE_H - 6),
+            ),
           );
           const barY = LANE_TOP + 3 * LANE_H + (TOKEN_LANE_H - 4) - h;
           ctx.fillStyle = colors.model;
           ctx.fillRect(event.x + 1, barY, SQUARE_PX - 2, h);
           const cachedShare = tokens.input > 0 && tokens.cached != null
-            ? Math.min(1, tokens.cached / tokens.input)
+            ? Math.min(1, tokens.cached / Math.max(tokens.input, tokens.cached))
             : 0;
           if (cachedShare > 0) {
             ctx.fillStyle = colors.hit;
@@ -343,19 +392,67 @@ export default function SessionTrajectory({ session }) {
       }
     }
 
-    if (stickRightRef.current && stripScrollRef.current) {
-      stripScrollRef.current.scrollLeft = stripScrollRef.current.scrollWidth;
+    ctx.restore();
+
+    /* Lane labels stay pinned: painted last in viewport coords over an
+       opaque gutter so squares scroll underneath them. */
+    ctx.fillStyle = colors.surface;
+    ctx.fillRect(0, 0, LABEL_GUTTER - 8, STRIP_H);
+    ctx.font = "600 9px ui-sans-serif, system-ui";
+    ctx.fillStyle = colors.label;
+    ctx.textBaseline = "middle";
+    ["Input", "Model", "Tools"].forEach((name, lane) => {
+      ctx.fillText(name, STRIP_PAD, LANE_TOP + lane * LANE_H + SQUARE_PX / 2 + 1);
+    });
+    ctx.fillText("Tokens", STRIP_PAD, LANE_TOP + 3 * LANE_H + TOKEN_LANE_H / 2);
+  }, [geometry, selectedKey, paintTick]);
+
+  /* Stick to the live edge on new data; scrolling repaints the window. */
+  useEffect(() => {
+    const scroller = stripScrollRef.current;
+    if (stickRightRef.current && scroller) {
+      scroller.scrollLeft = scroller.scrollWidth;
     }
-  }, [derived, selectedSeq, themeTick]);
+    repaint();
+  }, [geometry, repaint]);
+
+  useEffect(() => {
+    const scroller = stripScrollRef.current;
+    if (!scroller || typeof ResizeObserver !== "function") return undefined;
+    const observer = new ResizeObserver(repaint);
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [repaint, loadState]);
+
+  const onStripScroll = useCallback(() => {
+    const node = stripScrollRef.current;
+    if (!node) return;
+    stickRightRef.current =
+      node.scrollWidth - node.scrollLeft - node.clientWidth < 40;
+    setHover(null);
+    if (!scrollFrameRef.current) {
+      scrollFrameRef.current = window.requestAnimationFrame(() => {
+        scrollFrameRef.current = 0;
+        repaint();
+      });
+    }
+  }, [repaint]);
+
+  useEffect(() => () => {
+    if (scrollFrameRef.current) window.cancelAnimationFrame(scrollFrameRef.current);
+  }, []);
 
   const hitTest = useCallback((clientX, clientY) => {
     const canvas = canvasRef.current;
-    if (!canvas) return null;
+    const scroller = stripScrollRef.current;
+    if (!canvas || !scroller) return null;
     const rect = canvas.getBoundingClientRect();
-    const mx = clientX - rect.left;
+    const viewX = clientX - rect.left;
+    if (viewX < LABEL_GUTTER - 8) return null; // squares under the gutter are hidden
+    const mx = viewX + scroller.scrollLeft;
     const my = clientY - rect.top;
     let best = null;
-    for (const event of geometryRef.current.events) {
+    for (const event of geometry.placed) {
       const { lane } = eventClass(event);
       const y = LANE_TOP + lane * LANE_H;
       const dx = Math.abs(mx - (event.x + SQUARE_PX / 2));
@@ -366,24 +463,29 @@ export default function SessionTrajectory({ session }) {
       }
     }
     return best?.event || null;
-  }, []);
+  }, [geometry]);
 
   const onStripMove = useCallback((mouse) => {
     const event = hitTest(mouse.clientX, mouse.clientY);
-    if (!event) {
+    const scroller = stripScrollRef.current;
+    if (!event || !scroller) {
       setHover(null);
       return;
     }
-    const host = stripScrollRef.current;
-    const hostRect = host.getBoundingClientRect();
+    /* Tooltip lives in the scroller's CONTENT coordinates: clamp the pointer
+       position into the visible window, then add scrollLeft. */
+    const hostRect = scroller.getBoundingClientRect();
+    const viewX = mouse.clientX - hostRect.left;
+    const lo = Math.min(TOOLTIP_CLAMP_PX, scroller.clientWidth / 2);
+    const hi = Math.max(lo, scroller.clientWidth - TOOLTIP_CLAMP_PX);
     setHover({
-      x: Math.min(Math.max(mouse.clientX - hostRect.left, 70), hostRect.width - 70),
+      x: scroller.scrollLeft + Math.min(Math.max(viewX, lo), hi),
       point: event,
     });
   }, [hitTest]);
 
-  const scrollListTo = useCallback((seq) => {
-    const index = derived.events.findIndex((event) => event.seq === seq);
+  const scrollListTo = useCallback((key) => {
+    const index = derived.events.findIndex((event) => event.key === key);
     if (index < 0 || !listRef.current) return;
     listStickRef.current = false;
     listRef.current.scrollTop = Math.max(0, index * LIST_ROW_PX - listHeight / 2);
@@ -392,16 +494,9 @@ export default function SessionTrajectory({ session }) {
   const onStripClick = useCallback((mouse) => {
     const event = hitTest(mouse.clientX, mouse.clientY);
     if (!event) return;
-    setSelectedSeq(event.seq);
-    scrollListTo(event.seq);
+    setSelectedKey(event.key);
+    scrollListTo(event.key);
   }, [hitTest, scrollListTo]);
-
-  const onStripScroll = useCallback(() => {
-    const node = stripScrollRef.current;
-    if (!node) return;
-    stickRightRef.current =
-      node.scrollWidth - node.scrollLeft - node.clientWidth < 40;
-  }, []);
 
   /* List: fixed-height rows → exact windowing without measurement. */
   useEffect(() => {
@@ -490,7 +585,8 @@ export default function SessionTrajectory({ session }) {
         onScroll={onStripScroll}
         ref={stripScrollRef}
       >
-        <canvas ref={canvasRef} />
+        <StripCanvas ref={canvasRef} />
+        <StripSpacer aria-hidden="true" style={{ width: geometry.width }} />
         {hover && (
           <StripTooltip style={{ left: hover.x }}>
             <TooltipKind data-color={eventClass(hover.point).color}>
@@ -515,9 +611,9 @@ export default function SessionTrajectory({ session }) {
           const { color } = eventClass(event);
           return (
             <EventRow
-              data-selected={event.seq === selectedSeq ? "true" : undefined}
-              key={event.seq}
-              onClick={() => setSelectedSeq(event.seq)}
+              data-selected={event.key === selectedKey ? "true" : undefined}
+              key={event.key}
+              onClick={() => setSelectedKey(event.key)}
               title={event.label}
               type="button"
             >
@@ -626,15 +722,26 @@ const LegendCache = styled.span`
 const StripScroller = styled.div`
   position: relative;
   flex: 0 0 auto;
+  height: ${STRIP_H}px;
   overflow-x: auto;
   overflow-y: hidden;
   border-bottom: 1px solid var(--forge-border);
   background: var(--forge-surface);
+`;
 
-  canvas {
-    display: block;
-    cursor: crosshair;
-  }
+/* Sticky viewport canvas: stays pinned while the spacer provides the scroll
+   range; the draw effect translates by scrollLeft. */
+const StripCanvas = styled.canvas`
+  position: sticky;
+  left: 0;
+  display: block;
+  cursor: crosshair;
+`;
+
+const StripSpacer = styled.div`
+  height: 1px;
+  margin-top: -1px;
+  pointer-events: none;
 `;
 
 const StripTooltip = styled.div`
