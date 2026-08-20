@@ -328,8 +328,9 @@ export default function SessionComposer({
 
 const ComposerRoot = styled.div`
   flex: 0 0 auto;
-  /* Session Deck measure: the composer shares the title/transcript column. */
-  width: min(54rem, calc(100% - 28px));
+  /* Session Deck measure: shares the transcript column, including its
+     scaling side gutter (near-none narrow → 56px before centering wins). */
+  width: min(54rem, calc(100% - 2 * max(14px, min(4.5%, 56px))));
   margin: 6px auto 12px;
 `;
 

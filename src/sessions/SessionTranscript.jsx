@@ -569,9 +569,10 @@ const TranscriptScroller = styled.div`
   min-height: 0;
   overflow-y: auto;
   /* Session Deck measure: the scroller spans the pane (scrollbar at the
-     edge) while its content centers on the shared ~54rem column that the
-     title line and composer also use. */
-  padding: 8px max(20px, calc((100% - 54rem) / 2)) 8px;
+     edge) while its content centers on the shared ~54rem column the
+     composer also uses. The side gutter SCALES — near-none when the pane
+     is narrow, growing with width (to 56px) until the centering wins. */
+  padding: 8px max(min(4.5%, 56px), calc((100% - 54rem) / 2)) 8px;
 `;
 
 const TranscriptRow = styled.div`
