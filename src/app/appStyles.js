@@ -2970,15 +2970,24 @@ export const RailBackgroundPill = styled.button`
   display: inline-flex;
   min-width: 0;
   flex: 0 0 auto;
+  height: 20px;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  padding: 3px 9px;
-  border: 1px solid color-mix(in srgb, var(--forge-ember) 34%, transparent);
+  gap: 4px;
+  padding: 0 8px;
   border-radius: 999px;
-  color: var(--forge-ember);
-  background: color-mix(in srgb, var(--forge-ember) 10%, transparent);
-  font-size: 10.5px;
+  /* Space-tinted like the badge: blue in Workspaces, ember in Loopspaces. */
+  border: 1px solid color-mix(in srgb, var(--forge-blue, #2f80ff) 38%, transparent);
+  color: var(--forge-blue, #62a0ff);
+  background: color-mix(in srgb, var(--forge-blue, #2f80ff) 12%, transparent);
+
+  &[data-space="loopspaces"] {
+    border-color: color-mix(in srgb, var(--forge-ember) 34%, transparent);
+    color: var(--forge-ember);
+    background: color-mix(in srgb, var(--forge-ember) 10%, transparent);
+  }
+
+  font-size: 9px;
   font-weight: 750;
   letter-spacing: 0.02em;
   white-space: nowrap;
@@ -3000,6 +3009,11 @@ export const RailBackgroundPill = styled.button`
   }
 
   &:hover {
+    border-color: color-mix(in srgb, var(--forge-blue, #2f80ff) 62%, transparent);
+    background: color-mix(in srgb, var(--forge-blue, #2f80ff) 18%, transparent);
+  }
+
+  &[data-space="loopspaces"]:hover {
     border-color: color-mix(in srgb, var(--forge-ember) 62%, transparent);
     background: color-mix(in srgb, var(--forge-ember) 16%, transparent);
   }
@@ -25206,7 +25220,10 @@ export const WindowSyncPill = styled.button`
 export const RailSyncPill = styled(WindowSyncPill)`
   min-width: 0;
   flex: 0 1 auto;
+  height: 20px;
+  padding: 0 8px;
   justify-content: center;
+  font-size: 9px;
   /* Informational (session-history sync) — not a click target. */
   cursor: default;
 

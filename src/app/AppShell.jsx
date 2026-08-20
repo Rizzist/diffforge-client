@@ -24163,6 +24163,7 @@ export default function App() {
                       <RailUtilityRow onClick={(event) => event.stopPropagation()}>
                         <RailBackgroundPill
                           aria-label="Run in background"
+                          data-space={loopspacesModeActive ? "loopspaces" : "workspaces"}
                           onClick={enterBackgroundMode}
                           title="Run in background — agents keep working, the window folds away"
                           type="button"

@@ -27,17 +27,15 @@ import { formatSessionRelativeTime } from "./sessionsModel.js";
 
 /* Main-pane surface for sessions — the Session Deck workspace.
 
-   Structure (per the approved /sdc design):
-   - NO top bar. The workspace is content-first: its FIRST LINE is the
-     session title as typography (with an ellipsis menu for Pin/Rename),
-     never a toolbar.
-   - The view controls FLOAT in the workspace's top-right corner: the
+   Structure (per the approved /sdc design, user iteration 2):
+   - NO top bar. ONE header row on every tab: small session title + its
+     ellipsis menu (Pin/Rename) on the left, the view cluster on the right —
      Chat|Shell|Traj segmented toggle (panel tabs — Web, PCB, AI Video —
-     ride the same segmented control, added via its "+"), the exact harness
-     status pill, and the theme toggle. App-level pills (Background, cloud
-     sync) are RAIL-owned, never floated here.
-   - Title, transcript, and composer share one centered ~54rem measure;
-     the Shell view alone bleeds full-width.
+     ride the same control via its "+"), the exact harness status pill, and
+     the theme toggle. The row wraps only when the pane is narrow. App-level
+     pills (Background, sync) are RAIL-owned, never here.
+   - Transcript and composer share one centered ~54rem measure; the Shell
+     view alone bleeds full-width.
    - A session is harness data, not a PTY: Chat view reads the projection.
      For the ACTIVE session (and the draft) Chat and Shell BOTH stay mounted
      — the unselected view collapses to display:none — so toggling is
