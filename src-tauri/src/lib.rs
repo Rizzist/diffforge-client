@@ -2980,6 +2980,7 @@ include!("workspace_files.rs");
 include!("sessions.rs");
 include!("haider_bridge.rs");
 include!("haider_projection.rs");
+mod haider_rpc_ade;
 include!("haider_run.rs");
 include!("architectures.rs");
 include!("pcb.rs");
@@ -6312,6 +6313,12 @@ fn run_app(daemon: bool) {
             session_start_with_prompt,
             session_submit_prompt,
             haider_library_snapshot,
+            session_config_get,
+            session_config_set,
+            haider_rpc_ade::rpc_features,
+            haider_rpc_ade::surface_attach,
+            haider_rpc_ade::surface_detach,
+            haider_rpc_ade::surface_publish_input,
             haider_usage_snapshot,
             open_html_document_in_browser,
             app_local_state_load,

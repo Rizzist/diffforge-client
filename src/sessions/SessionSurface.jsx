@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 import { Forum } from "@styled-icons/material-rounded/Forum";
@@ -83,27 +84,145 @@ export default function SessionSurface({
   /* Chips show REALITY (the session's actual model/provider, the harness's
      actual account), never an unapplied local preference — switching stays
      read-only until the harness exposes a headless door for it. */
-  const chipValuesFor = (session) => ({
-    model: session?.model || "default",
-    effort: "default",
-    speed: "default",
-    provider: session?.provider || usageMeta?.account?.provider || "default",
-    account: usageMeta?.account?.alias || "default",
-  });
+  /* Live session config (0.0.933 session_config_v1) — fetched per session,
+     applied through session_config_set; chips reflect the daemon's truth. */
+  const [sessionConfigs, setSessionConfigs] = useState({});
+  const [paneOverrides, setPaneOverrides] = useState({});
+  const [surfaceStatus, setSurfaceStatus] = useState({});
+  const [surfaceInput, setSurfaceInput] = useState({});
+
+  const refreshConfig = useCallback((sessionId) => {
+    void invoke("session_config_get", { session_id: sessionId })
+      .then((config) => {
+        if (config && typeof config === "object") {
+          setSessionConfigs((current) => ({ ...current, [sessionId]: config }));
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (activeSessionId && activeSessionId !== "draft") {
+      refreshConfig(activeSessionId);
+      void invoke("surface_attach", { session_id: activeSessionId }).catch(() => {});
+    }
+  }, [activeSessionId, refreshConfig]);
+
+  /* Daemon-owned volatile surfaces (input mirror + status segment): events
+     arrive keyed by PROVIDER session id; map to local rows. */
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    void listen("session-surface", (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      const local = sessions.find(
+        (row) => row.provider_session_id === payload.session_id,
+      );
+      if (!local) return;
+      if (payload.status?.line != null) {
+        setSurfaceStatus((current) => ({ ...current, [local.id]: payload.status.line }));
+      }
+      if (payload.input?.text != null) {
+        setSurfaceInput((current) => {
+          const previous = current[local.id];
+          if (previous && previous.revision >= (payload.input.revision || 0)) {
+            return current;
+          }
+          return { ...current, [local.id]: payload.input };
+        });
+      }
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, [sessions]);
+
+  /* tui_attach_announce_v1: the TUI told us which session its PTY now
+     serves — auto-select it and re-home the live pane under it. */
+  const handleTuiAttached = useCallback(({ paneId, providerSessionId, hostSessionId }) => {
+    if (!providerSessionId) {
+      return; // back at the launcher — the pane keeps its host session
+    }
+    const target = sessions.find(
+      (row) => row.provider_session_id === providerSessionId,
+    );
+    if (!target || target.id === hostSessionId) {
+      return;
+    }
+    setPaneOverrides((current) => {
+      const next = { ...current };
+      for (const key of Object.keys(next)) {
+        if (next[key] === paneId) delete next[key];
+      }
+      next[target.id] = paneId;
+      return next;
+    });
+    setTerminalStarted((current) => ({ ...current, [target.id]: true }));
+    setViewModes((current) => ({ ...current, [target.id]: "terminal" }));
+    onOpenSession?.(target);
+  }, [sessions, onOpenSession]);
+
+  const chipValuesFor = (session) => {
+    const config = session ? sessionConfigs[session.id] : null;
+    const prefs = composerPrefs[session?.id || "draft"] || {};
+    return {
+      model: config?.model || prefs.model || session?.model || "default",
+      effort: config?.effort || prefs.effort || "default",
+      speed: config?.speed === "fast" || prefs.speed === "fast" ? "fast" : "default",
+      provider: config?.provider || session?.provider || usageMeta?.account?.provider || "default",
+      account: config?.account_alias || prefs.account || usageMeta?.account?.alias || "default",
+    };
+  };
   const chipOptionsFor = () => {
     const models = Array.isArray(library?.models) ? library.models : [];
+    const accounts = Array.isArray(library?.accounts) ? library.accounts : [];
     return {
       model: [...new Set(models.map((entry) => entry?.model).filter(Boolean))],
       provider: [...new Set(models.map((entry) => entry?.provider).filter(Boolean))],
-      account: library?.account?.alias ? [library.account.alias] : [],
+      account: accounts.length
+        ? accounts
+        : library?.account?.alias
+          ? [library.account.alias]
+          : [],
     };
   };
+  /* Bound sessions apply through the harness (session_config_set) so the
+     TUI, the daemon, and the chips agree; the draft stashes prefs that ride
+     the first `haider run` as flags. */
   const handleChipChange = useCallback((sessionId, key, option) => {
     setComposerPrefs((current) => ({
       ...current,
       [sessionId]: { ...(current[sessionId] || {}), [key]: option },
     }));
-  }, []);
+    if (sessionId !== "draft") {
+      const value = option === "default" ? null : option;
+      const patch = { session_id: sessionId };
+      if (key === "model") patch.model = value;
+      else if (key === "effort") patch.effort = value;
+      else if (key === "speed") patch.speed = value === null ? "normal" : value;
+      else if (key === "account") patch.account = value;
+      else return;
+      void invoke("session_config_set", patch)
+        .then(() => refreshConfig(sessionId))
+        .catch(() => {});
+    }
+  }, [refreshConfig]);
+
+  const runConfigFromPrefs = (prefs) => {
+    const pick = (value) => (value && value !== "default" ? value : null);
+    const config = {
+      model: pick(prefs.model),
+      effort: pick(prefs.effort),
+      speed: prefs.speed === "fast" ? "fast" : null,
+      account: pick(prefs.account),
+    };
+    return Object.values(config).some((v) => v) ? config : null;
+  };
 
   const modeFor = (sessionId) => viewModes[sessionId] || "ui";
   const setModeFor = useCallback((sessionId, mode) => {
@@ -159,10 +278,12 @@ export default function SessionSurface({
     submitBusyRef.current = true;
     setDraftError("");
     try {
+      const config = runConfigFromPrefs(composerPrefs.draft || {});
       const row = await invoke("session_start_with_prompt", {
         prompt,
         pinned_dir: null,
         attachments: attachments?.length ? attachments : null,
+        config,
       });
       if (row?.id) {
         onDraftMaterialized(row);
@@ -238,10 +359,12 @@ export default function SessionSurface({
       {session && session.id !== "draft" && (
         <StatusPill data-status={session.status}>
           <i aria-hidden="true" />
-          {/* The pill mirrors the HARNESS's own state word (the TUI status
-              bar), falling back to the bucket only when raw is absent. */}
+          {/* status_segment_v1: the pill mirrors the TUI's bottom-left strip
+              byte-for-byte when the daemon publishes it; state_raw and the
+              buckets are the fallbacks. */}
           <span>
-            {(session.state_raw || "").trim()
+            {(surfaceStatus[session.id] || "").trim()
+              || (session.state_raw || "").trim()
               || (session.status === "running"
                 ? "Running"
                 : session.status === "waiting"
@@ -443,7 +566,20 @@ export default function SessionSurface({
                     chipCapabilities={library?.capabilities || {}}
                     chipOptions={chipOptionsFor()}
                     chipValues={chipValuesFor(session)}
+                    mirror={surfaceInput[session.id] || null}
                     onChipChange={(key, option) => handleChipChange(session.id, key, option)}
+                    onMirrorType={(text) => {
+                      const revision = (surfaceInput[session.id]?.revision || 0) + 1;
+                      setSurfaceInput((current) => ({
+                        ...current,
+                        [session.id]: { text, revision },
+                      }));
+                      void invoke("surface_publish_input", {
+                        session_id: session.id,
+                        text,
+                        revision,
+                      }).catch(() => {});
+                    }}
                     onSubmit={(prompt, attachments) => submitIntoSession(session, prompt, attachments)}
                   />
                 </>
@@ -453,7 +589,12 @@ export default function SessionSurface({
               )}
               {chatTabActive && terminalEverStarted && (
                 <TerminalHostLayer data-visible={mode === "terminal" ? "true" : "false"}>
-                  <SessionTerminal active={active && mode === "terminal"} session={session} />
+                  <SessionTerminal
+                    active={active && mode === "terminal"}
+                    onTuiAttached={handleTuiAttached}
+                    paneIdOverride={paneOverrides[session.id]}
+                    session={session}
+                  />
                 </TerminalHostLayer>
               )}
 

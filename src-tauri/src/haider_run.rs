@@ -19,6 +19,15 @@ struct HaiderRunAccepted {
     head_seq: i64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+struct RunConfig {
+    model: Option<String>,
+    effort: Option<String>,
+    speed: Option<String>,
+    account: Option<String>,
+}
+
 fn haider_run_children() -> &'static StdMutex<HashMap<String, HaiderRunChild>> {
     static CHILDREN: OnceLock<StdMutex<HashMap<String, HaiderRunChild>>> = OnceLock::new();
     CHILDREN.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -34,6 +43,115 @@ fn haider_run_prompt(prompt: String) -> Result<String, String> {
         ));
     }
     Ok(prompt)
+}
+
+fn haider_run_validate_config_value(field: &str, value: &str) -> Result<(), String> {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._/-".contains(character))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Haider {field} must contain only letters, numbers, '.', '_', '/', or '-'."
+        ))
+    }
+}
+
+fn haider_run_validate_config(config: &RunConfig) -> Result<(), String> {
+    for (field, value) in [
+        ("model", config.model.as_deref()),
+        ("effort", config.effort.as_deref()),
+        ("speed", config.speed.as_deref()),
+        ("account", config.account.as_deref()),
+    ] {
+        if let Some(value) = value {
+            haider_run_validate_config_value(field, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn haider_run_append_config(command: &mut Command, config: &RunConfig) -> Result<(), String> {
+    haider_run_validate_config(config)?;
+    for (flag, value) in [
+        ("--model", config.model.as_deref()),
+        ("--effort", config.effort.as_deref()),
+        ("--speed", config.speed.as_deref()),
+        ("--account", config.account.as_deref()),
+    ] {
+        if let Some(value) = value {
+            command.arg(flag).arg(value);
+        }
+    }
+    Ok(())
+}
+
+fn haider_session_config_get_command(provider_session_id: &str) -> Command {
+    let mut command = Command::new("haider");
+    command.args(["session", provider_session_id, "config", "--json"]);
+    command
+}
+
+fn haider_session_config_set_command(
+    provider_session_id: &str,
+    config: &RunConfig,
+) -> Result<Command, String> {
+    let mut command = Command::new("haider");
+    command.args(["session", provider_session_id, "config"]);
+    haider_run_append_config(&mut command, config)?;
+    Ok(command)
+}
+
+fn haider_run_capture_json(command: Command) -> Result<Value, String> {
+    let Some((success, stdout, stderr)) = haider_run_capture(command) else {
+        return Err("Haider command was unavailable or timed out.".to_string());
+    };
+    if !success {
+        let detail = String::from_utf8_lossy(&stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "Haider command was not supported.".to_string()
+        } else {
+            detail
+        });
+    }
+    serde_json::from_slice(&stdout)
+        .ok()
+        .or_else(|| {
+            stdout
+                .split(|byte| *byte == b'\n')
+                .rev()
+                .find_map(|line| serde_json::from_slice(line).ok())
+        })
+        .ok_or_else(|| "Haider returned an invalid JSON response.".to_string())
+}
+
+fn haider_run_execute(command: Command) -> Result<(), String> {
+    let Some((success, _, stderr)) = haider_run_capture(command) else {
+        return Err("Haider command was unavailable or timed out.".to_string());
+    };
+    if success {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&stderr).trim().to_string();
+        Err(if detail.is_empty() {
+            "Haider command was not supported.".to_string()
+        } else {
+            detail
+        })
+    }
+}
+
+fn haider_run_provider_session_id(session_id: &str) -> Result<String, String> {
+    let connection = sessions_open_database()?;
+    let row = sessions_row_by_id(&connection, session_id.trim())?;
+    let provider_session_id = row.provider_session_id.trim();
+    if provider_session_id.is_empty() {
+        Err("Haider session id is not bound yet.".to_string())
+    } else {
+        Ok(provider_session_id.to_string())
+    }
 }
 
 fn haider_run_title(prompt: &str) -> String {
@@ -317,6 +435,7 @@ fn haider_run_spawn(
     prompt: String,
     cwd: PathBuf,
     attachments: Vec<String>,
+    config: Option<RunConfig>,
     binding_sender: Option<std::sync::mpsc::SyncSender<Result<SessionRow, String>>>,
 ) -> Result<(), String> {
     if haider_run_is_active(&local_session_id)? {
@@ -333,6 +452,9 @@ fn haider_run_spawn(
         command.args(["--session", provider_session_id]);
     }
     command.args(["--output", "jsonl"]);
+    if let Some(config) = config.as_ref() {
+        haider_run_append_config(&mut command, config)?;
+    }
     // `haider run --attach <path>` is repeatable; only existing files ride.
     for attachment in &attachments {
         let path = attachment.trim();
@@ -537,9 +659,13 @@ async fn session_start_with_prompt(
     prompt: String,
     pinned_dir: Option<String>,
     attachments: Option<Vec<String>>,
+    config: Option<RunConfig>,
 ) -> Result<SessionRow, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let prompt = haider_run_prompt(prompt)?;
+        if let Some(config) = config.as_ref() {
+            haider_run_validate_config(config)?;
+        }
         // Harness-first doctrine: the rail must never show an ADE-created
         // session. The store row exists silently (create/delete emit nothing)
         // until Haider reports the provider session id — the binding update
@@ -565,6 +691,7 @@ async fn session_start_with_prompt(
             prompt.clone(),
             cwd,
             attachments.clone().unwrap_or_default(),
+            config,
             Some(binding_sender),
         ) {
             discard_created(&app);
@@ -601,9 +728,13 @@ async fn session_submit_prompt(
     session_id: String,
     prompt: String,
     attachments: Option<Vec<String>>,
+    config: Option<RunConfig>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let prompt = haider_run_prompt(prompt)?;
+        if let Some(config) = config.as_ref() {
+            haider_run_validate_config(config)?;
+        }
         if !haider_run_supports_session() {
             return Err("haider_run_session_unsupported".to_string());
         }
@@ -631,6 +762,7 @@ async fn session_submit_prompt(
             prompt,
             cwd,
             attachments.unwrap_or_default(),
+            config,
             Some(binding_sender),
         ) {
             let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
@@ -659,9 +791,57 @@ async fn session_submit_prompt(
     .map_err(|error| format!("Session submit worker failed: {error}"))?
 }
 
+#[tauri::command(rename_all = "snake_case")]
+async fn session_config_get(session_id: String) -> Value {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = haider_run_provider_session_id(&session_id).and_then(|provider_session_id| {
+            haider_run_capture_json(haider_session_config_get_command(&provider_session_id))
+        });
+        result.unwrap_or_else(|error| json!({"ok": false, "error": error}))
+    })
+    .await
+    .unwrap_or_else(
+        |error| json!({"ok": false, "error": format!("Session config worker failed: {error}")}),
+    )
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn session_config_set(
+    app: AppHandle,
+    session_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+    speed: Option<String>,
+    account: Option<String>,
+) -> Result<Value, String> {
+    let config = RunConfig {
+        model,
+        effort,
+        speed,
+        account,
+    };
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let provider_session_id = haider_run_provider_session_id(&session_id)?;
+        let command = haider_session_config_set_command(&provider_session_id, &config)?;
+        haider_run_execute(command)?;
+        Ok::<_, String>(json!({"ok": true}))
+    })
+    .await
+    .map_err(|error| format!("Session config worker failed: {error}"))??;
+    haider_bridge_sync_once(&app).await;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod haider_run_tests {
     use super::*;
+
+    fn haider_run_test_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
 
     #[test]
     fn haider_run_title_is_whitespace_compacted_and_bounded() {
@@ -761,5 +941,84 @@ mod haider_run_tests {
         };
         assert!(haider_run_accepts_session(&accepted, "session-requested").is_ok());
         assert!(haider_run_accepts_session(&accepted, "session-other").is_err());
+    }
+
+    #[test]
+    fn haider_session_config_builds_get_and_sparse_set_args() {
+        assert_eq!(
+            haider_run_test_args(&haider_session_config_get_command("session-provider")),
+            ["session", "session-provider", "config", "--json"]
+        );
+
+        let config = RunConfig {
+            model: Some("openai/gpt-5.4".to_string()),
+            effort: None,
+            speed: Some("fast".to_string()),
+            account: Some("work_account-1".to_string()),
+        };
+        let command = haider_session_config_set_command("session-provider", &config).unwrap();
+        assert_eq!(
+            haider_run_test_args(&command),
+            [
+                "session",
+                "session-provider",
+                "config",
+                "--model",
+                "openai/gpt-5.4",
+                "--speed",
+                "fast",
+                "--account",
+                "work_account-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn haider_session_config_rejects_unsafe_values() {
+        for unsafe_value in ["", "high power", "x;touch", "$(command)", "name@host"] {
+            let config = RunConfig {
+                model: Some(unsafe_value.to_string()),
+                ..RunConfig::default()
+            };
+            assert!(haider_session_config_set_command("session-provider", &config).is_err());
+        }
+        let config = RunConfig {
+            effort: Some("xhigh".to_string()),
+            ..RunConfig::default()
+        };
+        assert!(haider_session_config_set_command("session-provider", &config).is_ok());
+    }
+
+    #[test]
+    fn haider_run_appends_all_config_flags() {
+        let mut command = Command::new("haider");
+        command.args(["run", "test prompt", "--output", "jsonl"]);
+        haider_run_append_config(
+            &mut command,
+            &RunConfig {
+                model: Some("anthropic/claude-sonnet".to_string()),
+                effort: Some("high".to_string()),
+                speed: Some("normal".to_string()),
+                account: Some("personal".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            haider_run_test_args(&command),
+            [
+                "run",
+                "test prompt",
+                "--output",
+                "jsonl",
+                "--model",
+                "anthropic/claude-sonnet",
+                "--effort",
+                "high",
+                "--speed",
+                "normal",
+                "--account",
+                "personal",
+            ]
+        );
     }
 }

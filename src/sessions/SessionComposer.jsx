@@ -38,15 +38,32 @@ export default function SessionComposer({
   chipValues = {},
   chipOptions = {},
   chipCapabilities = {},
+  mirror = null,
+  onMirrorType = null,
   onChipChange = null,
   slashCommands = null,
 }) {
   const [value, setValue] = useState("");
+  const mirrorRevisionRef = useRef(0);
   const [busy, setBusy] = useState(false);
   const [openMenu, setOpenMenu] = useState("");
   const [attachments, setAttachments] = useState([]);
   const textareaRef = useRef(null);
   const rootRef = useRef(null);
+
+  /* input_mirror_v1: the composer and the TUI input line are two views of
+     one daemon-owned buffer. Newer revisions from the daemon replace local
+     text; local typing publishes through onMirrorType. */
+  useEffect(() => {
+    if (!mirror || mirror.text == null) {
+      return;
+    }
+    const revision = mirror.revision || 0;
+    if (revision > mirrorRevisionRef.current) {
+      mirrorRevisionRef.current = revision;
+      setValue((current) => (current === mirror.text ? current : mirror.text));
+    }
+  }, [mirror]);
 
   const pickAttachments = useCallback(async () => {
     try {
@@ -217,7 +234,11 @@ export default function SessionComposer({
           <ComposerInput
             autoFocus={autoFocus}
             disabled={disabled || busy}
-            onChange={(event) => setValue(event.target.value)}
+            onChange={(event) => {
+              const text = event.target.value;
+              setValue(text);
+              onMirrorType?.(text);
+            }}
             onKeyDown={(event) => {
               if (event.key === "Escape" && slashActive) {
                 setValue("");

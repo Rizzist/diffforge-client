@@ -81,7 +81,9 @@ export function sessionPaneId(sessionId) {
   return `workspace-terminal-${sessionPaneToken(sessionId)}-0-haider`;
 }
 
-export default function SessionTerminal({ session, active }) {
+export default function SessionTerminal({ session, active, paneIdOverride, onTuiAttached }) {
+  const onTuiAttachedRef = useRef(onTuiAttached);
+  onTuiAttachedRef.current = onTuiAttached;
   const containerRef = useRef(null);
   const mountRef = useRef(null);
   const xtermRef = useRef(null);
@@ -97,7 +99,10 @@ export default function SessionTerminal({ session, active }) {
       return undefined;
     }
 
-    const paneId = sessionPaneId(session.id);
+    // A TUI hop re-homes the LIVE pane under the newly-attached session:
+    // the override points this host at the announcing pane, and the open
+    // below adopts the running PTY instead of launching a fresh one.
+    const paneId = paneIdOverride || sessionPaneId(session.id);
     let disposed = false;
     let term = null;
     let resizeTimer = 0;
@@ -218,6 +223,23 @@ export default function SessionTerminal({ session, active }) {
       term.parser.registerOscHandler(10, swallowOscColorQuery);
       term.parser.registerOscHandler(11, applyHarnessBackground);
       term.parser.registerOscHandler(12, swallowOscColorQuery);
+      // tui_attach_announce_v1: the TUI announces its bound session on every
+      // attach/hop/detach — OSC 7791 "haider;attached=<id>" (empty = back at
+      // the launcher). This is THE honest PTY↔session correlation; harnesses
+      // without the feature simply never emit it.
+      term.parser.registerOscHandler(7791, (data) => {
+        const text = String(data || "");
+        if (!text.startsWith("haider;attached=")) {
+          return false;
+        }
+        const providerId = text.slice("haider;attached=".length).trim();
+        onTuiAttachedRef.current?.({
+          paneId,
+          providerSessionId: providerId || null,
+          hostSessionId: session.id,
+        });
+        return true;
+      });
 
       term.onData((data) => {
         invoke("terminal_write", { pane_id: paneId, data }).catch(() => {});
@@ -352,7 +374,7 @@ export default function SessionTerminal({ session, active }) {
       xtermRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session?.id]);
+  }, [session?.id, paneIdOverride]);
 
   /* Refit + focus when this session becomes the visible one. */
   useEffect(() => {
