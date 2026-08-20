@@ -2660,9 +2660,9 @@ export const DashboardShell = styled.main`
 export const WorkspaceRail = styled.aside`
   display: grid;
   min-height: 0;
-  /* Rows: chrome head (traffic lights + brand + nav) · utility pills ·
-     scrolling session list · footer (device/account). */
-  grid-template-rows: auto auto minmax(0, 1fr) minmax(0, max-content);
+  /* Rows: chrome head (traffic row w/ pills + brand) · scrolling session
+     list · footer (views/device/account) PINNED at the bottom. */
+  grid-template-rows: auto minmax(0, 1fr) minmax(0, max-content);
   gap: 8px;
   padding: 8px;
   border-right: 1px solid rgba(var(--forge-tint-soft-rgb), 0.14);

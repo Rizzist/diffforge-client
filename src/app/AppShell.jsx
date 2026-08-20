@@ -24850,6 +24850,7 @@ export default function App() {
                       appThemeIsLight={activeAppTheme === APP_THEME_LIGHT}
                       draftOpen={sessionDraftOpen}
                       onDraftMaterialized={handleDraftMaterialized}
+                      onHeaderDragStart={handleTitleBarMouseDown}
                       onOpenSession={openSessionFromRail}
                       onResetToDraft={startNewSessionChat}
                       onSyncingChange={setSessionHistorySyncing}

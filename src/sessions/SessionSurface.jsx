@@ -55,6 +55,7 @@ export default function SessionSurface({
   appThemeIsLight = false,
   draftOpen,
   onDraftMaterialized,
+  onHeaderDragStart = null,
   onOpenSession,
   onResetToDraft,
   onSyncingChange,
@@ -455,7 +456,9 @@ export default function SessionSurface({
      view cluster (segmented, status pill, theme) on the right; wraps to a
      second line only when the pane is too narrow. */
   const workHeader = (session, options = {}) => (
-    <WorkHeader>
+    /* The header doubles as a window-drag region (AppShell's titlebar
+       handler: interactive elements opt out, double-click zooms). */
+    <WorkHeader onMouseDown={onHeaderDragStart || undefined}>
       {session ? renderTitleBlock(session) : <span />}
       <WorkHeaderSpacer aria-hidden="true" />
       {floatingControls(session, options)}
@@ -909,7 +912,11 @@ const WorkHeader = styled.div`
   align-items: center;
   flex-wrap: wrap;
   gap: 6px 10px;
-  padding: 10px 16px 4px;
+  padding: 10px 16px 8px;
+  border-bottom: 1px solid var(--forge-border);
+  /* Drag region (see workHeader). */
+  user-select: none;
+  -webkit-user-select: none;
 `;
 
 const WorkHeaderSpacer = styled.span`
