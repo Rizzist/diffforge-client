@@ -38,32 +38,22 @@ export default function SessionComposer({
   chipValues = {},
   chipOptions = {},
   chipCapabilities = {},
-  mirror = null,
+  value = "",
+  onValueChange = null,
   onMirrorType = null,
   onChipChange = null,
   slashCommands = null,
 }) {
-  const [value, setValue] = useState("");
-  const mirrorRevisionRef = useRef(0);
+  /* The draft text is SURFACE-owned (value/onValueChange): the composer
+     unmounts on every view/session switch, so component-local text would be
+     lost. The input_mirror_v1 reconcile (and its revision clock) lives in
+     SessionSurface for the same reason; local typing still publishes into
+     the daemon surface through onMirrorType. */
   const [busy, setBusy] = useState(false);
   const [openMenu, setOpenMenu] = useState("");
   const [attachments, setAttachments] = useState([]);
   const textareaRef = useRef(null);
   const rootRef = useRef(null);
-
-  /* input_mirror_v1: the composer and the TUI input line are two views of
-     one daemon-owned buffer. Newer revisions from the daemon replace local
-     text; local typing publishes through onMirrorType. */
-  useEffect(() => {
-    if (!mirror || mirror.text == null) {
-      return;
-    }
-    const revision = mirror.revision || 0;
-    if (revision > mirrorRevisionRef.current) {
-      mirrorRevisionRef.current = revision;
-      setValue((current) => (current === mirror.text ? current : mirror.text));
-    }
-  }, [mirror]);
 
   const pickAttachments = useCallback(async () => {
     try {
@@ -116,14 +106,14 @@ export default function SessionComposer({
     try {
       const accepted = await onSubmit(prompt, attachments);
       if (accepted !== false) {
-        setValue("");
+        onValueChange?.("");
         setAttachments([]);
       }
     } finally {
       setBusy(false);
       textareaRef.current?.focus();
     }
-  }, [attachments, busy, disabled, onSubmit, value]);
+  }, [attachments, busy, disabled, onSubmit, onValueChange, value]);
 
   const chip = (key, label, fallbackOptions = []) => {
     const current = String(chipValues[key] || "default");
@@ -245,7 +235,7 @@ export default function SessionComposer({
               <SlashItem
                 key={entry.command}
                 onClick={() => {
-                  setValue(`${entry.command} `);
+                  onValueChange?.(`${entry.command} `);
                   textareaRef.current?.focus();
                 }}
                 role="option"
@@ -288,17 +278,17 @@ export default function SessionComposer({
             disabled={disabled || busy}
             onChange={(event) => {
               const text = event.target.value;
-              setValue(text);
+              onValueChange?.(text);
               onMirrorType?.(text);
             }}
             onKeyDown={(event) => {
               if (event.key === "Escape" && slashActive) {
-                setValue("");
+                onValueChange?.("");
                 return;
               }
               if (event.key === "Tab" && slashActive && slashMatches.length) {
                 event.preventDefault();
-                setValue(`${slashMatches[0].command} `);
+                onValueChange?.(`${slashMatches[0].command} `);
                 return;
               }
               if (event.key === "Enter" && !event.shiftKey) {

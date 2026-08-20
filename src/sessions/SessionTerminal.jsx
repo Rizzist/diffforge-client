@@ -14,9 +14,11 @@ import { sessionWorkingDirectory } from "./sessionsModel.js";
 
 /* Lean single-PTY host for a Haider session pane. Deliberately NOT the
    19k-line WorkspaceTerminal: one terminal, one PTY, no thread overlay, no
-   role machinery. The PTY stays alive across session switches — the host
-   component stays mounted (hidden) for every opened session, so switching
-   back is instant and scrollback survives. */
+   role machinery. The PTY stays alive across session switches — it persists
+   daemon-side and each mount adopts it (adopt_existing), so switching back
+   is instant and scrollback survives. The ACTIVE session keeps this host
+   mounted warm behind Chat (display:none); measurement fails harmlessly
+   while hidden and the reveal refit below squares everything up. */
 
 const SESSION_TERMINAL_RESIZE_DEBOUNCE_MS = 120;
 const SESSION_TERMINAL_GRID_GUARD_PX = 2;
@@ -376,7 +378,9 @@ export default function SessionTerminal({ session, active, paneIdOverride, onTui
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.id, paneIdOverride]);
 
-  /* Refit + focus when this session becomes the visible one. */
+  /* Refit + focus on reveal (Chat→Shell flip or session switch). This is
+     the refit that squares up a mount that happened behind display:none, so
+     it must target the REAL pane — a hopped TUI lives on the override. */
   useEffect(() => {
     if (!active) {
       return;
@@ -392,13 +396,16 @@ export default function SessionTerminal({ session, active, paneIdOverride, onTui
         term.resize(measurement.cols, measurement.rows);
       }
       invoke("terminal_resize", {
-        pane_id: sessionPaneId(session.id),
+        pane_id: paneIdOverride || sessionPaneId(session.id),
         cols: measurement.cols,
         rows: measurement.rows,
       }).catch(() => {});
+      // A hidden mount can leave stale glyph metrics even at matching
+      // dimensions — repaint now that the box is measurable.
+      term.refresh(0, Math.max(0, term.rows - 1));
     }
     term.focus();
-  }, [active, session?.id]);
+  }, [active, session?.id, paneIdOverride]);
 
   return (
     <TerminalHost ref={containerRef}>

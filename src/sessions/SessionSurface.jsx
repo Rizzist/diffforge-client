@@ -32,9 +32,12 @@ import { formatSessionRelativeTime } from "./sessionsModel.js";
      now, live panels as they are re-scoped to sessions.
    - The Chat/Shell toggle, run-state pill, new-chat (reset to draft), and
      theme toggle FLOAT top-right over the content, dashboard-style.
-   - A session is harness data, not a PTY: Chat view reads the projection;
-     the Shell PTY spawns lazily on first entry and stays mounted.
-   - "New chat" is a zero-cost draft; the first prompt materializes it. */
+   - A session is harness data, not a PTY: Chat view reads the projection.
+     For the ACTIVE session (and the draft) Chat and Shell BOTH stay mounted
+     — the unselected view collapses to display:none — so toggling is
+     instant and the shell is already warm. Background sessions mount
+     nothing; their PTYs persist daemon-side and are re-adopted on return.
+   - "New chat" is a draft; the first prompt materializes it. */
 
 const PANEL_KINDS = {
   web: { label: "Web", Icon: Language },
@@ -55,8 +58,18 @@ export default function SessionSurface({
   sessions = [],
 }) {
   const [viewModes, setViewModes] = useState({});
-  const [terminalStarted, setTerminalStarted] = useState({});
   const [sessionTabs, setSessionTabs] = useState({});
+  /* Composer drafts are SURFACE-owned, keyed by session id ("draft" for the
+     unmaterialized chat): the composer unmounts on view/session switches, so
+     the text must outlive it. mirrorRevisionsRef is the ONE input_mirror_v1
+     revision clock per session — shared by local typing and daemon frames —
+     so a composer remount can never re-apply a stale mirror frame over
+     newer local text: whichever revision is newest owns the draft. */
+  const [composerTexts, setComposerTexts] = useState({});
+  const mirrorRevisionsRef = useRef({});
+  const setComposerText = useCallback((sessionId, text) => {
+    setComposerTexts((current) => ({ ...current, [sessionId]: text }));
+  }, []);
   const [composerPrefs, setComposerPrefs] = useState({});
   const [usageMeta, setUsageMeta] = useState(null);
   const [library, setLibrary] = useState(null);
@@ -89,7 +102,6 @@ export default function SessionSurface({
   const [sessionConfigs, setSessionConfigs] = useState({});
   const [paneOverrides, setPaneOverrides] = useState({});
   const [surfaceStatus, setSurfaceStatus] = useState({});
-  const [surfaceInput, setSurfaceInput] = useState({});
 
   const refreshConfig = useCallback((sessionId) => {
     void invoke("session_config_get", { session_id: sessionId })
@@ -124,13 +136,19 @@ export default function SessionSurface({
         setSurfaceStatus((current) => ({ ...current, [local.id]: payload.status.line }));
       }
       if (payload.input?.text != null) {
-        setSurfaceInput((current) => {
-          const previous = current[local.id];
-          if (previous && previous.revision >= (payload.input.revision || 0)) {
-            return current;
-          }
-          return { ...current, [local.id]: payload.input };
-        });
+        /* input_mirror_v1: a daemon frame replaces the hoisted draft only
+           when its revision beats everything seen so far — including local
+           typing, which bumps the same clock through onMirrorType. */
+        const revision = payload.input.revision || 0;
+        if (revision > (mirrorRevisionsRef.current[local.id] || 0)) {
+          mirrorRevisionsRef.current[local.id] = revision;
+          const text = payload.input.text;
+          setComposerTexts((current) => (
+            (current[local.id] || "") === text
+              ? current
+              : { ...current, [local.id]: text }
+          ));
+        }
       }
     }).then((fn) => {
       if (disposed) fn();
@@ -162,10 +180,14 @@ export default function SessionSurface({
       next[target.id] = paneId;
       return next;
     });
-    setTerminalStarted((current) => ({ ...current, [target.id]: true }));
-    setViewModes((current) => ({ ...current, [target.id]: "terminal" }));
+    /* Land where the user actually was: a hop driven from a live Shell keeps
+       the Shell; materializing from the Chat composer (the warm hidden TUI
+       announcing the bind) must land in Chat. */
+    if ((viewModes[hostSessionId] || "ui") === "terminal") {
+      setViewModes((current) => ({ ...current, [target.id]: "terminal" }));
+    }
     onOpenSession?.(target);
-  }, [sessions, onOpenSession]);
+  }, [sessions, onOpenSession, viewModes]);
 
   /* ONE model chip: provider, model, and the provider's bound account are a
      single coherent choice (a deepseek model can never ride an openai
@@ -245,9 +267,6 @@ export default function SessionSurface({
   const modeFor = (sessionId) => viewModes[sessionId] || "ui";
   const setModeFor = useCallback((sessionId, mode) => {
     setViewModes((current) => ({ ...current, [sessionId]: mode }));
-    if (mode === "terminal") {
-      setTerminalStarted((current) => ({ ...current, [sessionId]: true }));
-    }
   }, []);
 
   const tabsStateFor = (sessionId) => sessionTabs[sessionId] || {
@@ -415,10 +434,10 @@ export default function SessionSurface({
   );
 
   if (draftOpen) {
-    // Draft = the harness itself. Default view is the plain haider TUI at
-    // its main menu (the harness creates the session when the user acts);
-    // the Chat toggle offers the composer path, which also defers creation
-    // to the harness (session_start_with_prompt only surfaces bound rows).
+    // Draft = the harness itself. Default view is the Chat composer —
+    // selected and immediately typeable — with the plain haider TUI mounted
+    // warm behind it (Shell toggle). Both defer creation to the harness
+    // (session_start_with_prompt only surfaces bound rows).
     const draftSession = {
       id: "draft",
       title: "New chat",
@@ -428,7 +447,7 @@ export default function SessionSurface({
       provider_session_id: "",
       status: "idle",
     };
-    const draftMode = viewModes.draft || "terminal";
+    const draftMode = modeFor("draft");
     return (
       <SessionSurfaceRoot>
         <SessionPane data-active="true">
@@ -440,33 +459,34 @@ export default function SessionSurface({
             {floatingControls(draftSession)}
           </SessionTabBar>
           <PaneContent>
-            {draftMode === "ui" ? (
-              <>
-                <DraftBody>
-                  <EmptyState>
-                    <EmptyStateIcon aria-hidden="true">
-                      <TerminalGlyph size={22} />
-                    </EmptyStateIcon>
-                    <h2>No session yet.</h2>
-                    <p>Send a message below — the Haider harness creates the session and its folder on your first message. Nothing runs until then.</p>
-                    {draftError && <DraftError>{draftError}</DraftError>}
-                  </EmptyState>
-                </DraftBody>
-                <SessionComposer
-                  autoFocus
-                  chipCapabilities={library?.capabilities || {}}
-                  chipOptions={chipOptionsFor(null)}
-                  chipValues={chipValuesFor(null)}
-                  onChipChange={(key, option) => handleChipChange("draft", key, option)}
-                  onSubmit={submitDraft}
-                  placeholder="Message Haider…"
-                />
-              </>
-            ) : (
-              <TerminalHostLayer data-visible="true">
-                <SessionTerminal active session={draftSession} />
-              </TerminalHostLayer>
-            )}
+            {/* Both draft views stay mounted (hidden one display:none) so
+                Chat↔Shell flips are instant and the TUI stays warm. */}
+            <ChatHostLayer data-visible={draftMode === "ui" ? "true" : "false"}>
+              <DraftBody>
+                <EmptyState>
+                  <EmptyStateIcon aria-hidden="true">
+                    <TerminalGlyph size={22} />
+                  </EmptyStateIcon>
+                  <h2>No session yet.</h2>
+                  <p>Send a message below — the Haider harness creates the session and its folder on your first message. Nothing runs until then.</p>
+                  {draftError && <DraftError>{draftError}</DraftError>}
+                </EmptyState>
+              </DraftBody>
+              <SessionComposer
+                autoFocus
+                chipCapabilities={library?.capabilities || {}}
+                chipOptions={chipOptionsFor(null)}
+                chipValues={chipValuesFor(null)}
+                onChipChange={(key, option) => handleChipChange("draft", key, option)}
+                onSubmit={submitDraft}
+                onValueChange={(text) => setComposerText("draft", text)}
+                placeholder="Message Haider…"
+                value={composerTexts.draft || ""}
+              />
+            </ChatHostLayer>
+            <TerminalHostLayer data-visible={draftMode === "terminal" ? "true" : "false"}>
+              <SessionTerminal active={draftMode === "terminal"} session={draftSession} />
+            </TerminalHostLayer>
           </PaneContent>
         </SessionPane>
       </SessionSurfaceRoot>
@@ -523,7 +543,6 @@ export default function SessionSurface({
       {openSessions.map((session) => {
         const active = session.id === activeSessionId;
         const mode = modeFor(session.id);
-        const terminalEverStarted = Boolean(terminalStarted[session.id]);
         const { tabs, activeTabId } = tabsStateFor(session.id);
         const activeTab = tabs.find((tab) => tab.id === activeTabId) || tabs[0];
         const chatTabActive = activeTab.id === "chat";
@@ -576,44 +595,56 @@ export default function SessionSurface({
             </SessionTabBar>
 
             <PaneContent>
-              {/* Chat tab: transcript + composer, or the lazy Shell PTY. */}
-              {chatTabActive && mode === "ui" && active && (
+              {/* Chat tab: Chat and Shell BOTH stay mounted for the ACTIVE
+                  session — the unselected view is display:none — so flips
+                  are instant, xterm state survives, and the shell is live
+                  before the first toggle. Background sessions mount neither;
+                  their PTYs persist daemon-side and are re-adopted here. */}
+              {chatTabActive && active && (
                 <>
-                  <SessionTranscript session={session} />
-                  <SessionComposer
-                    chipCapabilities={library?.capabilities || {}}
-                    chipOptions={chipOptionsFor(session)}
-                    chipValues={chipValuesFor(session)}
-                    mirror={surfaceInput[session.id] || null}
-                    onChipChange={(key, option) => handleChipChange(session.id, key, option)}
-                    onMirrorType={(text) => {
-                      const revision = (surfaceInput[session.id]?.revision || 0) + 1;
-                      setSurfaceInput((current) => ({
-                        ...current,
-                        [session.id]: { text, revision },
-                      }));
-                      void invoke("surface_publish_input", {
-                        session_id: session.id,
-                        text,
-                        revision,
-                      }).catch(() => {});
-                    }}
-                    onSubmit={(prompt, attachments) => submitIntoSession(session, prompt, attachments)}
-                  />
+                  <ChatHostLayer data-visible={mode === "ui" ? "true" : "false"}>
+                    <SessionTranscript
+                      runStatus={session.status === "running"
+                        ? ((surfaceStatus[session.id] || "").trim()
+                          || (session.state_raw || "").trim()
+                          || "working…")
+                        : ""}
+                      session={session}
+                    />
+                    <SessionComposer
+                      chipCapabilities={library?.capabilities || {}}
+                      chipOptions={chipOptionsFor(session)}
+                      chipValues={chipValuesFor(session)}
+                      onChipChange={(key, option) => handleChipChange(session.id, key, option)}
+                      onMirrorType={(text) => {
+                        /* Local typing keeps publishing into the daemon
+                           surface, stamped from the shared revision clock so
+                           the publish is the newest frame by construction. */
+                        const revision = (mirrorRevisionsRef.current[session.id] || 0) + 1;
+                        mirrorRevisionsRef.current[session.id] = revision;
+                        void invoke("surface_publish_input", {
+                          session_id: session.id,
+                          text,
+                          revision,
+                        }).catch(() => {});
+                      }}
+                      onSubmit={(prompt, attachments) => submitIntoSession(session, prompt, attachments)}
+                      onValueChange={(text) => setComposerText(session.id, text)}
+                      value={composerTexts[session.id] || ""}
+                    />
+                  </ChatHostLayer>
+                  {mode === "trajectory" && (
+                    <SessionTrajectory session={session} />
+                  )}
+                  <TerminalHostLayer data-visible={mode === "terminal" ? "true" : "false"}>
+                    <SessionTerminal
+                      active={mode === "terminal"}
+                      onTuiAttached={handleTuiAttached}
+                      paneIdOverride={paneOverrides[session.id]}
+                      session={session}
+                    />
+                  </TerminalHostLayer>
                 </>
-              )}
-              {chatTabActive && mode === "trajectory" && active && (
-                <SessionTrajectory session={session} />
-              )}
-              {chatTabActive && terminalEverStarted && (
-                <TerminalHostLayer data-visible={mode === "terminal" ? "true" : "false"}>
-                  <SessionTerminal
-                    active={active && mode === "terminal"}
-                    onTuiAttached={handleTuiAttached}
-                    paneIdOverride={paneOverrides[session.id]}
-                    session={session}
-                  />
-                </TerminalHostLayer>
               )}
 
               {/* Panel tabs: picker, then staged panel stubs. */}
@@ -887,9 +918,22 @@ const HeaderIconButton = styled.button`
   }
 `;
 
+/* Keep-warm wrappers: the active session's Chat and Shell both stay mounted;
+   the view not selected collapses to display:none. */
 const TerminalHostLayer = styled.div`
   flex: 1;
   min-height: 0;
+
+  &[data-visible="false"] {
+    display: none;
+  }
+`;
+
+const ChatHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
 
   &[data-visible="false"] {
     display: none;

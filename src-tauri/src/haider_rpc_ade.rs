@@ -30,6 +30,13 @@ const WIRE_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_FRAME_LIMIT: usize = 48 * 1024 * 1024;
 const FEATURE_INPUT_MIRROR_V1: &str = "input_mirror_v1";
 const FEATURE_STATUS_SEGMENT_V1: &str = "status_segment_v1";
+const FEATURE_SESSION_LIST_WATCH_V1: &str = "session_list_watch_v1";
+const FEATURE_SESSION_CONFIG_V1: &str = "session_config_v1";
+const FEATURE_SESSION_OBSERVE_V1: &str = "session_observe_v1";
+const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
+const FEATURE_SESSION_EFFORT_SELECT_V1: &str = "session_effort_select_v1";
+const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
+const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
 const SURFACE_EVENT: &str = "session-surface";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -184,6 +191,61 @@ struct SurfaceStatusWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method")]
 enum RequestBody {
+    #[serde(rename = "session.list")]
+    SessionList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        limit: u32,
+    },
+    #[serde(rename = "session.list_watch")]
+    SessionListWatch {},
+    #[serde(rename = "provider.list")]
+    ProviderList {},
+    #[serde(rename = "session.observe")]
+    SessionObserve {
+        session_id: String,
+        last_event_limit: u32,
+    },
+    #[serde(rename = "session.attach")]
+    SessionAttach {
+        session_id: String,
+        after_seq: u64,
+        mode: AttachMode,
+        #[serde(default, skip_serializing_if = "is_false")]
+        sealed_replay: bool,
+    },
+    #[serde(rename = "session.detach")]
+    SessionDetach { attachment_id: String },
+    #[serde(rename = "session.select_model")]
+    SessionSelectModel {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        confirm_new_epoch: bool,
+    },
+    #[serde(rename = "session.select_effort")]
+    SessionSelectEffort {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        confirm_new_epoch: bool,
+    },
+    #[serde(rename = "session.select_fast")]
+    SessionSelectFast {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        confirm_new_epoch: bool,
+    },
     #[serde(rename = "session.surface_publish")]
     SessionSurfacePublish {
         session_id: String,
@@ -199,6 +261,52 @@ enum RequestBody {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method")]
 enum ResponseBody {
+    #[serde(rename = "session.list")]
+    SessionList {
+        #[serde(default)]
+        sessions: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+    },
+    #[serde(rename = "session.list_watch")]
+    SessionListWatch { accepted: bool },
+    #[serde(rename = "provider.list")]
+    ProviderList {
+        #[serde(default)]
+        providers: Vec<Value>,
+    },
+    #[serde(rename = "session.observe")]
+    SessionObserve { digest: Value },
+    #[serde(rename = "session.attach")]
+    SessionAttach {
+        attachment_id: String,
+        attach_state: AttachStateWire,
+    },
+    #[serde(rename = "session.detach")]
+    SessionDetach { attachment_id: String },
+    #[serde(rename = "session.select_model")]
+    SessionSelectModel {
+        session_id: String,
+        provider: String,
+        model: String,
+        selected_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "session.select_effort")]
+    SessionSelectEffort {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        selected_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "session.select_fast")]
+    SessionSelectFast {
+        session_id: String,
+        enabled: bool,
+        selected_seq: u64,
+        worker_generation: u64,
+    },
     #[serde(rename = "session.surface_publish")]
     SessionSurfacePublished {
         session_id: String,
@@ -247,6 +355,10 @@ enum WireFrame {
         request_id: String,
         body: ResponseBody,
     },
+    SessionRosterDelta {
+        #[serde(default)]
+        summaries: Vec<Value>,
+    },
     SessionSurfaceDelta {
         session_id: String,
         #[serde(default)]
@@ -263,6 +375,25 @@ enum WireFrame {
     ProtocolError(ProtocolError),
     #[serde(other)]
     Unknown,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AttachMode {
+    Control,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AttachStateWire {
+    session_id: String,
+    requested_after_seq: u64,
+    replay_through_seq: u64,
+    worker_generation: u64,
+    authority_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -435,6 +566,12 @@ impl ConnectionSnapshot {
             && self.capabilities_granted.contains(&Capability::Control)
             && self.features.contains(FEATURE_INPUT_MIRROR_V1)
     }
+
+    fn can_watch_roster(&self) -> bool {
+        self.connected
+            && self.capabilities_granted.contains(&Capability::View)
+            && self.features.contains(FEATURE_SESSION_LIST_WATCH_V1)
+    }
 }
 
 #[cfg(unix)]
@@ -444,7 +581,19 @@ struct Subscription {
 }
 
 #[cfg(unix)]
+type RpcReply = oneshot::Sender<Option<Result<ResponseBody, String>>>;
+
+#[cfg(unix)]
 enum ActorCommand {
+    RosterAttach {
+        app: AppHandle,
+    },
+    RpcRequest {
+        body: RequestBody,
+        capability: Capability,
+        features: BTreeSet<String>,
+        reply: RpcReply,
+    },
     Attach {
         app: AppHandle,
         session_id: String,
@@ -598,6 +747,431 @@ pub async fn surface_publish_input(
     }
 }
 
+pub(crate) fn roster_watch_start(app: AppHandle) {
+    #[cfg(unix)]
+    {
+        let _ = actor_handle()
+            .commands
+            .send(ActorCommand::RosterAttach { app });
+    }
+    #[cfg(not(unix))]
+    let _ = app;
+}
+
+#[cfg(unix)]
+async fn rpc_request(
+    body: RequestBody,
+    capability: Capability,
+    features: BTreeSet<String>,
+) -> Option<Result<ResponseBody, String>> {
+    let (reply, answer) = oneshot::channel();
+    actor_handle()
+        .commands
+        .send(ActorCommand::RpcRequest {
+            body,
+            capability,
+            features,
+            reply,
+        })
+        .ok()?;
+    tokio::time::timeout(COMMAND_REPLY_TIMEOUT, answer)
+        .await
+        .ok()?
+        .ok()?
+}
+
+#[cfg(unix)]
+fn config_features(extra: &[&str]) -> BTreeSet<String> {
+    [FEATURE_SESSION_CONFIG_V1, FEATURE_SESSION_OBSERVE_V1]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(unix)]
+async fn config_request(
+    body: RequestBody,
+    capability: Capability,
+    extra_features: &[&str],
+) -> Result<Option<ResponseBody>, String> {
+    match rpc_request(body, capability, config_features(extra_features)).await {
+        Some(Ok(response)) => Ok(Some(response)),
+        Some(Err(error)) => Err(error),
+        None => Ok(None),
+    }
+}
+
+#[cfg(unix)]
+async fn config_session_summary(
+    session_id: &str,
+    capability: Capability,
+) -> Result<Option<Value>, String> {
+    let mut cursor = None;
+    loop {
+        let Some(response) = config_request(
+            RequestBody::SessionList { cursor, limit: 256 },
+            capability,
+            &[],
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let ResponseBody::SessionList {
+            sessions,
+            next_cursor,
+        } = response
+        else {
+            return Err("session.list response method mismatch".to_string());
+        };
+        if let Some(summary) = sessions
+            .into_iter()
+            .find(|summary| summary.get("session_id").and_then(Value::as_str) == Some(session_id))
+        {
+            return Ok(Some(summary));
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Err(format!("session `{session_id}` was not found"));
+        };
+        cursor = Some(next_cursor);
+    }
+}
+
+#[cfg(unix)]
+async fn config_providers(capability: Capability) -> Result<Option<Vec<Value>>, String> {
+    let Some(response) = config_request(RequestBody::ProviderList {}, capability, &[]).await?
+    else {
+        return Ok(None);
+    };
+    match response {
+        ResponseBody::ProviderList { providers } => Ok(Some(providers)),
+        _ => Err("provider.list response method mismatch".to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn config_u64(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+    })
+}
+
+#[cfg(unix)]
+fn config_document(summary: &Value, providers: &[Value], digest: Value) -> Result<Value, String> {
+    let digest = digest
+        .as_object()
+        .ok_or_else(|| "session.observe digest was invalid".to_string())?;
+    let metadata = digest
+        .get("metadata")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "session has no typed configuration metadata; it may have been created by an older daemon"
+                .to_string()
+        })?;
+    let provider = metadata
+        .get("provider")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "session config provider was missing".to_string())?;
+    let model = metadata
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "session config model was missing".to_string())?;
+    let context_window = providers
+        .iter()
+        .find(|candidate| candidate.get("provider").and_then(Value::as_str) == Some(provider))
+        .and_then(|candidate| candidate.get("model_details"))
+        .and_then(Value::as_array)
+        .and_then(|details| {
+            details
+                .iter()
+                .find(|detail| detail.get("name").and_then(Value::as_str) == Some(model))
+        })
+        .and_then(|detail| config_u64(detail.get("context_window")));
+    let footprint = digest
+        .get("latest_context_footprint")
+        .and_then(Value::as_object)
+        .and_then(|footprint| {
+            Some(serde_json::json!({
+                "truth": footprint.get("truth")?.clone(),
+                "tokens": config_u64(footprint.get("used_tokens"))?,
+            }))
+        })
+        .unwrap_or(Value::Null);
+    let fast = metadata
+        .get("fast")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let summary = summary.as_object();
+
+    Ok(serde_json::json!({
+        "schema": "haider.session_config.v1",
+        "session_id": digest.get("session_id").cloned().unwrap_or(Value::Null),
+        "title": digest.get("title").cloned().unwrap_or(Value::Null),
+        "run_state": digest.get("run_state").cloned().unwrap_or(Value::Null),
+        "provider": provider,
+        "model": model,
+        "effort": metadata.get("effort").cloned().unwrap_or(Value::Null),
+        "speed": if fast { "fast" } else { "normal" },
+        "fast": fast,
+        "account_alias": Value::Null,
+        "agent_type": metadata.get("agent_type").cloned().unwrap_or(Value::Null),
+        "context_window": context_window,
+        "workspace_cwd": metadata.get("cwd").cloned().unwrap_or(Value::Null),
+        "max_tokens": metadata.get("max_tokens").cloned().unwrap_or(Value::Null),
+        "created_at_ms": metadata.get("created_at_ms").cloned().unwrap_or(Value::Null),
+        "head_seq": digest.get("head_seq").cloned().unwrap_or(Value::Null),
+        "worker_generation": digest.get("worker_generation").cloned().unwrap_or(Value::Null),
+        "turn_count": summary.and_then(|summary| summary.get("turn_count")).cloned().unwrap_or(Value::Null),
+        "footprint": footprint,
+        "subagent_count": digest.get("subagents").and_then(Value::as_array).map_or(0, Vec::len),
+        "agent_metrics": summary.and_then(|summary| summary.get("agent_metrics")).cloned().unwrap_or(Value::Null),
+        "updated_at_ms": digest.get("updated_at_ms").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+#[cfg(unix)]
+async fn session_config_get_rpc_inner(session_id: String) -> Result<Option<Value>, String> {
+    let Some(summary) = config_session_summary(&session_id, Capability::View).await? else {
+        return Ok(None);
+    };
+    let Some(providers) = config_providers(Capability::View).await? else {
+        return Ok(None);
+    };
+    let Some(response) = config_request(
+        RequestBody::SessionObserve {
+            session_id,
+            last_event_limit: 0,
+        },
+        Capability::View,
+        &[],
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    match response {
+        ResponseBody::SessionObserve { digest } => {
+            config_document(&summary, &providers, digest).map(Some)
+        }
+        _ => Err("session.observe response method mismatch".to_string()),
+    }
+}
+
+pub(crate) async fn session_config_get_rpc(session_id: String) -> Option<Result<Value, String>> {
+    #[cfg(unix)]
+    {
+        return match session_config_get_rpc_inner(session_id).await {
+            Ok(Some(value)) => Some(Ok(value)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session_id;
+        None
+    }
+}
+
+#[cfg(unix)]
+fn config_model_selector(
+    selector: &str,
+    providers: &[Value],
+) -> Result<(Option<String>, String), String> {
+    if let Some((provider, model)) = selector.split_once('/') {
+        if providers
+            .iter()
+            .any(|candidate| candidate.get("provider").and_then(Value::as_str) == Some(provider))
+        {
+            if model.is_empty() {
+                return Err("provider/model selector has an empty model".to_string());
+            }
+            return Ok((Some(provider.to_string()), model.to_string()));
+        }
+    }
+    Ok((None, selector.to_string()))
+}
+
+#[cfg(unix)]
+fn config_command_id(label: &str) -> String {
+    format!("diffforge-{label}-{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(unix)]
+async fn session_config_set_rpc_inner(
+    session_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+    speed: Option<String>,
+    account: Option<String>,
+) -> Result<Option<Value>, String> {
+    let Some(summary) = config_session_summary(&session_id, Capability::Control).await? else {
+        return Ok(None);
+    };
+    let Some(providers) = config_providers(Capability::Control).await? else {
+        return Ok(None);
+    };
+    if account.is_some() {
+        return Err(format!(
+            "missing_feature: daemon does not advertise {FEATURE_SESSION_ACCOUNT_SELECT_V1}"
+        ));
+    }
+    let fast = match speed.as_deref() {
+        Some("fast") => Some(true),
+        Some("normal") => Some(false),
+        Some(_) => return Err("Haider speed must be `fast` or `normal`.".to_string()),
+        None => None,
+    };
+    let head_seq = config_u64(summary.get("head_seq"))
+        .ok_or_else(|| "session summary head_seq was missing".to_string())?;
+    let Some(response) = config_request(
+        RequestBody::SessionAttach {
+            session_id: session_id.clone(),
+            after_seq: head_seq,
+            mode: AttachMode::Control,
+            sealed_replay: false,
+        },
+        Capability::Control,
+        &[],
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let ResponseBody::SessionAttach {
+        attachment_id,
+        attach_state,
+    } = response
+    else {
+        return Err("session.attach response method mismatch".to_string());
+    };
+    if attach_state.session_id != session_id {
+        let _ = config_request(
+            RequestBody::SessionDetach { attachment_id },
+            Capability::Control,
+            &[],
+        )
+        .await;
+        return Err("session.attach response session mismatch".to_string());
+    }
+    let mut worker_generation = attach_state.worker_generation;
+
+    let mutation = async {
+        if let Some(selector) = model.as_deref() {
+            let (provider, model) = config_model_selector(selector, &providers)?;
+            let Some(response) = config_request(
+                RequestBody::SessionSelectModel {
+                    command_id: config_command_id("session-config-model"),
+                    session_id: session_id.clone(),
+                    worker_generation,
+                    model,
+                    provider,
+                    confirm_new_epoch: false,
+                },
+                Capability::Control,
+                &[FEATURE_SESSION_MODEL_SELECT_V1],
+            )
+            .await?
+            else {
+                return Err("Haider RPC disconnected during session config update".to_string());
+            };
+            match response {
+                ResponseBody::SessionSelectModel {
+                    session_id: selected_session,
+                    worker_generation: selected_generation,
+                    ..
+                } if selected_session == session_id => worker_generation = selected_generation,
+                _ => return Err("session.select_model response method mismatch".to_string()),
+            }
+        }
+        if let Some(effort) = effort {
+            let Some(response) = config_request(
+                RequestBody::SessionSelectEffort {
+                    command_id: config_command_id("session-config-effort"),
+                    session_id: session_id.clone(),
+                    worker_generation,
+                    effort: Some(effort),
+                    confirm_new_epoch: false,
+                },
+                Capability::Control,
+                &[FEATURE_SESSION_EFFORT_SELECT_V1],
+            )
+            .await?
+            else {
+                return Err("Haider RPC disconnected during session config update".to_string());
+            };
+            match response {
+                ResponseBody::SessionSelectEffort {
+                    session_id: selected_session,
+                    worker_generation: selected_generation,
+                    ..
+                } if selected_session == session_id => worker_generation = selected_generation,
+                _ => return Err("session.select_effort response method mismatch".to_string()),
+            }
+        }
+        if let Some(enabled) = fast {
+            let Some(response) = config_request(
+                RequestBody::SessionSelectFast {
+                    command_id: config_command_id("session-config-speed"),
+                    session_id: session_id.clone(),
+                    worker_generation,
+                    enabled,
+                    confirm_new_epoch: false,
+                },
+                Capability::Control,
+                &[FEATURE_SESSION_FAST_SELECT_V1],
+            )
+            .await?
+            else {
+                return Err("Haider RPC disconnected during session config update".to_string());
+            };
+            match response {
+                ResponseBody::SessionSelectFast {
+                    session_id: selected_session,
+                    ..
+                } if selected_session == session_id => {}
+                _ => return Err("session.select_fast response method mismatch".to_string()),
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = config_request(
+        RequestBody::SessionDetach { attachment_id },
+        Capability::Control,
+        &[],
+    )
+    .await;
+    mutation?;
+    Ok(Some(serde_json::json!({"ok": true})))
+}
+
+pub(crate) async fn session_config_set_rpc(
+    session_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+    speed: Option<String>,
+    account: Option<String>,
+) -> Option<Result<Value, String>> {
+    #[cfg(unix)]
+    {
+        return match session_config_set_rpc_inner(session_id, model, effort, speed, account).await {
+            Ok(Some(value)) => Some(Ok(value)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, model, effort, speed, account);
+        None
+    }
+}
+
 #[cfg(unix)]
 async fn command_answer(
     answer: oneshot::Receiver<SurfaceCommandStatus>,
@@ -617,11 +1191,17 @@ async fn run_actor(
 ) {
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
     let mut last_published_revision: HashMap<String, u64> = HashMap::new();
+    let mut roster_app = None;
     let mut reconnect_delay = Duration::from_millis(100);
 
     loop {
         while let Ok(command) = commands.try_recv() {
-            apply_disconnected_command(command, &mut subscriptions, &mut last_published_revision);
+            apply_disconnected_command(
+                command,
+                &mut subscriptions,
+                &mut last_published_revision,
+                &mut roster_app,
+            );
         }
 
         let Some(socket_path) = resolve_socket_path() else {
@@ -630,6 +1210,7 @@ async fn run_actor(
                 &mut commands,
                 &mut subscriptions,
                 &mut last_published_revision,
+                &mut roster_app,
                 reconnect_delay,
             )
             .await
@@ -651,6 +1232,7 @@ async fn run_actor(
                 &mut commands,
                 &mut subscriptions,
                 &mut last_published_revision,
+                &mut roster_app,
                 reconnect_delay,
             )
             .await
@@ -672,6 +1254,14 @@ async fn run_actor(
 
         let mut next_request = 1_u64;
         let mut setup_failed = false;
+        if roster_app.is_some()
+            && snapshot.can_watch_roster()
+            && send_roster_watch(&mut stream, snapshot.frame_limit, &mut next_request)
+                .await
+                .is_err()
+        {
+            setup_failed = true;
+        }
         if snapshot.can_watch_surfaces() {
             let session_ids = subscriptions.keys().cloned().collect::<Vec<_>>();
             for session_id in session_ids {
@@ -697,6 +1287,7 @@ async fn run_actor(
                 &mut commands,
                 &mut subscriptions,
                 &mut last_published_revision,
+                &mut roster_app,
                 &mut next_request,
             )
             .await;
@@ -717,12 +1308,13 @@ async fn wait_disconnected(
     commands: &mut mpsc::UnboundedReceiver<ActorCommand>,
     subscriptions: &mut HashMap<String, Subscription>,
     last_published_revision: &mut HashMap<String, u64>,
+    roster_app: &mut Option<AppHandle>,
     delay: Duration,
 ) -> bool {
     tokio::select! {
         command = commands.recv() => {
             let Some(command) = command else { return false; };
-            apply_disconnected_command(command, subscriptions, last_published_revision);
+            apply_disconnected_command(command, subscriptions, last_published_revision, roster_app);
         }
         _ = tokio::time::sleep(delay) => {}
     }
@@ -734,8 +1326,13 @@ fn apply_disconnected_command(
     command: ActorCommand,
     subscriptions: &mut HashMap<String, Subscription>,
     _last_published_revision: &mut HashMap<String, u64>,
+    roster_app: &mut Option<AppHandle>,
 ) {
     match command {
+        ActorCommand::RosterAttach { app } => *roster_app = Some(app),
+        ActorCommand::RpcRequest { reply, .. } => {
+            let _ = reply.send(None);
+        }
         ActorCommand::Attach {
             app,
             session_id,
@@ -767,12 +1364,14 @@ async fn run_connected(
     commands: &mut mpsc::UnboundedReceiver<ActorCommand>,
     subscriptions: &mut HashMap<String, Subscription>,
     last_published_revision: &mut HashMap<String, u64>,
+    roster_app: &mut Option<AppHandle>,
     next_request: &mut u64,
 ) {
     let mut heartbeat = tokio::time::interval(PING_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut ping_nonce = 1_u64;
     let mut unacked_pings: VecDeque<(u64, Instant)> = VecDeque::new();
+    let mut pending_requests: HashMap<String, RpcReply> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -784,6 +1383,8 @@ async fn run_connected(
                     &connection,
                     subscriptions,
                     last_published_revision,
+                    roster_app,
+                    &mut pending_requests,
                     next_request,
                 ).await;
                 if !keep_connection {
@@ -793,14 +1394,22 @@ async fn run_connected(
             frame = read_frame(stream, connection.frame_limit) => {
                 let Ok(frame) = frame else { return; };
                 match frame {
-                    WireFrame::Response { body, .. } => {
+                    WireFrame::Response { request_id, body } => {
                         if let ResponseBody::SessionSurfaceWatching {
                             session_id,
                             input,
                             status,
-                        } = body
+                        } = body.clone()
                         {
                             emit_surface(subscriptions, &connection, session_id, input, status);
+                        }
+                        if let Some(reply) = pending_requests.remove(&request_id) {
+                            let _ = reply.send(Some(response_result(body)));
+                        }
+                    }
+                    WireFrame::SessionRosterDelta { summaries } => {
+                        if let Some(app) = roster_app.as_ref() {
+                            super::haider_bridge_reconcile_from_summaries(app.clone(), summaries);
                         }
                     }
                     WireFrame::SessionSurfaceDelta { session_id, input, status } => {
@@ -859,9 +1468,56 @@ async fn apply_connected_command(
     connection: &ConnectionSnapshot,
     subscriptions: &mut HashMap<String, Subscription>,
     last_published_revision: &mut HashMap<String, u64>,
+    roster_app: &mut Option<AppHandle>,
+    pending_requests: &mut HashMap<String, RpcReply>,
     next_request: &mut u64,
 ) -> bool {
     match command {
+        ActorCommand::RosterAttach { app } => {
+            *roster_app = Some(app);
+            !connection.can_watch_roster()
+                || send_roster_watch(stream, connection.frame_limit, next_request)
+                    .await
+                    .is_ok()
+        }
+        ActorCommand::RpcRequest {
+            body,
+            capability,
+            features,
+            reply,
+        } => {
+            if !connection.capabilities_granted.contains(&capability) {
+                let _ = reply.send(Some(Err(format!(
+                    "Haider RPC connection does not grant {capability:?} capability"
+                ))));
+                return true;
+            }
+            if !features.is_subset(&connection.features) {
+                let missing = features
+                    .difference(&connection.features)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = reply.send(Some(Err(format!(
+                    "missing_feature: daemon does not advertise {missing}"
+                ))));
+                return true;
+            }
+            let request_id = request_id(next_request);
+            let request = WireFrame::Request {
+                request_id: request_id.clone(),
+                body,
+            };
+            if write_frame(stream, &request, connection.frame_limit)
+                .await
+                .is_err()
+            {
+                let _ = reply.send(None);
+                return false;
+            }
+            pending_requests.insert(request_id, reply);
+            true
+        }
         ActorCommand::Attach {
             app,
             session_id,
@@ -965,6 +1621,34 @@ fn emit_surface(
             status,
         },
     );
+}
+
+#[cfg(unix)]
+fn response_result(body: ResponseBody) -> Result<ResponseBody, String> {
+    match body {
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            ..
+        } => Err(format!(
+            "daemon rejected session config ({code}, retryable={retryable}): {message}"
+        )),
+        response => Ok(response),
+    }
+}
+
+#[cfg(unix)]
+async fn send_roster_watch(
+    stream: &mut UnixStream,
+    frame_limit: usize,
+    next_request: &mut u64,
+) -> std::io::Result<()> {
+    let request = WireFrame::Request {
+        request_id: request_id(next_request),
+        body: RequestBody::SessionListWatch {},
+    };
+    write_frame(stream, &request, frame_limit).await
 }
 
 #[cfg(unix)]
@@ -1429,6 +2113,117 @@ mod tests {
     }
 
     #[test]
+    fn roster_watch_and_session_config_frames_match_reference_json_bytes() {
+        let encoded = |frame: WireFrame| {
+            let framed = encode_framed(&frame, DEFAULT_FRAME_LIMIT).expect("encode frame");
+            std::str::from_utf8(&framed[4..])
+                .expect("frame JSON")
+                .to_string()
+        };
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-roster".to_string(),
+                body: RequestBody::SessionListWatch {},
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-roster","body":{"method":"session.list_watch"}}"#
+        );
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-list".to_string(),
+                body: RequestBody::SessionList {
+                    cursor: None,
+                    limit: 256,
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-list","body":{"method":"session.list","limit":256}}"#
+        );
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-provider".to_string(),
+                body: RequestBody::ProviderList {},
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-provider","body":{"method":"provider.list"}}"#
+        );
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-observe".to_string(),
+                body: RequestBody::SessionObserve {
+                    session_id: "session-1".to_string(),
+                    last_event_limit: 0,
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-observe","body":{"method":"session.observe","session_id":"session-1","last_event_limit":0}}"#
+        );
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-attach".to_string(),
+                body: RequestBody::SessionAttach {
+                    session_id: "session-1".to_string(),
+                    after_seq: 42,
+                    mode: AttachMode::Control,
+                    sealed_replay: false,
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-attach","body":{"method":"session.attach","session_id":"session-1","after_seq":42,"mode":"control"}}"#
+        );
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-model".to_string(),
+                body: RequestBody::SessionSelectModel {
+                    command_id: "command-model".to_string(),
+                    session_id: "session-1".to_string(),
+                    worker_generation: 7,
+                    model: "gpt-5".to_string(),
+                    provider: Some("openai".to_string()),
+                    confirm_new_epoch: false,
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-model","body":{"method":"session.select_model","command_id":"command-model","session_id":"session-1","worker_generation":7,"model":"gpt-5","provider":"openai"}}"#
+        );
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-effort".to_string(),
+                body: RequestBody::SessionSelectEffort {
+                    command_id: "command-effort".to_string(),
+                    session_id: "session-1".to_string(),
+                    worker_generation: 8,
+                    effort: Some("xhigh".to_string()),
+                    confirm_new_epoch: false,
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-effort","body":{"method":"session.select_effort","command_id":"command-effort","session_id":"session-1","worker_generation":8,"effort":"xhigh"}}"#
+        );
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-fast".to_string(),
+                body: RequestBody::SessionSelectFast {
+                    command_id: "command-fast".to_string(),
+                    session_id: "session-1".to_string(),
+                    worker_generation: 9,
+                    enabled: true,
+                    confirm_new_epoch: false,
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-fast","body":{"method":"session.select_fast","command_id":"command-fast","session_id":"session-1","worker_generation":9,"enabled":true}}"#
+        );
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-detach".to_string(),
+                body: RequestBody::SessionDetach {
+                    attachment_id: "attachment-1".to_string(),
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-detach","body":{"method":"session.detach","attachment_id":"attachment-1"}}"#
+        );
+
+        let push = br#"{"v":1,"kind":"session_roster_delta","summaries":[{"session_id":"session-1","head_seq":9,"worker_generation":7}]}"#;
+        assert!(matches!(
+            decode_body(push, DEFAULT_FRAME_LIMIT).unwrap(),
+            WireFrame::SessionRosterDelta { summaries } if summaries.len() == 1
+        ));
+    }
+
+    #[test]
     fn stale_surface_revisions_are_dropped_independently() {
         let mut gate = RevisionGate::default();
         let fresh = gate.accept(
@@ -1508,6 +2303,30 @@ mod tests {
         assert_eq!(status.expect("fresh status").revision, 10);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_rpc_request_selects_cli_fallback() {
+        let (reply, mut answer) = oneshot::channel();
+        let mut subscriptions = HashMap::new();
+        let mut revisions = HashMap::new();
+        let mut roster_app = None;
+        apply_disconnected_command(
+            ActorCommand::RpcRequest {
+                body: RequestBody::SessionList {
+                    cursor: None,
+                    limit: 256,
+                },
+                capability: Capability::View,
+                features: config_features(&[]),
+                reply,
+            },
+            &mut subscriptions,
+            &mut revisions,
+            &mut roster_app,
+        );
+        assert!(answer.try_recv().expect("fallback reply").is_none());
+    }
+
     #[test]
     fn socket_path_resolution_matches_profile_hash_and_newest_fallback() {
         assert_eq!(
@@ -1546,7 +2365,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn live_daemon_handshake_advertises_input_mirror_when_socket_exists() {
+    async fn live_daemon_handshake_advertises_ade_features_when_socket_exists() {
         let Some(path) = resolve_socket_path() else {
             return;
         };
@@ -1564,10 +2383,20 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
             Err(error) => panic!("live Haider handshake failed: {error}"),
         };
-        assert!(
-            welcome.features.contains(FEATURE_INPUT_MIRROR_V1),
-            "daemon {} did not advertise {FEATURE_INPUT_MIRROR_V1}",
-            welcome.daemon_version
-        );
+        for feature in [
+            FEATURE_INPUT_MIRROR_V1,
+            FEATURE_SESSION_LIST_WATCH_V1,
+            FEATURE_SESSION_CONFIG_V1,
+            FEATURE_SESSION_OBSERVE_V1,
+            FEATURE_SESSION_MODEL_SELECT_V1,
+            FEATURE_SESSION_EFFORT_SELECT_V1,
+            FEATURE_SESSION_FAST_SELECT_V1,
+        ] {
+            assert!(
+                welcome.features.contains(feature),
+                "daemon {} did not advertise {feature}",
+                welcome.daemon_version
+            );
+        }
     }
 }

@@ -9,7 +9,8 @@ const HAIDER_PROJECTION_MAX_WINDOW_ROWS: i64 = 1_000;
 const HAIDER_PROJECTION_WATCH_LIMIT: usize = 6;
 const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 2;
 const HAIDER_PROJECTION_PIPE_BATCH_LINES: usize = 256;
-const HAIDER_PROJECTION_PIPE_POLL_TIME: Duration = Duration::from_millis(250);
+const HAIDER_PROJECTION_PIPE_SAFETY_POLL: Duration = Duration::from_secs(2);
+const HAIDER_PROJECTION_PIPE_STOP_POLL: Duration = Duration::from_millis(100);
 const HAIDER_PROJECTION_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_FRAME_TIME: Duration = Duration::from_millis(50);
 const HAIDER_PROJECTION_ROWS_EVENT: &str = "session-rows-appended";
@@ -284,7 +285,25 @@ fn haider_projection_open_database() -> Result<rusqlite::Connection, String> {
     let _schema_guard = haider_projection_schema_lock()
         .lock()
         .map_err(|_| "Session projection schema lock is unavailable.".to_string())?;
+    #[cfg(not(test))]
     let mut connection = sessions_open_database()?;
+    #[cfg(test)]
+    let mut connection = {
+        static TEST_DATABASE: OnceLock<PathBuf> = OnceLock::new();
+        let path = TEST_DATABASE.get_or_init(|| {
+            std::env::temp_dir().join(format!(
+                "rust-diffforge-haider-projection-{}.sqlite",
+                uuid::Uuid::new_v4().simple()
+            ))
+        });
+        let mut connection = rusqlite::Connection::open(path)
+            .map_err(|error| format!("Unable to open test projection store: {error}"))?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("Unable to configure test projection store: {error}"))?;
+        sessions_initialize_database(&mut connection)?;
+        connection
+    };
     haider_projection_migrate_database(&mut connection)?;
     Ok(connection)
 }
@@ -1174,7 +1193,10 @@ fn haider_projection_apply_status(
         state_raw,
         provider_session_id: None,
         first_user_message: None,
-        touch: Some(true),
+        // Recency is DAEMON-owned (reconcile mirrors updated_at). Touching
+        // here made merely OPENING a session jump to the top of Recent —
+        // status/state writes must never move the clock.
+        touch: None,
     });
     if result.is_ok() {
         if let Some(app) = app {
@@ -2142,6 +2164,210 @@ fn haider_projection_pipe_finished(session_id: &str, generation: u64) {
     }
 }
 
+#[cfg(target_os = "macos")]
+struct HaiderProjectionPipeWatcher {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for HaiderProjectionPipeWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct HaiderProjectionPipeWatcher {
+    _watcher: notify::RecommendedWatcher,
+}
+
+#[cfg(target_os = "macos")]
+fn haider_projection_pipe_open(path: &Path) -> Option<libc::c_int> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `path` is NUL-terminated and remains live for the call.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
+    (fd >= 0).then_some(fd)
+}
+
+#[cfg(target_os = "macos")]
+fn haider_projection_pipe_kqueue_register(kqueue: libc::c_int, fd: libc::c_int) -> bool {
+    let change = libc::kevent {
+        ident: fd as libc::uintptr_t,
+        filter: libc::EVFILT_VNODE,
+        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+        fflags: libc::NOTE_WRITE
+            | libc::NOTE_EXTEND
+            | libc::NOTE_ATTRIB
+            | libc::NOTE_RENAME
+            | libc::NOTE_DELETE
+            | libc::NOTE_REVOKE,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: `change` is initialized and no output buffer is requested.
+    unsafe {
+        libc::kevent(
+            kqueue,
+            &change,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        ) == 0
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn haider_projection_pipe_watcher(
+    path: &Path,
+) -> Option<(HaiderProjectionPipeWatcher, std::sync::mpsc::Receiver<()>)> {
+    let file_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let parent_path = file_path.parent()?.to_path_buf();
+    let parent_fd = haider_projection_pipe_open(&parent_path)?;
+    let mut file_fd = haider_projection_pipe_open(&file_path);
+    // SAFETY: `kqueue` has no preconditions.
+    let kqueue = unsafe { libc::kqueue() };
+    if kqueue < 0 || !haider_projection_pipe_kqueue_register(kqueue, parent_fd) {
+        // SAFETY: descriptors were opened above and are owned here.
+        unsafe {
+            libc::close(parent_fd);
+            if kqueue >= 0 {
+                libc::close(kqueue);
+            }
+        }
+        return None;
+    }
+    if file_fd.is_some_and(|fd| !haider_projection_pipe_kqueue_register(kqueue, fd)) {
+        if let Some(fd) = file_fd.take() {
+            // SAFETY: `fd` is owned here and will not be reused.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let watcher_thread = thread::spawn(move || {
+        while !thread_stop.load(Ordering::Acquire) {
+            // SAFETY: zero is a valid empty event output buffer.
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 100_000_000,
+            };
+            // SAFETY: output and timeout pointers remain valid for the call.
+            let count =
+                unsafe { libc::kevent(kqueue, std::ptr::null(), 0, &mut event, 1, &timeout) };
+            if count < 0 {
+                break;
+            }
+            if count == 0 {
+                continue;
+            }
+            // `kevent` is packed on macOS; copy fields without references.
+            let ident = unsafe { std::ptr::addr_of!(event.ident).read_unaligned() };
+            let flags = unsafe { std::ptr::addr_of!(event.fflags).read_unaligned() };
+            let file_replaced = file_fd.is_some_and(|fd| {
+                ident == fd as libc::uintptr_t
+                    && flags & (libc::NOTE_RENAME | libc::NOTE_DELETE | libc::NOTE_REVOKE) != 0
+            });
+            if ident == parent_fd as libc::uintptr_t || file_replaced {
+                if let Some(fd) = file_fd.take() {
+                    // SAFETY: the watcher thread owns the descriptor.
+                    unsafe { libc::close(fd) };
+                }
+                file_fd = haider_projection_pipe_open(&file_path).and_then(|fd| {
+                    if haider_projection_pipe_kqueue_register(kqueue, fd) {
+                        Some(fd)
+                    } else {
+                        // SAFETY: registration failed and the descriptor is unused.
+                        unsafe { libc::close(fd) };
+                        None
+                    }
+                });
+            }
+            if sender.send(()).is_err() {
+                break;
+            }
+        }
+        // SAFETY: the watcher thread owns each remaining descriptor.
+        unsafe {
+            if let Some(fd) = file_fd {
+                libc::close(fd);
+            }
+            libc::close(parent_fd);
+            libc::close(kqueue);
+        }
+    });
+    Some((
+        HaiderProjectionPipeWatcher {
+            stop,
+            thread: Some(watcher_thread),
+        },
+        receiver,
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn haider_projection_pipe_watcher(
+    path: &Path,
+) -> Option<(HaiderProjectionPipeWatcher, std::sync::mpsc::Receiver<()>)> {
+    use notify::Watcher as _;
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let event_path = path.to_path_buf();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if event
+            .as_ref()
+            .is_ok_and(|event| haider_projection_pipe_event_matches(event, &event_path))
+        {
+            let _ = sender.send(());
+        }
+    })
+    .ok()?;
+    let watched_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let watched_file = watcher
+        .watch(&watched_path, notify::RecursiveMode::NonRecursive)
+        .is_ok();
+    let watched_parent = watched_path.parent().is_some_and(|parent| {
+        watcher
+            .watch(parent, notify::RecursiveMode::NonRecursive)
+            .is_ok()
+    });
+    (watched_file || watched_parent)
+        .then_some((HaiderProjectionPipeWatcher { _watcher: watcher }, receiver))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn haider_projection_pipe_event_matches(event: &notify::Event, path: &Path) -> bool {
+    let watched_name = path.file_name();
+    matches!(
+        event.kind,
+        notify::EventKind::Any
+            | notify::EventKind::Create(_)
+            | notify::EventKind::Modify(_)
+            | notify::EventKind::Remove(_)
+    ) && (event.paths.is_empty()
+        || event.paths.iter().any(|changed| {
+            changed == path || watched_name.is_some_and(|name| changed.file_name() == Some(name))
+        }))
+}
+
+#[cfg(test)]
+fn haider_projection_wait_for_pipe_event(
+    receiver: &std::sync::mpsc::Receiver<()>,
+    _path: &Path,
+    timeout: Duration,
+) -> bool {
+    receiver.recv_timeout(timeout).is_ok()
+}
+
 fn haider_projection_start_pipe_tail(
     app: AppHandle,
     session_id: String,
@@ -2166,11 +2392,39 @@ fn haider_projection_start_pipe_tail(
         );
     }
     thread::spawn(move || {
+        let watcher = haider_projection_pipe_watcher(&route.path);
+        let (_watcher, mut receiver) = match watcher {
+            Some((watcher, receiver)) => (Some(watcher), Some(receiver)),
+            None => (None, None),
+        };
+        // Fold once immediately so startup events cannot fall into watcher setup.
+        let mut next_safety_poll = Instant::now();
         while !HAIDER_PROJECTION_STOPPING.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
-            thread::sleep(HAIDER_PROJECTION_PIPE_POLL_TIME);
+            let wait = next_safety_poll
+                .saturating_duration_since(Instant::now())
+                .min(HAIDER_PROJECTION_PIPE_STOP_POLL);
+            let event_fired = match receiver.as_ref() {
+                Some(events) => match events.recv_timeout(wait) {
+                    Ok(()) => true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        receiver = None;
+                        false
+                    }
+                },
+                None => {
+                    thread::sleep(wait);
+                    false
+                }
+            };
             if HAIDER_PROJECTION_STOPPING.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
                 break;
             }
+            let safety_poll = Instant::now() >= next_safety_poll;
+            if !event_fired && !safety_poll {
+                continue;
+            }
+            next_safety_poll = Instant::now() + HAIDER_PROJECTION_PIPE_SAFETY_POLL;
             match haider_projection_ingest_pipe(&session_id, &provider_session_id, &route) {
                 Ok(frame) if frame.appended > 0 || frame.tail_changed || frame.sync_changed => {
                     let _ = haider_projection_frame_sender(&app).send(frame);
@@ -2498,6 +2752,52 @@ async fn session_projection_detach(session_id: String) -> Result<(), String> {
 mod haider_projection_tests {
     use super::*;
 
+    struct HaiderProjectionTestSession {
+        session_id: String,
+        provider_session_id: String,
+    }
+
+    impl Drop for HaiderProjectionTestSession {
+        fn drop(&mut self) {
+            if let Ok(connection) = haider_projection_open_database() {
+                let _ = connection.execute(
+                    "DELETE FROM session_projection_rows WHERE session_id = ?1",
+                    [&self.session_id],
+                );
+                let _ = connection.execute(
+                    "DELETE FROM session_pipe_cursors WHERE session_id = ?1",
+                    [&self.session_id],
+                );
+            }
+            if let Ok(mut states) = haider_projection_states().lock() {
+                states.remove(&self.session_id);
+            }
+            if let Ok(mut heads) = haider_bridge_head_sequences().lock() {
+                heads.remove(&self.provider_session_id);
+            }
+        }
+    }
+
+    fn haider_projection_test_session() -> HaiderProjectionTestSession {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        HaiderProjectionTestSession {
+            session_id: format!("projection-test-{suffix}"),
+            provider_session_id: format!("provider-test-{suffix}"),
+        }
+    }
+
+    fn haider_projection_test_pipe_header(provider_session_id: &str, generation: i64) -> String {
+        format!(
+            "{}\n",
+            json!({
+                "pipe":"haider.session.jsonl",
+                "version":2,
+                "session_id":provider_session_id,
+                "generation":generation
+            })
+        )
+    }
+
     #[test]
     fn haider_projection_unknown_head_is_caught_up() {
         assert!(haider_projection_caught_up(None, Some(0), Some(0)));
@@ -2814,6 +3114,119 @@ mod haider_projection_tests {
             100,
             140
         ));
+    }
+
+    #[test]
+    fn haider_projection_pipe_append_fires_filesystem_ingest_wake() {
+        let test_session = haider_projection_test_session();
+        let root = std::env::temp_dir().join(format!(
+            "haider-pipe-event-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            haider_projection_test_pipe_header(&test_session.provider_session_id, 1),
+        )
+        .unwrap();
+        let (watcher, receiver) =
+            haider_projection_pipe_watcher(&path).expect("filesystem pipe watcher");
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"seq\":1,\"ordinal\":0,\"role\":\"assistant\",\"text\":\"ready\"}\n")
+            .unwrap();
+        file.sync_all().unwrap();
+        assert!(haider_projection_wait_for_pipe_event(
+            &receiver,
+            &path,
+            Duration::from_secs(2)
+        ));
+        let frame = haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &HaiderProjectionPipeRoute {
+                path: path.clone(),
+                head_seq: Some(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(frame.appended, 1);
+        assert_eq!(frame.from_seq, Some(1));
+
+        drop(watcher);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn haider_projection_pipe_rename_swap_wakes_and_requires_refold() {
+        let test_session = haider_projection_test_session();
+        let root = std::env::temp_dir().join(format!(
+            "haider-pipe-swap-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let replacement = root.join("session.next");
+        let old = root.join("session.old");
+        fs::write(
+            &path,
+            haider_projection_test_pipe_header(&test_session.provider_session_id, 1),
+        )
+        .unwrap();
+        fs::write(
+            &replacement,
+            format!(
+                "{}{}\n",
+                haider_projection_test_pipe_header(&test_session.provider_session_id, 2),
+                json!({
+                    "seq":2,
+                    "ordinal":0,
+                    "role":"assistant",
+                    "text":"replacement"
+                })
+            ),
+        )
+        .unwrap();
+        let (watcher, receiver) =
+            haider_projection_pipe_watcher(&path).expect("filesystem pipe watcher");
+        let route = HaiderProjectionPipeRoute {
+            path: path.clone(),
+            head_seq: Some(2),
+        };
+        let initial = haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &route,
+        )
+        .unwrap();
+        assert!(initial.tail_changed);
+
+        fs::rename(&path, &old).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert!(haider_projection_wait_for_pipe_event(
+            &receiver,
+            &path,
+            Duration::from_secs(2)
+        ));
+        let replaced = haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &route,
+        )
+        .unwrap();
+        assert!(replaced.tail_changed);
+        assert_eq!(replaced.appended, 1);
+        assert_eq!(
+            haider_projection_load_pipe_cursor(&test_session.session_id)
+                .unwrap()
+                .unwrap()
+                .generation,
+            2
+        );
+
+        drop(watcher);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

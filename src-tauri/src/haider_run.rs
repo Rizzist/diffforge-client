@@ -143,6 +143,16 @@ fn haider_run_execute(command: Command) -> Result<(), String> {
     }
 }
 
+fn haider_run_config_or_cli<T>(
+    rpc: Option<Result<T, String>>,
+    cli: impl FnOnce() -> Result<T, String>,
+) -> (Result<T, String>, bool) {
+    match rpc {
+        Some(result) => (result, false),
+        None => (cli(), true),
+    }
+}
+
 fn haider_run_provider_session_id(session_id: &str) -> Result<String, String> {
     let connection = sessions_open_database()?;
     let row = sessions_row_by_id(&connection, session_id.trim())?;
@@ -793,8 +803,20 @@ async fn session_submit_prompt(
 
 #[tauri::command(rename_all = "snake_case")]
 async fn session_config_get(session_id: String) -> Value {
+    let provider_session_id = match tauri::async_runtime::spawn_blocking(move || {
+        haider_run_provider_session_id(&session_id)
+    })
+    .await
+    {
+        Ok(Ok(provider_session_id)) => provider_session_id,
+        Ok(Err(error)) => return json!({"ok": false, "error": error}),
+        Err(error) => {
+            return json!({"ok": false, "error": format!("Session config worker failed: {error}")})
+        }
+    };
+    let rpc = haider_rpc_ade::session_config_get_rpc(provider_session_id.clone()).await;
     tauri::async_runtime::spawn_blocking(move || {
-        let result = haider_run_provider_session_id(&session_id).and_then(|provider_session_id| {
+        let (result, _) = haider_run_config_or_cli(rpc, || {
             haider_run_capture_json(haider_session_config_get_command(&provider_session_id))
         });
         result.unwrap_or_else(|error| json!({"ok": false, "error": error}))
@@ -820,15 +842,32 @@ async fn session_config_set(
         speed,
         account,
     };
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let provider_session_id = haider_run_provider_session_id(&session_id)?;
-        let command = haider_session_config_set_command(&provider_session_id, &config)?;
-        haider_run_execute(command)?;
-        Ok::<_, String>(json!({"ok": true}))
+    haider_run_validate_config(&config)?;
+    let provider_session_id =
+        tauri::async_runtime::spawn_blocking(move || haider_run_provider_session_id(&session_id))
+            .await
+            .map_err(|error| format!("Session config worker failed: {error}"))??;
+    let rpc = haider_rpc_ade::session_config_set_rpc(
+        provider_session_id.clone(),
+        config.model.clone(),
+        config.effort.clone(),
+        config.speed.clone(),
+        config.account.clone(),
+    )
+    .await;
+    let (result, used_cli) = tauri::async_runtime::spawn_blocking(move || {
+        haider_run_config_or_cli(rpc, || {
+            let command = haider_session_config_set_command(&provider_session_id, &config)?;
+            haider_run_execute(command)?;
+            Ok(json!({"ok": true}))
+        })
     })
     .await
-    .map_err(|error| format!("Session config worker failed: {error}"))??;
-    haider_bridge_sync_once(&app).await;
+    .map_err(|error| format!("Session config worker failed: {error}"))?;
+    let result = result?;
+    if used_cli {
+        haider_bridge_sync_once(&app).await;
+    }
     Ok(result)
 }
 
@@ -987,6 +1026,25 @@ mod haider_run_tests {
             ..RunConfig::default()
         };
         assert!(haider_session_config_set_command("session-provider", &config).is_ok());
+    }
+
+    #[test]
+    fn haider_session_config_uses_cli_fallback_without_rpc_socket() {
+        let cli_calls = std::cell::Cell::new(0);
+        let (result, used_cli) = haider_run_config_or_cli(None::<Result<Value, String>>, || {
+            cli_calls.set(cli_calls.get() + 1);
+            Ok(json!({"schema":"haider.session_config.v1"}))
+        });
+        assert!(used_cli);
+        assert_eq!(cli_calls.get(), 1);
+        assert_eq!(result.unwrap()["schema"], "haider.session_config.v1");
+
+        let (result, used_cli) =
+            haider_run_config_or_cli(Some(Ok(json!({"ok":true}))), || -> Result<Value, String> {
+                panic!("CLI must not run while RPC is available")
+            });
+        assert!(!used_cli);
+        assert_eq!(result.unwrap(), json!({"ok":true}));
     }
 
     #[test]

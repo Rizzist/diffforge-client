@@ -1,9 +1,6 @@
 const HAIDER_BRIDGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const HAIDER_BRIDGE_INITIAL_SYNC_DELAY: Duration = Duration::from_secs(3);
-const HAIDER_BRIDGE_EVENT_DEBOUNCE: Duration = Duration::from_millis(750);
-const HAIDER_BRIDGE_RETRY_MIN: Duration = Duration::from_secs(5);
-const HAIDER_BRIDGE_RETRY_MAX: Duration = Duration::from_secs(120);
-const HAIDER_BRIDGE_STABLE_FOLLOW: Duration = Duration::from_secs(30);
+const HAIDER_BRIDGE_FULL_RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const HAIDER_BRIDGE_MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 const HAIDER_BRIDGE_GHOST_MAX_AGE_MS: i64 = 10 * 60 * 1_000;
 const HAIDER_LIBRARY_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -84,11 +81,6 @@ fn haider_library_cache() -> &'static StdMutex<Option<(Instant, Value)>> {
 fn haider_bridge_sync_lock() -> &'static StdMutex<()> {
     static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| StdMutex::new(()))
-}
-
-fn haider_bridge_child_slot() -> &'static StdMutex<Option<Arc<StdMutex<std::process::Child>>>> {
-    static CHILD: OnceLock<StdMutex<Option<Arc<StdMutex<std::process::Child>>>>> = OnceLock::new();
-    CHILD.get_or_init(|| StdMutex::new(None))
 }
 
 fn haider_bridge_json_args(args: &[&str]) -> Option<Value> {
@@ -378,8 +370,6 @@ fn haider_bridge_collect_head_sequences(
             .and_then(haider_bridge_sequence);
             if let (Some(session_id), Some(head_seq)) = (session_id, head_seq) {
                 haider_bridge_note_head_seq(&session_id, head_seq);
-                let head_seq =
-                    head_seq.max(haider_bridge_head_seq(&session_id).unwrap_or(head_seq));
                 observed
                     .entry(session_id)
                     .and_modify(|head| *head = (*head).max(head_seq))
@@ -548,10 +538,12 @@ fn haider_bridge_session_matches_dir(session: &HaiderBridgeSession, row: &Sessio
 }
 
 fn haider_bridge_reconcile_store(
-    roster: &[HaiderBridgeSession],
+    roster: Option<&[HaiderBridgeSession]>,
     sessions: &[HaiderBridgeSession],
 ) -> Result<bool, String> {
-    if roster.is_empty() {
+    if roster.is_some_and(<[HaiderBridgeSession]>::is_empty)
+        || (roster.is_none() && sessions.is_empty())
+    {
         return Ok(false);
     }
     let _write_guard = sessions_write_lock()
@@ -575,21 +567,28 @@ fn haider_bridge_reconcile_store(
         .map_err(|error| format!("Unable to begin Haider reconciliation: {error}"))?;
     let mut changed = false;
 
-    let roster_ids = roster
-        .iter()
-        .map(|session| session.id.as_str())
-        .collect::<HashSet<_>>();
+    let roster_ids = roster.map(|roster| {
+        roster
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<HashSet<_>>()
+    });
     let ghost_cutoff_ms = sessions_now_ms().saturating_sub(HAIDER_BRIDGE_GHOST_MAX_AGE_MS);
     let mut kept_rows = Vec::with_capacity(rows.len());
     for row in rows {
-        let prune = if row.provider_session_id.trim().is_empty() {
-            row.created_at_ms < ghost_cutoff_ms
-                && !roster
-                    .iter()
-                    .any(|session| haider_bridge_session_matches_dir(session, &row))
-        } else {
-            !roster_ids.contains(row.provider_session_id.as_str())
-        };
+        let prune = roster.is_some_and(|roster| {
+            let prune = if row.provider_session_id.trim().is_empty() {
+                row.created_at_ms < ghost_cutoff_ms
+                    && !roster
+                        .iter()
+                        .any(|session| haider_bridge_session_matches_dir(session, &row))
+            } else {
+                !roster_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(row.provider_session_id.as_str()))
+            };
+            prune
+        });
         if prune {
             // Reconcile only removes the rail row; session directories stay intact.
             transaction
@@ -632,20 +631,30 @@ fn haider_bridge_reconcile_store(
             row.title = session.title.clone().unwrap_or_default();
             row_changed = true;
         }
-        let model = session.model.clone().unwrap_or_default();
-        if row.model != model {
-            row.model = model;
-            row_changed = true;
+        if let Some(model) = session
+            .model
+            .clone()
+            .or_else(|| roster.is_some().then(String::new))
+        {
+            if row.model != model {
+                row.model = model;
+                row_changed = true;
+            }
         }
-        let state_raw = session.state_raw.clone().unwrap_or_default();
-        let status = haider_bridge_store_status(Some(&state_raw));
-        if row.status != status {
-            row.status = status.to_string();
-            row_changed = true;
-        }
-        if row.state_raw != state_raw {
-            row.state_raw = state_raw;
-            row_changed = true;
+        if let Some(state_raw) = session
+            .state_raw
+            .clone()
+            .or_else(|| roster.is_some().then(String::new))
+        {
+            let status = haider_bridge_store_status(Some(&state_raw));
+            if row.status != status {
+                row.status = status.to_string();
+                row_changed = true;
+            }
+            if row.state_raw != state_raw {
+                row.state_raw = state_raw;
+                row_changed = true;
+            }
         }
         if session
             .latest_at_ms
@@ -683,7 +692,7 @@ fn haider_bridge_reconcile_store(
         .filter(|row| !row.provider_session_id.trim().is_empty())
         .map(|row| row.provider_session_id.as_str())
         .collect();
-    for session in roster {
+    for session in roster.unwrap_or(sessions) {
         if session.id.trim().is_empty() || bound.contains(session.id.as_str()) {
             continue;
         }
@@ -727,9 +736,13 @@ fn haider_bridge_reconcile_tracked(
     tracker: &mut HaiderBridgeReconcileTracker,
     sessions: &[HaiderBridgeSession],
     head_sequences: &HashMap<String, i64>,
-    reconcile: impl FnOnce(&[HaiderBridgeSession], &[HaiderBridgeSession]) -> Result<bool, String>,
+    complete: bool,
+    reconcile: impl FnOnce(
+        Option<&[HaiderBridgeSession]>,
+        &[HaiderBridgeSession],
+    ) -> Result<bool, String>,
 ) -> Result<bool, String> {
-    let snapshot = sessions
+    let mut snapshot = sessions
         .iter()
         .map(|session| {
             (
@@ -738,52 +751,126 @@ fn haider_bridge_reconcile_tracked(
             )
         })
         .collect::<HashMap<_, _>>();
-    let roster_changed = tracker.initialized
+    if !complete && tracker.initialized {
+        snapshot.retain(|session_id, incoming| {
+            !incoming
+                .head_seq
+                .zip(
+                    tracker
+                        .sessions
+                        .get(session_id)
+                        .and_then(|previous| previous.head_seq),
+                )
+                .is_some_and(|(incoming, previous)| incoming < previous)
+        });
+    }
+    let roster_changed = complete
+        && tracker.initialized
         && (snapshot.len() != tracker.sessions.len()
             || snapshot
                 .keys()
                 .any(|session_id| !tracker.sessions.contains_key(session_id)));
+    let observed_at_ms = sessions_now_ms();
     let candidates = if tracker.initialized {
         sessions
             .iter()
-            .filter(|session| {
-                !head_sequences.contains_key(&session.id)
-                    || snapshot.get(&session.id) != tracker.sessions.get(&session.id)
+            .filter_map(|session| {
+                (snapshot.contains_key(&session.id)
+                    && (!head_sequences.contains_key(&session.id)
+                        || snapshot.get(&session.id) != tracker.sessions.get(&session.id)))
+                .then(|| {
+                    let mut session = session.clone();
+                    let head_advanced = snapshot
+                        .get(&session.id)
+                        .and_then(|stamp| stamp.head_seq)
+                        .zip(
+                            tracker
+                                .sessions
+                                .get(&session.id)
+                                .and_then(|stamp| stamp.head_seq),
+                        )
+                        .is_some_and(|(incoming, previous)| incoming > previous);
+                    if !complete && head_advanced && session.latest_at_ms.is_none() {
+                        session.latest_at_ms = Some(observed_at_ms);
+                    }
+                    session
+                })
             })
-            .cloned()
             .collect::<Vec<_>>()
     } else {
         sessions.to_vec()
     };
     if candidates.is_empty() && !roster_changed {
         tracker.initialized = true;
-        tracker.sessions = snapshot;
+        if complete {
+            tracker.sessions = snapshot;
+        } else {
+            tracker.sessions.extend(snapshot);
+        }
         return Ok(false);
     }
-    let changed = reconcile(sessions, &candidates)?;
+    let changed = reconcile(complete.then_some(sessions), &candidates)?;
     tracker.initialized = true;
-    tracker.sessions = snapshot;
+    if complete {
+        tracker.sessions = snapshot;
+    } else {
+        tracker.sessions.extend(snapshot);
+    }
     Ok(changed)
 }
 
 #[cfg(test)]
 fn haider_bridge_reconcile(sessions: &[HaiderBridgeSession]) -> Result<bool, String> {
-    haider_bridge_reconcile_store(sessions, sessions)
+    haider_bridge_reconcile_store(Some(sessions), sessions)
 }
 
-fn haider_bridge_reconcile_snapshot(
-    sessions: &[HaiderBridgeSession],
-    head_sequences: &HashMap<String, i64>,
+fn haider_bridge_reconcile_summary_values_tracked(
+    tracker: &mut HaiderBridgeReconcileTracker,
+    summaries: Vec<Value>,
+    complete: bool,
+    reconcile: impl FnOnce(
+        Option<&[HaiderBridgeSession]>,
+        &[HaiderBridgeSession],
+    ) -> Result<bool, String>,
+) -> Result<bool, String> {
+    let value = Value::Array(summaries);
+    let mut head_sequences = HashMap::new();
+    haider_bridge_collect_head_sequences(&value, None, &mut head_sequences);
+    let sessions = haider_bridge_parse_session_list(&value);
+    haider_bridge_reconcile_tracked(tracker, &sessions, &head_sequences, complete, reconcile)
+}
+
+fn haider_bridge_reconcile_summary_values(
+    summaries: Vec<Value>,
+    complete: bool,
 ) -> Result<bool, String> {
     let mut tracker = haider_bridge_reconcile_tracker()
         .lock()
         .map_err(|_| "Haider reconciliation tracker is unavailable.".to_string())?;
-    haider_bridge_reconcile_tracked(
+    haider_bridge_reconcile_summary_values_tracked(
         &mut tracker,
-        sessions,
-        head_sequences,
+        summaries,
+        complete,
         haider_bridge_reconcile_store,
     )
+}
+
+fn haider_bridge_reconcile_from_summaries(app: AppHandle, summaries: Vec<Value>) {
+    tauri::async_runtime::spawn(async move {
+        let changed = tauri::async_runtime::spawn_blocking(move || {
+            let _sync_guard = haider_bridge_sync_lock()
+                .lock()
+                .map_err(|_| "Haider bridge sync lock is unavailable.".to_string())?;
+            haider_bridge_reconcile_summary_values(summaries, false)
+        })
+        .await;
+        match changed {
+            Ok(Ok(true)) => sessions_emit_changed(&app),
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => eprintln!("Haider session reconciliation failed: {error}"),
+            Err(error) => eprintln!("Haider session reconciliation worker failed: {error}"),
+        }
+    });
 }
 
 async fn haider_bridge_sync_once(app: &AppHandle) {
@@ -794,10 +881,7 @@ async fn haider_bridge_sync_once(app: &AppHandle) {
         let Some(value) = haider_bridge_json_command("sessions") else {
             return Ok(false);
         };
-        let mut head_sequences = HashMap::new();
-        haider_bridge_collect_head_sequences(&value, None, &mut head_sequences);
-        let sessions = haider_bridge_parse_session_list(&value);
-        haider_bridge_reconcile_snapshot(&sessions, &head_sequences)
+        haider_bridge_reconcile_summary_values(vec![value], true)
     })
     .await;
     match changed {
@@ -808,68 +892,8 @@ async fn haider_bridge_sync_once(app: &AppHandle) {
     }
 }
 
-fn haider_bridge_follow_once(events: tokio::sync::mpsc::UnboundedSender<()>) -> bool {
-    let started_at = Instant::now();
-    let mut child = match Command::new("haider")
-        .args(["events", "--follow"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return false;
-    };
-    let child = Arc::new(StdMutex::new(child));
-    if let Ok(mut slot) = haider_bridge_child_slot().lock() {
-        *slot = Some(child.clone());
-    }
-    let mut saw_event = false;
-    for line in std::io::BufReader::new(stdout).lines() {
-        if HAIDER_BRIDGE_STOPPING.load(Ordering::Acquire) {
-            break;
-        }
-        let Ok(line) = line else {
-            break;
-        };
-        if serde_json::from_str::<Value>(line.trim()).is_ok() {
-            saw_event = true;
-            let _ = events.send(());
-        }
-    }
-    if let Ok(mut child) = child.lock() {
-        if HAIDER_BRIDGE_STOPPING.load(Ordering::Acquire) {
-            let _ = child.kill();
-        }
-        let _ = child.wait();
-    }
-    if let Ok(mut slot) = haider_bridge_child_slot().lock() {
-        if slot
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &child))
-        {
-            *slot = None;
-        }
-    }
-    saw_event || started_at.elapsed() >= HAIDER_BRIDGE_STABLE_FOLLOW
-}
-
 fn haider_bridge_stop() {
     HAIDER_BRIDGE_STOPPING.store(true, Ordering::Release);
-    let child = haider_bridge_child_slot()
-        .lock()
-        .ok()
-        .and_then(|slot| slot.as_ref().cloned());
-    if let Some(child) = child {
-        if let Ok(mut child) = child.lock() {
-            let _ = child.kill();
-        }
-    }
 }
 
 fn haider_bridge_start(app: AppHandle) {
@@ -880,47 +904,14 @@ fn haider_bridge_start(app: AppHandle) {
     if let Ok(mut tracker) = haider_bridge_reconcile_tracker().lock() {
         *tracker = HaiderBridgeReconcileTracker::default();
     }
-    let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
+    haider_rpc_ade::roster_watch_start(app.clone());
 
     let sync_app = app.clone();
     tauri::async_runtime::spawn(async move {
         sleep(HAIDER_BRIDGE_INITIAL_SYNC_DELAY).await;
-        if !HAIDER_BRIDGE_STOPPING.load(Ordering::Acquire) {
-            haider_bridge_sync_once(&sync_app).await;
-        }
-    });
-
-    let debounce_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        while event_receiver.recv().await.is_some() {
-            while timeout(HAIDER_BRIDGE_EVENT_DEBOUNCE, event_receiver.recv())
-                .await
-                .is_ok_and(|event| event.is_some())
-            {}
-            if HAIDER_BRIDGE_STOPPING.load(Ordering::Acquire) {
-                return;
-            }
-            haider_bridge_sync_once(&debounce_app).await;
-        }
-    });
-
-    tauri::async_runtime::spawn(async move {
-        let mut backoff = HAIDER_BRIDGE_RETRY_MIN;
         while !HAIDER_BRIDGE_STOPPING.load(Ordering::Acquire) {
-            let sender = event_sender.clone();
-            let stable =
-                tauri::async_runtime::spawn_blocking(move || haider_bridge_follow_once(sender))
-                    .await
-                    .unwrap_or(false);
-            if HAIDER_BRIDGE_STOPPING.load(Ordering::Acquire) {
-                return;
-            }
-            sleep(backoff).await;
-            backoff = if stable {
-                HAIDER_BRIDGE_RETRY_MIN
-            } else {
-                backoff.saturating_mul(2).min(HAIDER_BRIDGE_RETRY_MAX)
-            };
+            haider_bridge_sync_once(&sync_app).await;
+            sleep(HAIDER_BRIDGE_FULL_RECONCILE_INTERVAL).await;
         }
     });
 }
@@ -1303,7 +1294,7 @@ mod haider_bridge_tests {
         let mut tracker = HaiderBridgeReconcileTracker::default();
         let mut heads = HashMap::from([(session.id.clone(), 7)]);
         let writes = std::cell::Cell::new(0);
-        let mut reconcile = |_: &[HaiderBridgeSession], _: &[HaiderBridgeSession]| {
+        let mut reconcile = |_: Option<&[HaiderBridgeSession]>, _: &[HaiderBridgeSession]| {
             writes.set(writes.get() + 1);
             Ok(false)
         };
@@ -1312,6 +1303,7 @@ mod haider_bridge_tests {
             &mut tracker,
             std::slice::from_ref(&session),
             &heads,
+            true,
             &mut reconcile,
         )
         .unwrap());
@@ -1320,6 +1312,7 @@ mod haider_bridge_tests {
             &mut tracker,
             std::slice::from_ref(&session),
             &heads,
+            true,
             &mut reconcile,
         )
         .unwrap());
@@ -1330,6 +1323,7 @@ mod haider_bridge_tests {
             &mut tracker,
             std::slice::from_ref(&session),
             &heads,
+            true,
             &mut reconcile,
         )
         .unwrap();
@@ -1341,6 +1335,7 @@ mod haider_bridge_tests {
             &mut tracker,
             std::slice::from_ref(&raw_changed),
             &heads,
+            true,
             &mut reconcile,
         )
         .unwrap();
@@ -1352,11 +1347,103 @@ mod haider_bridge_tests {
                 &mut tracker,
                 std::slice::from_ref(&raw_changed),
                 &heads,
+                true,
                 &mut reconcile,
             )
             .unwrap();
         }
         assert_eq!(writes.get(), 5);
+    }
+
+    #[test]
+    fn haider_bridge_push_and_full_summaries_share_apply_and_skip_logic() {
+        let mut full_tracker = HaiderBridgeReconcileTracker::default();
+        let mut push_tracker = HaiderBridgeReconcileTracker::default();
+        let full_calls = std::cell::RefCell::new(Vec::new());
+        let push_calls = std::cell::RefCell::new(Vec::new());
+
+        for head_seq in [4, 4, 5] {
+            let full = json!({
+                "sessions": [{
+                    "session_id":"session-shared",
+                    "head_seq":head_seq,
+                    "title":"Shared",
+                    "model":"model",
+                    "state":"idle",
+                    "updated_at_ms":100
+                }]
+            });
+            let push = json!({
+                "session_id":"session-shared",
+                "head_seq":head_seq,
+                "title":"Shared",
+                "last_model":"model"
+            });
+            haider_bridge_reconcile_summary_values_tracked(
+                &mut full_tracker,
+                vec![full],
+                true,
+                |_, candidates| {
+                    full_calls.borrow_mut().push(
+                        candidates
+                            .iter()
+                            .map(|session| session.id.clone())
+                            .collect::<Vec<_>>(),
+                    );
+                    Ok(false)
+                },
+            )
+            .unwrap();
+            haider_bridge_reconcile_summary_values_tracked(
+                &mut push_tracker,
+                vec![push],
+                false,
+                |_, candidates| {
+                    push_calls.borrow_mut().push(
+                        candidates
+                            .iter()
+                            .map(|session| (session.id.clone(), session.latest_at_ms))
+                            .collect::<Vec<_>>(),
+                    );
+                    Ok(false)
+                },
+            )
+            .unwrap();
+        }
+        haider_bridge_reconcile_summary_values_tracked(
+            &mut push_tracker,
+            vec![json!({
+                "session_id":"session-shared",
+                "head_seq":3,
+                "title":"stale title",
+                "last_model":"stale-model"
+            })],
+            false,
+            |_, candidates| {
+                push_calls.borrow_mut().push(
+                    candidates
+                        .iter()
+                        .map(|session| (session.id.clone(), session.latest_at_ms))
+                        .collect::<Vec<_>>(),
+                );
+                Ok(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            full_calls.borrow().as_slice(),
+            &[
+                vec!["session-shared".to_string()],
+                vec!["session-shared".to_string()]
+            ]
+        );
+        let push_calls = push_calls.borrow();
+        assert_eq!(push_calls.len(), 2);
+        assert_eq!(push_calls[0][0].0, "session-shared");
+        assert!(push_calls[0][0].1.is_none());
+        assert!(push_calls[1][0].1.is_some());
+        assert_eq!(push_tracker.sessions["session-shared"].head_seq, Some(5));
     }
 
     #[test]
