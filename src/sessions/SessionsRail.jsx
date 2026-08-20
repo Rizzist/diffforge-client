@@ -9,6 +9,9 @@ import {
   SettingsNavGroupLabel,
   ButtonEditIcon,
   RailComposeRow,
+  RailSearchRow,
+  RailSearchIcon,
+  RailSearchField,
 } from "../app/appStyles.js";
 import { formatSessionRelativeTime } from "./sessionsModel.js";
 import { ModelBrandIcon } from "./modelBrand.jsx";
@@ -25,6 +28,7 @@ export default function SessionsRail({
   sessions,
   activeSessionId,
   onNewChat,
+  onSearchChange = null,
   onSelectSession,
   searchQuery = "",
 }) {
@@ -182,6 +186,26 @@ export default function SessionsRail({
         <em aria-hidden="true">＋</em>
       </RailComposeRow>
 
+      {/* Persistent chat search under New chat (folds away when the rail is
+          collapsed — RailSearchRow hides itself). */}
+      <RailSearchRow>
+        <RailSearchBox>
+          <RailSearchIcon aria-hidden="true" />
+          <RailSearchField
+            aria-label="Search chats"
+            onChange={(event) => onSearchChange?.(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                onSearchChange?.("");
+              }
+            }}
+            placeholder="Search chats…"
+            value={searchQuery}
+          />
+        </RailSearchBox>
+      </RailSearchRow>
+
       <SessionListArea>
         {pinned.length > 0 && (
           <SessionGroup>
@@ -264,6 +288,29 @@ const SessionListArea = styled.div`
   flex: 1;
   flex-direction: column;
   gap: 7px;
+
+  /* Collapsed rail shows chrome only — the session list folds away. */
+  [data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
+/* Search box: magnifier inside the field. */
+const RailSearchBox = styled.div`
+  position: relative;
+  display: flex;
+  align-items: center;
+
+  svg {
+    position: absolute;
+    left: 8px;
+    color: var(--forge-text-muted);
+    pointer-events: none;
+  }
+
+  input {
+    padding-left: 26px;
+  }
 `;
 
 const SessionGroup = styled.div`

@@ -262,12 +262,6 @@ import {
   RailModeTag,
   RailHeadIcons,
   RailHeadIconButton,
-  RailSearchIcon,
-  RailNavRow,
-  RailNavSpacer,
-  RailNavExpandedOnly,
-  RailSearchRow,
-  RailSearchField,
   RailUtilityRow,
   RailBackgroundPill,
   RailSyncPill,
@@ -555,7 +549,6 @@ import {
   ButtonRefreshIcon,
   ButtonAddIcon,
   ButtonBackIcon,
-  ButtonForwardIcon,
   ButtonBrowserIcon,
   ButtonWebIcon,
   ButtonCloseIcon,
@@ -18417,108 +18410,41 @@ export default function App() {
       // Store not available yet (first boot before Rust lane) — rail stays empty.
     }
   }, []);
-  /* Session Deck back/forward: a small selection history over the rail's
-     navigation targets (home / draft / session). User navigations record an
-     entry; the rail's arrows replay entries without recording. */
-  const sessionNavRef = useRef({ stack: [{ kind: "home", id: "" }], index: 0 });
-  const [sessionNavCan, setSessionNavCan] = useState({ back: false, forward: false });
-  const syncSessionNavCan = useCallback(() => {
-    const nav = sessionNavRef.current;
-    setSessionNavCan({
-      back: nav.index > 0,
-      forward: nav.index < nav.stack.length - 1,
-    });
-  }, []);
-  const recordSessionNav = useCallback((entry) => {
-    const nav = sessionNavRef.current;
-    const current = nav.stack[nav.index];
-    if (current && current.kind === entry.kind && current.id === entry.id) {
-      return;
-    }
-    nav.stack = [...nav.stack.slice(0, nav.index + 1), entry].slice(-64);
-    nav.index = nav.stack.length - 1;
-    syncSessionNavCan();
-  }, [syncSessionNavCan]);
-  const applySessionNav = useCallback((entry) => {
-    if (entry.kind === "draft") {
-      setSessionDraftOpen(true);
-      setActiveSessionId("");
-    } else if (entry.kind === "session") {
-      setSessionDraftOpen(false);
-      setActiveSessionId(entry.id);
-      setOpenSessionIds((ids) => (ids.includes(entry.id) ? ids : [...ids, entry.id]));
-    } else {
-      setSessionDraftOpen(false);
-      setActiveSessionId("");
-    }
-    showView(DEFAULT_WORKSPACE_VIEW);
-  }, [showView]);
-  const stepSessionNav = useCallback((delta) => {
-    const nav = sessionNavRef.current;
-    let index = nav.index + delta;
-    // Walk past entries whose session rows no longer exist (deleted rows).
-    while (index >= 0 && index < nav.stack.length) {
-      const entry = nav.stack[index];
-      if (entry.kind !== "session" || sessions.some((row) => row.id === entry.id)) {
-        break;
-      }
-      index += delta;
-    }
-    if (index < 0 || index >= nav.stack.length || index === nav.index) {
-      // Nothing live in that direction — prune dead session entries so the
-      // arrows reflect reality instead of staying enabled forever.
-      const currentEntry = nav.stack[nav.index];
-      const liveStack = nav.stack.filter((entry, i) => (
-        i === nav.index
-        || entry.kind !== "session"
-        || sessions.some((row) => row.id === entry.id)
-      ));
-      nav.index = liveStack.indexOf(currentEntry);
-      nav.stack = liveStack;
-      syncSessionNavCan();
-      return;
-    }
-    nav.index = index;
-    syncSessionNavCan();
-    applySessionNav(nav.stack[index]);
-  }, [applySessionNav, sessions, syncSessionNavCan]);
   const openSessionFromRail = useCallback((session) => {
     if (!session?.id) {
       return;
     }
-    recordSessionNav({ kind: "session", id: session.id });
     setSessionDraftOpen(false);
     setActiveSessionId(session.id);
     setOpenSessionIds((ids) => (ids.includes(session.id) ? ids : [...ids, session.id]));
     showView(DEFAULT_WORKSPACE_VIEW);
-  }, [recordSessionNav, showView]);
+  }, [showView]);
   const startNewSessionChat = useCallback(() => {
-    recordSessionNav({ kind: "draft", id: "" });
     setSessionDraftOpen(true);
     setActiveSessionId("");
     showView(DEFAULT_WORKSPACE_VIEW);
-  }, [recordSessionNav, showView]);
+  }, [showView]);
   const deselectSessionToHome = useCallback(() => {
-    recordSessionNav({ kind: "home", id: "" });
     setSessionDraftOpen(false);
     setActiveSessionId("");
-  }, [recordSessionNav]);
+  }, []);
+  /* Rail "New chat" is a toggle: first click opens the draft; clicking it
+     again while the draft is showing deselects back to the home (flame)
+     view. ⌘N stays open-only. */
+  const toggleNewSessionChat = useCallback(() => {
+    if (sessionDraftOpen && !activeSessionId) {
+      deselectSessionToHome();
+      return;
+    }
+    startNewSessionChat();
+  }, [activeSessionId, deselectSessionToHome, sessionDraftOpen, startNewSessionChat]);
   /* Session-history sync for the rail's syncing pill: lifted from
      SessionTranscript (projection caught_up) through SessionSurface's
      additive onSyncingChange callback. */
   const [sessionHistorySyncing, setSessionHistorySyncing] = useState(false);
-  /* Rail session search: the head's magnifier toggles a filter box that
-     narrows the Pinned/Recent lists by title. */
-  const [railSearchOpen, setRailSearchOpen] = useState(false);
+  /* Rail session search: a persistent input under the New chat row (rendered
+     by SessionsRail) narrows the Pinned/Recent lists by title. */
   const [railSearchQuery, setRailSearchQuery] = useState("");
-  const toggleRailSearch = useCallback(() => {
-    setRailSearchOpen((open) => {
-      if (open) {
-        setRailSearchQuery("");
-      }
-      return !open;
-    });
-  }, []);
   const handleDraftMaterialized = useCallback((session) => {
     if (!session?.id) {
       return;
@@ -24232,6 +24158,38 @@ export default function App() {
                           <TitleCloseIcon aria-hidden="true" />
                         </WindowControlButton>
                       </RailWindowControls>
+                      {/* App pills ride the traffic row, right of the window
+                          controls; the collapsed rail hides them. */}
+                      <RailUtilityRow onClick={(event) => event.stopPropagation()}>
+                        <RailBackgroundPill
+                          aria-label="Run in background"
+                          onClick={enterBackgroundMode}
+                          title="Run in background — agents keep working, the window folds away"
+                          type="button"
+                        >
+                          <TitleBackgroundIcon aria-hidden="true" />
+                          <span>Background</span>
+                        </RailBackgroundPill>
+                        {/* Session-history sync — the transcript's projection
+                            caught_up signal, lifted through SessionSurface.
+                            Informational, never faked. */}
+                        <RailSyncPill
+                          aria-label={sessionHistorySyncing
+                            ? "Syncing session history"
+                            : "Session history synced"}
+                          data-state={sessionHistorySyncing ? "syncing" : undefined}
+                          title={sessionHistorySyncing
+                            ? "Syncing this session's history from the harness…"
+                            : "Session history synced"}
+                          type="button"
+                        >
+                          <WindowSyncPillIndicator
+                            aria-hidden="true"
+                            data-variant={sessionHistorySyncing ? "spinner" : "dot"}
+                          />
+                          <span>{sessionHistorySyncing ? "Syncing" : "Synced"}</span>
+                        </RailSyncPill>
+                      </RailUtilityRow>
                     </RailTrafficRow>
                     <RailBrandRow>
                       <RailBrandMark alt="" src="/logo.webp" />
@@ -24245,109 +24203,28 @@ export default function App() {
                         <span>{BRAND_NAME}</span>
                         <RailBrandChevronIcon aria-hidden="true" />
                       </RailBrandButton>
-                      {loopspacesModeActive && <RailModeTag>Loops</RailModeTag>}
+                      {/* Space badge names the CURRENT space — navy blue for
+                          Workspaces, dark gold for Loopspaces (the themes). */}
+                      <RailModeTag data-space={loopspacesModeActive ? "loopspaces" : "workspaces"}>
+                        {loopspacesModeActive ? "Loopspaces" : "Workspaces"}
+                      </RailModeTag>
                       <RailHeadIcons>
                         <RailHeadIconButton
-                          aria-label="Search sessions"
-                          aria-pressed={railSearchOpen}
-                          data-active={railSearchOpen ? "true" : undefined}
-                          onClick={toggleRailSearch}
-                          title="Search sessions"
+                          aria-label={workspaceRailCollapsed ? "Expand rail" : "Collapse rail"}
+                          aria-pressed={workspaceRailCollapsed}
+                          onClick={toggleWorkspaceRailCollapsed}
+                          title={workspaceRailCollapsed ? "Expand rail" : "Collapse rail"}
                           type="button"
                         >
-                          <RailSearchIcon aria-hidden="true" />
+                          {workspaceRailCollapsed ? (
+                            <ButtonRailExpandIcon aria-hidden="true" />
+                          ) : (
+                            <ButtonRailCollapseIcon aria-hidden="true" />
+                          )}
                         </RailHeadIconButton>
                       </RailHeadIcons>
                     </RailBrandRow>
-                    <RailNavRow>
-                      <RailNavExpandedOnly>
-                        <RailHeadIconButton
-                          aria-label="Back"
-                          disabled={!sessionNavCan.back}
-                          onClick={() => stepSessionNav(-1)}
-                          title="Back"
-                          type="button"
-                        >
-                          <ButtonBackIcon aria-hidden="true" />
-                        </RailHeadIconButton>
-                        <RailHeadIconButton
-                          aria-label="Forward"
-                          disabled={!sessionNavCan.forward}
-                          onClick={() => stepSessionNav(1)}
-                          title="Forward"
-                          type="button"
-                        >
-                          <ButtonForwardIcon aria-hidden="true" />
-                        </RailHeadIconButton>
-                      </RailNavExpandedOnly>
-                      <RailNavSpacer />
-                      <RailHeadIconButton
-                        aria-label={workspaceRailCollapsed ? "Expand rail" : "Collapse rail"}
-                        aria-pressed={workspaceRailCollapsed}
-                        onClick={toggleWorkspaceRailCollapsed}
-                        title={workspaceRailCollapsed ? "Expand rail" : "Collapse rail"}
-                        type="button"
-                      >
-                        {workspaceRailCollapsed ? (
-                          <ButtonRailExpandIcon aria-hidden="true" />
-                        ) : (
-                          <ButtonRailCollapseIcon aria-hidden="true" />
-                        )}
-                      </RailHeadIconButton>
-                    </RailNavRow>
-                    {railSearchOpen && (
-                      <RailSearchRow>
-                        <RailSearchField
-                          aria-label="Search sessions"
-                          autoFocus
-                          onChange={(event) => setRailSearchQuery(event.target.value)}
-                          onKeyDown={(event) => {
-                            if (event.key === "Escape") {
-                              event.preventDefault();
-                              toggleRailSearch();
-                            }
-                          }}
-                          placeholder="Search sessions…"
-                          value={railSearchQuery}
-                        />
-                      </RailSearchRow>
-                    )}
                   </RailChrome>
-
-                  {/* Rail-owned utilities: Background + cloud sync live here,
-                      between the head and the compose row — app-level state
-                      never floats over the session content. */}
-                  <RailUtilityRow onClick={(event) => event.stopPropagation()}>
-                    <RailBackgroundPill
-                      aria-label="Run in background"
-                      onClick={enterBackgroundMode}
-                      title="Run in background — agents keep working, the window folds away"
-                      type="button"
-                    >
-                      <TitleBackgroundIcon aria-hidden="true" />
-                      <span>Background</span>
-                    </RailBackgroundPill>
-                    {/* Session-history sync — the transcript's projection
-                        caught_up signal, lifted through SessionSurface.
-                        Informational, never faked: it spins only while the
-                        active session's history is actually folding in. */}
-                    <RailSyncPill
-                      aria-label={sessionHistorySyncing
-                        ? "Syncing session history"
-                        : "Session history synced"}
-                      data-state={sessionHistorySyncing ? "syncing" : undefined}
-                      title={sessionHistorySyncing
-                        ? "Syncing this session's history from the harness…"
-                        : "Session history synced"}
-                      type="button"
-                    >
-                      <WindowSyncPillIndicator
-                        aria-hidden="true"
-                        data-variant={sessionHistorySyncing ? "spinner" : "dot"}
-                      />
-                      <span>{sessionHistorySyncing ? "Syncing" : "Synced"}</span>
-                    </RailSyncPill>
-                  </RailUtilityRow>
 
                   <RailTop>
                     {settingsRailMode ? (
@@ -24552,10 +24429,11 @@ export default function App() {
                       ) : (
                         <SessionsRail
                           activeSessionId={activeSessionId}
-                          onNewChat={startNewSessionChat}
+                          onNewChat={toggleNewSessionChat}
+                          onSearchChange={setRailSearchQuery}
                           onSelectSession={openSessionFromRail}
-                          /* Collapsed hides the search box AND its toggle, so
-                             the filter must not keep acting invisibly. */
+                          /* Collapsed hides the search box, so the filter
+                             must not keep acting invisibly. */
                           searchQuery={workspaceRailCollapsed ? "" : railSearchQuery}
                           sessions={sessions}
                         />

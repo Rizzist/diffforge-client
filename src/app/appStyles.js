@@ -2775,8 +2775,12 @@ export const RailBrandRow = styled.div`
   gap: 8px;
   padding: 4px 6px 0;
 
+  /* Collapsed: the mark stacks over the expand toggle — the toggle must
+     survive collapse or there is no way back. */
   ${WorkspaceRail}[data-collapsed="true"] & {
+    flex-direction: column;
     justify-content: center;
+    gap: 6px;
     padding: 4px 0 0;
   }
 `;
@@ -2844,12 +2848,22 @@ export const RailModeTag = styled.span`
   flex: 0 0 auto;
   padding: 1px 6px;
   border-radius: 5px;
-  color: var(--forge-amber);
-  background: color-mix(in srgb, var(--forge-amber) 14%, transparent);
   font-size: 8.5px;
   font-weight: 800;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+
+  /* Space colors match the space themes: Workspaces navy blue,
+     Loopspaces dark gold. */
+  &[data-space="workspaces"] {
+    color: var(--forge-blue, #62a0ff);
+    background: color-mix(in srgb, var(--forge-blue, #2f80ff) 16%, transparent);
+  }
+
+  &[data-space="loopspaces"] {
+    color: var(--forge-amber);
+    background: color-mix(in srgb, var(--forge-amber) 14%, transparent);
+  }
 
   ${WorkspaceRail}[data-collapsed="true"] & {
     display: none;
@@ -2861,9 +2875,12 @@ export const RailHeadIcons = styled.div`
   flex: 0 0 auto;
   align-items: center;
   gap: 1px;
+  margin-left: auto;
 
+  /* Stays visible collapsed — it now holds the expand toggle. */
   ${WorkspaceRail}[data-collapsed="true"] & {
-    display: none;
+    margin-left: 0;
+    justify-content: center;
   }
 `;
 
@@ -2903,41 +2920,6 @@ export const RailHeadIconButton = styled.button`
   }
 `;
 
-export const RailNavRow = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 1px;
-  padding: 0 4px;
-
-  ${WorkspaceRail}[data-collapsed="true"] & {
-    justify-content: center;
-    padding: 0;
-  }
-`;
-
-export const RailNavSpacer = styled.div`
-  flex: 1;
-
-  ${WorkspaceRail}[data-collapsed="true"] & {
-    display: none;
-  }
-`;
-
-export const RailNavCollapsedOnly = styled.span`
-  display: contents;
-
-  ${WorkspaceRail}:not([data-collapsed="true"]) & {
-    display: none;
-  }
-`;
-
-export const RailNavExpandedOnly = styled.span`
-  display: contents;
-
-  ${WorkspaceRail}[data-collapsed="true"] & {
-    display: none;
-  }
-`;
 
 export const RailSearchRow = styled.div`
   padding: 2px 6px 0;
@@ -2973,26 +2955,25 @@ export const RailUtilityRow = styled.div`
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 7px;
-  /* Same 8px inset as the compose row and the footer cards (the rail's own
-     padding provides it). */
+  gap: 5px;
+  /* Rides the traffic row, right of the window controls. */
+  margin-left: auto;
   padding: 0;
 
+  /* Collapsed rail shows chrome only — no app pills. */
   ${WorkspaceRail}[data-collapsed="true"] & {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 5px;
+    display: none;
   }
 `;
 
 export const RailBackgroundPill = styled.button`
   display: inline-flex;
   min-width: 0;
-  flex: 1;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 5px 11px;
+  gap: 5px;
+  padding: 3px 9px;
   border: 1px solid color-mix(in srgb, var(--forge-ember) 34%, transparent);
   border-radius: 999px;
   color: var(--forge-ember);

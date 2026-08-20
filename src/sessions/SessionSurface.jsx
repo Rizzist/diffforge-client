@@ -45,7 +45,6 @@ import { formatSessionRelativeTime } from "./sessionsModel.js";
      nothing; their PTYs persist daemon-side and are re-adopted on return.
    - "New chat" is a draft; the first prompt materializes it. */
 
-const CONTENT_MEASURE = "54rem";
 
 const PANEL_KINDS = {
   web: { label: "Web", Icon: Language },
@@ -454,8 +453,18 @@ export default function SessionSurface({
     }
   }, [titleDraft, titleRenamingId]);
 
-  const renderTitleRow = (session) => (
-    <WorkTitleCol>
+  /* ONE header row for every tab: small title + its menu on the left, the
+     view cluster (segmented, status pill, theme) on the right; wraps to a
+     second line only when the pane is too narrow. */
+  const workHeader = (session, options = {}) => (
+    <WorkHeader>
+      {session ? renderTitleBlock(session) : <span />}
+      <WorkHeaderSpacer aria-hidden="true" />
+      {floatingControls(session, options)}
+    </WorkHeader>
+  );
+
+  const renderTitleBlock = (session) => (
       <TitleRow>
         {titleRenamingId === session.id ? (
           <TitleRenameInput
@@ -512,7 +521,6 @@ export default function SessionSurface({
           )}
         </TitleMenuWrap>
       </TitleRow>
-    </WorkTitleCol>
   );
 
   /* Floating cluster, top-right of the workspace — ONLY view-scoped chrome:
@@ -661,7 +669,7 @@ export default function SessionSurface({
     return (
       <SessionSurfaceRoot>
         <SessionPane data-active="true">
-          {floatingControls(draftSession)}
+          {workHeader(draftSession)}
           <PaneContent>
             {/* Both draft views stay mounted (hidden one display:none) so
                 Chat↔Shell flips are instant and the TUI stays warm. */}
@@ -706,7 +714,7 @@ export default function SessionSurface({
     return (
       <SessionSurfaceRoot>
         <SessionPane data-active="true">
-          {floatingControls(null, { showToggle: false })}
+          {workHeader(null, { showToggle: false })}
           <PaneContent>
             <HomeBody>
               <HomeLogo alt="" src="/logo.webp" />
@@ -750,7 +758,7 @@ export default function SessionSurface({
         const chatTabActive = activeTab.id === "chat";
         return (
           <SessionPane data-active={active ? "true" : "false"} key={session.id}>
-            {floatingControls(session)}
+            {workHeader(session)}
 
             <PaneContent>
               {/* Chat tab: Chat and Shell BOTH stay mounted for the ACTIVE
@@ -761,9 +769,6 @@ export default function SessionSurface({
               {chatTabActive && active && (
                 <>
                   <ChatHostLayer data-visible={mode === "ui" ? "true" : "false"}>
-                    {/* Content-first: the session title is the first line of
-                        the workspace — typography with a menu, not a bar. */}
-                    {renderTitleRow(session)}
                     <SessionTranscript
                       onSyncingChange={(syncing) => handleTranscriptSyncing(session.id, syncing)}
                       runStatus={session.status === "running"
@@ -798,7 +803,6 @@ export default function SessionSurface({
                   </ChatHostLayer>
                   {mode === "trajectory" && (
                     <TrajectoryHostLayer>
-                      {renderTitleRow(session)}
                       <SessionTrajectory session={session} />
                     </TrajectoryHostLayer>
                   )}
@@ -814,7 +818,6 @@ export default function SessionSurface({
               )}
 
               {/* Panel tabs: picker, then staged panel stubs. */}
-              {!chatTabActive && renderTitleRow(session)}
               {!chatTabActive && activeTab.kind === "picker" && (
                 <PanelPickerBody>
                   <EmptyState>
@@ -890,15 +893,29 @@ const PaneContent = styled.div`
 
 /* The old top bar's controls live HERE — floating in the workspace's
    top-right corner, scoped visually to the session under them. */
+/* The view cluster rides the header row (right side), wrapping under the
+   title only when the pane is too narrow. */
 const FloatingControls = styled.div`
-  position: absolute;
-  top: 12px;
-  right: 16px;
-  z-index: 30;
   display: inline-flex;
-  max-width: calc(100% - 32px);
+  min-width: 0;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+`;
+
+/* ONE row of workspace chrome, on every tab: title + menu left, cluster
+   right. Normal flow — content starts below it, no overlay clearances. */
+const WorkHeader = styled.div`
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding: 10px 16px 4px;
+`;
+
+const WorkHeaderSpacer = styled.span`
+  flex: 1;
 `;
 
 const SessionViewToggle = styled.div`
@@ -1064,30 +1081,21 @@ const HeaderIconButton = styled.button`
 
 /* ---- content-first title line ---------------------------------------- */
 
-/* One centered measure shared by title, transcript, and composer. */
-const WorkTitleCol = styled.div`
-  width: 100%;
-  max-width: ${CONTENT_MEASURE};
-  margin: 0 auto;
-  flex: 0 0 auto;
-  /* First content line sits below the floating control cluster (~40px). */
-  padding: 46px 20px 6px;
-`;
-
 const TitleRow = styled.div`
-  display: flex;
+  display: inline-flex;
+  min-width: 0;
   align-items: center;
-  gap: 10px;
+  gap: 4px;
 
   h1 {
-    flex: 1;
     min-width: 0;
+    max-width: 34rem;
     margin: 0;
     overflow: hidden;
     color: var(--forge-text);
-    font-size: 19px;
-    font-weight: 720;
-    letter-spacing: -0.015em;
+    font-size: 14px;
+    font-weight: 680;
+    letter-spacing: -0.01em;
     white-space: nowrap;
     text-overflow: ellipsis;
   }
@@ -1158,9 +1166,6 @@ const TitleMenuItem = styled.button`
 const TerminalHostLayer = styled.div`
   flex: 1;
   min-height: 0;
-  /* The Shell view alone bleeds full-width; the floating controls still
-     overlay its corner, so the PTY starts below them. */
-  padding-top: 46px;
 
   &[data-visible="false"] {
     display: none;
