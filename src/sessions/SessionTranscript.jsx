@@ -572,7 +572,7 @@ const TranscriptScroller = styled.div`
      edge) while its content centers on the shared ~54rem column the
      composer also uses. The side gutter SCALES — near-none when the pane
      is narrow, growing with width (to 56px) until the centering wins. */
-  padding: 8px max(min(4.5%, 56px), calc((100% - 54rem) / 2)) 8px;
+  padding: 8px max(min(7%, 64px), calc((100% - 54rem) / 2)) 8px;
 `;
 
 const TranscriptRow = styled.div`
