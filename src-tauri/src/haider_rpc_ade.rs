@@ -88,6 +88,10 @@ impl SurfaceCommandStatus {
 pub struct SurfaceInput {
     pub text: String,
     pub revision: u64,
+    /// Daemon-stamped publisher connection id. Revision lanes are
+    /// PER-CONNECTION, so the UI must discriminate self/foreign by owner —
+    /// never by comparing revisions across lanes (rev934 P1-1).
+    pub owner: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,10 +501,11 @@ impl RevisionGate {
                         .is_none_or(|revision| input.revision > revision) =>
             {
                 self.last_input_revision = Some(input.revision);
-                self.input_owner = Some(input.owner);
+                self.input_owner = Some(input.owner.clone());
                 self.input = Some(SurfaceInput {
                     text: input.text,
                     revision: input.revision,
+                    owner: input.owner,
                 });
                 changed = true;
             }

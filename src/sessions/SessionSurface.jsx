@@ -61,12 +61,17 @@ export default function SessionSurface({
   const [sessionTabs, setSessionTabs] = useState({});
   /* Composer drafts are SURFACE-owned, keyed by session id ("draft" for the
      unmaterialized chat): the composer unmounts on view/session switches, so
-     the text must outlive it. mirrorRevisionsRef is the ONE input_mirror_v1
-     revision clock per session — shared by local typing and daemon frames —
-     so a composer remount can never re-apply a stale mirror frame over
-     newer local text: whichever revision is newest owns the draft. */
+     the text must outlive it. Daemon revision lanes are PER-CONNECTION
+     (rev934 P1-1), so frames are discriminated by OWNER, never by comparing
+     revisions across lanes: mirrorRevisionsRef stamps only OUR publishes;
+     mirrorPublishedRef remembers the last publish so our own echo (revision
+     AND text match) teaches us our owner id; foreign lanes keep per-owner
+     applied floors in mirrorForeignRef. A fresh TUI's revision 1 applies. */
   const [composerTexts, setComposerTexts] = useState({});
   const mirrorRevisionsRef = useRef({});
+  const mirrorPublishedRef = useRef({}); // sessionId -> {text, revision}
+  const mirrorSelfOwnerRef = useRef(""); // learned daemon connection id
+  const mirrorForeignRef = useRef({}); // sessionId -> {owner -> floor}
   const setComposerText = useCallback((sessionId, text) => {
     setComposerTexts((current) => ({ ...current, [sessionId]: text }));
   }, []);
@@ -136,18 +141,26 @@ export default function SessionSurface({
         setSurfaceStatus((current) => ({ ...current, [local.id]: payload.status.line }));
       }
       if (payload.input?.text != null) {
-        /* input_mirror_v1: a daemon frame replaces the hoisted draft only
-           when its revision beats everything seen so far — including local
-           typing, which bumps the same clock through onMirrorType. */
+        /* input_mirror_v1, owner-aware (rev934 P1-1): our own accepted
+           publish echoed back (revision AND text match) names our lane and
+           drops; other frames from that learned owner drop as echoes; every
+           foreign lane applies when its OWN revision advances — a fresh
+           publisher's revision 1 is newer than nothing of ours. */
+        const { text, owner = "" } = payload.input;
         const revision = payload.input.revision || 0;
-        if (revision > (mirrorRevisionsRef.current[local.id] || 0)) {
-          mirrorRevisionsRef.current[local.id] = revision;
-          const text = payload.input.text;
-          setComposerTexts((current) => (
-            (current[local.id] || "") === text
-              ? current
-              : { ...current, [local.id]: text }
-          ));
+        const published = mirrorPublishedRef.current[local.id];
+        if (published && published.revision === revision && published.text === text) {
+          if (owner) mirrorSelfOwnerRef.current = owner;
+        } else if (!owner || owner !== mirrorSelfOwnerRef.current) {
+          const floors = (mirrorForeignRef.current[local.id] ||= {});
+          if (!(owner in floors) || revision > floors[owner]) {
+            floors[owner] = revision;
+            setComposerTexts((current) => (
+              (current[local.id] || "") === text
+                ? current
+                : { ...current, [local.id]: text }
+            ));
+          }
         }
       }
     }).then((fn) => {
@@ -617,11 +630,12 @@ export default function SessionSurface({
                       chipValues={chipValuesFor(session)}
                       onChipChange={(key, option) => handleChipChange(session.id, key, option)}
                       onMirrorType={(text) => {
-                        /* Local typing keeps publishing into the daemon
-                           surface, stamped from the shared revision clock so
-                           the publish is the newest frame by construction. */
+                        /* Local typing publishes on OUR monotone lane; the
+                           remembered (text, revision) lets the echo teach us
+                           our daemon-assigned owner id. */
                         const revision = (mirrorRevisionsRef.current[session.id] || 0) + 1;
                         mirrorRevisionsRef.current[session.id] = revision;
+                        mirrorPublishedRef.current[session.id] = { text, revision };
                         void invoke("surface_publish_input", {
                           session_id: session.id,
                           text,
