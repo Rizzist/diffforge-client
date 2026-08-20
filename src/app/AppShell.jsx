@@ -251,13 +251,31 @@ import {
   WorkspaceStartupDetails,
   DashboardShell,
   WorkspaceRail,
-  RailHeader,
   RailTop,
-  RailSectionTitle,
-  RailTitleGroup,
-  RailSpaceModeSwitchButton,
-  RailCollapseButton,
-  RailCreateWorkspaceButton,
+  RailChrome,
+  RailTrafficRow,
+  RailWindowControls,
+  RailBrandRow,
+  RailBrandMark,
+  RailBrandButton,
+  RailBrandChevronIcon,
+  RailModeTag,
+  RailHeadIcons,
+  RailHeadIconButton,
+  RailSearchIcon,
+  RailNavRow,
+  RailNavSpacer,
+  RailNavExpandedOnly,
+  RailSearchRow,
+  RailSearchField,
+  RailUtilityRow,
+  RailBackgroundPill,
+  RailSyncPill,
+  RailComposeRow,
+  RailDeviceCard,
+  RailDeviceDot,
+  RailDeviceMeta,
+  RailFootIconButton,
   WorkspaceList,
   WorkspaceRow,
   WorkspaceButton,
@@ -283,7 +301,6 @@ import {
   SettingsNavGroups,
   SettingsNavGroupLabel,
   SettingsContentTitle,
-  TitleToolDockToggle,
   RailViewActions,
   RailActionButton,
   RailAssetsIcon,
@@ -538,6 +555,7 @@ import {
   ButtonRefreshIcon,
   ButtonAddIcon,
   ButtonBackIcon,
+  ButtonForwardIcon,
   ButtonBrowserIcon,
   ButtonWebIcon,
   ButtonCloseIcon,
@@ -562,7 +580,6 @@ import {
   ButtonCheckIcon,
   ButtonRailCollapseIcon,
   ButtonRailExpandIcon,
-  ButtonRailSpaceModeIcon,
   WorkspaceCreateLayer,
   WorkspaceCreateSurface,
   WorkspaceCreateCard,
@@ -2313,6 +2330,9 @@ function readMainWindowRenderableFallback() {
 
 const APP_CLOSE_REQUESTED_EVENT = "forge-app-close-requested";
 const WORKSPACE_RAIL_STORAGE_KEY = "diffforge.workspaceRail.v1";
+// Session Deck rail: the collapse choice persists across app opens. A fresh
+// key — the legacy v1 rail-density key above is actively cleaned up.
+const WORKSPACE_RAIL_COLLAPSED_STORAGE_KEY = "diffforge.railCollapsed.v1";
 const APP_APPEARANCE_STORAGE_KEY = "diffforge.appearance.v1";
 const APP_SPACE_MODE_STORAGE_KEY = "diffforge.app.spaceMode";
 const LOOPSPACE_CACHE_STORAGE_KEY = "diffforge.loopspaces.cache.v1";
@@ -15907,7 +15927,13 @@ export default function App() {
   // workspaceId -> { id, panes: [{ paneId, terminalIndex, count, title, kind }] }
   // captured at the switch-back moment so the terminal grid can show WHICH
   // terminals produced the badge/SFX that pulled the user back.
-  const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(false);
+  const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem(WORKSPACE_RAIL_COLLAPSED_STORAGE_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
   const [appAppearanceSettings, setAppAppearanceSettings] = useState(readAppAppearanceSettings);
   const [appStartupSettings, setAppStartupSettings] = useState(() => normalizeAppStartupSettings(null));
   const [appStartupSettingsState, setAppStartupSettingsState] = useState("idle");
@@ -18391,20 +18417,108 @@ export default function App() {
       // Store not available yet (first boot before Rust lane) — rail stays empty.
     }
   }, []);
+  /* Session Deck back/forward: a small selection history over the rail's
+     navigation targets (home / draft / session). User navigations record an
+     entry; the rail's arrows replay entries without recording. */
+  const sessionNavRef = useRef({ stack: [{ kind: "home", id: "" }], index: 0 });
+  const [sessionNavCan, setSessionNavCan] = useState({ back: false, forward: false });
+  const syncSessionNavCan = useCallback(() => {
+    const nav = sessionNavRef.current;
+    setSessionNavCan({
+      back: nav.index > 0,
+      forward: nav.index < nav.stack.length - 1,
+    });
+  }, []);
+  const recordSessionNav = useCallback((entry) => {
+    const nav = sessionNavRef.current;
+    const current = nav.stack[nav.index];
+    if (current && current.kind === entry.kind && current.id === entry.id) {
+      return;
+    }
+    nav.stack = [...nav.stack.slice(0, nav.index + 1), entry].slice(-64);
+    nav.index = nav.stack.length - 1;
+    syncSessionNavCan();
+  }, [syncSessionNavCan]);
+  const applySessionNav = useCallback((entry) => {
+    if (entry.kind === "draft") {
+      setSessionDraftOpen(true);
+      setActiveSessionId("");
+    } else if (entry.kind === "session") {
+      setSessionDraftOpen(false);
+      setActiveSessionId(entry.id);
+      setOpenSessionIds((ids) => (ids.includes(entry.id) ? ids : [...ids, entry.id]));
+    } else {
+      setSessionDraftOpen(false);
+      setActiveSessionId("");
+    }
+    showView(DEFAULT_WORKSPACE_VIEW);
+  }, [showView]);
+  const stepSessionNav = useCallback((delta) => {
+    const nav = sessionNavRef.current;
+    let index = nav.index + delta;
+    // Walk past entries whose session rows no longer exist (deleted rows).
+    while (index >= 0 && index < nav.stack.length) {
+      const entry = nav.stack[index];
+      if (entry.kind !== "session" || sessions.some((row) => row.id === entry.id)) {
+        break;
+      }
+      index += delta;
+    }
+    if (index < 0 || index >= nav.stack.length || index === nav.index) {
+      // Nothing live in that direction — prune dead session entries so the
+      // arrows reflect reality instead of staying enabled forever.
+      const currentEntry = nav.stack[nav.index];
+      const liveStack = nav.stack.filter((entry, i) => (
+        i === nav.index
+        || entry.kind !== "session"
+        || sessions.some((row) => row.id === entry.id)
+      ));
+      nav.index = liveStack.indexOf(currentEntry);
+      nav.stack = liveStack;
+      syncSessionNavCan();
+      return;
+    }
+    nav.index = index;
+    syncSessionNavCan();
+    applySessionNav(nav.stack[index]);
+  }, [applySessionNav, sessions, syncSessionNavCan]);
   const openSessionFromRail = useCallback((session) => {
     if (!session?.id) {
       return;
     }
+    recordSessionNav({ kind: "session", id: session.id });
     setSessionDraftOpen(false);
     setActiveSessionId(session.id);
     setOpenSessionIds((ids) => (ids.includes(session.id) ? ids : [...ids, session.id]));
     showView(DEFAULT_WORKSPACE_VIEW);
-  }, [showView]);
+  }, [recordSessionNav, showView]);
   const startNewSessionChat = useCallback(() => {
+    recordSessionNav({ kind: "draft", id: "" });
     setSessionDraftOpen(true);
     setActiveSessionId("");
     showView(DEFAULT_WORKSPACE_VIEW);
-  }, [showView]);
+  }, [recordSessionNav, showView]);
+  const deselectSessionToHome = useCallback(() => {
+    recordSessionNav({ kind: "home", id: "" });
+    setSessionDraftOpen(false);
+    setActiveSessionId("");
+  }, [recordSessionNav]);
+  /* Session-history sync for the rail's syncing pill: lifted from
+     SessionTranscript (projection caught_up) through SessionSurface's
+     additive onSyncingChange callback. */
+  const [sessionHistorySyncing, setSessionHistorySyncing] = useState(false);
+  /* Rail session search: the head's magnifier toggles a filter box that
+     narrows the Pinned/Recent lists by title. */
+  const [railSearchOpen, setRailSearchOpen] = useState(false);
+  const [railSearchQuery, setRailSearchQuery] = useState("");
+  const toggleRailSearch = useCallback(() => {
+    setRailSearchOpen((open) => {
+      if (open) {
+        setRailSearchQuery("");
+      }
+      return !open;
+    });
+  }, []);
   const handleDraftMaterialized = useCallback((session) => {
     if (!session?.id) {
       return;
@@ -18817,6 +18931,11 @@ export default function App() {
     const nextCollapsed = !workspaceRailCollapsed;
     animateWorkspaceRailWidth(nextCollapsed);
     setWorkspaceRailCollapsed(nextCollapsed);
+    try {
+      window.localStorage.setItem(WORKSPACE_RAIL_COLLAPSED_STORAGE_KEY, String(nextCollapsed));
+    } catch {
+      // The collapse choice is cosmetic; losing persistence is harmless.
+    }
   }, [animateWorkspaceRailWidth, workspaceRailCollapsed]);
 
   useEffect(() => {
@@ -20089,7 +20208,9 @@ export default function App() {
   }, [refreshWindowFrameState, windowFrameState.isFullscreen]);
 
   const handleTitleBarMouseDown = useCallback((event) => {
-    if (event.button !== 0 || event.target.closest("[data-window-control]")) {
+    // The rail head is a drag region with real controls inside it — any
+    // interactive element opts out of dragging, not only window controls.
+    if (event.button !== 0 || event.target.closest("[data-window-control], button, input")) {
       return;
     }
 
@@ -23906,7 +24027,15 @@ export default function App() {
           outside App would unmount those listeners on error, which is exactly
           the failure mode this guards against. */}
       <PaneErrorBoundary label="Diff Forge interface" variant="shell">
-      <AppFrame data-platform={windowControlPlatform} data-window-expanded={isWindowFrameExpanded}>
+      <AppFrame
+        data-chrome={authState === "authenticated" ? "rail" : "bar"}
+        data-platform={windowControlPlatform}
+        data-window-expanded={isWindowFrameExpanded}
+      >
+        {/* Session Deck: the authenticated shell has NO top bar — the rail
+            owns window controls, brand, and app pills. The titlebar remains
+            only for the signed-out flows (splash/login/pricing). */}
+        {authState !== "authenticated" && (
         <WindowTitleBar
           data-platform={windowControlPlatform}
           onMouseDown={handleTitleBarMouseDown}
@@ -24020,21 +24149,6 @@ export default function App() {
             </WindowControlButton>
           </WindowControls>
         </WindowTitleBar>
-
-        {authState === "authenticated" && workspaceToolPaneVisible && (
-          <TitleToolDockToggle
-            aria-label={workspaceToolPaneMinimized ? "Show app tools" : "Hide app tools"}
-            aria-pressed={!workspaceToolPaneMinimized}
-            data-active={workspaceToolPaneMinimized ? undefined : "true"}
-            data-platform={windowControlPlatform}
-            onClick={() => (workspaceToolPaneMinimized ? restoreWorkspaceToolPane() : minimizeWorkspaceToolPane())}
-            onMouseDown={(event) => event.stopPropagation()}
-            title={workspaceToolPaneMinimized ? "Show app tools" : "Hide app tools"}
-            type="button"
-          >
-            <RailToolsIcon aria-hidden="true" />
-            <span>Tools</span>
-          </TitleToolDockToggle>
         )}
 
         <WindowResizeEdges aria-hidden="true">
@@ -24065,61 +24179,113 @@ export default function App() {
                   data-space-mode={spaceMode}
                   onClick={() => {
                     // Clicking empty rail space deselects → the flame home view.
-                    setSessionDraftOpen(false);
-                    setActiveSessionId("");
+                    deselectSessionToHome();
                   }}
                   ref={workspaceRailRef}
                 >
-                  <RailTop>
-                    <RailHeader>
-                      <RailTitleGroup>
-                        <RailSectionTitle
-                          aria-label={railSpaceModeTitle}
-                          aria-pressed={loopspacesModeActive}
-                          data-mode={spaceMode}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            toggleRailSpaceMode();
-                          }}
-                          title={railSpaceModeTitle}
+                  {/* The rail head IS the window chrome: real window controls
+                      in the traffic inset, brand + space-mode chevron, and
+                      back/forward + collapse. The head doubles as the drag
+                      region (interactive children opt out). */}
+                  <RailChrome
+                    onClick={(event) => event.stopPropagation()}
+                    onMouseDown={handleTitleBarMouseDown}
+                  >
+                    <RailTrafficRow>
+                      <RailWindowControls aria-label="Window controls" data-platform={windowControlPlatform}>
+                        <WindowControlButton
+                          aria-label="Minimize"
+                          data-action="minimize"
+                          data-platform={windowControlPlatform}
+                          data-window-control
+                          onClick={minimizeWindow}
+                          title="Minimize"
                           type="button"
                         >
-                          {railSpaceModeLabel}
-                        </RailSectionTitle>
-                        <RailSpaceModeSwitchButton
-                          aria-label={railSpaceModeTitle}
-                          aria-pressed={loopspacesModeActive}
-                          data-mode={spaceMode}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            toggleRailSpaceMode();
-                          }}
-                          title={railSpaceModeTitle}
+                          <TitleMinimizeIcon aria-hidden="true" />
+                        </WindowControlButton>
+                        <WindowControlButton
+                          aria-label={windowResizeLabel}
+                          data-action="maximize"
+                          data-platform={windowControlPlatform}
+                          data-window-control
+                          onClick={toggleMaximizeWindow}
+                          title={windowResizeLabel}
                           type="button"
                         >
-                          <ButtonRailSpaceModeIcon aria-hidden="true" />
-                        </RailSpaceModeSwitchButton>
-                      </RailTitleGroup>
-                      <RailCreateWorkspaceButton
-                        aria-label={loopspacesModeActive ? "Create loop" : "New chat"}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          if (loopspacesModeActive) {
-                            openCreateLoopspacePanel();
-                            return;
-                          }
-                          void startNewSessionChat();
-                        }}
-                        title={loopspacesModeActive ? "Create loop" : "New chat (⌘N)"}
+                          {windowResizeActive ? (
+                            <TitleRestoreIcon aria-hidden="true" />
+                          ) : (
+                            <TitleMaximizeIcon aria-hidden="true" />
+                          )}
+                        </WindowControlButton>
+                        <WindowControlButton
+                          aria-label="Close"
+                          data-action="close"
+                          data-platform={windowControlPlatform}
+                          data-window-control
+                          data-variant="close"
+                          onClick={closeWindow}
+                          title="Close"
+                          type="button"
+                        >
+                          <TitleCloseIcon aria-hidden="true" />
+                        </WindowControlButton>
+                      </RailWindowControls>
+                    </RailTrafficRow>
+                    <RailBrandRow>
+                      <RailBrandMark alt="" src="/logo.webp" />
+                      <RailBrandButton
+                        aria-label={railSpaceModeTitle}
+                        aria-pressed={loopspacesModeActive}
+                        onClick={toggleRailSpaceMode}
+                        title={railSpaceModeTitle}
                         type="button"
                       >
-                        <ButtonAddIcon aria-hidden="true" />
-                      </RailCreateWorkspaceButton>
-                      <RailCollapseButton
-                        aria-label={workspaceRailCollapsed ? "Expand workspace drawer" : "Collapse workspace drawer"}
+                        <span>{BRAND_NAME}</span>
+                        <RailBrandChevronIcon aria-hidden="true" />
+                      </RailBrandButton>
+                      {loopspacesModeActive && <RailModeTag>Loops</RailModeTag>}
+                      <RailHeadIcons>
+                        <RailHeadIconButton
+                          aria-label="Search sessions"
+                          aria-pressed={railSearchOpen}
+                          data-active={railSearchOpen ? "true" : undefined}
+                          onClick={toggleRailSearch}
+                          title="Search sessions"
+                          type="button"
+                        >
+                          <RailSearchIcon aria-hidden="true" />
+                        </RailHeadIconButton>
+                      </RailHeadIcons>
+                    </RailBrandRow>
+                    <RailNavRow>
+                      <RailNavExpandedOnly>
+                        <RailHeadIconButton
+                          aria-label="Back"
+                          disabled={!sessionNavCan.back}
+                          onClick={() => stepSessionNav(-1)}
+                          title="Back"
+                          type="button"
+                        >
+                          <ButtonBackIcon aria-hidden="true" />
+                        </RailHeadIconButton>
+                        <RailHeadIconButton
+                          aria-label="Forward"
+                          disabled={!sessionNavCan.forward}
+                          onClick={() => stepSessionNav(1)}
+                          title="Forward"
+                          type="button"
+                        >
+                          <ButtonForwardIcon aria-hidden="true" />
+                        </RailHeadIconButton>
+                      </RailNavExpandedOnly>
+                      <RailNavSpacer />
+                      <RailHeadIconButton
+                        aria-label={workspaceRailCollapsed ? "Expand rail" : "Collapse rail"}
                         aria-pressed={workspaceRailCollapsed}
                         onClick={toggleWorkspaceRailCollapsed}
-                        title={workspaceRailCollapsed ? "Expand drawer" : "Drawer smaller"}
+                        title={workspaceRailCollapsed ? "Expand rail" : "Collapse rail"}
                         type="button"
                       >
                         {workspaceRailCollapsed ? (
@@ -24127,8 +24293,63 @@ export default function App() {
                         ) : (
                           <ButtonRailCollapseIcon aria-hidden="true" />
                         )}
-                      </RailCollapseButton>
-                    </RailHeader>
+                      </RailHeadIconButton>
+                    </RailNavRow>
+                    {railSearchOpen && (
+                      <RailSearchRow>
+                        <RailSearchField
+                          aria-label="Search sessions"
+                          autoFocus
+                          onChange={(event) => setRailSearchQuery(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Escape") {
+                              event.preventDefault();
+                              toggleRailSearch();
+                            }
+                          }}
+                          placeholder="Search sessions…"
+                          value={railSearchQuery}
+                        />
+                      </RailSearchRow>
+                    )}
+                  </RailChrome>
+
+                  {/* Rail-owned utilities: Background + cloud sync live here,
+                      between the head and the compose row — app-level state
+                      never floats over the session content. */}
+                  <RailUtilityRow onClick={(event) => event.stopPropagation()}>
+                    <RailBackgroundPill
+                      aria-label="Run in background"
+                      onClick={enterBackgroundMode}
+                      title="Run in background — agents keep working, the window folds away"
+                      type="button"
+                    >
+                      <TitleBackgroundIcon aria-hidden="true" />
+                      <span>Background</span>
+                    </RailBackgroundPill>
+                    {/* Session-history sync — the transcript's projection
+                        caught_up signal, lifted through SessionSurface.
+                        Informational, never faked: it spins only while the
+                        active session's history is actually folding in. */}
+                    <RailSyncPill
+                      aria-label={sessionHistorySyncing
+                        ? "Syncing session history"
+                        : "Session history synced"}
+                      data-state={sessionHistorySyncing ? "syncing" : undefined}
+                      title={sessionHistorySyncing
+                        ? "Syncing this session's history from the harness…"
+                        : "Session history synced"}
+                      type="button"
+                    >
+                      <WindowSyncPillIndicator
+                        aria-hidden="true"
+                        data-variant={sessionHistorySyncing ? "spinner" : "dot"}
+                      />
+                      <span>{sessionHistorySyncing ? "Syncing" : "Synced"}</span>
+                    </RailSyncPill>
+                  </RailUtilityRow>
+
+                  <RailTop>
                     {settingsRailMode ? (
                       <SettingsRailNav
                         aria-label="Settings navigation"
@@ -24287,6 +24508,19 @@ export default function App() {
                     <WorkspaceList>
                       {loopspacesModeActive ? (
                         <>
+                          <RailComposeRow
+                            aria-label="Create loop"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openCreateLoopspacePanel();
+                            }}
+                            style={{ margin: "2px 8px 6px" }}
+                            title="Create loop"
+                            type="button"
+                          >
+                            <ButtonAddIcon aria-hidden="true" />
+                            <span>Create loop</span>
+                          </RailComposeRow>
                           {loopspaces.map((loopspace) => (
                             <LoopspaceRailRow
                               key={loopspace.id}
@@ -24320,6 +24554,9 @@ export default function App() {
                           activeSessionId={activeSessionId}
                           onNewChat={startNewSessionChat}
                           onSelectSession={openSessionFromRail}
+                          /* Collapsed hides the search box AND its toggle, so
+                             the filter must not keep acting invisibly. */
+                          searchQuery={workspaceRailCollapsed ? "" : railSearchQuery}
                           sessions={sessions}
                         />
                       )}
@@ -24354,6 +24591,55 @@ export default function App() {
                         </RailActionButton>
                       </RailViewActions>
                     )}
+                    {/* Presence: this device — name, app version, and the
+                        live connectivity word from the cloud sync state. The
+                        card carries the old titlebar sync pill's behavior:
+                        click opens networking diagnostics (or, for free
+                        plans, the Plus checkout). */}
+                    <RailDeviceCard
+                      aria-label={cloudSyncPillState === "upgrade"
+                        ? cloudSyncPillTitle
+                        : `Open networking diagnostics. ${cloudSyncPillTitle}`}
+                      onClick={
+                        cloudSyncPillState === "upgrade"
+                          ? forceUpgradePillPreview
+                            // In test-preview mode keep the modal reachable so the
+                            // toggle can be turned back off.
+                            ? openNetworkingOverlay
+                            : () => {
+                                // Start the Plus subscription checkout on the website in the
+                                // system browser — the page opens Stripe checkout for the
+                                // signed-in account (or routes through sign-in first).
+                                openUrl("https://diffforge.ai/billing/checkout?plan=plus").catch(() => {});
+                              }
+                          : openNetworkingOverlay
+                      }
+                      title={cloudSyncPillTitle || undefined}
+                      type="button"
+                    >
+                      <RailDeviceDot
+                        aria-hidden="true"
+                        data-state={cloudSyncPillState === "upgrade" ? "local" : (cloudSyncPillState || "local")}
+                      />
+                      <RailDeviceMeta>
+                        <strong>
+                          {cloudDesktopDeviceProfile?.display_name
+                            || cloudDesktopDeviceProfile?.device_label
+                            || cloudDesktopDeviceProfile?.device_name
+                            || cloudDesktopDeviceProfile?.name
+                            || "This device"}
+                        </strong>
+                        <span>
+                          {appVersion ? `v${appVersion}` : BRAND_NAME}
+                          {" · "}
+                          {cloudSyncPillState === "live"
+                            ? "online"
+                            : cloudSyncPillState === "upgrade" || !cloudSyncPillState
+                              ? "local"
+                              : (cloudSyncPillLabel || "local").toLowerCase()}
+                        </span>
+                      </RailDeviceMeta>
+                    </RailDeviceCard>
                     <RailAccountBar ref={accountMenuRef}>
                       {accountMenuOpen && createPortal(
                         <AccountMenuPop aria-label="Account" ref={accountMenuPopRef} role="menu">
@@ -24450,6 +24736,27 @@ export default function App() {
                         <RailAccountAvatar aria-hidden="true">{accountInitial}</RailAccountAvatar>
                         <span>{accountDisplayName}</span>
                       </RailAccountChipButton>
+                      {workspaceToolPaneVisible && (
+                        <RailFootIconButton
+                          aria-label={workspaceToolPaneMinimized ? "Show app tools" : "Hide app tools"}
+                          aria-pressed={!workspaceToolPaneMinimized}
+                          data-active={workspaceToolPaneMinimized ? undefined : "true"}
+                          onClick={() => (workspaceToolPaneMinimized ? restoreWorkspaceToolPane() : minimizeWorkspaceToolPane())}
+                          title={workspaceToolPaneMinimized ? "Show app tools" : "Hide app tools"}
+                          type="button"
+                        >
+                          <RailToolsIcon aria-hidden="true" />
+                        </RailFootIconButton>
+                      )}
+                      <RailFootIconButton
+                        aria-label="Settings"
+                        data-active={activeView === "settings" ? "true" : undefined}
+                        onClick={() => showView("settings")}
+                        title="Settings (⌘,)"
+                        type="button"
+                      >
+                        <RailSettingsIcon aria-hidden="true" />
+                      </RailFootIconButton>
                     </RailAccountBar>
                   </RailFooter>
                 </WorkspaceRail>
@@ -24666,6 +24973,7 @@ export default function App() {
                       onDraftMaterialized={handleDraftMaterialized}
                       onOpenSession={openSessionFromRail}
                       onResetToDraft={startNewSessionChat}
+                      onSyncingChange={setSessionHistorySyncing}
                       onToggleTheme={() => updateAppTheme(
                         activeAppTheme === APP_THEME_LIGHT ? APP_THEME_DARK : APP_THEME_LIGHT,
                       )}

@@ -8,23 +8,25 @@ import { Edit } from "@styled-icons/material-rounded/Edit";
 import {
   SettingsNavGroupLabel,
   ButtonEditIcon,
+  RailComposeRow,
 } from "../app/appStyles.js";
 import { formatSessionRelativeTime } from "./sessionsModel.js";
 import { ModelBrandIcon } from "./modelBrand.jsx";
 
-/* Codex-style session rail: a compact compose "New chat" on top, then two
+/* Session Deck rail list: a prominent "New chat" compose row on top, then two
    groups — Pinned (user-pinned rows) and Recent (everything else, newest
    first). Rows lead with the brand mark of the session's current model.
    Right-click opens Pin/Unpin + Rename; renames set a title lock so daemon
-   reconciles never clobber them. Collapsed rail shows ONLY the compose
-   button. New chat opens a zero-cost draft (no session is created until the
-   harness acts). */
+   reconciles never clobber them. The collapsed rail keeps the rows as a
+   brand-dot icon strip (compose stays as an icon square). New chat opens a
+   zero-cost draft (no session is created until the harness acts). */
 
 export default function SessionsRail({
   sessions,
   activeSessionId,
   onNewChat,
   onSelectSession,
+  searchQuery = "",
 }) {
   /* Relative times tick once a minute while the rail is mounted. */
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -106,8 +108,17 @@ export default function SessionsRail({
   const sorted = [...sessions].sort(
     (a, b) => (b.latest_at_ms || 0) - (a.latest_at_ms || 0),
   );
-  const pinned = sorted.filter((session) => session.pinned);
-  const recent = sorted.filter((session) => !session.pinned);
+  /* Rail search (the head's magnifier) narrows both groups by title or the
+     opening user message. */
+  const query = searchQuery.trim().toLowerCase();
+  const matches = query
+    ? sorted.filter((session) => (
+      String(session.title || "").toLowerCase().includes(query)
+      || String(session.first_user_message || "").toLowerCase().includes(query)
+    ))
+    : sorted;
+  const pinned = matches.filter((session) => session.pinned);
+  const recent = matches.filter((session) => !session.pinned);
 
   const renderRow = (session) => {
     if (session.id === renamingId) {
@@ -160,7 +171,7 @@ export default function SessionsRail({
 
   return (
     <SessionsRailRoot onClick={(event) => event.stopPropagation()}>
-      <NewChatButton
+      <RailComposeRow
         aria-label="New chat"
         onClick={onNewChat}
         title="New chat (⌘N)"
@@ -168,7 +179,8 @@ export default function SessionsRail({
       >
         <ButtonEditIcon aria-hidden="true" />
         <span>New chat</span>
-      </NewChatButton>
+        <em aria-hidden="true">＋</em>
+      </RailComposeRow>
 
       <SessionListArea>
         {pinned.length > 0 && (
@@ -187,6 +199,11 @@ export default function SessionsRail({
         {!sorted.length && (
           <SessionsEmptyHint>
             No sessions yet. Start with New chat.
+          </SessionsEmptyHint>
+        )}
+        {sorted.length > 0 && !matches.length && (
+          <SessionsEmptyHint>
+            No sessions match “{searchQuery.trim()}”.
           </SessionsEmptyHint>
         )}
       </SessionListArea>
@@ -227,89 +244,52 @@ const SessionsRailRoot = styled.div`
   padding: 2px 8px 10px;
 
   [data-collapsed="true"] & {
-    align-items: center;
-    padding: 2px 4px 10px;
-    overflow: hidden;
+    align-items: stretch;
+    padding: 2px 6px 10px;
+    overflow-y: auto;
+    scrollbar-width: none;
+  }
+
+  [data-collapsed="true"] &::-webkit-scrollbar {
+    width: 0;
+    height: 0;
   }
 `;
 
-const NewChatButton = styled.button`
-  display: inline-flex;
-  min-height: 26px;
-  align-items: center;
-  gap: 7px;
-  align-self: stretch;
-  padding: 0 8px;
-  border: 1px solid var(--forge-border);
-  border-radius: 8px;
-  color: var(--forge-text-soft);
-  background: var(--forge-surface);
-  font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
-  text-align: left;
-
-  svg {
-    width: 13px;
-    height: 13px;
-    flex: 0 0 auto;
-    opacity: 0.85;
-  }
-
-  &:hover {
-    color: var(--forge-text);
-    border-color: var(--forge-border-strong);
-    background: var(--forge-surface-hover);
-  }
-
-  /* Collapsed rail: icon-only square. */
-  [data-collapsed="true"] & {
-    width: 30px;
-    min-height: 30px;
-    align-self: center;
-    justify-content: center;
-    gap: 0;
-    padding: 0;
-  }
-
-  [data-collapsed="true"] & span {
-    display: none;
-  }
-`;
-
-/* The whole list disappears when the rail is collapsed — clean icon strip. */
+/* Collapsed rail: the list stays as a brand-dot icon strip — group labels
+   and row text fold away, the marks keep their activity badges. */
 const SessionListArea = styled.div`
   display: flex;
   min-height: 0;
   flex: 1;
   flex-direction: column;
   gap: 7px;
-
-  [data-collapsed="true"] & {
-    display: none;
-  }
 `;
 
 const SessionGroup = styled.div`
   display: grid;
   gap: 2px;
+
+  [data-collapsed="true"] & ${SettingsNavGroupLabel} {
+    display: none;
+  }
 `;
 
 /* Dedicated row: shared rail buttons wrap a three-part row (mark · title ·
-   meta); this keeps 26px/11px metrics and the active pill on a flex row. */
+   meta) on the Session Deck's 284px measure — 30px rows, 12px type. */
 const SessionRowButton = styled.button`
   display: flex;
   width: 100%;
   min-width: 0;
-  min-height: 26px;
+  min-height: 30px;
   align-items: center;
-  gap: 6px;
-  padding: 0 8px 0 6px;
+  gap: 8px;
+  padding: 0 9px 0 8px;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 8px;
   color: var(--forge-text-soft);
   background: transparent;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 550;
   cursor: pointer;
   text-align: left;
@@ -323,6 +303,14 @@ const SessionRowButton = styled.button`
     color: var(--forge-text);
     border-color: rgba(var(--forge-tint-soft-rgb), 0.52);
     background: var(--forge-surface-selected);
+  }
+
+  /* Collapsed: a centered brand mark, nothing else. */
+  [data-collapsed="true"] & {
+    min-height: 30px;
+    justify-content: center;
+    gap: 0;
+    padding: 0;
   }
 `;
 
@@ -353,6 +341,10 @@ const SessionRowTitle = styled.span`
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+
+  [data-collapsed="true"] & {
+    display: none;
+  }
 `;
 
 const SessionRowMeta = styled.em`
@@ -360,6 +352,10 @@ const SessionRowMeta = styled.em`
   color: var(--forge-text-muted);
   font-size: 9.5px;
   font-style: normal;
+
+  [data-collapsed="true"] & {
+    display: none;
+  }
 `;
 
 const SessionContextMenu = styled.div`

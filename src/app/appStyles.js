@@ -39,6 +39,7 @@ import { Mic } from "@styled-icons/material-rounded/Mic";
 import { MicOff } from "@styled-icons/material-rounded/MicOff";
 import { NotificationsActive } from "@styled-icons/material-rounded/NotificationsActive";
 import { Remove } from "@styled-icons/material-rounded/Remove";
+import { Search } from "@styled-icons/material-rounded/Search";
 import { OpenInBrowser } from "@styled-icons/material-rounded/OpenInBrowser";
 import { Pending } from "@styled-icons/material-rounded/Pending";
 import { PrivacyTip } from "@styled-icons/material-rounded/PrivacyTip";
@@ -546,6 +547,13 @@ export const AppFrame = styled.div`
   grid-template-rows: ${TITLE_BAR_HEIGHT} minmax(0, 1fr);
   background: var(--forge-bg);
 
+  /* Session Deck chrome: the authenticated shell has NO top bar — the rail
+     owns window controls, brand, and app-level pills. The titlebar row only
+     exists for the signed-out flows (splash/login/pricing). */
+  &[data-chrome="rail"] {
+    grid-template-rows: minmax(0, 1fr);
+  }
+
   &[data-platform="macos"][data-window-expanded="false"] {
     min-height: 100vh;
     border: 0;
@@ -597,6 +605,12 @@ export const WindowResizeHandle = styled.div`
     bottom: 10px;
     width: 6px;
     cursor: ew-resize;
+  }
+
+  /* Rail chrome (no top bar): the side edges reach the top corners. */
+  [data-chrome="rail"] &[data-placement="right"],
+  [data-chrome="rail"] &[data-placement="left"] {
+    top: 10px;
   }
 
   &[data-placement="right"] {
@@ -2493,14 +2507,15 @@ export const AuthenticatedWorkspaceFrame = styled.div`
   position: relative;
   width: 100%;
   min-width: 320px;
-  height: calc(100vh - ${TITLE_BAR_HEIGHT});
+  /* No top bar in the authenticated shell — the frame owns the full height. */
+  height: 100vh;
   min-height: 0;
   overflow: hidden;
   background: var(--forge-bg);
 
   @media (max-width: 760px) {
     height: auto;
-    min-height: calc(100vh - ${TITLE_BAR_HEIGHT});
+    min-height: 100vh;
   }
 `;
 
@@ -2584,14 +2599,16 @@ export const WorkspaceStartupDetails = styled.div`
 `;
 
 export const DashboardShell = styled.main`
-  --workspace-rail-width: 160px;
-  --workspace-rail-collapsed-width: 44px;
+  /* Session Deck proportions: one wide rail (~284px) that collapses to a
+     60px icon strip; the workspace column never reflows, it gains margin. */
+  --workspace-rail-width: 284px;
+  --workspace-rail-collapsed-width: 60px;
   --workspace-rail-target-width: var(--workspace-rail-width);
 
   position: relative;
   display: grid;
   min-width: 320px;
-  height: calc(100vh - ${TITLE_BAR_HEIGHT});
+  height: 100vh;
   min-height: 0;
   grid-template-columns: var(--workspace-rail-current-width, var(--workspace-rail-target-width)) minmax(280px, 1fr);
   color: var(--forge-text);
@@ -2623,14 +2640,14 @@ export const DashboardShell = styled.main`
   }
 
   @media (max-width: 980px) {
-    --workspace-rail-width: 152px;
+    --workspace-rail-width: 236px;
 
     grid-template-columns: var(--workspace-rail-current-width, var(--workspace-rail-target-width)) minmax(0, 1fr);
   }
 
   @media (max-width: 760px) {
     height: auto;
-    min-height: calc(100vh - ${TITLE_BAR_HEIGHT});
+    min-height: 100vh;
     grid-template-columns: 1fr;
     overflow: auto;
 
@@ -2643,7 +2660,9 @@ export const DashboardShell = styled.main`
 export const WorkspaceRail = styled.aside`
   display: grid;
   min-height: 0;
-  grid-template-rows: minmax(0, 1fr) minmax(0, max-content);
+  /* Rows: chrome head (traffic lights + brand + nav) · utility pills ·
+     scrolling session list · footer (device/account). */
+  grid-template-rows: auto auto minmax(0, 1fr) minmax(0, max-content);
   gap: 8px;
   padding: 8px;
   border-right: 1px solid rgba(var(--forge-tint-soft-rgb), 0.14);
@@ -2681,11 +2700,513 @@ export const WorkspaceRail = styled.aside`
 
   @media (max-width: 760px) {
     min-height: auto;
-    grid-template-rows: auto auto;
+    grid-template-rows: auto auto auto auto;
     gap: 8px;
     padding: 8px;
     border-right: 0;
     border-bottom: 1px solid var(--forge-border);
+  }
+`;
+
+/* ---- Session Deck rail chrome ------------------------------------------
+   The rail's head IS the app chrome: real window controls sit in the
+   traffic-light inset, the brand row carries identity + the space-mode
+   switcher chevron, and the nav row holds back/forward + the collapse
+   toggle. The whole head doubles as the window drag region. */
+
+export const RailChrome = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 2px 0 0;
+  user-select: none;
+`;
+
+export const RailTrafficRow = styled.div`
+  display: flex;
+  min-height: 18px;
+  align-items: center;
+  padding: 6px 6px 2px;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    justify-content: center;
+    padding: 6px 0 2px;
+  }
+`;
+
+/* Extends the titlebar's control cluster so the per-platform button styling
+   (macOS traffic lights / linux squares) keeps working inside the rail. */
+export const RailWindowControls = styled(WindowControls)`
+  height: auto;
+
+  &[data-platform="windows"] ${WindowControlButton},
+  &[data-platform="linux"] ${WindowControlButton} {
+    width: 26px;
+    height: 20px;
+    border-radius: 6px;
+  }
+
+  &[data-platform="windows"] {
+    gap: 3px;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] &[data-platform="macos"] {
+    gap: 5px;
+    padding: 0;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] &[data-platform="windows"] ${WindowControlButton},
+  ${WorkspaceRail}[data-collapsed="true"] &[data-platform="linux"] ${WindowControlButton} {
+    width: 15px;
+    height: 15px;
+    border-radius: 4px;
+
+    svg {
+      width: 9px;
+      height: 9px;
+    }
+  }
+`;
+
+export const RailBrandRow = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 0;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    justify-content: center;
+    padding: 4px 0 0;
+  }
+`;
+
+export const RailBrandMark = styled.img`
+  display: block;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border-radius: 6px;
+  object-fit: cover;
+`;
+
+export const RailBrandButton = styled.button`
+  display: inline-flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 2px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--forge-text);
+  background: transparent;
+  font-size: 13.5px;
+  font-weight: 760;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  text-align: left;
+
+  > span {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  svg {
+    flex: 0 0 auto;
+    color: var(--forge-text-muted);
+    transition: color 140ms ease, transform 160ms ease;
+  }
+
+  &:hover svg {
+    color: var(--forge-text);
+    transform: translateY(1px);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
+export const RailBrandChevronIcon = styled(ExpandMore)`
+  width: 15px;
+  height: 15px;
+`;
+
+export const RailSearchIcon = styled(Search)`
+  width: 14px;
+  height: 14px;
+`;
+
+export const RailModeTag = styled.span`
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 5px;
+  color: var(--forge-amber);
+  background: color-mix(in srgb, var(--forge-amber) 14%, transparent);
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
+export const RailHeadIcons = styled.div`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 1px;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
+export const RailHeadIconButton = styled.button`
+  display: grid;
+  width: 25px;
+  height: 25px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: var(--forge-text-muted);
+  background: transparent;
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover:not(:disabled) {
+    color: var(--forge-text);
+    background: var(--forge-surface-hover);
+  }
+
+  &:disabled {
+    color: var(--forge-text-disabled);
+    cursor: default;
+    opacity: 0.6;
+  }
+
+  &[data-active="true"] {
+    color: var(--forge-text);
+    background: rgba(var(--forge-tint-rgb), 0.16);
+  }
+`;
+
+export const RailNavRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 0 4px;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    justify-content: center;
+    padding: 0;
+  }
+`;
+
+export const RailNavSpacer = styled.div`
+  flex: 1;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
+export const RailNavCollapsedOnly = styled.span`
+  display: contents;
+
+  ${WorkspaceRail}:not([data-collapsed="true"]) & {
+    display: none;
+  }
+`;
+
+export const RailNavExpandedOnly = styled.span`
+  display: contents;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
+export const RailSearchRow = styled.div`
+  padding: 2px 6px 0;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
+export const RailSearchField = styled.input`
+  width: 100%;
+  min-width: 0;
+  padding: 5px 9px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: var(--forge-surface);
+  font-size: 11.5px;
+  outline: none;
+
+  &::placeholder {
+    color: var(--forge-text-muted);
+  }
+
+  &:focus {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.5);
+  }
+`;
+
+/* Rail-owned utility pills (Background + cloud sync) — app-level state lives
+   in the rail with the brand, never floating over the session content. */
+export const RailUtilityRow = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  /* Same 8px inset as the compose row and the footer cards (the rail's own
+     padding provides it). */
+  padding: 0;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 5px;
+  }
+`;
+
+export const RailBackgroundPill = styled.button`
+  display: inline-flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border: 1px solid color-mix(in srgb, var(--forge-ember) 34%, transparent);
+  border-radius: 999px;
+  color: var(--forge-ember);
+  background: color-mix(in srgb, var(--forge-ember) 10%, transparent);
+  font-size: 10.5px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease,
+    color 150ms ease;
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  svg {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 auto;
+  }
+
+  &:hover {
+    border-color: color-mix(in srgb, var(--forge-ember) 62%, transparent);
+    background: color-mix(in srgb, var(--forge-ember) 16%, transparent);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    padding: 5px 0;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & span {
+    display: none;
+  }
+`;
+
+/* The prominent compose row: "New chat" in sessions mode, "Create loop" in
+   loops mode. Collapsed rail keeps it as an icon square. */
+export const RailComposeRow = styled.button`
+  display: flex;
+  min-width: 0;
+  min-height: 32px;
+  align-items: center;
+  gap: 9px;
+  padding: 0 11px;
+  border: 1px solid var(--forge-border);
+  border-radius: 10px;
+  color: var(--forge-text);
+  background: var(--forge-surface);
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease;
+
+  > svg:first-child {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 auto;
+    color: var(--forge-accent-soft, var(--forge-text-soft));
+  }
+
+  span {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  em {
+    flex: 0 0 auto;
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-style: normal;
+  }
+
+  &:hover {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.5);
+    background: var(--forge-surface-hover);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    width: 32px;
+    min-height: 32px;
+    align-self: center;
+    justify-content: center;
+    gap: 0;
+    padding: 0;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & span,
+  ${WorkspaceRail}[data-collapsed="true"] & em {
+    display: none;
+  }
+`;
+
+/* Rail footer presence: this device (name · version · connectivity). It is
+   a button — it inherits the old titlebar sync pill's click (networking
+   diagnostics / Plus checkout). */
+export const RailDeviceCard = styled.button`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 10px;
+  color: inherit;
+  background: var(--forge-surface);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 150ms ease, background 150ms ease;
+
+  &:hover {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.45);
+    background: var(--forge-surface-hover);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    justify-content: center;
+    padding: 7px 0;
+  }
+`;
+
+export const RailDeviceDot = styled.span`
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--forge-text-disabled);
+
+  &[data-state="live"] {
+    background: var(--forge-green);
+  }
+
+  &[data-state="syncing"],
+  &[data-state="connecting"],
+  &[data-state="provisioning"],
+  &[data-state="retrying"] {
+    background: var(--forge-amber);
+  }
+
+  &[data-state="offline"],
+  &[data-state="offline_permanent"],
+  &[data-state="blocked"] {
+    background: var(--forge-red);
+  }
+`;
+
+export const RailDeviceMeta = styled.div`
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+
+  strong {
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 11.5px;
+    font-weight: 680;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
+export const RailFootIconButton = styled.button`
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: var(--forge-text-muted);
+  background: transparent;
+  cursor: pointer;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: var(--forge-surface-hover);
+  }
+
+  &[data-active="true"] {
+    color: var(--forge-text);
+    background: rgba(var(--forge-tint-rgb), 0.16);
+  }
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
   }
 `;
 
@@ -2719,10 +3240,11 @@ export const RailTop = styled.div`
     height: 0;
   }
 
-  /* Collapsed pins the rail top (no scrolling) so the header/expand button
-     can never scroll out of view above the icon rows. */
+  /* Collapsed: the icon strip must stay reachable — RailTop keeps owning
+     the scroll (the chrome head lives OUTSIDE RailTop now, so nothing
+     important can scroll away). */
   ${WorkspaceRail}[data-collapsed="true"] & {
-    overflow-y: hidden;
+    overflow-y: auto;
   }
 `;
 
@@ -24695,6 +25217,27 @@ export const WindowSyncPill = styled.button`
   html[data-forge-theme="light"] &[data-state="upgrade"]:hover {
     color: rgba(154, 52, 18, 1);
     background: rgba(255, 122, 24, 0.2);
+  }
+`;
+
+/* Rail-homed variant of the cloud sync pill: same live states/behavior, but
+   it lives in the rail's utility row and collapses to the bare indicator. */
+export const RailSyncPill = styled(WindowSyncPill)`
+  min-width: 0;
+  flex: 0 1 auto;
+  justify-content: center;
+  /* Informational (session-history sync) — not a click target. */
+  cursor: default;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    width: 100%;
+    padding: 5px 0;
+  }
+
+  /* Collapsed: keep only the state indicator (it carries data-variant);
+     the text label and direction counts fold away. */
+  ${WorkspaceRail}[data-collapsed="true"] & > span:not([data-variant]) {
+    display: none;
   }
 `;
 

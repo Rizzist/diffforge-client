@@ -333,7 +333,7 @@ function ToolCluster({ rows, sessionId }) {
 
 /* ---- transcript ------------------------------------------------------- */
 
-export default function SessionTranscript({ session, runStatus = "" }) {
+export default function SessionTranscript({ session, runStatus = "", onSyncingChange }) {
   const sessionId = session?.id || "";
   const scrollerRef = useRef(null);
   const [totalRows, setTotalRows] = useState(0);
@@ -341,6 +341,20 @@ export default function SessionTranscript({ session, runStatus = "" }) {
   const [windowState, setWindowState] = useState({ start: 0, rows: [] });
   const [loadState, setLoadState] = useState("loading"); // loading | ready | empty | error
   const [caughtUp, setCaughtUp] = useState(true);
+  /* Additive sync lift (Session Deck): report whether this projection is
+     still catching up — cold load or a live fold gap — so the shell's rail
+     pill can show it. Read through a ref so an inline callback prop can't
+     retrigger the effect; unmount reports false (a hidden transcript is not
+     syncing anything the shell should show). Nothing else here changes. */
+  const onSyncingChangeRef = useRef(onSyncingChange);
+  onSyncingChangeRef.current = onSyncingChange;
+  const syncing = loadState === "loading" || !caughtUp;
+  useEffect(() => {
+    onSyncingChangeRef.current?.(syncing);
+  }, [syncing]);
+  useEffect(() => () => {
+    onSyncingChangeRef.current?.(false);
+  }, []);
   const heightsRef = useRef(new Map()); // seq -> measured px
   const stickBottomRef = useRef(true);
   const fetchInFlightRef = useRef(false);
@@ -554,7 +568,10 @@ const TranscriptScroller = styled.div`
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 18px 20px 8px;
+  /* Session Deck measure: the scroller spans the pane (scrollbar at the
+     edge) while its content centers on the shared ~54rem column that the
+     title line and composer also use. */
+  padding: 8px max(20px, calc((100% - 54rem) / 2)) 8px;
 `;
 
 const TranscriptRow = styled.div`

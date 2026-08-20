@@ -2,17 +2,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import styled from "styled-components";
+import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Forum } from "@styled-icons/material-rounded/Forum";
 import { Language } from "@styled-icons/material-rounded/Language";
 import { Memory } from "@styled-icons/material-rounded/Memory";
+import { MoreHoriz } from "@styled-icons/material-rounded/MoreHoriz";
 import { Movie } from "@styled-icons/material-rounded/Movie";
+import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Terminal as TerminalGlyph } from "@styled-icons/material-rounded/Terminal";
 import { Timeline } from "@styled-icons/material-rounded/Timeline";
 
 import {
   ButtonDarkModeIcon,
   ButtonLightModeIcon,
-  ButtonRefreshIcon,
   ButtonCloseIcon,
   ButtonAddIcon,
 } from "../app/appStyles.js";
@@ -23,21 +25,27 @@ import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
 import { formatSessionRelativeTime } from "./sessionsModel.js";
 
-/* Main-pane surface for sessions.
+/* Main-pane surface for sessions — the Session Deck workspace.
 
-   Structure (per the approved design):
-   - The header is a TAB BAR: the session's Chat tab plus user-created panel
-     tabs; "+" opens a new tab showing the panel picker (Web, PCB Design,
-     AI Video Editor). Panel embedding is staged — picker + branded stubs
-     now, live panels as they are re-scoped to sessions.
-   - The Chat/Shell toggle, run-state pill, new-chat (reset to draft), and
-     theme toggle FLOAT top-right over the content, dashboard-style.
+   Structure (per the approved /sdc design):
+   - NO top bar. The workspace is content-first: its FIRST LINE is the
+     session title as typography (with an ellipsis menu for Pin/Rename),
+     never a toolbar.
+   - The view controls FLOAT in the workspace's top-right corner: the
+     Chat|Shell|Traj segmented toggle (panel tabs — Web, PCB, AI Video —
+     ride the same segmented control, added via its "+"), the exact harness
+     status pill, and the theme toggle. App-level pills (Background, cloud
+     sync) are RAIL-owned, never floated here.
+   - Title, transcript, and composer share one centered ~54rem measure;
+     the Shell view alone bleeds full-width.
    - A session is harness data, not a PTY: Chat view reads the projection.
      For the ACTIVE session (and the draft) Chat and Shell BOTH stay mounted
      — the unselected view collapses to display:none — so toggling is
      instant and the shell is already warm. Background sessions mount
      nothing; their PTYs persist daemon-side and are re-adopted on return.
    - "New chat" is a draft; the first prompt materializes it. */
+
+const CONTENT_MEASURE = "54rem";
 
 const PANEL_KINDS = {
   web: { label: "Web", Icon: Language },
@@ -52,6 +60,7 @@ export default function SessionSurface({
   onDraftMaterialized,
   onOpenSession,
   onResetToDraft,
+  onSyncingChange,
   onToggleTheme,
   openSessions,
   planKey = "free",
@@ -282,6 +291,25 @@ export default function SessionSurface({
     setViewModes((current) => ({ ...current, [sessionId]: mode }));
   }, []);
 
+  /* Session-history sync, lifted from the transcript's additive callback
+     (projection caught_up + cold-load state) and reported upward for the
+     rail's syncing pill. Keyed per session; only the ACTIVE session's state
+     surfaces. */
+  const [transcriptSyncing, setTranscriptSyncing] = useState({});
+  const handleTranscriptSyncing = useCallback((sessionId, syncing) => {
+    setTranscriptSyncing((current) => (
+      Boolean(current[sessionId]) === Boolean(syncing)
+        ? current
+        : { ...current, [sessionId]: Boolean(syncing) }
+    ));
+  }, []);
+  const activeTranscriptSyncing = Boolean(
+    !draftOpen && activeSessionId && transcriptSyncing[activeSessionId],
+  );
+  useEffect(() => {
+    onSyncingChange?.(activeTranscriptSyncing);
+  }, [activeTranscriptSyncing, onSyncingChange]);
+
   const tabsStateFor = (sessionId) => sessionTabs[sessionId] || {
     tabs: [{ id: "chat", kind: "chat" }],
     activeTabId: "chat",
@@ -367,84 +395,253 @@ export default function SessionSurface({
     }
   }, [setModeFor]);
 
-  const floatingControls = (session, { showToggle = true } = {}) => (
-    <FloatingControls>
-      {showToggle && session && (
-      <SessionViewToggle aria-label="Session view" role="tablist">
-        <SessionViewButton
-          aria-selected={modeFor(session.id) === "ui"}
-          data-active={modeFor(session.id) === "ui" ? "true" : undefined}
-          onClick={() => setModeFor(session.id, "ui")}
-          role="tab"
-          type="button"
-        >
-          <Forum aria-hidden="true" size={13} />
-          <span>Chat</span>
-        </SessionViewButton>
-        <SessionViewButton
-          aria-selected={modeFor(session.id) === "terminal"}
-          data-active={modeFor(session.id) === "terminal" ? "true" : undefined}
-          onClick={() => setModeFor(session.id, "terminal")}
-          role="tab"
-          type="button"
-        >
-          <TerminalGlyph aria-hidden="true" size={13} />
-          <span>Shell</span>
-        </SessionViewButton>
-        {session.id !== "draft" && (
-          <SessionViewButton
-            aria-selected={modeFor(session.id) === "trajectory"}
-            data-active={modeFor(session.id) === "trajectory" ? "true" : undefined}
-            onClick={() => setModeFor(session.id, "trajectory")}
-            role="tab"
-            title="Trajectory"
+  /* Session title chrome: the title is the workspace's first content line;
+     its ellipsis menu carries Pin/Unpin + Rename (the same harness doors the
+     rail's context menu uses). */
+  const [titleMenuFor, setTitleMenuFor] = useState("");
+  const [titleRenamingId, setTitleRenamingId] = useState("");
+  const [titleDraft, setTitleDraft] = useState("");
+  const titleMenuRef = useRef(null);
+  useEffect(() => {
+    if (!titleMenuFor) {
+      return undefined;
+    }
+    const close = (event) => {
+      if (titleMenuRef.current && titleMenuRef.current.contains(event.target)) {
+        return;
+      }
+      setTitleMenuFor("");
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape") {
+        setTitleMenuFor("");
+      }
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [titleMenuFor]);
+  const toggleSessionPin = useCallback(async (session) => {
+    setTitleMenuFor("");
+    try {
+      await invoke("session_set_pinned", {
+        session_id: session.id,
+        pinned: !session.pinned,
+      });
+    } catch {
+      // Store predates pinning — the menu action is a quiet no-op.
+    }
+  }, []);
+  const beginTitleRename = useCallback((session) => {
+    setTitleMenuFor("");
+    setTitleRenamingId(session.id);
+    setTitleDraft(session.title || "");
+  }, []);
+  const commitTitleRename = useCallback(async () => {
+    const id = titleRenamingId;
+    const title = titleDraft.trim();
+    setTitleRenamingId("");
+    if (!id || !title) {
+      return;
+    }
+    try {
+      await invoke("session_rename", { session_id: id, title });
+    } catch {
+      // Store predates renaming — leave the daemon title in place.
+    }
+  }, [titleDraft, titleRenamingId]);
+
+  const renderTitleRow = (session) => (
+    <WorkTitleCol>
+      <TitleRow>
+        {titleRenamingId === session.id ? (
+          <TitleRenameInput
+            aria-label="Rename session"
+            autoFocus
+            onBlur={() => void commitTitleRename()}
+            onChange={(event) => setTitleDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void commitTitleRename();
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                setTitleRenamingId("");
+              }
+            }}
+            value={titleDraft}
+          />
+        ) : (
+          <h1 title={session.title}>{session.title}</h1>
+        )}
+        <TitleMenuWrap ref={titleMenuFor === session.id ? titleMenuRef : undefined}>
+          <HeaderIconButton
+            aria-expanded={titleMenuFor === session.id}
+            aria-haspopup="menu"
+            aria-label="Session menu"
+            onClick={() => setTitleMenuFor(
+              (current) => (current === session.id ? "" : session.id),
+            )}
+            title="Session options"
             type="button"
           >
-            <Timeline aria-hidden="true" size={13} />
-            <span>Traj</span>
-          </SessionViewButton>
-        )}
-      </SessionViewToggle>
-      )}
-      {session && session.id !== "draft" && (
-        <StatusPill data-status={session.status}>
-          <i aria-hidden="true" />
-          {/* status_segment_v1: the pill mirrors the TUI's bottom-left strip
-              byte-for-byte when the daemon publishes it; state_raw and the
-              buckets are the fallbacks. */}
-          <span>
-            {(surfaceStatus[session.id] || "").trim()
-              || (session.state_raw || "").trim()
-              || (session.status === "running"
-                ? "Running"
-                : session.status === "waiting"
-                  ? "Waiting"
-                  : session.status === "error"
-                    ? "Error"
-                    : "Idle")}
-          </span>
-        </StatusPill>
-      )}
-      <HeaderIconButton
-        aria-label="New chat"
-        onClick={onResetToDraft}
-        title="New chat (⌘N)"
-        type="button"
-      >
-        <ButtonRefreshIcon aria-hidden="true" />
-      </HeaderIconButton>
-      <HeaderIconButton
-        aria-label={appThemeIsLight ? "Switch to dark theme" : "Switch to light theme"}
-        onClick={onToggleTheme}
-        title={appThemeIsLight ? "Dark theme" : "Light theme"}
-        type="button"
-      >
-        {appThemeIsLight
-          ? <ButtonDarkModeIcon aria-hidden="true" />
-          : <ButtonLightModeIcon aria-hidden="true" />}
-      </HeaderIconButton>
-    </FloatingControls>
+            <MoreHoriz aria-hidden="true" size={15} />
+          </HeaderIconButton>
+          {titleMenuFor === session.id && (
+            <TitleMenu role="menu">
+              <TitleMenuItem
+                onClick={() => void toggleSessionPin(session)}
+                role="menuitem"
+                type="button"
+              >
+                <PushPin aria-hidden="true" />
+                <span>{session.pinned ? "Unpin" : "Pin"}</span>
+              </TitleMenuItem>
+              <TitleMenuItem
+                onClick={() => beginTitleRename(session)}
+                role="menuitem"
+                type="button"
+              >
+                <Edit aria-hidden="true" />
+                <span>Rename</span>
+              </TitleMenuItem>
+            </TitleMenu>
+          )}
+        </TitleMenuWrap>
+      </TitleRow>
+    </WorkTitleCol>
   );
+
+  /* Floating cluster, top-right of the workspace — ONLY view-scoped chrome:
+     the segmented view control (with the session's panel tabs riding it),
+     the exact harness status pill, and the theme toggle. */
+  const floatingControls = (session, { showToggle = true } = {}) => {
+    const tabsState = session && session.id !== "draft" ? tabsStateFor(session.id) : null;
+    const panelTabs = tabsState ? tabsState.tabs.filter((tab) => tab.kind !== "chat") : [];
+    const activeTabIsChat = !tabsState
+      || !tabsState.tabs.some((tab) => tab.id === tabsState.activeTabId)
+      || tabsState.activeTabId === "chat";
+    const selectView = (viewMode) => {
+      if (tabsState && !activeTabIsChat) {
+        selectTab(session.id, "chat");
+      }
+      setModeFor(session.id, viewMode);
+    };
+    /* status_segment_v1: the pill mirrors the TUI's bottom-left strip
+       byte-for-byte when the daemon publishes it; state_raw and the buckets
+       are the fallbacks. */
+    const statusLine = session && session.id !== "draft"
+      ? ((surfaceStatus[session.id] || "").trim()
+        || (session.state_raw || "").trim()
+        || (session.status === "running"
+          ? "Running"
+          : session.status === "waiting"
+            ? "Waiting"
+            : session.status === "error"
+              ? "Error"
+              : "Idle"))
+      : "";
+    return (
+      <FloatingControls>
+        {showToggle && session && (
+        <SessionViewToggle aria-label="Session view" role="tablist">
+          <SessionViewButton
+            aria-selected={activeTabIsChat && modeFor(session.id) === "ui"}
+            data-active={activeTabIsChat && modeFor(session.id) === "ui" ? "true" : undefined}
+            onClick={() => selectView("ui")}
+            role="tab"
+            type="button"
+          >
+            <Forum aria-hidden="true" size={13} />
+            <span>Chat</span>
+          </SessionViewButton>
+          <SessionViewButton
+            aria-selected={activeTabIsChat && modeFor(session.id) === "terminal"}
+            data-active={activeTabIsChat && modeFor(session.id) === "terminal" ? "true" : undefined}
+            onClick={() => selectView("terminal")}
+            role="tab"
+            type="button"
+          >
+            <TerminalGlyph aria-hidden="true" size={13} />
+            <span>Shell</span>
+          </SessionViewButton>
+          {session.id !== "draft" && (
+            <SessionViewButton
+              aria-selected={activeTabIsChat && modeFor(session.id) === "trajectory"}
+              data-active={activeTabIsChat && modeFor(session.id) === "trajectory" ? "true" : undefined}
+              onClick={() => selectView("trajectory")}
+              role="tab"
+              title="Trajectory"
+              type="button"
+            >
+              <Timeline aria-hidden="true" size={13} />
+              <span>Traj</span>
+            </SessionViewButton>
+          )}
+          {panelTabs.map((tab) => {
+            const panel = PANEL_KINDS[tab.kind];
+            const PanelIcon = panel?.Icon || ButtonAddIcon;
+            const label = panel?.label || "New panel";
+            return (
+              <SessionViewButton
+                aria-selected={tabsState.activeTabId === tab.id}
+                data-active={tabsState.activeTabId === tab.id ? "true" : undefined}
+                key={tab.id}
+                onClick={() => selectTab(session.id, tab.id)}
+                role="tab"
+                title={label}
+                type="button"
+              >
+                <PanelIcon aria-hidden="true" size={13} />
+                <span>{label}</span>
+                <PanelSegClose
+                  aria-label="Close panel"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    closeTab(session.id, tab.id);
+                  }}
+                  role="button"
+                  tabIndex={-1}
+                >
+                  <ButtonCloseIcon aria-hidden="true" />
+                </PanelSegClose>
+              </SessionViewButton>
+            );
+          })}
+          {session.id !== "draft" && (
+            <SegAddButton
+              aria-label="New panel"
+              onClick={() => addTab(session.id)}
+              title="New panel"
+              type="button"
+            >
+              <ButtonAddIcon aria-hidden="true" />
+            </SegAddButton>
+          )}
+        </SessionViewToggle>
+        )}
+        {session && session.id !== "draft" && (
+          <StatusPill data-status={session.status} title={statusLine}>
+            <i aria-hidden="true" />
+            <span>{statusLine}</span>
+          </StatusPill>
+        )}
+        <HeaderIconButton
+          aria-label={appThemeIsLight ? "Switch to dark theme" : "Switch to light theme"}
+          onClick={onToggleTheme}
+          title={appThemeIsLight ? "Dark theme" : "Light theme"}
+          type="button"
+        >
+          {appThemeIsLight
+            ? <ButtonDarkModeIcon aria-hidden="true" />
+            : <ButtonLightModeIcon aria-hidden="true" />}
+        </HeaderIconButton>
+      </FloatingControls>
+    );
+  };
 
   if (draftOpen) {
     // Draft = the harness itself. Default view is the Chat composer —
@@ -464,13 +661,7 @@ export default function SessionSurface({
     return (
       <SessionSurfaceRoot>
         <SessionPane data-active="true">
-          <SessionTabBar>
-            <TabChip data-active="true" type="button">
-              <Forum aria-hidden="true" size={12} />
-              <span>New chat</span>
-            </TabChip>
-            {floatingControls(draftSession)}
-          </SessionTabBar>
+          {floatingControls(draftSession)}
           <PaneContent>
             {/* Both draft views stay mounted (hidden one display:none) so
                 Chat↔Shell flips are instant and the TUI stays warm. */}
@@ -515,9 +706,7 @@ export default function SessionSurface({
     return (
       <SessionSurfaceRoot>
         <SessionPane data-active="true">
-          <SessionTabBar>
-            {floatingControls(null, { showToggle: false })}
-          </SessionTabBar>
+          {floatingControls(null, { showToggle: false })}
           <PaneContent>
             <HomeBody>
               <HomeLogo alt="" src="/logo.webp" />
@@ -561,51 +750,7 @@ export default function SessionSurface({
         const chatTabActive = activeTab.id === "chat";
         return (
           <SessionPane data-active={active ? "true" : "false"} key={session.id}>
-            <SessionTabBar>
-              {tabs.map((tab) => {
-                const panel = PANEL_KINDS[tab.kind];
-                const TabIcon = tab.kind === "chat"
-                  ? Forum
-                  : panel?.Icon || ButtonAddIcon;
-                const label = tab.kind === "chat"
-                  ? session.title
-                  : panel?.label || "New tab";
-                return (
-                  <TabChip
-                    data-active={tab.id === activeTab.id ? "true" : undefined}
-                    key={tab.id}
-                    onClick={() => selectTab(session.id, tab.id)}
-                    title={label}
-                    type="button"
-                  >
-                    <TabIcon aria-hidden="true" size={12} />
-                    <span>{label}</span>
-                    {tab.id !== "chat" && (
-                      <TabClose
-                        aria-label="Close tab"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          closeTab(session.id, tab.id);
-                        }}
-                        role="button"
-                        tabIndex={-1}
-                      >
-                        <ButtonCloseIcon aria-hidden="true" />
-                      </TabClose>
-                    )}
-                  </TabChip>
-                );
-              })}
-              <TabAddButton
-                aria-label="New tab"
-                onClick={() => addTab(session.id)}
-                title="New tab"
-                type="button"
-              >
-                <ButtonAddIcon aria-hidden="true" />
-              </TabAddButton>
-              {floatingControls(session)}
-            </SessionTabBar>
+            {floatingControls(session)}
 
             <PaneContent>
               {/* Chat tab: Chat and Shell BOTH stay mounted for the ACTIVE
@@ -616,7 +761,11 @@ export default function SessionSurface({
               {chatTabActive && active && (
                 <>
                   <ChatHostLayer data-visible={mode === "ui" ? "true" : "false"}>
+                    {/* Content-first: the session title is the first line of
+                        the workspace — typography with a menu, not a bar. */}
+                    {renderTitleRow(session)}
                     <SessionTranscript
+                      onSyncingChange={(syncing) => handleTranscriptSyncing(session.id, syncing)}
                       runStatus={session.status === "running"
                         ? ((surfaceStatus[session.id] || "").trim()
                           || (session.state_raw || "").trim()
@@ -648,7 +797,10 @@ export default function SessionSurface({
                     />
                   </ChatHostLayer>
                   {mode === "trajectory" && (
-                    <SessionTrajectory session={session} />
+                    <TrajectoryHostLayer>
+                      {renderTitleRow(session)}
+                      <SessionTrajectory session={session} />
+                    </TrajectoryHostLayer>
                   )}
                   <TerminalHostLayer data-visible={mode === "terminal" ? "true" : "false"}>
                     <SessionTerminal
@@ -662,6 +814,7 @@ export default function SessionSurface({
               )}
 
               {/* Panel tabs: picker, then staged panel stubs. */}
+              {!chatTabActive && renderTitleRow(session)}
               {!chatTabActive && activeTab.kind === "picker" && (
                 <PanelPickerBody>
                   <EmptyState>
@@ -727,98 +880,6 @@ const SessionPane = styled.div`
   }
 `;
 
-const SessionTabBar = styled.div`
-  display: flex;
-  min-height: 34px;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 4px;
-  padding: 0 10px;
-  overflow-x: auto;
-  border-bottom: 1px solid var(--forge-border);
-  background: var(--forge-surface);
-`;
-
-const TabChip = styled.button`
-  display: inline-flex;
-  max-width: 220px;
-  min-height: 24px;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 6px;
-  padding: 0 9px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  color: var(--forge-text-muted);
-  background: transparent;
-  font-size: 11px;
-  font-weight: 650;
-  cursor: pointer;
-
-  span {
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
-
-  svg {
-    flex: 0 0 auto;
-  }
-
-  &:hover {
-    color: var(--forge-text-soft);
-    background: var(--forge-surface-hover);
-  }
-
-  &[data-active="true"] {
-    color: var(--forge-text);
-    border-color: rgba(var(--forge-tint-soft-rgb), 0.4);
-    background: rgba(var(--forge-tint-rgb), 0.14);
-  }
-`;
-
-const TabClose = styled.span`
-  display: grid;
-  width: 14px;
-  height: 14px;
-  place-items: center;
-  border-radius: 4px;
-  color: var(--forge-text-muted);
-
-  svg {
-    width: 10px;
-    height: 10px;
-  }
-
-  &:hover {
-    color: var(--forge-text);
-    background: rgba(255, 255, 255, 0.1);
-  }
-`;
-
-const TabAddButton = styled.button`
-  display: grid;
-  width: 22px;
-  height: 22px;
-  flex: 0 0 auto;
-  place-items: center;
-  border: 1px solid var(--forge-border);
-  border-radius: 7px;
-  color: var(--forge-text-soft);
-  background: transparent;
-  cursor: pointer;
-
-  svg {
-    width: 12px;
-    height: 12px;
-  }
-
-  &:hover {
-    color: var(--forge-text);
-    border-color: var(--forge-border-strong);
-  }
-`;
-
 const PaneContent = styled.div`
   position: relative;
   display: flex;
@@ -827,10 +888,15 @@ const PaneContent = styled.div`
   flex-direction: column;
 `;
 
+/* The old top bar's controls live HERE — floating in the workspace's
+   top-right corner, scoped visually to the session under them. */
 const FloatingControls = styled.div`
+  position: absolute;
+  top: 12px;
+  right: 16px;
+  z-index: 30;
   display: inline-flex;
-  flex: 0 0 auto;
-  margin-left: auto;
+  max-width: calc(100% - 32px);
   align-items: center;
   gap: 8px;
 `;
@@ -876,10 +942,65 @@ const SessionViewButton = styled.button`
     opacity: 0.55;
     cursor: default;
   }
+
+  > span {
+    max-width: 120px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+`;
+
+/* Close affordance on a panel segment (design note 5: panels are workspace
+   tabs riding behind the segmented control). */
+const PanelSegClose = styled.span`
+  display: grid;
+  width: 13px;
+  height: 13px;
+  margin-left: 1px;
+  place-items: center;
+  border-radius: 4px;
+  color: var(--forge-text-muted);
+
+  svg {
+    width: 9px;
+    height: 9px;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: rgba(255, 255, 255, 0.12);
+  }
+`;
+
+const SegAddButton = styled.button`
+  display: grid;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  place-items: center;
+  align-self: center;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: transparent;
+  cursor: pointer;
+
+  svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: var(--forge-surface-hover);
+  }
 `;
 
 const StatusPill = styled.span`
   display: inline-flex;
+  min-width: 0;
   align-items: center;
   gap: 6px;
   padding: 3px 10px;
@@ -889,6 +1010,15 @@ const StatusPill = styled.span`
   background: var(--forge-surface-control);
   font-size: 10px;
   font-weight: 700;
+
+  /* The harness line stays byte-exact; a floating pill just can't grow
+     without bound, so extreme lines clip visually (full text on hover). */
+  > span {
+    max-width: 300px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
 
   i {
     width: 6px;
@@ -932,15 +1062,116 @@ const HeaderIconButton = styled.button`
   }
 `;
 
+/* ---- content-first title line ---------------------------------------- */
+
+/* One centered measure shared by title, transcript, and composer. */
+const WorkTitleCol = styled.div`
+  width: 100%;
+  max-width: ${CONTENT_MEASURE};
+  margin: 0 auto;
+  flex: 0 0 auto;
+  /* First content line sits below the floating control cluster (~40px). */
+  padding: 46px 20px 6px;
+`;
+
+const TitleRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+
+  h1 {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 19px;
+    font-weight: 720;
+    letter-spacing: -0.015em;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+`;
+
+const TitleRenameInput = styled.input`
+  flex: 1;
+  min-width: 0;
+  padding: 2px 8px;
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.52);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: var(--forge-surface);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  outline: none;
+`;
+
+const TitleMenuWrap = styled.div`
+  position: relative;
+  flex: 0 0 auto;
+`;
+
+const TitleMenu = styled.div`
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  display: grid;
+  min-width: 148px;
+  gap: 1px;
+  padding: 4px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 9px;
+  background: var(--forge-surface-raised, var(--forge-surface));
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
+`;
+
+const TitleMenuItem = styled.button`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--forge-text-soft);
+  background: transparent;
+  font-size: 11.5px;
+  font-weight: 550;
+  cursor: pointer;
+  text-align: left;
+
+  svg {
+    width: 13px;
+    height: 13px;
+    opacity: 0.8;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    background: var(--forge-surface-hover);
+  }
+`;
+
 /* Keep-warm wrappers: the active session's Chat and Shell both stay mounted;
    the view not selected collapses to display:none. */
 const TerminalHostLayer = styled.div`
   flex: 1;
   min-height: 0;
+  /* The Shell view alone bleeds full-width; the floating controls still
+     overlay its corner, so the PTY starts below them. */
+  padding-top: 46px;
 
   &[data-visible="false"] {
     display: none;
   }
+`;
+
+const TrajectoryHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
 `;
 
 const ChatHostLayer = styled.div`
