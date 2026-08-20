@@ -2599,9 +2599,9 @@ export const WorkspaceStartupDetails = styled.div`
 `;
 
 export const DashboardShell = styled.main`
-  /* Session Deck proportions: one wide rail (~284px) that collapses to a
+  /* Session Deck proportions: one wide rail (~256px) that collapses to a
      60px icon strip; the workspace column never reflows, it gains margin. */
-  --workspace-rail-width: 284px;
+  --workspace-rail-width: 256px;
   --workspace-rail-collapsed-width: 60px;
   --workspace-rail-target-width: var(--workspace-rail-width);
 
