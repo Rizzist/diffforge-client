@@ -72,10 +72,11 @@ const TOOL_STATUS_LABEL = {
   running: "Running",
 };
 
-/* Secondary dim detail: what the call touched, when the (live) meta says. */
+/* Secondary dim detail: what the call touched. Sidecar v3 (0.0.934) ships
+   args_preview/result_preview on cold rows; live meta may carry the raw keys. */
 function toolDetailOf(row, name) {
   const meta = row?.meta && typeof row.meta === "object" ? row.meta : {};
-  for (const key of ["command", "path", "query", "url", "prompt", "summary"]) {
+  for (const key of ["args_preview", "command", "path", "query", "url", "prompt", "summary"]) {
     const value = meta[key];
     if (typeof value === "string" && value.trim() && value.trim() !== name
       && !/^tool call settled/i.test(value)) {
@@ -92,11 +93,12 @@ function toolDetailOf(row, name) {
   return "";
 }
 
-/* Cold history rows carry only the export turn envelope; anything beyond
-   these keys means the live watch recorded the full call item. */
+/* Cold history rows carry only the export turn envelope (plus, from sidecar
+   v3, capped previews); anything beyond these keys means the live watch
+   recorded the full call item. Thin rows go through the item detail door. */
 const THIN_META_KEYS = new Set([
   "role", "name", "summary", "at_ms", "seq", "ordinal", "branch_id",
-  "kind", "type", "status", "item",
+  "kind", "type", "status", "item", "args_preview", "result_preview",
 ]);
 
 function toolMetaIsRich(row) {
@@ -215,17 +217,42 @@ function buildBlocks(rows) {
 
 /* ---- tool cluster card ------------------------------------------------ */
 
-function ToolCluster({ rows }) {
+function ToolCluster({ rows, sessionId }) {
   const failedCount = rows.reduce(
     (count, row) => count + (toolStatusOf(row) === "failed" ? 1 : 0),
     0,
   );
   const [open, setOpen] = useState(failedCount > 0 || rows.length === 1);
   const [detailKey, setDetailKey] = useState("");
+  const [detailDocs, setDetailDocs] = useState({}); // key -> {state, doc}
   useEffect(() => {
     // A failure arriving in a live cluster must surface itself.
     if (failedCount > 0) setOpen(true);
   }, [failedCount]);
+
+  /* Thin rows fetch the full item through the 0.0.934 detail door on first
+     open (haider session <id> item <seq> --json); pre-934 harnesses fall
+     back to the sidecar previews or the honest note. */
+  const toggleDetail = (row, key) => {
+    if (detailKey === key) {
+      setDetailKey("");
+      return;
+    }
+    setDetailKey(key);
+    if (toolMetaIsRich(row) || detailDocs[key]) return;
+    setDetailDocs((current) => ({ ...current, [key]: { state: "loading" } }));
+    invoke("session_item_get", { session_id: sessionId, seq: row.seq })
+      .then((doc) => {
+        const ok = doc && doc.schema === "haider.item.v1";
+        setDetailDocs((current) => ({
+          ...current,
+          [key]: ok ? { state: "ok", doc } : { state: "error" },
+        }));
+      })
+      .catch(() => {
+        setDetailDocs((current) => ({ ...current, [key]: { state: "error" } }));
+      });
+  };
 
   const counts = { ok: 0, failed: 0, cancelled: 0, running: 0 };
   for (const row of rows) {
@@ -258,11 +285,15 @@ function ToolCluster({ rows }) {
             const status = toolStatusOf(row);
             const detail = toolDetailOf(row, name);
             const detailOpen = detailKey === key;
+            const fetched = detailDocs[key];
+            const previewFallback = [row.meta?.args_preview, row.meta?.result_preview]
+              .filter((value) => typeof value === "string" && value.trim())
+              .join("\n→ ");
             return (
               <ClusterRowWrap key={key}>
                 <ClusterRow
                   data-status={status}
-                  onClick={() => setDetailKey(detailOpen ? "" : key)}
+                  onClick={() => toggleDetail(row, key)}
                   type="button"
                 >
                   <ToolIcon name={name} />
@@ -276,6 +307,14 @@ function ToolCluster({ rows }) {
                     <DetailPre>
                       {JSON.stringify(row.meta, null, 1).slice(0, 4000)}
                     </DetailPre>
+                  ) : fetched?.state === "ok" ? (
+                    <DetailPre>
+                      {JSON.stringify(fetched.doc, null, 1).slice(0, 4000)}
+                    </DetailPre>
+                  ) : fetched?.state === "loading" ? (
+                    <DetailNote>fetching call details…</DetailNote>
+                  ) : previewFallback ? (
+                    <DetailPre>{previewFallback}</DetailPre>
                   ) : (
                     <DetailNote>
                       Full call details aren’t carried in cold history — live
@@ -457,7 +496,7 @@ export default function SessionTranscript({ session, runStatus = "" }) {
               ref={(element) => measureRow(block.key, element)}
             >
               <RowBody data-kind="tool" data-role="tool">
-                <ToolCluster rows={block.rows} />
+                <ToolCluster rows={block.rows} sessionId={sessionId} />
               </RowBody>
             </TranscriptRow>
           );

@@ -94,6 +94,13 @@ fn haider_session_config_get_command(provider_session_id: &str) -> Command {
     command
 }
 
+fn haider_session_item_command(provider_session_id: &str, seq: i64) -> Command {
+    let mut command = Command::new("haider");
+    let seq = seq.to_string();
+    command.args(["session", provider_session_id, "item", &seq, "--json"]);
+    command
+}
+
 fn haider_session_config_set_command(
     provider_session_id: &str,
     config: &RunConfig,
@@ -827,6 +834,20 @@ async fn session_config_get(session_id: String) -> Value {
     )
 }
 
+/// Item detail door (0.0.934, `haider.item.v1`): fetch ONE full journal item
+/// for the chat drawer — cold sidecar rows carry only the envelope; the door
+/// has the joined args/result.
+#[tauri::command(rename_all = "snake_case")]
+async fn session_item_get(session_id: String, seq: i64) -> Value {
+    tauri::async_runtime::spawn_blocking(move || {
+        let provider_session_id = haider_run_provider_session_id(&session_id)?;
+        haider_run_capture_json(haider_session_item_command(&provider_session_id, seq))
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("Session item worker failed: {error}")))
+    .unwrap_or_else(|error| json!({"ok": false, "error": error}))
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn session_config_set(
     app: AppHandle,
@@ -1045,6 +1066,15 @@ mod haider_run_tests {
             });
         assert!(!used_cli);
         assert_eq!(result.unwrap(), json!({"ok":true}));
+    }
+
+    #[test]
+    fn haider_session_item_command_matches_the_934_door() {
+        let command = haider_session_item_command("session-abc", 221);
+        assert_eq!(
+            haider_run_test_args(&command),
+            ["session", "session-abc", "item", "221", "--json"]
+        );
     }
 
     #[test]

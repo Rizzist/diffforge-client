@@ -6314,6 +6314,7 @@ fn run_app(daemon: bool) {
             session_submit_prompt,
             haider_library_snapshot,
             session_config_get,
+            session_item_get,
             session_config_set,
             haider_rpc_ade::rpc_features,
             haider_rpc_ade::surface_attach,

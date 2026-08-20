@@ -1654,7 +1654,9 @@ fn haider_projection_parse_pipe_header(
     }
     let version = haider_projection_json_i64(object.get("version"))
         .ok_or_else(|| "Haider pipe header version was missing.".to_string())?;
-    if version != 2 {
+    // v2 = 0.0.932 baseline; v3 (0.0.934) adds args_preview/result_preview on
+    // tool rows — additive, and they ride into row meta untouched.
+    if !(2..=3).contains(&version) {
         return Err(format!("Unsupported Haider pipe version {version}."));
     }
     let session_id = object
@@ -3023,24 +3025,26 @@ mod haider_projection_tests {
     }
 
     #[test]
-    fn haider_projection_parses_v2_header_and_rejects_future_version() {
-        let header = haider_projection_parse_pipe_header(
-            &json!({
-                "pipe":"haider.session.jsonl",
-                "version":2,
-                "session_id":"session-test",
-                "generation":7
-            }),
-            "session-test",
-        )
-        .unwrap();
-        assert_eq!(header.generation, 7);
+    fn haider_projection_parses_v2_v3_headers_and_rejects_future_version() {
+        for (version, generation) in [(2, 7), (3, 8)] {
+            let header = haider_projection_parse_pipe_header(
+                &json!({
+                    "pipe":"haider.session.jsonl",
+                    "version":version,
+                    "session_id":"session-test",
+                    "generation":generation
+                }),
+                "session-test",
+            )
+            .unwrap();
+            assert_eq!(header.generation, generation);
+        }
         assert!(haider_projection_parse_pipe_header(
             &json!({
                 "pipe":"haider.session.jsonl",
-                "version":3,
+                "version":4,
                 "session_id":"session-test",
-                "generation":8
+                "generation":9
             }),
             "session-test",
         )
