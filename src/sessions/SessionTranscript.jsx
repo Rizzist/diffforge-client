@@ -578,7 +578,7 @@ const TranscriptRow = styled.div`
   position: relative;
   display: flex;
   width: 100%;
-  max-width: 54rem;
+  max-width: 44rem;
   margin: 0 auto;
   padding: 5px 0;
 
@@ -909,7 +909,7 @@ const ErrorTag = styled.div`
 const DayDivider = styled.div`
   display: flex;
   width: 100%;
-  max-width: 54rem;
+  max-width: 44rem;
   margin: 0 auto;
   align-items: center;
   gap: 12px;
@@ -947,7 +947,7 @@ const LiveCaret = styled.span`
 const ShimmerRow = styled.div`
   display: flex;
   width: 100%;
-  max-width: 54rem;
+  max-width: 44rem;
   margin: 0 auto;
   align-items: center;
   gap: 8px;
