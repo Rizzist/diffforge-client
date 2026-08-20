@@ -840,6 +840,33 @@ fn haider_bridge_reconcile_summary_values_tracked(
     haider_bridge_reconcile_tracked(tracker, &sessions, &head_sequences, complete, reconcile)
 }
 
+fn haider_bridge_reconcile_summary_values_prefold(
+    tracker: &mut HaiderBridgeReconcileTracker,
+    summaries: Vec<Value>,
+    complete: bool,
+    reconcile: impl FnOnce(
+        Option<&[HaiderBridgeSession]>,
+        &[HaiderBridgeSession],
+    ) -> Result<bool, String>,
+    mut enqueue: impl FnMut(Vec<String>),
+) -> Result<bool, String> {
+    let mut prefold = Vec::new();
+    let changed = haider_bridge_reconcile_summary_values_tracked(
+        tracker,
+        summaries,
+        complete,
+        |roster, candidates| {
+            let changed = reconcile(roster, candidates)?;
+            prefold.extend(candidates.iter().map(|session| session.id.clone()));
+            Ok(changed)
+        },
+    )?;
+    if !prefold.is_empty() {
+        enqueue(prefold);
+    }
+    Ok(changed)
+}
+
 fn haider_bridge_reconcile_summary_values(
     summaries: Vec<Value>,
     complete: bool,
@@ -847,11 +874,12 @@ fn haider_bridge_reconcile_summary_values(
     let mut tracker = haider_bridge_reconcile_tracker()
         .lock()
         .map_err(|_| "Haider reconciliation tracker is unavailable.".to_string())?;
-    haider_bridge_reconcile_summary_values_tracked(
+    haider_bridge_reconcile_summary_values_prefold(
         &mut tracker,
         summaries,
         complete,
         haider_bridge_reconcile_store,
+        haider_projection_prefold_enqueue_provider_sessions,
     )
 }
 
@@ -1444,6 +1472,57 @@ mod haider_bridge_tests {
         assert!(push_calls[0][0].1.is_none());
         assert!(push_calls[1][0].1.is_some());
         assert_eq!(push_tracker.sessions["session-shared"].head_seq, Some(5));
+    }
+
+    #[test]
+    fn haider_bridge_reconcile_enqueues_changed_sessions_deduped() {
+        let mut tracker = HaiderBridgeReconcileTracker::default();
+        let enqueued = std::cell::RefCell::new(Vec::new());
+        let initial = json!({
+            "sessions": [
+                {"session_id":"a", "head_seq":1},
+                {"session_id":"a", "head_seq":1},
+                {"session_id":"b", "head_seq":1},
+                {"session_id":"c", "head_seq":1}
+            ]
+        });
+        haider_bridge_reconcile_summary_values_prefold(
+            &mut tracker,
+            vec![initial.clone()],
+            true,
+            |_, _| Ok(true),
+            |sessions| enqueued.borrow_mut().push(sessions),
+        )
+        .unwrap();
+        haider_bridge_reconcile_summary_values_prefold(
+            &mut tracker,
+            vec![initial],
+            true,
+            |_, _| Ok(false),
+            |sessions| enqueued.borrow_mut().push(sessions),
+        )
+        .unwrap();
+        haider_bridge_reconcile_summary_values_prefold(
+            &mut tracker,
+            vec![json!({
+                "sessions": [
+                    {"session_id":"a", "head_seq":2},
+                    {"session_id":"c", "head_seq":2}
+                ]
+            })],
+            false,
+            |_, _| Ok(true),
+            |sessions| enqueued.borrow_mut().push(sessions),
+        )
+        .unwrap();
+
+        assert_eq!(
+            enqueued.into_inner(),
+            vec![
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                vec!["a".to_string(), "c".to_string()]
+            ]
+        );
     }
 
     #[test]

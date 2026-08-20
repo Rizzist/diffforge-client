@@ -42,6 +42,7 @@ export default function SessionComposer({
   onValueChange = null,
   onMirrorType = null,
   onChipChange = null,
+  onChipMenuOpen = null,
   slashCommands = null,
 }) {
   /* The draft text is SURFACE-owned (value/onValueChange): the composer
@@ -128,7 +129,13 @@ export default function SessionComposer({
       <ChipWrap key={key}>
         <Chip
           data-open={openMenu === key ? "true" : undefined}
-          onClick={() => setOpenMenu((open) => (open === key ? "" : key))}
+          onClick={() => {
+            /* Config detail loads lazily at menu-open — the click path that
+               SELECTS a session never fetches (chips render from the roster
+               row the bridge already mirrors). */
+            if (openMenu !== key) onChipMenuOpen?.();
+            setOpenMenu((open) => (open === key ? "" : key));
+          }}
           type="button"
         >
           <em>{label}</em>
@@ -175,7 +182,10 @@ export default function SessionComposer({
       <ChipWrap key="model">
         <Chip
           data-open={openMenu === "model" ? "true" : undefined}
-          onClick={() => setOpenMenu((open) => (open === "model" ? "" : "model"))}
+          onClick={() => {
+            if (openMenu !== "model") onChipMenuOpen?.();
+            setOpenMenu((open) => (open === "model" ? "" : "model"));
+          }}
           type="button"
         >
           <em>Model</em>

@@ -14,6 +14,7 @@ const HAIDER_PROJECTION_PIPE_STOP_POLL: Duration = Duration::from_millis(100);
 const HAIDER_PROJECTION_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_FRAME_TIME: Duration = Duration::from_millis(50);
 const HAIDER_PROJECTION_ROWS_EVENT: &str = "session-rows-appended";
+const HAIDER_PROJECTION_PREFOLD_QUEUE_LIMIT: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct SessionProjectionRow {
@@ -46,10 +47,12 @@ struct HaiderProjectionTail {
     row: SessionProjectionRow,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct HaiderProjectionFoldState {
     next_fallback_seq: i64,
     total_rows: i64,
+    persisted_max_key: Option<(i64, i64)>,
+    window_anchors: HashMap<i64, (i64, i64)>,
     tail: Option<HaiderProjectionTail>,
     metadata: serde_json::Map<String, Value>,
     effect_summaries: HashMap<String, String>,
@@ -62,6 +65,8 @@ impl Default for HaiderProjectionFoldState {
         Self {
             next_fallback_seq: 1,
             total_rows: 0,
+            persisted_max_key: None,
+            window_anchors: HashMap::new(),
             tail: None,
             metadata: serde_json::Map::new(),
             effect_summaries: HashMap::new(),
@@ -89,6 +94,7 @@ struct HaiderProjectionFrame {
     tail_changed: bool,
     covered_through_seq: Option<i64>,
     head_seq: Option<i64>,
+    pipe_max_seq: Option<i64>,
     caught_up: bool,
     sync_changed: bool,
 }
@@ -126,6 +132,50 @@ struct HaiderProjectionWatchManager {
 #[derive(Default)]
 struct HaiderProjectionPipeManager {
     tails: HashMap<String, HaiderProjectionPipeTail>,
+}
+
+#[derive(Default)]
+struct HaiderProjectionPrefoldManager {
+    queue: VecDeque<String>,
+    queued: HashSet<String>,
+    active: HashSet<String>,
+    attached: HashSet<String>,
+    in_flight: Option<(String, String)>,
+    worker_running: bool,
+}
+
+struct HaiderProjectionForeground {
+    ids: HashSet<String>,
+}
+
+impl HaiderProjectionForeground {
+    fn add(&mut self, id: &str) {
+        let id = id.trim();
+        if id.is_empty() || !self.ids.insert(id.to_string()) {
+            return;
+        }
+        if let Ok(mut manager) = haider_projection_prefold_manager().lock() {
+            manager.active.insert(id.to_string());
+            manager.queue.retain(|queued| queued != id);
+            manager.queued.remove(id);
+        }
+    }
+
+    fn mark_attached(self) {
+        if let Ok(mut manager) = haider_projection_prefold_manager().lock() {
+            manager.attached.extend(self.ids.iter().cloned());
+        }
+    }
+}
+
+impl Drop for HaiderProjectionForeground {
+    fn drop(&mut self) {
+        if let Ok(mut manager) = haider_projection_prefold_manager().lock() {
+            for id in &self.ids {
+                manager.active.remove(id);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,9 +232,49 @@ fn haider_projection_pipe_manager() -> &'static StdMutex<HaiderProjectionPipeMan
     MANAGER.get_or_init(|| StdMutex::new(HaiderProjectionPipeManager::default()))
 }
 
-fn haider_projection_schema_lock() -> &'static StdMutex<()> {
-    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| StdMutex::new(()))
+fn haider_projection_ingest_locks() -> &'static StdMutex<HashMap<String, Arc<StdMutex<()>>>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<StdMutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn haider_projection_ingest_lock(session_id: &str) -> Result<Arc<StdMutex<()>>, String> {
+    let mut locks = haider_projection_ingest_locks()
+        .lock()
+        .map_err(|_| "Haider projection ingest locks are unavailable.".to_string())?;
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    Ok(locks
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(StdMutex::new(())))
+        .clone())
+}
+
+fn haider_projection_prefold_manager() -> &'static StdMutex<HaiderProjectionPrefoldManager> {
+    static MANAGER: OnceLock<StdMutex<HaiderProjectionPrefoldManager>> = OnceLock::new();
+    MANAGER.get_or_init(|| StdMutex::new(HaiderProjectionPrefoldManager::default()))
+}
+
+fn haider_projection_foreground(session_id: &str) -> HaiderProjectionForeground {
+    let mut foreground = HaiderProjectionForeground {
+        ids: HashSet::new(),
+    };
+    foreground.add(session_id);
+    foreground
+}
+
+fn haider_projection_pipe_routes() -> &'static StdMutex<HashMap<String, HaiderProjectionPipeRoute>>
+{
+    static ROUTES: OnceLock<StdMutex<HashMap<String, HaiderProjectionPipeRoute>>> = OnceLock::new();
+    ROUTES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn haider_projection_database_cache() -> &'static StdMutex<Option<rusqlite::Connection>> {
+    static DATABASE: OnceLock<StdMutex<Option<rusqlite::Connection>>> = OnceLock::new();
+    DATABASE.get_or_init(|| StdMutex::new(None))
+}
+
+fn haider_projection_database_open_count() -> &'static AtomicUsize {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    &COUNT
 }
 
 fn haider_projection_ensure_lock() -> &'static StdMutex<()> {
@@ -281,10 +371,7 @@ fn haider_projection_migrate_database(connection: &mut rusqlite::Connection) -> 
     Ok(())
 }
 
-fn haider_projection_open_database() -> Result<rusqlite::Connection, String> {
-    let _schema_guard = haider_projection_schema_lock()
-        .lock()
-        .map_err(|_| "Session projection schema lock is unavailable.".to_string())?;
+fn haider_projection_new_database() -> Result<rusqlite::Connection, String> {
     #[cfg(not(test))]
     let mut connection = sessions_open_database()?;
     #[cfg(test)]
@@ -308,16 +395,119 @@ fn haider_projection_open_database() -> Result<rusqlite::Connection, String> {
     Ok(connection)
 }
 
-fn haider_projection_database_stats(session_id: &str) -> Result<(i64, i64), String> {
-    let connection = haider_projection_open_database()?;
+fn haider_projection_with_database_cache<T>(
+    cache: &StdMutex<Option<rusqlite::Connection>>,
+    open_count: &AtomicUsize,
+    mut open: impl FnMut() -> Result<rusqlite::Connection, String>,
+    mut validate: impl FnMut(&mut rusqlite::Connection) -> Result<bool, String>,
+    operation: impl FnOnce(&mut rusqlite::Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut connection = match cache.lock() {
+        Ok(connection) => connection,
+        Err(poisoned) => {
+            let mut connection = poisoned.into_inner();
+            *connection = None;
+            cache.clear_poison();
+            connection
+        }
+    };
+    if let Some(cached) = connection.as_mut() {
+        if !validate(cached)? {
+            *connection = None;
+        }
+    }
+    if connection.is_none() {
+        *connection = Some(open()?);
+        open_count.fetch_add(1, Ordering::Relaxed);
+    }
+    operation(
+        connection
+            .as_mut()
+            .expect("projection database initialized"),
+    )
+}
+
+fn haider_projection_database_connection_valid(
+    connection: &mut rusqlite::Connection,
+) -> Result<bool, String> {
+    match connection.query_row("SELECT 1", [], |_| Ok(())) {
+        Ok(()) => Ok(true),
+        Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ApiMisuse) => {
+            Ok(false)
+        }
+        Err(error) => Err(format!(
+            "Unable to validate cached session projection store: {error}"
+        )),
+    }
+}
+
+fn haider_projection_with_database<T>(
+    operation: impl FnMut(&mut rusqlite::Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    haider_projection_with_database_cache(
+        haider_projection_database_cache(),
+        haider_projection_database_open_count(),
+        haider_projection_new_database,
+        haider_projection_database_connection_valid,
+        operation,
+    )
+}
+
+fn haider_projection_database_stats_with_connection(
+    connection: &mut rusqlite::Connection,
+    session_id: &str,
+) -> Result<(i64, i64, i64), String> {
     connection
-        .query_row(
-            "SELECT COUNT(*), COALESCE(MAX(seq), 0)
-             FROM session_projection_rows WHERE session_id = ?1",
-            [session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+        .prepare_cached(
+            "SELECT COUNT(*),
+                        COALESCE((SELECT seq FROM session_projection_rows
+                                  WHERE session_id = ?1
+                                  ORDER BY seq DESC, ordinal DESC LIMIT 1), 0),
+                        COALESCE((SELECT ordinal FROM session_projection_rows
+                                  WHERE session_id = ?1
+                                  ORDER BY seq DESC, ordinal DESC LIMIT 1), 0)
+                 FROM session_projection_rows WHERE session_id = ?1",
         )
+        .and_then(|mut statement| {
+            statement.query_row([session_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+        })
         .map_err(|error| format!("Unable to inspect session projection: {error}"))
+}
+
+fn haider_projection_database_stats(session_id: &str) -> Result<(i64, i64), String> {
+    haider_projection_with_database(|connection| {
+        haider_projection_database_stats_with_connection(connection, session_id)
+            .map(|(total_rows, max_seq, _)| (total_rows, max_seq))
+    })
+}
+
+fn haider_projection_initialize_state_with_connection(
+    connection: &mut rusqlite::Connection,
+    session_id: &str,
+) -> Result<(), String> {
+    if haider_projection_states()
+        .lock()
+        .map_err(|_| "Session projection state is unavailable.".to_string())?
+        .contains_key(session_id)
+    {
+        return Ok(());
+    }
+    let (total_rows, max_seq, max_ordinal) =
+        haider_projection_database_stats_with_connection(connection, session_id)?;
+    let mut states = haider_projection_states()
+        .lock()
+        .map_err(|_| "Session projection state is unavailable.".to_string())?;
+    states
+        .entry(session_id.to_string())
+        .or_insert_with(|| HaiderProjectionFoldState {
+            next_fallback_seq: max_seq.saturating_add(1).max(1),
+            total_rows,
+            persisted_max_key: (total_rows > 0).then_some((max_seq, max_ordinal)),
+            ..HaiderProjectionFoldState::default()
+        });
+    Ok(())
 }
 
 fn haider_projection_initialize_state(session_id: &str) -> Result<(), String> {
@@ -328,18 +518,19 @@ fn haider_projection_initialize_state(session_id: &str) -> Result<(), String> {
     {
         return Ok(());
     }
-    let (total_rows, max_seq) = haider_projection_database_stats(session_id)?;
-    let mut states = haider_projection_states()
+    haider_projection_with_database(|connection| {
+        haider_projection_initialize_state_with_connection(connection, session_id)
+    })
+}
+
+fn haider_projection_state_total_rows(session_id: &str) -> Result<i64, String> {
+    haider_projection_initialize_state(session_id)?;
+    haider_projection_states()
         .lock()
-        .map_err(|_| "Session projection state is unavailable.".to_string())?;
-    states
-        .entry(session_id.to_string())
-        .or_insert_with(|| HaiderProjectionFoldState {
-            next_fallback_seq: max_seq.saturating_add(1).max(1),
-            total_rows,
-            ..HaiderProjectionFoldState::default()
-        });
-    Ok(())
+        .map_err(|_| "Session projection state is unavailable.".to_string())?
+        .get(session_id)
+        .map(|state| state.total_rows)
+        .ok_or_else(|| "Session projection state was not initialized.".to_string())
 }
 
 fn haider_projection_json_i64(value: Option<&Value>) -> Option<i64> {
@@ -992,19 +1183,25 @@ fn haider_projection_persist_batch(
     let _write_guard = sessions_write_lock()
         .lock()
         .map_err(|_| "Sessions write lock is unavailable.".to_string())?;
-    let mut connection = haider_projection_open_database()?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| format!("Unable to begin session projection write: {error}"))?;
-    let mut appended = 0usize;
-    for row in rows {
-        appended = appended.saturating_add(
-            transaction
-                .execute(
+    haider_projection_initialize_state(session_id)?;
+    haider_projection_with_database(|connection| {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("Unable to begin session projection write: {error}"))?;
+        let mut appended = 0usize;
+        let mut min_inserted = None::<(i64, i64)>;
+        let mut max_inserted = None::<(i64, i64)>;
+        {
+            let mut statement = transaction
+                .prepare_cached(
                     "INSERT OR IGNORE INTO session_projection_rows
                      (session_id, seq, ordinal, branch_id, kind, role, text, meta, at_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    rusqlite::params![
+                )
+                .map_err(|error| format!("Unable to prepare session projection row: {error}"))?;
+            for row in rows {
+                let inserted = statement
+                    .execute(rusqlite::params![
                         row.session_id,
                         row.seq,
                         row.ordinal,
@@ -1014,48 +1211,81 @@ fn haider_projection_persist_batch(
                         row.text,
                         serde_json::to_string(&row.meta).unwrap_or_else(|_| "null".to_string()),
                         row.at_ms,
-                    ],
-                )
-                .map_err(|error| format!("Unable to append session projection row: {error}"))?,
-        );
-    }
-    if let Some(cursor) = cursor {
-        transaction
-            .execute(
-                "INSERT INTO session_pipe_cursors (
+                    ])
+                    .map_err(|error| format!("Unable to append session projection row: {error}"))?;
+                appended = appended.saturating_add(inserted);
+                if inserted > 0 {
+                    let key = (row.seq, row.ordinal);
+                    min_inserted = Some(min_inserted.map_or(key, |current| current.min(key)));
+                    max_inserted = Some(max_inserted.map_or(key, |current| current.max(key)));
+                }
+            }
+        }
+        if let Some(cursor) = cursor {
+            transaction
+                .prepare_cached(
+                    "INSERT INTO session_pipe_cursors (
                     session_id, byte_offset, last_seq, last_ordinal, generation,
                     covered_through_seq, coverage_known
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(session_id) DO UPDATE SET
                     byte_offset = excluded.byte_offset,
-                    last_seq = excluded.last_seq,
-                    last_ordinal = excluded.last_ordinal,
-                    generation = excluded.generation,
-                    covered_through_seq = excluded.covered_through_seq,
-                    coverage_known = excluded.coverage_known",
-                rusqlite::params![
-                    cursor.session_id,
-                    cursor.byte_offset,
-                    cursor.last_seq,
-                    cursor.last_ordinal,
-                    cursor.generation,
-                    cursor.covered_through_seq,
-                    cursor.coverage_known,
-                ],
-            )
-            .map_err(|error| format!("Unable to persist session pipe cursor: {error}"))?;
-    }
-    let total_rows = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM session_projection_rows WHERE session_id = ?1",
-            [session_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("Unable to count session projection rows: {error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("Unable to commit session projection rows: {error}"))?;
-    Ok((appended, total_rows))
+                    last_seq = CASE
+                        WHEN (excluded.last_seq, excluded.last_ordinal) >=
+                             (session_pipe_cursors.last_seq, session_pipe_cursors.last_ordinal)
+                        THEN excluded.last_seq ELSE session_pipe_cursors.last_seq END,
+                    last_ordinal = CASE
+                        WHEN (excluded.last_seq, excluded.last_ordinal) >=
+                             (session_pipe_cursors.last_seq, session_pipe_cursors.last_ordinal)
+                        THEN excluded.last_ordinal ELSE session_pipe_cursors.last_ordinal END,
+                    covered_through_seq = MAX(
+                        session_pipe_cursors.covered_through_seq,
+                        excluded.covered_through_seq
+                    ),
+                    coverage_known = MAX(
+                        session_pipe_cursors.coverage_known,
+                        excluded.coverage_known
+                    )
+                 WHERE session_pipe_cursors.generation = excluded.generation
+                   AND session_pipe_cursors.byte_offset <= excluded.byte_offset",
+                )
+                .and_then(|mut statement| {
+                    statement.execute(rusqlite::params![
+                        cursor.session_id,
+                        cursor.byte_offset,
+                        cursor.last_seq,
+                        cursor.last_ordinal,
+                        cursor.generation,
+                        cursor.covered_through_seq,
+                        cursor.coverage_known,
+                    ])
+                })
+                .map_err(|error| format!("Unable to persist session pipe cursor: {error}"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("Unable to commit session projection rows: {error}"))?;
+        let mut states = haider_projection_states()
+            .lock()
+            .map_err(|_| "Session projection state is unavailable.".to_string())?;
+        let state = states
+            .get_mut(session_id)
+            .ok_or_else(|| "Session projection state was not initialized.".to_string())?;
+        state.total_rows = state
+            .total_rows
+            .saturating_add(i64::try_from(appended).unwrap_or(i64::MAX));
+        if appended > 0 {
+            if min_inserted.is_some_and(|key| state.persisted_max_key.is_some_and(|max| key <= max))
+            {
+                state.window_anchors.clear();
+            }
+            state.persisted_max_key = match (state.persisted_max_key, max_inserted) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (None, value) | (value, None) => value,
+            };
+        }
+        Ok((appended, state.total_rows))
+    })
 }
 
 fn haider_projection_persist_rows(rows: &[SessionProjectionRow]) -> Result<(usize, i64), String> {
@@ -1068,28 +1298,32 @@ fn haider_projection_persist_rows(rows: &[SessionProjectionRow]) -> Result<(usiz
 fn haider_projection_load_pipe_cursor(
     session_id: &str,
 ) -> Result<Option<HaiderProjectionPipeCursor>, String> {
-    let connection = haider_projection_open_database()?;
-    match connection.query_row(
-        "SELECT session_id, byte_offset, last_seq, last_ordinal, generation,
-                covered_through_seq, coverage_known
-         FROM session_pipe_cursors WHERE session_id = ?1",
-        [session_id],
-        |row| {
-            Ok(HaiderProjectionPipeCursor {
-                session_id: row.get(0)?,
-                byte_offset: row.get(1)?,
-                last_seq: row.get(2)?,
-                last_ordinal: row.get(3)?,
-                generation: row.get(4)?,
-                covered_through_seq: row.get(5)?,
-                coverage_known: row.get(6)?,
-            })
-        },
-    ) {
-        Ok(cursor) => Ok(Some(cursor)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(error) => Err(format!("Unable to read session pipe cursor: {error}")),
-    }
+    haider_projection_with_database(|connection| {
+        let result = connection
+            .prepare_cached(
+                "SELECT session_id, byte_offset, last_seq, last_ordinal, generation,
+                        covered_through_seq, coverage_known
+                 FROM session_pipe_cursors WHERE session_id = ?1",
+            )
+            .and_then(|mut statement| {
+                statement.query_row([session_id], |row| {
+                    Ok(HaiderProjectionPipeCursor {
+                        session_id: row.get(0)?,
+                        byte_offset: row.get(1)?,
+                        last_seq: row.get(2)?,
+                        last_ordinal: row.get(3)?,
+                        generation: row.get(4)?,
+                        covered_through_seq: row.get(5)?,
+                        coverage_known: row.get(6)?,
+                    })
+                })
+            });
+        match result {
+            Ok(cursor) => Ok(Some(cursor)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(format!("Unable to read session pipe cursor: {error}")),
+        }
+    })
 }
 
 fn haider_projection_reset_pipe_session(
@@ -1099,45 +1333,45 @@ fn haider_projection_reset_pipe_session(
     let _write_guard = sessions_write_lock()
         .lock()
         .map_err(|_| "Sessions write lock is unavailable.".to_string())?;
-    let mut connection = haider_projection_open_database()?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| format!("Unable to begin session pipe refold: {error}"))?;
-    transaction
-        .execute(
-            "DELETE FROM session_projection_rows WHERE session_id = ?1",
-            [session_id],
-        )
-        .map_err(|error| format!("Unable to reset session projection rows: {error}"))?;
-    transaction
-        .execute(
-            "DELETE FROM session_pipe_cursors WHERE session_id = ?1",
-            [session_id],
-        )
-        .map_err(|error| format!("Unable to reset session pipe cursor: {error}"))?;
-    transaction
-        .execute(
-            "INSERT INTO session_pipe_cursors (
+    haider_projection_with_database(|connection| {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("Unable to begin session pipe refold: {error}"))?;
+        transaction
+            .prepare_cached("DELETE FROM session_projection_rows WHERE session_id = ?1")
+            .and_then(|mut statement| statement.execute([session_id]))
+            .map_err(|error| format!("Unable to reset session projection rows: {error}"))?;
+        transaction
+            .prepare_cached("DELETE FROM session_pipe_cursors WHERE session_id = ?1")
+            .and_then(|mut statement| statement.execute([session_id]))
+            .map_err(|error| format!("Unable to reset session pipe cursor: {error}"))?;
+        transaction
+            .prepare_cached(
+                "INSERT INTO session_pipe_cursors (
                 session_id, byte_offset, last_seq, last_ordinal, generation,
                 covered_through_seq, coverage_known
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                cursor.session_id,
-                cursor.byte_offset,
-                cursor.last_seq,
-                cursor.last_ordinal,
-                cursor.generation,
-                cursor.covered_through_seq,
-                cursor.coverage_known,
-            ],
-        )
-        .map_err(|error| format!("Unable to initialize session pipe cursor: {error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("Unable to commit session pipe refold: {error}"))?;
-    if let Ok(mut states) = haider_projection_states().lock() {
-        states.remove(session_id);
-    }
+            )
+            .and_then(|mut statement| {
+                statement.execute(rusqlite::params![
+                    cursor.session_id,
+                    cursor.byte_offset,
+                    cursor.last_seq,
+                    cursor.last_ordinal,
+                    cursor.generation,
+                    cursor.covered_through_seq,
+                    cursor.coverage_known,
+                ])
+            })
+            .map_err(|error| format!("Unable to initialize session pipe cursor: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Unable to commit session pipe refold: {error}"))?;
+        if let Ok(mut states) = haider_projection_states().lock() {
+            states.remove(session_id);
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1210,6 +1444,18 @@ fn haider_projection_ingest_value(
     session_id: &str,
     value: &Value,
 ) -> Result<HaiderProjectionFrame, String> {
+    // Same serialization law as the pipe path: the metadata watch fold must
+    // never interleave with a pipe ingest — an unlocked fold here could
+    // persist N+2 then be overwritten in memory by a concurrent N+1
+    // (rev-2 P1), undercounting totals for the session's lifetime.
+    let ingest_lock = haider_projection_ingest_lock(session_id)?;
+    let _ingest_guard = match ingest_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            ingest_lock.clear_poison();
+            poisoned.into_inner()
+        }
+    };
     haider_projection_initialize_state(session_id)?;
     let mut all_rows = Vec::new();
     let mut status = None;
@@ -1265,6 +1511,7 @@ fn haider_projection_ingest_value(
         tail_changed,
         covered_through_seq: sync.covered_through_seq,
         head_seq: sync.head_seq,
+        pipe_max_seq: None,
         caught_up: sync.caught_up,
         sync_changed: false,
     })
@@ -1639,7 +1886,52 @@ fn haider_projection_resolve_pipe_route(
     if !haider_projection_pipe_supported() {
         return Err("Haider native pipe capability is unavailable.".to_string());
     }
-    haider_projection_resolve_pipe_route_rpc(provider_session_id)
+    haider_projection_resolve_pipe_route_cached_with(
+        haider_projection_pipe_routes(),
+        provider_session_id,
+        haider_projection_resolve_pipe_route_rpc,
+    )
+}
+
+fn haider_projection_resolve_pipe_route_cached_with(
+    routes: &StdMutex<HashMap<String, HaiderProjectionPipeRoute>>,
+    provider_session_id: &str,
+    mut resolve: impl FnMut(&str) -> Result<HaiderProjectionPipeRoute, String>,
+) -> Result<HaiderProjectionPipeRoute, String> {
+    {
+        let mut routes = routes
+            .lock()
+            .map_err(|_| "Haider pipe route cache is unavailable.".to_string())?;
+        if let Some(route) = routes.get(provider_session_id) {
+            if route.path.exists() {
+                return Ok(route.clone());
+            }
+        }
+        routes.remove(provider_session_id);
+    }
+    let route = resolve(provider_session_id)?;
+    let mut routes = routes
+        .lock()
+        .map_err(|_| "Haider pipe route cache is unavailable.".to_string())?;
+    if let Some(cached) = routes.get(provider_session_id) {
+        if cached.path.exists() {
+            return Ok(cached.clone());
+        }
+    }
+    routes.insert(provider_session_id.to_string(), route.clone());
+    Ok(route)
+}
+
+fn haider_projection_refresh_pipe_route_with(
+    routes: &StdMutex<HashMap<String, HaiderProjectionPipeRoute>>,
+    provider_session_id: &str,
+    resolve: impl FnMut(&str) -> Result<HaiderProjectionPipeRoute, String>,
+) -> Result<HaiderProjectionPipeRoute, String> {
+    routes
+        .lock()
+        .map_err(|_| "Haider pipe route cache is unavailable.".to_string())?
+        .remove(provider_session_id);
+    haider_projection_resolve_pipe_route_cached_with(routes, provider_session_id, resolve)
 }
 
 fn haider_projection_parse_pipe_header(
@@ -1763,6 +2055,51 @@ fn haider_projection_ingest_pipe(
     provider_session_id: &str,
     route: &HaiderProjectionPipeRoute,
 ) -> Result<HaiderProjectionFrame, String> {
+    haider_projection_ingest_pipe_cancellable(session_id, provider_session_id, route, &|| false)
+}
+
+fn haider_projection_state_snapshot(session_id: &str) -> Result<HaiderProjectionFoldState, String> {
+    haider_projection_states()
+        .lock()
+        .map_err(|_| "Session projection state is unavailable.".to_string())?
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| "Session projection state was not initialized.".to_string())
+}
+
+fn haider_projection_cancel_owned_pipe_ingest(
+    session_id: &str,
+    committed_state: &HaiderProjectionFoldState,
+) -> String {
+    if let Ok(mut states) = haider_projection_states().lock() {
+        states.insert(session_id.to_string(), committed_state.clone());
+    }
+    "Haider projection prefold was cancelled.".to_string()
+}
+
+fn haider_projection_ingest_pipe_cancellable(
+    session_id: &str,
+    provider_session_id: &str,
+    route: &HaiderProjectionPipeRoute,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<HaiderProjectionFrame, String> {
+    let ingest_lock = haider_projection_ingest_lock(session_id)?;
+    let _ingest_guard = match ingest_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            ingest_lock.clear_poison();
+            poisoned.into_inner()
+        }
+    };
+    haider_projection_ingest_pipe_owned(session_id, provider_session_id, route, should_cancel)
+}
+
+fn haider_projection_ingest_pipe_owned(
+    session_id: &str,
+    provider_session_id: &str,
+    route: &HaiderProjectionPipeRoute,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<HaiderProjectionFrame, String> {
     if let Some(head_seq) = route.head_seq {
         haider_bridge_note_head_seq(provider_session_id, head_seq);
     }
@@ -1788,10 +2125,27 @@ fn haider_projection_ingest_pipe(
     let header_value: Value = serde_json::from_slice(&line)
         .map_err(|error| format!("Unable to decode Haider pipe header: {error}"))?;
     let header = haider_projection_parse_pipe_header(&header_value, provider_session_id)?;
+    if should_cancel() {
+        return Err("Haider projection prefold was cancelled.".to_string());
+    }
 
     let existing = haider_projection_load_pipe_cursor(session_id)?;
+    if existing
+        .as_ref()
+        .is_some_and(|cursor| cursor.generation > header.generation)
+    {
+        return Err("Haider pipe generation was stale.".to_string());
+    }
+    if existing.as_ref().is_some_and(|cursor| {
+        cursor.generation == header.generation && cursor.byte_offset > file_len
+    }) {
+        return Err("Haider pipe route was stale.".to_string());
+    }
     let reset =
         haider_projection_pipe_requires_refold(existing.as_ref(), &header, header_end, file_len);
+    if should_cancel() {
+        return Err("Haider projection prefold was cancelled.".to_string());
+    }
     let mut cursor = if reset {
         let cursor = HaiderProjectionPipeCursor {
             session_id: session_id.to_string(),
@@ -1808,16 +2162,23 @@ fn haider_projection_ingest_pipe(
         .seek(SeekFrom::Start(cursor.byte_offset.max(0) as u64))
         .map_err(|error| format!("Unable to resume Haider session pipe: {error}"))?;
     haider_projection_initialize_state(session_id)?;
+    let mut committed_state = haider_projection_state_snapshot(session_id)?;
 
     let mut rows = Vec::new();
     let mut line_count = 0usize;
     let mut appended = 0usize;
-    let mut total_rows = haider_projection_database_stats(session_id)?.0;
+    let mut total_rows = haider_projection_state_total_rows(session_id)?;
     let mut from_seq = None;
     let mut advanced = false;
     let mut consumed_to_eof = false;
 
     loop {
+        if should_cancel() {
+            return Err(haider_projection_cancel_owned_pipe_ingest(
+                session_id,
+                &committed_state,
+            ));
+        }
         let consumed = match haider_projection_read_pipe_line(&mut reader, &mut line)
             .map_err(|error| format!("Unable to read Haider session pipe: {error}"))?
         {
@@ -1855,14 +2216,22 @@ fn haider_projection_ingest_pipe(
                 haider_projection_fold_value_locked(state, session_id, &value)
             };
             rows.extend(step.rows);
-            cursor.last_seq = cursor.last_seq.max(seq);
-            cursor.last_ordinal = ordinal;
+            if (seq, ordinal) > (cursor.last_seq, cursor.last_ordinal) {
+                cursor.last_seq = seq;
+                cursor.last_ordinal = ordinal;
+            }
         }
         cursor.byte_offset = cursor.byte_offset.saturating_add(consumed);
         advanced = true;
         line_count = line_count.saturating_add(1);
 
         if line_count >= HAIDER_PROJECTION_PIPE_BATCH_LINES {
+            if should_cancel() {
+                return Err(haider_projection_cancel_owned_pipe_ingest(
+                    session_id,
+                    &committed_state,
+                ));
+            }
             let batch_from = rows.iter().map(|row| row.seq).min();
             let (batch_appended, persisted_total) =
                 haider_projection_persist_batch(session_id, &rows, Some(&cursor))?;
@@ -1874,9 +2243,16 @@ fn haider_projection_ingest_pipe(
             };
             rows.clear();
             line_count = 0;
+            committed_state = haider_projection_state_snapshot(session_id)?;
         }
     }
 
+    if should_cancel() {
+        return Err(haider_projection_cancel_owned_pipe_ingest(
+            session_id,
+            &committed_state,
+        ));
+    }
     if advanced && (line_count > 0 || !rows.is_empty()) {
         let batch_from = rows.iter().map(|row| row.seq).min();
         let (batch_appended, persisted_total) =
@@ -1887,12 +2263,22 @@ fn haider_projection_ingest_pipe(
             (Some(left), Some(right)) => Some(left.min(right)),
             (None, value) | (value, None) => value,
         };
+        committed_state = haider_projection_state_snapshot(session_id)?;
     }
     if let Ok(mut states) = haider_projection_states().lock() {
         if let Some(state) = states.get_mut(session_id) {
             state.total_rows = total_rows;
-            state.pipe_eof_max_seq = consumed_to_eof.then_some(cursor.last_seq);
+            if consumed_to_eof {
+                state.pipe_eof_max_seq = Some(cursor.last_seq);
+            }
+            committed_state = state.clone();
         }
+    }
+    if should_cancel() {
+        return Err(haider_projection_cancel_owned_pipe_ingest(
+            session_id,
+            &committed_state,
+        ));
     }
     let sync = haider_projection_sync(session_id, Some(provider_session_id))?;
     Ok(HaiderProjectionFrame {
@@ -1904,9 +2290,113 @@ fn haider_projection_ingest_pipe(
         tail_changed: reset,
         covered_through_seq: sync.covered_through_seq,
         head_seq: sync.head_seq,
+        pipe_max_seq: Some(cursor.last_seq),
         caught_up: sync.caught_up,
         sync_changed: reset || advanced,
     })
+}
+
+fn haider_projection_ingest_pipe_route_retry(
+    session_id: &str,
+    provider_session_id: &str,
+    route: HaiderProjectionPipeRoute,
+) -> Result<(HaiderProjectionFrame, HaiderProjectionPipeRoute), String> {
+    haider_projection_ingest_pipe_route_retry_cancellable(
+        session_id,
+        provider_session_id,
+        route,
+        &|| false,
+    )
+}
+
+fn haider_projection_ingest_pipe_route_retry_cancellable(
+    session_id: &str,
+    provider_session_id: &str,
+    route: HaiderProjectionPipeRoute,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<(HaiderProjectionFrame, HaiderProjectionPipeRoute), String> {
+    let ingest_lock = haider_projection_ingest_lock(session_id)?;
+    let _ingest_guard = match ingest_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            ingest_lock.clear_poison();
+            poisoned.into_inner()
+        }
+    };
+    haider_projection_ingest_pipe_route_retry_owned_with(
+        session_id,
+        provider_session_id,
+        route,
+        should_cancel,
+        || {
+            haider_projection_refresh_pipe_route_with(
+                haider_projection_pipe_routes(),
+                provider_session_id,
+                haider_projection_resolve_pipe_route_rpc,
+            )
+        },
+    )
+}
+
+fn haider_projection_head_advanced_without_pipe_progress(frame: &HaiderProjectionFrame) -> bool {
+    !frame.sync_changed
+        && frame.head_seq.is_some_and(|head_seq| {
+            frame
+                .covered_through_seq
+                .or(frame.pipe_max_seq)
+                .is_some_and(|pipe_seq| pipe_seq < head_seq)
+        })
+}
+
+fn haider_projection_ingest_pipe_route_retry_owned_with(
+    session_id: &str,
+    provider_session_id: &str,
+    route: HaiderProjectionPipeRoute,
+    should_cancel: &dyn Fn() -> bool,
+    mut refresh: impl FnMut() -> Result<HaiderProjectionPipeRoute, String>,
+) -> Result<(HaiderProjectionFrame, HaiderProjectionPipeRoute), String> {
+    match haider_projection_ingest_pipe_owned(
+        session_id,
+        provider_session_id,
+        &route,
+        should_cancel,
+    ) {
+        Ok(frame) if haider_projection_head_advanced_without_pipe_progress(&frame) => {
+            let route = refresh()?;
+            let frame = haider_projection_ingest_pipe_owned(
+                session_id,
+                provider_session_id,
+                &route,
+                should_cancel,
+            )?;
+            Ok((frame, route))
+        }
+        Ok(frame) => Ok((frame, route)),
+        Err(error)
+            if !route.path.exists()
+                || error.contains("Haider pipe header session id did not match.")
+                || error.contains("Haider pipe generation was stale.")
+                || error.contains("Haider pipe route was stale.") =>
+        {
+            let route = refresh()?;
+            let frame = haider_projection_ingest_pipe_owned(
+                session_id,
+                provider_session_id,
+                &route,
+                should_cancel,
+            )?;
+            Ok((frame, route))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn haider_projection_ingest_resolved_pipe(
+    session_id: &str,
+    provider_session_id: &str,
+) -> Result<(HaiderProjectionFrame, HaiderProjectionPipeRoute), String> {
+    let route = haider_projection_resolve_pipe_route(provider_session_id)?;
+    haider_projection_ingest_pipe_route_retry(session_id, provider_session_id, route)
 }
 
 fn haider_projection_export_json(provider_session_id: &str) -> Result<Value, String> {
@@ -1971,13 +2461,340 @@ fn haider_projection_export_json(provider_session_id: &str) -> Result<Value, Str
 fn haider_projection_resolve_provider_session(
     session_id: &str,
 ) -> Result<(SessionRow, String), String> {
-    let connection = sessions_open_database()?;
-    let row = sessions_row_by_id(&connection, session_id.trim())?;
+    let row = haider_projection_with_database(|connection| {
+        sessions_row_by_id(connection, session_id.trim())
+    })?;
     let provider_session_id = row.provider_session_id.trim().to_string();
     if provider_session_id.is_empty() {
         return Err("Haider session id is not bound yet.".to_string());
     }
     Ok((row, provider_session_id))
+}
+
+fn haider_projection_local_session_for_provider(provider_session_id: &str) -> Option<String> {
+    haider_projection_with_database(|connection| {
+        match connection
+            .prepare_cached(
+                "SELECT id FROM sessions
+                 WHERE provider = 'haider' AND provider_session_id = ?1 LIMIT 1",
+            )
+            .and_then(|mut statement| {
+                statement.query_row([provider_session_id], |row| row.get::<_, String>(0))
+            }) {
+            Ok(session_id) => Ok(Some(session_id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(format!("Unable to resolve prefold session: {error}")),
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+fn haider_projection_prefold_cancelled(session_id: &str, provider_session_id: &str) -> bool {
+    if HAIDER_PROJECTION_STOPPING.load(Ordering::Acquire) {
+        return true;
+    }
+    match haider_projection_prefold_manager().lock() {
+        Ok(manager) => {
+            !manager.active.is_empty()
+                || manager.attached.contains(session_id)
+                || manager.attached.contains(provider_session_id)
+        }
+        Err(_) => true,
+    }
+}
+
+fn haider_projection_prefold_one(session_id: &str, provider_session_id: &str) {
+    if haider_projection_prefold_cancelled(session_id, provider_session_id) {
+        return;
+    }
+    let Ok(route) = haider_projection_resolve_pipe_route(provider_session_id) else {
+        return;
+    };
+    if haider_projection_prefold_cancelled(session_id, provider_session_id) {
+        return;
+    }
+    let cancelled = || haider_projection_prefold_cancelled(session_id, provider_session_id);
+    let _ = haider_projection_ingest_pipe_route_retry_cancellable(
+        session_id,
+        provider_session_id,
+        route,
+        &cancelled,
+    );
+}
+
+fn haider_projection_prefold_enqueue_with(
+    manager: &StdMutex<HaiderProjectionPrefoldManager>,
+    provider_session_ids: impl IntoIterator<Item = String>,
+) -> bool {
+    let Ok(mut manager) = manager.lock() else {
+        return false;
+    };
+    for provider_session_id in provider_session_ids {
+        let provider_session_id = provider_session_id.trim();
+        if provider_session_id.is_empty()
+            || manager.active.contains(provider_session_id)
+            || manager.attached.contains(provider_session_id)
+            || !manager.queued.insert(provider_session_id.to_string())
+        {
+            continue;
+        }
+        if manager.queue.len() >= HAIDER_PROJECTION_PREFOLD_QUEUE_LIMIT {
+            if let Some(evicted) = manager.queue.pop_front() {
+                manager.queued.remove(&evicted);
+            }
+        }
+        manager.queue.push_back(provider_session_id.to_string());
+    }
+    if manager.queue.is_empty() || manager.worker_running {
+        return false;
+    }
+    manager.worker_running = true;
+    true
+}
+
+fn haider_projection_prefold_drain_with(
+    manager: &StdMutex<HaiderProjectionPrefoldManager>,
+    mut resolve_local: impl FnMut(&str) -> Option<String>,
+    mut fold: impl FnMut(&str, &str),
+) {
+    loop {
+        let provider_session_id = {
+            let Ok(mut manager) = manager.lock() else {
+                return;
+            };
+            let Some(provider_session_id) = manager.queue.pop_front() else {
+                manager.worker_running = false;
+                return;
+            };
+            manager.queued.remove(&provider_session_id);
+            if manager.active.contains(&provider_session_id)
+                || manager.attached.contains(&provider_session_id)
+            {
+                continue;
+            }
+            provider_session_id
+        };
+        let Some(session_id) = resolve_local(&provider_session_id) else {
+            continue;
+        };
+        {
+            let Ok(mut manager) = manager.lock() else {
+                return;
+            };
+            if manager.active.contains(&provider_session_id)
+                || manager.active.contains(&session_id)
+                || manager.attached.contains(&provider_session_id)
+                || manager.attached.contains(&session_id)
+            {
+                continue;
+            }
+            manager.in_flight = Some((provider_session_id.clone(), session_id.clone()));
+        }
+        fold(&session_id, &provider_session_id);
+        if let Ok(mut manager) = manager.lock() {
+            if manager.in_flight.as_ref()
+                == Some(&(provider_session_id.clone(), session_id.clone()))
+            {
+                manager.in_flight = None;
+            }
+        }
+        thread::yield_now();
+    }
+}
+
+fn haider_projection_prefold_enqueue_provider_sessions(provider_session_ids: Vec<String>) {
+    if !haider_projection_prefold_enqueue_with(
+        haider_projection_prefold_manager(),
+        provider_session_ids,
+    ) {
+        return;
+    }
+    #[cfg(not(test))]
+    thread::spawn(|| {
+        haider_projection_prefold_drain_with(
+            haider_projection_prefold_manager(),
+            haider_projection_local_session_for_provider,
+            |session_id, provider_session_id| {
+                thread::sleep(Duration::from_millis(10));
+                haider_projection_prefold_one(session_id, provider_session_id);
+            },
+        );
+    });
+}
+
+fn haider_projection_prefold_detach(ids: &[String]) {
+    if let Ok(mut manager) = haider_projection_prefold_manager().lock() {
+        for id in ids {
+            manager.attached.remove(id);
+        }
+    }
+}
+
+fn haider_projection_decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionProjectionRow> {
+    let meta: String = row.get(7)?;
+    Ok(SessionProjectionRow {
+        session_id: row.get(0)?,
+        seq: row.get(1)?,
+        ordinal: row.get(2)?,
+        branch_id: row.get(3)?,
+        kind: row.get(4)?,
+        role: row.get(5)?,
+        text: row.get(6)?,
+        meta: serde_json::from_str(&meta).unwrap_or_else(|_| json!({"raw": meta})),
+        at_ms: row.get(8)?,
+    })
+}
+
+fn haider_projection_window_rows_keyset(
+    connection: &mut rusqlite::Connection,
+    session_id: &str,
+    start_index: i64,
+    count: i64,
+    total_rows: i64,
+) -> Result<Vec<SessionProjectionRow>, String> {
+    if count == 0 || start_index >= total_rows {
+        return Ok(Vec::new());
+    }
+    let (base_index, base_anchor, following) = {
+        let states = haider_projection_states()
+            .lock()
+            .map_err(|_| "Session projection state is unavailable.".to_string())?;
+        let anchors = states.get(session_id).map(|state| &state.window_anchors);
+        let preceding = anchors
+            .and_then(|anchors| {
+                anchors
+                    .iter()
+                    .filter(|(index, _)| **index <= start_index)
+                    .max_by_key(|(index, _)| *index)
+                    .map(|(index, anchor)| (*index, *anchor))
+            })
+            .unwrap_or((0, (-1, -1)));
+        let following = anchors.and_then(|anchors| {
+            anchors
+                .iter()
+                .filter(|(index, _)| **index > start_index)
+                .min_by_key(|(index, _)| *index)
+                .map(|(index, anchor)| (*index, *anchor))
+        });
+        (preceding.0, preceding.1, following)
+    };
+    let forward_distance = start_index - base_index;
+    let reverse_index = following.map_or(total_rows.saturating_add(1), |(index, _)| index);
+    let reverse_distance = reverse_index - start_index;
+    let mut anchor = base_anchor;
+    if reverse_distance < forward_distance {
+        let skipped = if let Some((_, following_anchor)) = following {
+            connection
+                .prepare_cached(
+                    "SELECT seq, ordinal FROM session_projection_rows
+                     WHERE session_id = ?1 AND (seq, ordinal) < (?2, ?3)
+                     ORDER BY seq DESC, ordinal DESC LIMIT ?4",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(
+                            rusqlite::params![
+                                session_id,
+                                following_anchor.0,
+                                following_anchor.1,
+                                reverse_distance
+                            ],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                        )?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+        } else {
+            connection
+                .prepare_cached(
+                    "SELECT seq, ordinal FROM session_projection_rows
+                     WHERE session_id = ?1
+                     ORDER BY seq DESC, ordinal DESC LIMIT ?2",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(rusqlite::params![session_id, reverse_distance], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+        }
+        .map_err(|error| format!("Unable to reverse-seek session projection window: {error}"))?;
+        if i64::try_from(skipped.len()).unwrap_or(i64::MAX) < reverse_distance {
+            return Ok(Vec::new());
+        }
+        let mut states = haider_projection_states()
+            .lock()
+            .map_err(|_| "Session projection state is unavailable.".to_string())?;
+        if let Some(state) = states.get_mut(session_id) {
+            for (offset, key) in skipped.iter().copied().enumerate() {
+                state.window_anchors.insert(
+                    reverse_index - i64::try_from(offset).unwrap_or(i64::MAX) - 1,
+                    key,
+                );
+            }
+        }
+        anchor = skipped.last().copied().unwrap_or(anchor);
+    } else if base_index < start_index {
+        let skipped = connection
+            .prepare_cached(
+                "SELECT seq, ordinal FROM session_projection_rows
+                 WHERE session_id = ?1 AND (seq, ordinal) > (?2, ?3)
+                 ORDER BY seq, ordinal LIMIT ?4",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(
+                        rusqlite::params![session_id, anchor.0, anchor.1, start_index - base_index],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|error| format!("Unable to seek session projection window: {error}"))?;
+        if i64::try_from(skipped.len()).unwrap_or(i64::MAX) < start_index - base_index {
+            return Ok(Vec::new());
+        }
+        let mut states = haider_projection_states()
+            .lock()
+            .map_err(|_| "Session projection state is unavailable.".to_string())?;
+        if let Some(state) = states.get_mut(session_id) {
+            for (offset, key) in skipped.iter().copied().enumerate() {
+                state.window_anchors.insert(
+                    base_index + i64::try_from(offset).unwrap_or(i64::MAX) + 1,
+                    key,
+                );
+            }
+        }
+        anchor = skipped.last().copied().unwrap_or(anchor);
+    }
+    let rows = connection
+        .prepare_cached(
+            "SELECT session_id, seq, ordinal, branch_id, kind, role, text, meta, at_ms
+             FROM session_projection_rows
+             WHERE session_id = ?1 AND (seq, ordinal) > (?2, ?3)
+             ORDER BY seq, ordinal LIMIT ?4",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    rusqlite::params![session_id, anchor.0, anchor.1, count],
+                    haider_projection_decode_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|error| format!("Unable to read session projection window: {error}"))?;
+    let mut states = haider_projection_states()
+        .lock()
+        .map_err(|_| "Session projection state is unavailable.".to_string())?;
+    if let Some(state) = states.get_mut(session_id) {
+        for (offset, row) in rows.iter().enumerate() {
+            state.window_anchors.insert(
+                start_index + i64::try_from(offset).unwrap_or(i64::MAX) + 1,
+                (row.seq, row.ordinal),
+            );
+        }
+    }
+    Ok(rows)
 }
 
 fn haider_projection_watch_finished(session_id: &str, generation: u64) {
@@ -2370,6 +3187,26 @@ fn haider_projection_wait_for_pipe_event(
     receiver.recv_timeout(timeout).is_ok()
 }
 
+fn haider_projection_rebuild_pipe_watcher(
+    watched_path: &mut PathBuf,
+    watcher: &mut Option<HaiderProjectionPipeWatcher>,
+    receiver: &mut Option<std::sync::mpsc::Receiver<()>>,
+    route: &HaiderProjectionPipeRoute,
+) -> bool {
+    if *watched_path == route.path {
+        return false;
+    }
+    let replacement = haider_projection_pipe_watcher(&route.path);
+    let (next_watcher, next_receiver) = match replacement {
+        Some((watcher, receiver)) => (Some(watcher), Some(receiver)),
+        None => (None, None),
+    };
+    *watcher = next_watcher;
+    *receiver = next_receiver;
+    *watched_path = route.path.clone();
+    true
+}
+
 fn haider_projection_start_pipe_tail(
     app: AppHandle,
     session_id: String,
@@ -2394,8 +3231,10 @@ fn haider_projection_start_pipe_tail(
         );
     }
     thread::spawn(move || {
-        let watcher = haider_projection_pipe_watcher(&route.path);
-        let (_watcher, mut receiver) = match watcher {
+        let mut route = route;
+        let mut watched_path = route.path.clone();
+        let watcher = haider_projection_pipe_watcher(&watched_path);
+        let (mut watcher, mut receiver) = match watcher {
             Some((watcher, receiver)) => (Some(watcher), Some(receiver)),
             None => (None, None),
         };
@@ -2427,11 +3266,32 @@ fn haider_projection_start_pipe_tail(
                 continue;
             }
             next_safety_poll = Instant::now() + HAIDER_PROJECTION_PIPE_SAFETY_POLL;
-            match haider_projection_ingest_pipe(&session_id, &provider_session_id, &route) {
-                Ok(frame) if frame.appended > 0 || frame.tail_changed || frame.sync_changed => {
+            match haider_projection_ingest_pipe_route_retry(
+                &session_id,
+                &provider_session_id,
+                route.clone(),
+            ) {
+                Ok((frame, refreshed_route))
+                    if frame.appended > 0 || frame.tail_changed || frame.sync_changed =>
+                {
+                    haider_projection_rebuild_pipe_watcher(
+                        &mut watched_path,
+                        &mut watcher,
+                        &mut receiver,
+                        &refreshed_route,
+                    );
+                    route = refreshed_route;
                     let _ = haider_projection_frame_sender(&app).send(frame);
                 }
-                Ok(_) => {}
+                Ok((_, refreshed_route)) => {
+                    haider_projection_rebuild_pipe_watcher(
+                        &mut watched_path,
+                        &mut watcher,
+                        &mut receiver,
+                        &refreshed_route,
+                    );
+                    route = refreshed_route;
+                }
                 Err(error) => eprintln!("Haider projection pipe tail failed: {error}"),
             }
         }
@@ -2440,11 +3300,16 @@ fn haider_projection_start_pipe_tail(
     Ok(())
 }
 
-fn haider_projection_attach_blocking(app: AppHandle, session_id: String) -> Result<(), String> {
+fn haider_projection_attach_blocking(
+    app: AppHandle,
+    session_id: String,
+    foreground: &mut HaiderProjectionForeground,
+) -> Result<(), String> {
     let _attach_guard = haider_projection_attach_lock()
         .lock()
         .map_err(|_| "Haider projection attach lock is unavailable.".to_string())?;
     let (_, provider_session_id) = haider_projection_resolve_provider_session(&session_id)?;
+    foreground.add(&provider_session_id);
     let (_, baseline_seq) = haider_projection_database_stats(&session_id)?;
     HAIDER_PROJECTION_STOPPING.store(false, Ordering::Release);
 
@@ -2468,33 +3333,32 @@ fn haider_projection_attach_blocking(app: AppHandle, session_id: String) -> Resu
             );
         }
     }
-    if let Ok(route) = haider_projection_resolve_pipe_route(&provider_session_id) {
+    if let Ok((frame, route)) =
+        haider_projection_ingest_resolved_pipe(&session_id, &provider_session_id)
+    {
         let pipe_has_usage = haider_projection_pipe_has_usage(&route.path);
-        if let Ok(frame) = haider_projection_ingest_pipe(&session_id, &provider_session_id, &route)
-        {
-            if frame.appended > 0 || frame.tail_changed || frame.sync_changed {
-                let _ = haider_projection_frame_sender(&app).send(frame);
-            }
-            haider_projection_start_pipe_tail(
-                app.clone(),
-                session_id.clone(),
-                provider_session_id.clone(),
-                route,
-            )?;
-            if pipe_has_usage {
-                haider_projection_stop_session_watch(&session_id)?;
-                return Ok(());
-            }
-            // v2 sidecars have no usage/run-state rows. Keep one filtered watch
-            // for trajectory lanes and status, never transcript projection.
-            return haider_projection_start_watch(
-                app,
-                session_id,
-                provider_session_id,
-                baseline_seq,
-                true,
-            );
+        if frame.appended > 0 || frame.tail_changed || frame.sync_changed {
+            let _ = haider_projection_frame_sender(&app).send(frame);
         }
+        haider_projection_start_pipe_tail(
+            app.clone(),
+            session_id.clone(),
+            provider_session_id.clone(),
+            route,
+        )?;
+        if pipe_has_usage {
+            haider_projection_stop_session_watch(&session_id)?;
+            return Ok(());
+        }
+        // v2 sidecars have no usage/run-state rows. Keep one filtered watch
+        // for trajectory lanes and status, never transcript projection.
+        return haider_projection_start_watch(
+            app,
+            session_id,
+            provider_session_id,
+            baseline_seq,
+            true,
+        );
     }
 
     haider_projection_start_watch(app, session_id, provider_session_id, baseline_seq, false)
@@ -2523,6 +3387,14 @@ fn haider_projection_stop() {
             let _ = child.kill();
         }
     }
+    if let Ok(mut manager) = haider_projection_prefold_manager().lock() {
+        manager.queue.clear();
+        manager.queued.clear();
+        manager.active.clear();
+        manager.attached.clear();
+        manager.in_flight = None;
+        manager.worker_running = false;
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -2535,39 +3407,23 @@ async fn session_projection_window(
         let session_id = session_id.trim();
         let start_index = start_index.max(0);
         let count = count.clamp(0, HAIDER_PROJECTION_MAX_WINDOW_ROWS);
-        let connection = haider_projection_open_database()?;
-        let total_rows: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM session_projection_rows WHERE session_id = ?1",
-                [session_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Unable to count session projection rows: {error}"))?;
-        let mut statement = connection
-            .prepare(
-                "SELECT session_id, seq, ordinal, branch_id, kind, role, text, meta, at_ms
-                 FROM session_projection_rows WHERE session_id = ?1
-                 ORDER BY seq, ordinal LIMIT ?2 OFFSET ?3",
-            )
-            .map_err(|error| format!("Unable to prepare session projection window: {error}"))?;
-        let rows = statement
-            .query_map(rusqlite::params![session_id, count, start_index], |row| {
-                let meta: String = row.get(7)?;
-                Ok(SessionProjectionRow {
-                    session_id: row.get(0)?,
-                    seq: row.get(1)?,
-                    ordinal: row.get(2)?,
-                    branch_id: row.get(3)?,
-                    kind: row.get(4)?,
-                    role: row.get(5)?,
-                    text: row.get(6)?,
-                    meta: serde_json::from_str(&meta).unwrap_or_else(|_| json!({"raw": meta})),
-                    at_ms: row.get(8)?,
-                })
-            })
-            .map_err(|error| format!("Unable to read session projection window: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to decode session projection row: {error}"))?;
+        let (total_rows, rows) = haider_projection_with_database(|connection| {
+            haider_projection_initialize_state_with_connection(connection, session_id)?;
+            let total_rows = haider_projection_states()
+                .lock()
+                .map_err(|_| "Session projection state is unavailable.".to_string())?
+                .get(session_id)
+                .map(|state| state.total_rows)
+                .ok_or_else(|| "Session projection state was not initialized.".to_string())?;
+            let rows = haider_projection_window_rows_keyset(
+                connection,
+                session_id,
+                start_index,
+                count,
+                total_rows,
+            )?;
+            Ok((total_rows, rows))
+        })?;
         let live_tail = haider_projection_states().lock().ok().and_then(|states| {
             states
                 .get(session_id)
@@ -2626,103 +3482,111 @@ fn haider_projection_json_i64_value(value: &Value) -> Option<i64> {
 async fn session_projection_trajectory(session_id: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let session_id = session_id.trim().to_string();
-        let connection = haider_projection_open_database()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT seq, ordinal, branch_id, kind, role, text, meta, at_ms
+        haider_projection_with_database(|connection| {
+            let mut statement = connection
+                .prepare_cached(
+                    "SELECT seq, ordinal, branch_id, kind, role, text, meta, at_ms
                  FROM session_projection_rows WHERE session_id = ?1
                  ORDER BY seq, ordinal",
-            )
-            .map_err(|error| format!("Unable to prepare session trajectory read: {error}"))?;
-        let points = statement
-            .query_map([&session_id], |row| {
-                let seq: i64 = row.get(0)?;
-                let ordinal: i64 = row.get(1)?;
-                let branch_id: String = row.get(2)?;
-                let kind: String = row.get(3)?;
-                let role: String = row.get(4)?;
-                let text: String = row.get(5)?;
-                let meta_text: String = row.get(6)?;
-                let at_ms: i64 = row.get(7)?;
-                Ok((seq, ordinal, branch_id, kind, role, text, meta_text, at_ms))
-            })
-            .map_err(|error| format!("Unable to read session trajectory rows: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Unable to decode session trajectory row: {error}"))?
-            .into_iter()
-            .map(
-                |(seq, ordinal, branch_id, kind, role, text, meta_text, at_ms)| {
-                    let mut point = json!({
-                        "seq": seq,
-                        "ordinal": ordinal,
-                        "branch_id": branch_id,
-                        "kind": kind,
-                        "role": role,
-                        "at_ms": at_ms,
-                        "label": haider_projection_compact(&text, 140),
-                    });
-                    if kind == "usage" {
-                        let meta: Value = serde_json::from_str(&meta_text).unwrap_or(Value::Null);
-                        let input = haider_projection_usage_number(
-                            &meta,
-                            &["input", "input_tokens", "prompt_tokens"],
-                        );
-                        let output = haider_projection_usage_number(
-                            &meta,
-                            &["output", "output_tokens", "completion_tokens"],
-                        );
-                        let cached = haider_projection_usage_number(
-                            &meta,
-                            &[
-                                "cached",
-                                "cached_tokens",
-                                "cache_read",
-                                "cache_read_input_tokens",
-                                "cached_input",
-                                "cached_input_tokens",
-                            ],
-                        );
-                        if let Some(object) = point.as_object_mut() {
-                            object.insert("input".to_string(), json!(input));
-                            object.insert("output".to_string(), json!(output));
-                            object.insert("cached".to_string(), json!(cached));
+                )
+                .map_err(|error| format!("Unable to prepare session trajectory read: {error}"))?;
+            let points = statement
+                .query_map([&session_id], |row| {
+                    let seq: i64 = row.get(0)?;
+                    let ordinal: i64 = row.get(1)?;
+                    let branch_id: String = row.get(2)?;
+                    let kind: String = row.get(3)?;
+                    let role: String = row.get(4)?;
+                    let text: String = row.get(5)?;
+                    let meta_text: String = row.get(6)?;
+                    let at_ms: i64 = row.get(7)?;
+                    Ok((seq, ordinal, branch_id, kind, role, text, meta_text, at_ms))
+                })
+                .map_err(|error| format!("Unable to read session trajectory rows: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Unable to decode session trajectory row: {error}"))?
+                .into_iter()
+                .map(
+                    |(seq, ordinal, branch_id, kind, role, text, meta_text, at_ms)| {
+                        let mut point = json!({
+                            "seq": seq,
+                            "ordinal": ordinal,
+                            "branch_id": branch_id,
+                            "kind": kind,
+                            "role": role,
+                            "at_ms": at_ms,
+                            "label": haider_projection_compact(&text, 140),
+                        });
+                        if kind == "usage" {
+                            let meta: Value =
+                                serde_json::from_str(&meta_text).unwrap_or(Value::Null);
+                            let input = haider_projection_usage_number(
+                                &meta,
+                                &["input", "input_tokens", "prompt_tokens"],
+                            );
+                            let output = haider_projection_usage_number(
+                                &meta,
+                                &["output", "output_tokens", "completion_tokens"],
+                            );
+                            let cached = haider_projection_usage_number(
+                                &meta,
+                                &[
+                                    "cached",
+                                    "cached_tokens",
+                                    "cache_read",
+                                    "cache_read_input_tokens",
+                                    "cached_input",
+                                    "cached_input_tokens",
+                                ],
+                            );
+                            if let Some(object) = point.as_object_mut() {
+                                object.insert("input".to_string(), json!(input));
+                                object.insert("output".to_string(), json!(output));
+                                object.insert("cached".to_string(), json!(cached));
+                            }
                         }
-                    }
-                    point
-                },
-            )
-            .collect::<Vec<_>>();
-        Ok(json!({ "points": points }))
+                        point
+                    },
+                )
+                .collect::<Vec<_>>();
+            Ok(json!({ "points": points }))
+        })
     })
     .await
     .map_err(|error| format!("Session trajectory worker failed: {error}"))?
 }
 
+fn haider_projection_ensure_blocking(
+    session_id: &str,
+    foreground: &mut HaiderProjectionForeground,
+) -> Result<i64, String> {
+    let total_rows = haider_projection_state_total_rows(session_id)?;
+    let provider = haider_projection_resolve_provider_session(session_id).ok();
+    if let Some((_, provider_session_id)) = provider.as_ref() {
+        foreground.add(provider_session_id);
+        if haider_projection_ingest_resolved_pipe(session_id, provider_session_id).is_ok() {
+            return haider_projection_state_total_rows(session_id);
+        }
+    }
+    if total_rows > 0 {
+        return Ok(total_rows);
+    }
+    let (_, provider_session_id) =
+        provider.ok_or_else(|| "Haider session id is not bound yet.".to_string())?;
+    let export = haider_projection_export_json(&provider_session_id)?;
+    let _ = haider_projection_ingest_value(None, session_id, &export)?;
+    haider_projection_state_total_rows(session_id)
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn session_projection_ensure(session_id: String) -> Result<i64, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let session_id = session_id.trim().to_string();
+        let mut foreground = haider_projection_foreground(&session_id);
         let _ensure_guard = haider_projection_ensure_lock()
             .lock()
             .map_err(|_| "Session projection ensure lock is unavailable.".to_string())?;
-        let session_id = session_id.trim().to_string();
-        let (total_rows, _) = haider_projection_database_stats(&session_id)?;
-        let provider = haider_projection_resolve_provider_session(&session_id).ok();
-        if let Some((_, provider_session_id)) = provider.as_ref() {
-            if let Ok(route) = haider_projection_resolve_pipe_route(provider_session_id) {
-                if haider_projection_ingest_pipe(&session_id, provider_session_id, &route).is_ok() {
-                    return haider_projection_database_stats(&session_id).map(|(total, _)| total);
-                }
-            }
-        }
-        if total_rows > 0 {
-            haider_projection_initialize_state(&session_id)?;
-            return Ok(total_rows);
-        }
-        let (_, provider_session_id) =
-            provider.ok_or_else(|| "Haider session id is not bound yet.".to_string())?;
-        let export = haider_projection_export_json(&provider_session_id)?;
-        let _ = haider_projection_ingest_value(None, &session_id, &export)?;
-        haider_projection_database_stats(&session_id).map(|(total, _)| total)
+        haider_projection_ensure_blocking(&session_id, &mut foreground)
     })
     .await
     .map_err(|error| format!("Session projection ensure worker failed: {error}"))?
@@ -2731,7 +3595,15 @@ async fn session_projection_ensure(session_id: String) -> Result<i64, String> {
 #[tauri::command(rename_all = "snake_case")]
 async fn session_projection_attach(app: AppHandle, session_id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        haider_projection_attach_blocking(app, session_id.trim().to_string())
+        let session_id = session_id.trim().to_string();
+        let mut foreground = haider_projection_foreground(&session_id);
+        match haider_projection_attach_blocking(app, session_id, &mut foreground) {
+            Ok(()) => {
+                foreground.mark_attached();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     })
     .await
     .map_err(|error| format!("Session projection attach worker failed: {error}"))?
@@ -2739,15 +3611,24 @@ async fn session_projection_attach(app: AppHandle, session_id: String) -> Result
 
 #[tauri::command(rename_all = "snake_case")]
 async fn session_projection_detach(session_id: String) -> Result<(), String> {
+    let session_id = session_id.trim().to_string();
+    let mut detached = vec![session_id.clone()];
+    if let Ok((_, provider_session_id)) = haider_projection_resolve_provider_session(&session_id) {
+        detached.push(provider_session_id);
+    }
     if let Some(tail) = haider_projection_pipe_manager()
         .lock()
         .map_err(|_| "Haider projection pipe manager is unavailable.".to_string())?
         .tails
-        .remove(session_id.trim())
+        .remove(&session_id)
     {
         tail.stop.store(true, Ordering::Release);
     }
-    haider_projection_stop_session_watch(session_id.trim())
+    let result = haider_projection_stop_session_watch(&session_id);
+    if result.is_ok() {
+        haider_projection_prefold_detach(&detached);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2761,7 +3642,7 @@ mod haider_projection_tests {
 
     impl Drop for HaiderProjectionTestSession {
         fn drop(&mut self) {
-            if let Ok(connection) = haider_projection_open_database() {
+            let _ = haider_projection_with_database(|connection| {
                 let _ = connection.execute(
                     "DELETE FROM session_projection_rows WHERE session_id = ?1",
                     [&self.session_id],
@@ -2770,7 +3651,8 @@ mod haider_projection_tests {
                     "DELETE FROM session_pipe_cursors WHERE session_id = ?1",
                     [&self.session_id],
                 );
-            }
+                Ok(())
+            });
             if let Ok(mut states) = haider_projection_states().lock() {
                 states.remove(&self.session_id);
             }
@@ -2798,6 +3680,644 @@ mod haider_projection_tests {
                 "generation":generation
             })
         )
+    }
+
+    fn haider_projection_test_row(
+        session_id: &str,
+        seq: i64,
+        ordinal: i64,
+    ) -> SessionProjectionRow {
+        haider_projection_row(
+            session_id,
+            seq,
+            ordinal,
+            String::new(),
+            "message",
+            if seq % 2 == 0 { "assistant" } else { "user" },
+            format!("row-{seq}-{ordinal}"),
+            json!({"seq":seq,"ordinal":ordinal}),
+            1_700_000_000_000 + seq * 10 + ordinal,
+        )
+    }
+
+    #[test]
+    fn haider_projection_pipe_route_cache_reuses_and_invalidates_missing_path() {
+        let root = std::env::temp_dir().join(format!(
+            "haider-route-cache-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let first_path = root.join("first.jsonl");
+        let second_path = root.join("second.jsonl");
+        fs::write(&first_path, b"first").unwrap();
+        fs::write(&second_path, b"second").unwrap();
+        let routes = StdMutex::new(HashMap::new());
+        let calls = std::cell::Cell::new(0usize);
+        let mut resolver = |_: &str| {
+            calls.set(calls.get() + 1);
+            Ok(HaiderProjectionPipeRoute {
+                path: if calls.get() == 1 {
+                    first_path.clone()
+                } else {
+                    second_path.clone()
+                },
+                head_seq: Some(calls.get() as i64),
+            })
+        };
+
+        let first =
+            haider_projection_resolve_pipe_route_cached_with(&routes, "provider", &mut resolver)
+                .unwrap();
+        let cached =
+            haider_projection_resolve_pipe_route_cached_with(&routes, "provider", &mut resolver)
+                .unwrap();
+        assert_eq!(first.path, cached.path);
+        assert_eq!(calls.get(), 1);
+
+        fs::remove_file(&first_path).unwrap();
+        let refreshed =
+            haider_projection_resolve_pipe_route_cached_with(&routes, "provider", &mut resolver)
+                .unwrap();
+        assert_eq!(refreshed.path, second_path);
+        assert_eq!(calls.get(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn haider_projection_prefold_hands_ingest_to_foreground_without_state_loss() {
+        let test_session = haider_projection_test_session();
+        let root = std::env::temp_dir().join(format!(
+            "haider-prefold-handoff-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let rows = (1..=257)
+            .map(|seq| {
+                let value = if seq == 1 {
+                    json!({"seq":seq,"ordinal":0,"usage":{"input_tokens":10}})
+                } else {
+                    json!({
+                        "seq":seq,
+                        "ordinal":0,
+                        "role":if seq % 2 == 0 { "assistant" } else { "user" },
+                        "text":format!("row-{seq}")
+                    })
+                };
+                format!("{value}\n")
+            })
+            .collect::<String>();
+        let contents = format!(
+            "{}{}",
+            haider_projection_test_pipe_header(&test_session.provider_session_id, 1),
+            rows
+        );
+        fs::write(&path, &contents).unwrap();
+        let route = HaiderProjectionPipeRoute {
+            path: path.clone(),
+            head_seq: Some(257),
+        };
+        let checks = Arc::new(AtomicUsize::new(0));
+        let foreground_started = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+
+        let prefold_session_id = test_session.session_id.clone();
+        let prefold_provider_id = test_session.provider_session_id.clone();
+        let prefold_route = route.clone();
+        let prefold_checks = checks.clone();
+        let prefold_started = foreground_started.clone();
+        let prefold_paused = paused.clone();
+        let prefold_resume = resume.clone();
+        let prefold = thread::spawn(move || {
+            let cancelled = || {
+                if prefold_checks.fetch_add(1, Ordering::SeqCst) == 259 {
+                    prefold_paused.wait();
+                    prefold_resume.wait();
+                }
+                prefold_started.load(Ordering::SeqCst)
+            };
+            haider_projection_ingest_pipe_cancellable(
+                &prefold_session_id,
+                &prefold_provider_id,
+                &prefold_route,
+                &cancelled,
+            )
+        });
+        paused.wait();
+
+        let foreground_session_id = test_session.session_id.clone();
+        let foreground_provider_id = test_session.provider_session_id.clone();
+        let foreground_route = route.clone();
+        let foreground_started_thread = foreground_started.clone();
+        let foreground = thread::spawn(move || {
+            let _foreground = haider_projection_foreground(&foreground_session_id);
+            foreground_started_thread.store(true, Ordering::SeqCst);
+            haider_projection_ingest_pipe(
+                &foreground_session_id,
+                &foreground_provider_id,
+                &foreground_route,
+            )
+        });
+        while !foreground_started.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        resume.wait();
+
+        assert!(prefold
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("prefold was cancelled"));
+        assert_eq!(foreground.join().unwrap().unwrap().appended, 1);
+        assert_eq!(
+            haider_projection_database_stats(&test_session.session_id)
+                .unwrap()
+                .0,
+            257
+        );
+        let states = haider_projection_states().lock().unwrap();
+        let state = states.get(&test_session.session_id).unwrap();
+        assert_eq!(state.total_rows, 257);
+        assert!(state.metadata.contains_key("usage"));
+        drop(states);
+        let cursor = haider_projection_load_pipe_cursor(&test_session.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.byte_offset, contents.len() as i64);
+        assert_eq!((cursor.last_seq, cursor.last_ordinal), (257, 0));
+
+        let stale = HaiderProjectionPipeCursor {
+            session_id: test_session.session_id.clone(),
+            byte_offset: cursor.byte_offset - 1,
+            last_seq: 256,
+            generation: 1,
+            ..HaiderProjectionPipeCursor::default()
+        };
+        haider_projection_persist_batch(&test_session.session_id, &[], Some(&stale)).unwrap();
+        assert_eq!(
+            haider_projection_load_pipe_cursor(&test_session.session_id)
+                .unwrap()
+                .unwrap(),
+            cursor
+        );
+
+        let next_path = root.join("session-next.jsonl");
+        let next_contents = format!(
+            "{}{}\n",
+            haider_projection_test_pipe_header(&test_session.provider_session_id, 2),
+            json!({"seq":3,"ordinal":0,"role":"assistant","text":"three"})
+        );
+        fs::write(&next_path, &next_contents).unwrap();
+        haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &HaiderProjectionPipeRoute {
+                path: next_path,
+                head_seq: Some(3),
+            },
+        )
+        .unwrap();
+        let generation_two = haider_projection_load_pipe_cursor(&test_session.session_id)
+            .unwrap()
+            .unwrap();
+        let truncated_path = root.join("session-truncated.jsonl");
+        fs::write(
+            &truncated_path,
+            haider_projection_test_pipe_header(&test_session.provider_session_id, 2),
+        )
+        .unwrap();
+        assert!(haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &HaiderProjectionPipeRoute {
+                path: truncated_path,
+                head_seq: Some(3),
+            },
+        )
+        .unwrap_err()
+        .contains("route was stale"));
+        assert!(haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &route,
+        )
+        .unwrap_err()
+        .contains("generation was stale"));
+        assert_eq!(
+            haider_projection_load_pipe_cursor(&test_session.session_id)
+                .unwrap()
+                .unwrap(),
+            generation_two
+        );
+        assert_eq!(
+            haider_projection_database_stats(&test_session.session_id).unwrap(),
+            (1, 3)
+        );
+        let old_generation = HaiderProjectionPipeCursor {
+            session_id: test_session.session_id.clone(),
+            byte_offset: i64::MAX,
+            last_seq: i64::MAX,
+            generation: 1,
+            ..HaiderProjectionPipeCursor::default()
+        };
+        haider_projection_persist_batch(&test_session.session_id, &[], Some(&old_generation))
+            .unwrap();
+        assert_eq!(
+            haider_projection_load_pipe_cursor(&test_session.session_id)
+                .unwrap()
+                .unwrap(),
+            generation_two
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn haider_projection_head_advance_refreshes_route_and_rebuilds_watcher() {
+        let test_session = haider_projection_test_session();
+        let root = std::env::temp_dir().join(format!(
+            "haider-route-rotation-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let old_path = root.join("session-old.jsonl");
+        let new_path = root.join("session-new.jsonl");
+        let first_line = format!(
+            "{}\n",
+            json!({"seq":1,"ordinal":0,"role":"user","text":"one"})
+        );
+        fs::write(
+            &old_path,
+            format!(
+                "{}{}",
+                haider_projection_test_pipe_header(&test_session.provider_session_id, 1),
+                first_line
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &new_path,
+            format!(
+                "{}{}{}\n",
+                haider_projection_test_pipe_header(&test_session.provider_session_id, 1),
+                first_line,
+                json!({"seq":2,"ordinal":0,"role":"assistant","text":"two"})
+            ),
+        )
+        .unwrap();
+        let old_route = HaiderProjectionPipeRoute {
+            path: old_path.clone(),
+            head_seq: Some(1),
+        };
+        haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &old_route,
+        )
+        .unwrap();
+        let mut old_pipe = fs::OpenOptions::new().append(true).open(&old_path).unwrap();
+        old_pipe.write_all(b"{\"seq\":2").unwrap();
+        old_pipe.sync_all().unwrap();
+        haider_bridge_note_head_seq(&test_session.provider_session_id, 2);
+        let stale_route = HaiderProjectionPipeRoute {
+            path: old_path.clone(),
+            head_seq: Some(2),
+        };
+
+        let routes = StdMutex::new(HashMap::from([(
+            test_session.provider_session_id.clone(),
+            stale_route.clone(),
+        )]));
+        let resolves = std::cell::Cell::new(0usize);
+        let ingest_lock = haider_projection_ingest_lock(&test_session.session_id).unwrap();
+        let _ingest_guard = ingest_lock.lock().unwrap();
+        let (frame, refreshed_route) = haider_projection_ingest_pipe_route_retry_owned_with(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            stale_route,
+            &|| false,
+            || {
+                haider_projection_refresh_pipe_route_with(
+                    &routes,
+                    &test_session.provider_session_id,
+                    |_| {
+                        resolves.set(resolves.get() + 1);
+                        Ok(HaiderProjectionPipeRoute {
+                            path: new_path.clone(),
+                            head_seq: Some(2),
+                        })
+                    },
+                )
+            },
+        )
+        .unwrap();
+        drop(_ingest_guard);
+        assert_eq!(resolves.get(), 1);
+        assert_eq!(refreshed_route.path, new_path);
+        assert_eq!(frame.appended, 1);
+        assert_eq!(
+            routes
+                .lock()
+                .unwrap()
+                .get(&test_session.provider_session_id)
+                .unwrap()
+                .path,
+            new_path
+        );
+
+        let (initial_watcher, initial_receiver) =
+            haider_projection_pipe_watcher(&old_path).expect("old pipe watcher");
+        let mut watched_path = old_path;
+        let mut watcher = Some(initial_watcher);
+        let mut receiver = Some(initial_receiver);
+        assert!(haider_projection_rebuild_pipe_watcher(
+            &mut watched_path,
+            &mut watcher,
+            &mut receiver,
+            &refreshed_route,
+        ));
+        assert_eq!(watched_path, new_path);
+        let mut file = fs::OpenOptions::new().append(true).open(&new_path).unwrap();
+        file.write_all(b"{\"coverage\":2,\"generation\":1}\n")
+            .unwrap();
+        file.sync_all().unwrap();
+        assert!(haider_projection_wait_for_pipe_event(
+            receiver.as_ref().unwrap(),
+            &new_path,
+            Duration::from_secs(2),
+        ));
+
+        drop(watcher);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn haider_projection_cached_database_reopens_only_invalid_connection() {
+        let path = std::env::temp_dir().join(format!(
+            "haider-db-cache-{}.sqlite",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let cache = StdMutex::new(None);
+        let opens = AtomicUsize::new(0);
+        let open = || {
+            let connection = rusqlite::Connection::open(&path)
+                .map_err(|error| format!("test open failed: {error}"))?;
+            connection
+                .execute("CREATE TABLE IF NOT EXISTS values_test(value INTEGER)", [])
+                .map_err(|error| format!("test schema failed: {error}"))?;
+            Ok(connection)
+        };
+        for value in [1_i64, 2] {
+            haider_projection_with_database_cache(
+                &cache,
+                &opens,
+                open,
+                |_| Ok(true),
+                |connection| {
+                    connection
+                        .execute("INSERT INTO values_test(value) VALUES (?1)", [value])
+                        .map(|_| ())
+                        .map_err(|error| format!("test persist failed: {error}"))
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+
+        let invalid = std::cell::Cell::new(true);
+        haider_projection_with_database_cache(
+            &cache,
+            &opens,
+            open,
+            |_| Ok(!invalid.replace(false)),
+            |connection| {
+                connection
+                    .execute("INSERT INTO values_test(value) VALUES (3)", [])
+                    .map(|_| ())
+                    .map_err(|error| format!("test fallback persist failed: {error}"))
+            },
+        )
+        .unwrap();
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+        let count = haider_projection_with_database_cache(
+            &cache,
+            &opens,
+            open,
+            |_| Ok(true),
+            |connection| {
+                connection
+                    .query_row("SELECT COUNT(*) FROM values_test", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(|error| format!("test count failed: {error}"))
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 3);
+        drop(cache);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn haider_projection_cached_database_never_reexecutes_committed_operation() {
+        let path = std::env::temp_dir().join(format!(
+            "haider-db-no-replay-{}.sqlite",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let cache = StdMutex::new(None);
+        let opens = AtomicUsize::new(0);
+        let executions = std::cell::Cell::new(0usize);
+        let open = || {
+            let connection = rusqlite::Connection::open(&path)
+                .map_err(|error| format!("test open failed: {error}"))?;
+            connection
+                .execute("CREATE TABLE IF NOT EXISTS values_test(value INTEGER)", [])
+                .map_err(|error| format!("test schema failed: {error}"))?;
+            Ok(connection)
+        };
+
+        let error = haider_projection_with_database_cache(
+            &cache,
+            &opens,
+            open,
+            |_| Ok(true),
+            |connection| {
+                executions.set(executions.get() + 1);
+                connection
+                    .execute("INSERT INTO values_test(value) VALUES (1)", [])
+                    .map_err(|error| format!("test persist failed: {error}"))?;
+                Err::<(), _>("forced post-commit state error".to_string())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "forced post-commit state error");
+        assert_eq!(executions.get(), 1);
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        let count = haider_projection_with_database_cache(
+            &cache,
+            &opens,
+            open,
+            |_| Ok(true),
+            |connection| {
+                connection
+                    .query_row("SELECT COUNT(*) FROM values_test", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(|error| format!("test count failed: {error}"))
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        drop(cache);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn haider_projection_incremental_total_matches_database_count() {
+        let test_session = haider_projection_test_session();
+        haider_projection_initialize_state(&test_session.session_id).unwrap();
+        let database_opens = haider_projection_database_open_count().load(Ordering::Relaxed);
+        let first = vec![
+            haider_projection_test_row(&test_session.session_id, 1, 0),
+            haider_projection_test_row(&test_session.session_id, 2, 0),
+            haider_projection_test_row(&test_session.session_id, 2, 0),
+        ];
+        let second = vec![
+            haider_projection_test_row(&test_session.session_id, 2, 0),
+            haider_projection_test_row(&test_session.session_id, 3, 0),
+            haider_projection_test_row(&test_session.session_id, 3, 1),
+        ];
+        for (rows, expected) in [(&first[..], 2_i64), (&second[..], 4_i64)] {
+            let (_, total) = haider_projection_persist_rows(rows).unwrap();
+            let ground_truth = haider_projection_with_database(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM session_projection_rows WHERE session_id = ?1",
+                        [&test_session.session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|error| format!("test projection count failed: {error}"))
+            })
+            .unwrap();
+            assert_eq!(total, expected);
+            assert_eq!(total, ground_truth);
+        }
+        assert_eq!(
+            haider_projection_database_open_count().load(Ordering::Relaxed),
+            database_opens
+        );
+        let cursor = HaiderProjectionPipeCursor {
+            session_id: test_session.session_id.clone(),
+            generation: 1,
+            ..HaiderProjectionPipeCursor::default()
+        };
+        let (_, total) =
+            haider_projection_persist_batch(&test_session.session_id, &[], Some(&cursor)).unwrap();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn haider_projection_keyset_window_matches_offset_golden() {
+        let test_session = haider_projection_test_session();
+        let rows = [
+            (1, 0),
+            (1, 1),
+            (2, 0),
+            (4, 0),
+            (4, 2),
+            (5, 0),
+            (8, 0),
+            (8, 1),
+        ]
+        .into_iter()
+        .map(|(seq, ordinal)| haider_projection_test_row(&test_session.session_id, seq, ordinal))
+        .collect::<Vec<_>>();
+        let (_, total_rows) = haider_projection_persist_rows(&rows).unwrap();
+        for (start_index, count) in [(0, 3), (2, 4), (5, 10), (7, 1), (8, 2), (3, 0)] {
+            let (offset_rows, keyset_rows) = haider_projection_with_database(|connection| {
+                let offset_rows = connection
+                    .prepare_cached(
+                        "SELECT session_id, seq, ordinal, branch_id, kind, role, text, meta, at_ms
+                             FROM session_projection_rows WHERE session_id = ?1
+                             ORDER BY seq, ordinal LIMIT ?2 OFFSET ?3",
+                    )
+                    .and_then(|mut statement| {
+                        statement
+                            .query_map(
+                                rusqlite::params![test_session.session_id, count, start_index],
+                                haider_projection_decode_row,
+                            )?
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .map_err(|error| format!("test offset window failed: {error}"))?;
+                let keyset_rows = haider_projection_window_rows_keyset(
+                    connection,
+                    &test_session.session_id,
+                    start_index,
+                    count,
+                    total_rows,
+                )?;
+                Ok((offset_rows, keyset_rows))
+            })
+            .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&keyset_rows).unwrap(),
+                serde_json::to_vec(&offset_rows).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn haider_projection_prefold_queue_dedupes_skips_active_and_drains() {
+        let manager = StdMutex::new(HaiderProjectionPrefoldManager::default());
+        assert!(haider_projection_prefold_enqueue_with(
+            &manager,
+            ["a", "a", "b", "c"].into_iter().map(str::to_string),
+        ));
+        assert!(!haider_projection_prefold_enqueue_with(
+            &manager,
+            ["c", "d"].into_iter().map(str::to_string),
+        ));
+        {
+            let mut manager = manager.lock().unwrap();
+            manager.attached.insert("local-b".to_string());
+            manager.active.insert("c".to_string());
+        }
+        let mut folded = Vec::new();
+        haider_projection_prefold_drain_with(
+            &manager,
+            |provider| Some(format!("local-{provider}")),
+            |_, provider| folded.push(provider.to_string()),
+        );
+        assert_eq!(folded, vec!["a", "d"]);
+        {
+            let manager = manager.lock().unwrap();
+            assert!(manager.queue.is_empty());
+            assert!(manager.queued.is_empty());
+            assert!(manager.in_flight.is_none());
+            assert!(!manager.worker_running);
+        }
+
+        {
+            let mut manager = manager.lock().unwrap();
+            manager.in_flight = Some(("e".to_string(), "local-e".to_string()));
+            manager.worker_running = true;
+        }
+        assert!(!haider_projection_prefold_enqueue_with(
+            &manager,
+            ["e", "e"].into_iter().map(str::to_string),
+        ));
+        manager.lock().unwrap().in_flight = None;
+        haider_projection_prefold_drain_with(
+            &manager,
+            |provider| Some(format!("local-{provider}")),
+            |_, provider| folded.push(provider.to_string()),
+        );
+        assert_eq!(folded, vec!["a", "d", "e"]);
+        assert!(manager.lock().unwrap().queue.is_empty());
     }
 
     #[test]

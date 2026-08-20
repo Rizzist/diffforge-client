@@ -65,6 +65,10 @@ export default function SessionSurface({
   sessions = [],
 }) {
   const [viewModes, setViewModes] = useState({});
+  /* Spawn discipline: selecting a session never spawns anything — the Shell
+     PTY mounts (and adopts/spawns) only after the Shell view is first shown
+     for that session; from then on it stays warm-mounted. */
+  const [shellTouched, setShellTouched] = useState({});
   const [sessionTabs, setSessionTabs] = useState({});
   /* Composer drafts are SURFACE-owned, keyed by session id ("draft" for the
      unmaterialized chat): the composer unmounts on view/session switches, so
@@ -115,22 +119,96 @@ export default function SessionSurface({
   const [paneOverrides, setPaneOverrides] = useState({});
   const [surfaceStatus, setSurfaceStatus] = useState({});
 
+  /* Config fetches are LATEST-WINS per session: a slow menu-open GET must
+     never overwrite the state a later post-SET GET already applied. */
+  const configFetchSeqRef = useRef({});
   const refreshConfig = useCallback((sessionId) => {
+    const seq = (configFetchSeqRef.current[sessionId] || 0) + 1;
+    configFetchSeqRef.current[sessionId] = seq;
     void invoke("session_config_get", { session_id: sessionId })
       .then((config) => {
         if (config && typeof config === "object") {
-          setSessionConfigs((current) => ({ ...current, [sessionId]: config }));
+          /* Staleness is rechecked INSIDE the updater: React may defer the
+             enqueued state write past a synchronous invalidation bump. */
+          setSessionConfigs((current) => (
+            configFetchSeqRef.current[sessionId] === seq
+              ? { ...current, [sessionId]: config }
+              : current
+          ));
         }
       })
       .catch(() => {});
   }, []);
 
+  /* The roster mirrors daemon truth: if a session's model changed elsewhere
+     (TUI switch), a cached config that disagrees is stale — drop it so the
+     chips fall back to the fresh roster row. */
+  const sessionConfigsRef = useRef({});
+  useEffect(() => {
+    sessionConfigsRef.current = sessionConfigs;
+  }, [sessionConfigs]);
+  /* Last roster model seen per session: the fence keys on roster CHANGE,
+     independent of whether a config ever committed — an in-flight FIRST GET
+     must also die when the model moved under it. */
+  const rosterModelRef = useRef({});
+  useEffect(() => {
+    /* Fencing is SYNCHRONOUS in the effect body (updaters can be deferred /
+       replayed — a bump inside one would let a pending GET slip its seq
+       check first). The prune updater stays pure. */
+    const staleIds = [];
+    for (const row of sessions) {
+      const model = (row.model || "").trim();
+      const previous = rosterModelRef.current[row.id];
+      rosterModelRef.current[row.id] = model;
+      if (previous !== undefined && previous !== model) {
+        if (configFetchSeqRef.current[row.id]) {
+          configFetchSeqRef.current[row.id] += 1;
+        }
+        staleIds.push(row.id);
+        continue;
+      }
+      const config = sessionConfigsRef.current[row.id];
+      if (model && config?.model && config.model !== model) {
+        staleIds.push(row.id);
+        configFetchSeqRef.current[row.id] = (configFetchSeqRef.current[row.id] || 0) + 1;
+      }
+    }
+    /* Sessions REMOVED from the roster are fenced too: a pre-removal GET
+       must never commit after a re-add. Seq tombstone stays; the roster
+       mirror entry goes so a re-add starts fresh. */
+    const liveIds = new Set(sessions.map((row) => row.id));
+    for (const id of Object.keys(rosterModelRef.current)) {
+      if (!liveIds.has(id)) {
+        delete rosterModelRef.current[id];
+        if (configFetchSeqRef.current[id]) {
+          configFetchSeqRef.current[id] += 1;
+        }
+        staleIds.push(id);
+      }
+    }
+    if (!staleIds.length) return;
+    setSessionConfigs((current) => {
+      const next = { ...current };
+      let changed = false;
+      for (const id of staleIds) {
+        if (id in next) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [sessions]);
+
+  /* Click path stays LOCAL: chips render from the roster row the bridge
+     already mirrors (model/provider ride every summary) — the config fetch
+     moved to chip-menu-open, the one moment that tolerates a beat. The only
+     daemon touch on click is the cheap surface_attach frame. */
   useEffect(() => {
     if (activeSessionId && activeSessionId !== "draft") {
-      refreshConfig(activeSessionId);
       void invoke("surface_attach", { session_id: activeSessionId }).catch(() => {});
     }
-  }, [activeSessionId, refreshConfig]);
+  }, [activeSessionId]);
 
   /* Daemon-owned volatile surfaces (input mirror + status segment): events
      arrive keyed by PROVIDER session id; map to local rows. */
@@ -203,6 +281,12 @@ export default function SessionSurface({
     /* Land where the user actually was: a hop driven from a live Shell keeps
        the Shell; materializing from the Chat composer (the warm hidden TUI
        announcing the bind) must land in Chat. */
+    /* A rehomed pane means a live TUI to adopt: mark the target
+       shell-touched UNCONDITIONALLY so its terminal mounts (warm) even when
+       the hop lands in Chat; only the VISIBLE mode stays conditional. */
+    setShellTouched((current) => (
+      current[target.id] ? current : { ...current, [target.id]: true }
+    ));
     if ((viewModes[hostSessionId] || "ui") === "terminal") {
       setViewModes((current) => ({ ...current, [target.id]: "terminal" }));
     }
@@ -213,13 +297,28 @@ export default function SessionSurface({
      single coherent choice (a deepseek model can never ride an openai
      account). The menu groups the catalog by provider; selecting applies
      "provider/model" through the harness. */
+  /* The roster row's `provider` is the INTEGRATION id ("haider"), never the
+     model provider — derive that from the models library instead. */
+  const libraryProviderFor = (model) => {
+    if (!model) return "";
+    const models = Array.isArray(library?.models) ? library.models : [];
+    /* The library allows the same model name under multiple providers —
+       infer only when the answer is unambiguous, never guess. */
+    const providers = new Set(
+      models.filter((entry) => entry?.model === model).map((entry) => entry.provider),
+    );
+    return providers.size === 1 ? [...providers][0] : "";
+  };
   const chipValuesFor = (session) => {
     const config = session ? sessionConfigs[session.id] : null;
     const prefs = composerPrefs[session?.id || "draft"] || {};
     const prefModel = (prefs.model || "").split("/").pop() || null;
+    const model = config?.model || prefModel || session?.model || "default";
     return {
-      model: config?.model || prefModel || session?.model || "default",
-      modelProvider: config?.provider || (prefs.model || "").split("/")[0] || session?.provider || "",
+      model,
+      modelProvider: config?.provider
+        || (prefs.model || "").split("/")[0]
+        || libraryProviderFor(model),
       effort: config?.effort || prefs.effort || "default",
       speed: config?.speed === "fast" || prefs.speed === "fast" ? "fast" : "default",
     };
@@ -268,7 +367,26 @@ export default function SessionSurface({
       else if (key === "account") patch.account = value;
       else return;
       void invoke("session_config_set", patch)
-        .then(() => refreshConfig(sessionId))
+        .then(() => {
+          /* Replace the cache with the SET value immediately — the verify
+             GET (latest-wins) confirms; a slow earlier GET can't clobber.
+             Model options are "provider/model": split before caching, the
+             config shape holds them separately. */
+          setSessionConfigs((current) => {
+            const previous = current[sessionId] || {};
+            let updated;
+            if (key === "model" && option && option !== "default") {
+              const slash = option.indexOf("/");
+              updated = slash > 0
+                ? { ...previous, provider: option.slice(0, slash), model: option.slice(slash + 1) }
+                : { ...previous, model: option };
+            } else {
+              updated = { ...previous, [key]: option === "default" ? null : option };
+            }
+            return { ...current, [sessionId]: updated };
+          });
+          refreshConfig(sessionId);
+        })
         .catch(() => {});
     }
   }, [refreshConfig]);
@@ -287,6 +405,11 @@ export default function SessionSurface({
   const modeFor = (sessionId) => viewModes[sessionId] || "ui";
   const setModeFor = useCallback((sessionId, mode) => {
     setViewModes((current) => ({ ...current, [sessionId]: mode }));
+    if (mode === "terminal") {
+      setShellTouched((current) => (
+        current[sessionId] ? current : { ...current, [sessionId]: true }
+      ));
+    }
   }, []);
 
   /* Session-history sync, lifted from the transcript's additive callback
@@ -697,9 +820,11 @@ export default function SessionSurface({
                 value={composerTexts.draft || ""}
               />
             </ChatHostLayer>
-            <TerminalHostLayer data-visible={draftMode === "terminal" ? "true" : "false"}>
-              <SessionTerminal active={draftMode === "terminal"} session={draftSession} />
-            </TerminalHostLayer>
+            {(draftMode === "terminal" || shellTouched.draft) && (
+              <TerminalHostLayer data-visible={draftMode === "terminal" ? "true" : "false"}>
+                <SessionTerminal active={draftMode === "terminal"} session={draftSession} />
+              </TerminalHostLayer>
+            )}
           </PaneContent>
         </SessionPane>
       </SessionSurfaceRoot>
@@ -784,6 +909,7 @@ export default function SessionSurface({
                       chipOptions={chipOptionsFor(session)}
                       chipValues={chipValuesFor(session)}
                       onChipChange={(key, option) => handleChipChange(session.id, key, option)}
+                      onChipMenuOpen={() => refreshConfig(session.id)}
                       onMirrorType={(text) => {
                         /* Local typing publishes on OUR monotone lane; the
                            remembered (text, revision) lets the echo teach us
@@ -807,14 +933,16 @@ export default function SessionSurface({
                       <SessionTrajectory session={session} />
                     </TrajectoryHostLayer>
                   )}
-                  <TerminalHostLayer data-visible={mode === "terminal" ? "true" : "false"}>
-                    <SessionTerminal
-                      active={mode === "terminal"}
-                      onTuiAttached={handleTuiAttached}
-                      paneIdOverride={paneOverrides[session.id]}
-                      session={session}
-                    />
-                  </TerminalHostLayer>
+                  {(mode === "terminal" || shellTouched[session.id]) && (
+                    <TerminalHostLayer data-visible={mode === "terminal" ? "true" : "false"}>
+                      <SessionTerminal
+                        active={mode === "terminal"}
+                        onTuiAttached={handleTuiAttached}
+                        paneIdOverride={paneOverrides[session.id]}
+                        session={session}
+                      />
+                    </TerminalHostLayer>
+                  )}
                 </>
               )}
 
