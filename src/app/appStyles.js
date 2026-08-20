@@ -2724,9 +2724,13 @@ export const RailChrome = styled.div`
 
 export const RailTrafficRow = styled.div`
   display: flex;
+  min-width: 0;
   min-height: 18px;
   align-items: center;
-  padding: 6px 6px 2px;
+  gap: 6px;
+  /* Tight left inset — the lights sit close to the edge so the pills get
+     the width. */
+  padding: 6px 6px 2px 2px;
 
   ${WorkspaceRail}[data-collapsed="true"] & {
     justify-content: center;
@@ -2738,6 +2742,13 @@ export const RailTrafficRow = styled.div`
    (macOS traffic lights / linux squares) keeps working inside the rail. */
 export const RailWindowControls = styled(WindowControls)`
   height: auto;
+  flex: 0 0 auto;
+
+  /* The titlebar's 12px inset is too wide for the rail — tighten it so the
+     pills keep their width. */
+  &[data-platform="macos"] {
+    padding: 0 4px 0 8px;
+  }
 
   &[data-platform="windows"] ${WindowControlButton},
   &[data-platform="linux"] ${WindowControlButton} {
@@ -2796,8 +2807,8 @@ export const RailBrandMark = styled.img`
 
 export const RailBrandButton = styled.button`
   display: inline-flex;
-  min-width: 0;
-  flex: 1;
+  /* The brand name NEVER truncates — the badge compacts instead. */
+  flex: 0 0 auto;
   align-items: center;
   gap: 3px;
   padding: 2px 2px;
@@ -2812,10 +2823,7 @@ export const RailBrandButton = styled.button`
   text-align: left;
 
   > span {
-    min-width: 0;
-    overflow: hidden;
     white-space: nowrap;
-    text-overflow: ellipsis;
   }
 
   svg {
@@ -2845,13 +2853,18 @@ export const RailSearchIcon = styled(Search)`
 `;
 
 export const RailModeTag = styled.span`
-  flex: 0 0 auto;
-  padding: 1px 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  margin-left: auto;
+  padding: 1px 5px;
   border-radius: 5px;
-  font-size: 8.5px;
+  font-size: 7.5px;
   font-weight: 800;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.05em;
+  text-overflow: ellipsis;
   text-transform: uppercase;
+  white-space: nowrap;
 
   /* Space colors match the space themes: Workspaces navy blue,
      Loopspaces dark gold. */
@@ -2954,9 +2967,11 @@ export const RailSearchField = styled.input`
 export const RailUtilityRow = styled.div`
   display: flex;
   min-width: 0;
+  flex: 0 1 auto;
   align-items: center;
-  gap: 5px;
-  /* Rides the traffic row, right of the window controls. */
+  gap: 4px;
+  /* Rides the traffic row, right of the window controls. Pills SHRINK with
+     ellipsis when the rail is tight — never clipped at the edge. */
   margin-left: auto;
   padding: 0;
 
@@ -2969,12 +2984,19 @@ export const RailUtilityRow = styled.div`
 export const RailBackgroundPill = styled.button`
   display: inline-flex;
   min-width: 0;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   height: 20px;
   align-items: center;
   justify-content: center;
   gap: 4px;
   padding: 0 8px;
+
+  > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   border-radius: 999px;
   /* Space-tinted like the badge: blue in Workspaces, ember in Loopspaces. */
   border: 1px solid color-mix(in srgb, var(--forge-blue, #2f80ff) 38%, transparent);
@@ -25224,6 +25246,13 @@ export const RailSyncPill = styled(WindowSyncPill)`
   padding: 0 8px;
   justify-content: center;
   font-size: 9px;
+
+  > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   /* Informational (session-history sync) — not a click target. */
   cursor: default;
 
