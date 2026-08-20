@@ -167,28 +167,46 @@ export default function SessionSurface({
     onOpenSession?.(target);
   }, [sessions, onOpenSession]);
 
+  /* ONE model chip: provider, model, and the provider's bound account are a
+     single coherent choice (a deepseek model can never ride an openai
+     account). The menu groups the catalog by provider; selecting applies
+     "provider/model" through the harness. */
   const chipValuesFor = (session) => {
     const config = session ? sessionConfigs[session.id] : null;
     const prefs = composerPrefs[session?.id || "draft"] || {};
+    const prefModel = (prefs.model || "").split("/").pop() || null;
     return {
-      model: config?.model || prefs.model || session?.model || "default",
+      model: config?.model || prefModel || session?.model || "default",
+      modelProvider: config?.provider || (prefs.model || "").split("/")[0] || session?.provider || "",
       effort: config?.effort || prefs.effort || "default",
       speed: config?.speed === "fast" || prefs.speed === "fast" ? "fast" : "default",
-      provider: config?.provider || session?.provider || usageMeta?.account?.provider || "default",
-      account: config?.account_alias || prefs.account || usageMeta?.account?.alias || "default",
     };
   };
-  const chipOptionsFor = () => {
+  const chipOptionsFor = (session) => {
     const models = Array.isArray(library?.models) ? library.models : [];
-    const accounts = Array.isArray(library?.accounts) ? library.accounts : [];
+    const groups = [];
+    const byProvider = new Map();
+    for (const entry of models) {
+      if (!entry?.model || !entry?.provider) continue;
+      let group = byProvider.get(entry.provider);
+      if (!group) {
+        group = {
+          provider: entry.provider,
+          available: Boolean(entry.available),
+          auth_state: entry.auth_state || "",
+          models: [],
+        };
+        byProvider.set(entry.provider, group);
+        groups.push(group);
+      }
+      group.available = group.available || Boolean(entry.available);
+      if (!group.models.includes(entry.model)) group.models.push(entry.model);
+    }
+    groups.sort((a, b) => (b.available - a.available) || a.provider.localeCompare(b.provider));
+    const config = session ? sessionConfigs[session.id] : null;
     return {
-      model: [...new Set(models.map((entry) => entry?.model).filter(Boolean))],
-      provider: [...new Set(models.map((entry) => entry?.provider).filter(Boolean))],
-      account: accounts.length
-        ? accounts
-        : library?.account?.alias
-          ? [library.account.alias]
-          : [],
+      modelGroups: groups,
+      speedApplicable: config?.speed != null,
     };
   };
   /* Bound sessions apply through the harness (session_config_set) so the
@@ -437,7 +455,7 @@ export default function SessionSurface({
                 <SessionComposer
                   autoFocus
                   chipCapabilities={library?.capabilities || {}}
-                  chipOptions={chipOptionsFor()}
+                  chipOptions={chipOptionsFor(null)}
                   chipValues={chipValuesFor(null)}
                   onChipChange={(key, option) => handleChipChange("draft", key, option)}
                   onSubmit={submitDraft}
@@ -564,7 +582,7 @@ export default function SessionSurface({
                   <SessionTranscript session={session} />
                   <SessionComposer
                     chipCapabilities={library?.capabilities || {}}
-                    chipOptions={chipOptionsFor()}
+                    chipOptions={chipOptionsFor(session)}
                     chipValues={chipValuesFor(session)}
                     mirror={surfaceInput[session.id] || null}
                     onChipChange={(key, option) => handleChipChange(session.id, key, option)}

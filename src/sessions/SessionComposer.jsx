@@ -176,14 +176,66 @@ export default function SessionComposer({
     );
   };
 
+  const modelChip = () => {
+    const groups = Array.isArray(chipOptions.modelGroups) ? chipOptions.modelGroups : [];
+    const current = String(chipValues.model || "default");
+    const provider = String(chipValues.modelProvider || "");
+    const switchable = chipCapabilities.model_switch === true;
+    return (
+      <ChipWrap key="model">
+        <Chip
+          data-open={openMenu === "model" ? "true" : undefined}
+          onClick={() => setOpenMenu((open) => (open === "model" ? "" : "model"))}
+          type="button"
+        >
+          <em>Model</em>
+          {provider && <ChipDim>{provider}/</ChipDim>}
+          <span>{current === "default" ? "Default" : current}</span>
+          <ChipCaret aria-hidden="true">▾</ChipCaret>
+        </Chip>
+        {openMenu === "model" && (
+          <ChipMenu role="menu">
+            {groups.length ? groups.map((group) => (
+              <ChipGroup key={group.provider} data-unavailable={group.available ? undefined : "true"}>
+                <ChipGroupHead>
+                  <span>{group.provider}</span>
+                  <em>{group.available ? (group.auth_state || "ready") : "no credential"}</em>
+                </ChipGroupHead>
+                {group.models.map((model) => (
+                  <ChipMenuItem
+                    data-active={model === current && group.provider === provider ? "true" : undefined}
+                    data-readonly={switchable && group.available ? undefined : "true"}
+                    key={`${group.provider}/${model}`}
+                    onClick={() => {
+                      if (!switchable || !group.available) return;
+                      setOpenMenu("");
+                      onChipChange?.("model", `${group.provider}/${model}`);
+                    }}
+                    role="menuitem"
+                    type="button"
+                  >
+                    {model}
+                  </ChipMenuItem>
+                ))}
+              </ChipGroup>
+            )) : (
+              <ChipMenuEmpty>Model catalog unavailable — is the harness running?</ChipMenuEmpty>
+            )}
+            {!switchable && groups.length > 0 && (
+              <ChipMenuEmpty>Read-only — switching lands with the next harness update.</ChipMenuEmpty>
+            )}
+          </ChipMenu>
+        )}
+      </ChipWrap>
+    );
+  };
+
   return (
     <ComposerRoot ref={rootRef}>
       <ChipsRow>
-        {chip("model", "Model", chipOptions.model || [])}
+        {modelChip()}
         {chip("effort", "Effort", EFFORT_OPTIONS)}
-        {chip("speed", "Speed", SPEED_OPTIONS)}
-        {chip("provider", "Provider", chipOptions.provider || [])}
-        {chip("account", "Account", chipOptions.account || [])}
+        {chipOptions.speedApplicable ? chip("speed", "Speed", SPEED_OPTIONS) : null}
       </ChipsRow>
 
       <ComposerBarWrap>
@@ -380,6 +432,44 @@ const ChipMenuItem = styled.button`
   &[data-readonly="true"] {
     opacity: 0.55;
     cursor: default;
+  }
+`;
+
+const ChipDim = styled.span`
+  color: var(--forge-text-muted);
+  font-weight: 500;
+`;
+
+const ChipGroup = styled.div`
+  &[data-unavailable="true"] {
+    opacity: 0.55;
+  }
+
+  & + & {
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px solid var(--forge-border);
+  }
+`;
+
+const ChipGroupHead = styled.div`
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 8px 2px;
+  color: var(--forge-text-muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+
+  em {
+    font-size: 8.5px;
+    font-style: normal;
+    font-weight: 550;
+    text-transform: none;
+    letter-spacing: 0;
   }
 `;
 
