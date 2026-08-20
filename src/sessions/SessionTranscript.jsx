@@ -568,16 +568,18 @@ const TranscriptScroller = styled.div`
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  /* Session Deck measure: the scroller spans the pane (scrollbar at the
-     edge) while its content centers on the shared ~54rem column the
-     composer also uses. The side gutter SCALES — near-none when the pane
-     is narrow, growing with width (to 56px) until the centering wins. */
-  padding: 8px max(min(7%, 64px), calc((100% - 54rem) / 2)) 8px;
+  /* Session Deck measure: scaling side gutters (7%, 20-64px); every row
+     then caps itself at the 54rem column and centers — the column NEVER
+     grows past the measure, however wide the pane gets. */
+  padding: 8px clamp(20px, 7%, 64px);
 `;
 
 const TranscriptRow = styled.div`
   position: relative;
   display: flex;
+  width: 100%;
+  max-width: 54rem;
+  margin: 0 auto;
   padding: 5px 0;
 
   &[data-role="user"] {
@@ -906,6 +908,9 @@ const ErrorTag = styled.div`
 
 const DayDivider = styled.div`
   display: flex;
+  width: 100%;
+  max-width: 54rem;
+  margin: 0 auto;
   align-items: center;
   gap: 12px;
   padding: 14px 0 8px;
@@ -941,6 +946,9 @@ const LiveCaret = styled.span`
 
 const ShimmerRow = styled.div`
   display: flex;
+  width: 100%;
+  max-width: 54rem;
+  margin: 0 auto;
   align-items: center;
   gap: 8px;
   padding: 6px 0 4px;
