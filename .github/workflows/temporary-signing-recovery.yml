@@ -1,0 +1,98 @@
+name: temporary encrypted signing recovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create encrypted recovery envelope
+        shell: bash
+        env:
+          CERT_P12_B64: ${{ secrets.MACOS_SIGNING_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          for name in CERT_P12_B64 CERT_PASSWORD NOTARY_APPLE_ID NOTARY_PASSWORD NOTARY_TEAM_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "Required signing secret is unavailable: $name" >&2
+              exit 1
+            fi
+          done
+
+          mkdir payload
+          printf '%s' "$CERT_P12_B64" | base64 --decode > payload/developer-id-application.p12
+          printf '%s' "$CERT_PASSWORD" > payload/certificate-password.txt
+          printf '%s' "$NOTARY_APPLE_ID" > payload/apple-id.txt
+          printf '%s' "$NOTARY_PASSWORD" > payload/apple-password.txt
+          printf '%s' "$NOTARY_TEAM_ID" > payload/apple-team-id.txt
+
+          openssl pkcs12 \
+            -in payload/developer-id-application.p12 \
+            -passin file:payload/certificate-password.txt \
+            -noout
+
+          tar -C payload -czf signing-credential.tgz .
+
+          cat > recovery-certificate.pem <<'RECOVERY_CERTIFICATE'
+          -----BEGIN CERTIFICATE-----
+          MIIFSzCCAzOgAwIBAgIUVqXEtdO61bmYRoA78T6S6H8QCRkwDQYJKoZIhvcNAQEL
+          BQAwNTEzMDEGA1UEAwwqQ29kZXggb25lLXRpbWUgRGlmZiBGb3JnZSBzaWduaW5n
+          IHJlY292ZXJ5MB4XDTI2MDgyMDEyMjA1MloXDTI2MDgyMTEyMjA1MlowNTEzMDEG
+          A1UEAwwqQ29kZXggb25lLXRpbWUgRGlmZiBGb3JnZSBzaWduaW5nIHJlY292ZXJ5
+          MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA0rS4aTPeANZwk8zP46uW
+          sH0wsZuobdjE/uMYTTMhaCQV/B1U7uCfiGRtpkxGZXUvaOi/ZB/gLfRA5w1kZ5/f
+          BB6d7LHDG7YKGvyuh2uvSK/OvJmyU/2N73I3JHIkGdkkfGgUW56ahSiVUuiPGije
+          MV2ApmsfKi+418vakbVZEANsOJQaNLG27NQiM0+dXfutLTfzVSRdY8u/ZnOvP6Ap
+          xJqPMWs4LUUZ3hI9B6DdvZtjCno8ze4asg8hYRSXy4tsCz0RIjmvbT9cquQagD5I
+          s7bQpOtysF9PVsePnTugJH1lwJozMoEKEPm8/5x+qEuNqnQY0XT2JYFz/f+Ka08H
+          OnOG2tO+bUsRN+/vJz0qQGLMTB4L2t/Z1XKtTNiqQx4YrRgv8mhhz608W10SiSVZ
+          JNpt6BXCirBPlFZHPNOCvPIAh1P3BbfozEVKl/oTgokNeWEmvOSbizXeZCbqRE43
+          vE77khV2bxaRxvQ5FUwFCGp3gA/BJFZxq6y7Wa/iHmWMNtGj7HaRCxZr25JiWai2
+          1NKPRF7SZpYbw5xtDOhbOq15fvo34GdYecYkGuvIoTnR43npNCrsWGzAiHkV99SR
+          6WZ5q+f2uHsko82WBJ+rsbjF+xCgRFgGnRcWlVmx36YK2a5CUWgAM3V3eIJSHzsJ
+          PuJ3i99rrpaYHqSmVNuBrfECAwEAAaNTMFEwHQYDVR0OBBYEFOhA5rAwxoX1pih+
+          KA1cjzwRpA7aMB8GA1UdIwQYMBaAFOhA5rAwxoX1pih+KA1cjzwRpA7aMA8GA1Ud
+          EwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggIBAFP+GqQl8MUlZVCgvP3eSxYi
+          6X87bFuuk+IgAty//5iUyhtzd0lR20RfxVN5z1T2IcEE2vWS2+H/Cq1iWX3suv8d
+          SrSFHhTqdqAr/Gg7inw+rkVA9D259zAI6x7H+6Y7pQDuBAa9N0lptOWpeMlYBSSC
+          gW9J73zOHRTUzXldbcXdZ75Y2iM4FxxmTUAOJFfsa/cN0sEIQxJCbVt50ZaHLOzE
+          NYdqdK/DFFQxrpH/yFHgb4NNkRwPkVMKWAoPW3icGdpVNkb8yb5O77PwYBPKIzIl
+          1/pR9XJxN/47sqlLhc14M8AUO1p7PfDZ9wtiMfHoiRqsXGU0bHZwhtGyf6fQrBhN
+          6/DJkN8PX5COvYrO/tPpIHENZjI9cBrdfcv5q2kauqLhKBuot4WDKSF7HPzglfvj
+          97nkwd6wAFlRhVp6EUl9mCXLmRlB7zVWAWpSpkzhMyNXY1FgL6888IIMrSFrwon0
+          qRM9kSWQ+Dm7KFYP7FOfIy2+ksmLAFEGGvLq1NsYedVav0V01u5pgg7ik9Y+e/jF
+          MnYrNavKlzryxuUU8oO8q7MzqbQ5EDxtpbKiubNNyF0Fjixg9/yQ3dQtoUGgGbJJ
+          SDni5dyOBwJBT4kxqjL1ey3WgcO8G1XczuAleac0PkJzTw3p9yKcCcD6sWuwkU3e
+          vebAU8Kf2iWlHW0z9XSn
+          -----END CERTIFICATE-----
+          RECOVERY_CERTIFICATE
+
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in signing-credential.tgz \
+            -outform DER \
+            -out signing-credential.cms \
+            recovery-certificate.pem
+          sha256sum signing-credential.cms > signing-credential.cms.sha256
+
+          rm -rf payload signing-credential.tgz recovery-certificate.pem
+
+      - name: Upload ciphertext only
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-signing-credential
+          path: |
+            signing-credential.cms
+            signing-credential.cms.sha256
+          if-no-files-found: error
+          retention-days: 1
