@@ -3591,6 +3591,10 @@ async fn session_projection_window(
     start_index: i64,
     count: i64,
 ) -> Result<SessionProjectionWindow, String> {
+    #[cfg(debug_assertions)]
+    let timed_at = Instant::now();
+    #[cfg(debug_assertions)]
+    let timed_session = session_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let session_id = session_id.trim();
         let start_index = start_index.max(0);
@@ -3633,7 +3637,17 @@ async fn session_projection_window(
         })
     })
     .await
-    .map_err(|error| format!("Session projection window worker failed: {error}"))?
+    .map_err(|error| format!("Session projection window worker failed: {error}"))
+    .map(|result| {
+        // Dev-build click-path telemetry: stderr lands in the detached
+        // launch log, so real clicks produce real numbers. Never in release.
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[ade-timing] window {}ms session={timed_session}",
+            timed_at.elapsed().as_millis()
+        );
+        result
+    })?
 }
 
 /// Alias-tolerant token count: usage payload shapes differ across harness
@@ -3768,6 +3782,10 @@ fn haider_projection_ensure_blocking(
 
 #[tauri::command(rename_all = "snake_case")]
 async fn session_projection_ensure(session_id: String) -> Result<i64, String> {
+    #[cfg(debug_assertions)]
+    let timed_at = Instant::now();
+    #[cfg(debug_assertions)]
+    let timed_session = session_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let session_id = session_id.trim().to_string();
         let mut foreground = haider_projection_foreground(&session_id);
@@ -3777,7 +3795,15 @@ async fn session_projection_ensure(session_id: String) -> Result<i64, String> {
         haider_projection_ensure_blocking(&session_id, &mut foreground)
     })
     .await
-    .map_err(|error| format!("Session projection ensure worker failed: {error}"))?
+    .map_err(|error| format!("Session projection ensure worker failed: {error}"))
+    .map(|result| {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[ade-timing] ensure {}ms session={timed_session}",
+            timed_at.elapsed().as_millis()
+        );
+        result
+    })?
 }
 
 #[tauri::command(rename_all = "snake_case")]
