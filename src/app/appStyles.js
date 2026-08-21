@@ -5188,7 +5188,9 @@ export const WorkspaceIdleLogo = styled.img`
   width: clamp(74px, 10vw, 118px);
   height: clamp(74px, 10vw, 118px);
   border: 1px solid rgba(185, 191, 203, 0.18);
-  border-radius: 8px;
+  /* App-icon rounding (~22% of edge, squircle-adjacent) — the flame screen
+     logo read as a hard-cornered square against the dark field. */
+  border-radius: clamp(16px, 2.2vw, 26px);
   background: rgba(3, 5, 8, 0.72);
   box-shadow: 0 18px 70px rgba(0, 0, 0, 0.34);
 
