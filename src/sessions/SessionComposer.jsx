@@ -60,6 +60,10 @@ export default function SessionComposer({
   mirrorAttachments = [],
   attachments = [],
   onAttachmentsChange = null,
+  /* Set while a submit is waiting for its session to come up. The typed text
+     stays put and un-editable rather than being cleared or lost — editing it
+     mid-flight would send something the user never finished writing. */
+  holdNotice = "",
 }) {
   /* The draft text is SURFACE-owned (value/onValueChange): the composer
      unmounts on every view/session switch, so component-local text would be
@@ -418,7 +422,10 @@ export default function SessionComposer({
             ))}
           </AttachmentChips>
         )}
-        <ComposerField data-busy={busy ? "true" : undefined}>
+        {/* The text is already held un-editable while a submit is in flight;
+            without this the user just sees a frozen composer and no reason. */}
+        {holdNotice && <HoldNotice role="status">{holdNotice}</HoldNotice>}
+        <ComposerField data-busy={busy || holdNotice ? "true" : undefined}>
           <ComposerRoundButton
             aria-label="Attach files"
             data-variant="attach"
@@ -430,7 +437,7 @@ export default function SessionComposer({
           </ComposerRoundButton>
           <ComposerInput
             autoFocus={autoFocus}
-            disabled={disabled || busy}
+            disabled={disabled || busy || Boolean(holdNotice)}
             onChange={(event) => {
               const text = event.target.value;
               onValueChange?.(text);
@@ -633,6 +640,13 @@ const ChipMenuEmpty = styled.div`
 
 const ComposerBarWrap = styled.div`
   position: relative;
+`;
+
+const HoldNotice = styled.p`
+  margin: 0 0 6px;
+  padding-left: 2px;
+  color: var(--forge-amber);
+  font-size: 11.5px;
 `;
 
 const AttachmentChips = styled.div`

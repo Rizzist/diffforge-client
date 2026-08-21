@@ -44,6 +44,13 @@ import { formatSessionRelativeTime } from "./sessionsModel.js";
      nothing; their PTYs persist daemon-side and are re-adopted on return.
    - "New chat" is a draft; the first prompt materializes it. */
 
+/* Waking a dormant session is a PTY spawn plus a harness handshake, so the
+   submit ladder is patient — the alternative is dropping what the user
+   typed, which is the one thing here that cannot be recreated. */
+const SUBMIT_WAKE_ATTEMPTS = 6;
+const SUBMIT_WAKE_BACKOFF_MS = 700;
+const SUBMIT_HOLD_CLEAR_MS = 6000;
+
 
 /* The TUI's status strip arrives whole ("[ ‖ IDLE (i) ] 3.7k tok · …"):
    extract the state word for the pill, drop key-hint parentheticals, keep
@@ -708,6 +715,10 @@ export default function SessionSurface({
     }));
   }, [patchTabs]);
 
+  /* A submit into a session whose shell is closed holds the typed text in
+     place while the session comes up, rather than failing silently. */
+  const [submitHold, setSubmitHold] = useState({});
+
   const submitDraft = useCallback(async (prompt, attachments) => {
     if (submitBusyRef.current) {
       return false;
@@ -749,27 +760,70 @@ export default function SessionSurface({
        nothing. The empty mirror publish rides the same history-recording
        door, so its echo can never resurrect the prompt. */
     const gen = editGenRef.current[session.id] || 0;
-    try {
-      await invoke("session_submit_prompt", {
-        session_id: session.id,
-        prompt,
-        attachments: attachments?.length ? attachments : null,
-      });
+    const send = () => invoke("session_submit_prompt", {
+      session_id: session.id,
+      prompt,
+      attachments: attachments?.length ? attachments : null,
+    });
+    const accept = () => {
       if ((editGenRef.current[session.id] || 0) === gen) {
         setComposerText(session.id, "");
         setComposerPastesFor(session.id, []);
         publishMirror(session, "");
       }
       return true;
+    };
+    try {
+      await send();
+      return accept();
     } catch (error) {
       const message = String(error?.message || error || "");
       if (message.includes("haider_run_session_unsupported")) {
         setModeFor(session.id, "terminal");
         return false;
       }
-      return false;
+      /* A session whose shell is closed has nothing to submit THROUGH, and
+         the message must not be lost for it: hold the typed text in place —
+         the composer greys it rather than clearing — bring the session up,
+         and send once it answers. The text only clears on a real accept. */
+      setSubmitHold((current) => ({ ...current, [session.id]: "Starting the session…" }));
+      onShellWarm?.(session.id);
+      setShellTouched((current) => (
+        current[session.id] ? current : { ...current, [session.id]: true }
+      ));
+      try {
+        for (let attempt = 0; attempt < SUBMIT_WAKE_ATTEMPTS; attempt += 1) {
+          await new Promise((resolve) => { window.setTimeout(resolve, SUBMIT_WAKE_BACKOFF_MS); });
+          try {
+            await send();
+            return accept();
+          } catch (retryError) {
+            if (String(retryError?.message || retryError || "")
+              .includes("haider_run_session_unsupported")) {
+              setModeFor(session.id, "terminal");
+              return false;
+            }
+          }
+        }
+        /* Still nothing after waking: say so and KEEP the text, because the
+           user's words are the one thing here that cannot be recreated. */
+        setSubmitHold((current) => ({
+          ...current,
+          [session.id]: "Could not reach this session — your message is kept here.",
+        }));
+        return false;
+      } finally {
+        window.setTimeout(() => {
+          setSubmitHold((current) => {
+            if (!(session.id in current)) return current;
+            const next = { ...current };
+            delete next[session.id];
+            return next;
+          });
+        }, SUBMIT_HOLD_CLEAR_MS);
+      }
     }
-  }, [publishMirror, setComposerPastesFor, setComposerText, setModeFor]);
+  }, [onShellWarm, publishMirror, setComposerPastesFor, setComposerText, setModeFor]);
 
   /* Session title chrome: the title is the workspace's first content line;
      its ellipsis menu carries Pin/Unpin + Rename (the same harness doors the
@@ -1208,6 +1262,7 @@ export default function SessionSurface({
                       onChipChange={(key, option) => handleChipChange(session.id, key, option)}
                       onChipMenuOpen={() => refreshConfig(session.id)}
                       attachments={composerAttachments[session.id] || []}
+                      holdNotice={submitHold[session.id] || ""}
                       mirrorAttachments={mirrorAttachments[session.id] || []}
                       onAttachmentsChange={(next) => handleAttachmentsChange(session, next)}
                       onMirrorType={(text) => publishMirror(session, text)}
