@@ -19,6 +19,10 @@ struct SessionRow {
     effort: Option<String>,
     #[serde(rename = "speed", serialize_with = "sessions_serialize_speed")]
     speed_fast: Option<i64>,
+    seen_at_ms: Option<i64>,
+    last_activity_ms: Option<i64>,
+    waiting_kind: Option<String>,
+    waiting_menu_id: Option<String>,
     pinned: bool,
     title_locked: bool,
 }
@@ -242,6 +246,10 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
                 model TEXT NOT NULL DEFAULT '',
                 effort TEXT,
                 speed_fast INTEGER,
+                seen_at_ms INTEGER,
+                last_activity_ms INTEGER,
+                waiting_kind TEXT,
+                waiting_menu_id TEXT,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 title_locked INTEGER NOT NULL DEFAULT 0
              );
@@ -256,6 +264,10 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
         ("state_raw", "TEXT NOT NULL DEFAULT ''"),
         ("effort", "TEXT"),
         ("speed_fast", "INTEGER"),
+        ("seen_at_ms", "INTEGER"),
+        ("last_activity_ms", "INTEGER"),
+        ("waiting_kind", "TEXT"),
+        ("waiting_menu_id", "TEXT"),
     ];
     let columns = sessions_table_columns(connection)?;
     if migrations
@@ -312,13 +324,17 @@ fn sessions_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> 
         model: row.get(12)?,
         effort: row.get(13)?,
         speed_fast: row.get(14)?,
-        pinned: row.get(15)?,
-        title_locked: row.get(16)?,
+        seen_at_ms: row.get(15)?,
+        last_activity_ms: row.get(16)?,
+        waiting_kind: row.get(17)?,
+        waiting_menu_id: row.get(18)?,
+        pinned: row.get(19)?,
+        title_locked: row.get(20)?,
     })
 }
 
 const SESSIONS_SELECT_COLUMNS: &str =
-    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, state_raw, first_user_message, model, effort, speed_fast, pinned, title_locked";
+    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, state_raw, first_user_message, model, effort, speed_fast, seen_at_ms, last_activity_ms, waiting_kind, waiting_menu_id, pinned, title_locked";
 
 fn sessions_row_by_id(connection: &rusqlite::Connection, id: &str) -> Result<SessionRow, String> {
     let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions WHERE id = ?1");
@@ -390,6 +406,10 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
         model: String::new(),
         effort: None,
         speed_fast: None,
+        seen_at_ms: None,
+        last_activity_ms: None,
+        waiting_kind: None,
+        waiting_menu_id: None,
         pinned: false,
         title_locked: false,
     };
@@ -687,6 +707,10 @@ mod sessions_tests {
             model: String::new(),
             effort: None,
             speed_fast: None,
+            seen_at_ms: None,
+            last_activity_ms: None,
+            waiting_kind: None,
+            waiting_menu_id: None,
             pinned: false,
             title_locked: false,
         }
@@ -812,6 +836,10 @@ mod sessions_tests {
             "state_raw",
             "effort",
             "speed_fast",
+            "seen_at_ms",
+            "last_activity_ms",
+            "waiting_kind",
+            "waiting_menu_id",
         ] {
             assert_eq!(columns.iter().filter(|name| *name == column).count(), 1);
         }
@@ -820,9 +848,17 @@ mod sessions_tests {
         assert_eq!(row.state_raw, "");
         assert_eq!(row.effort, None);
         assert_eq!(row.speed_fast, None);
+        assert_eq!(row.seen_at_ms, None);
+        assert_eq!(row.last_activity_ms, None);
+        assert_eq!(row.waiting_kind, None);
+        assert_eq!(row.waiting_menu_id, None);
         let row_json = serde_json::to_value(&row).unwrap();
         assert_eq!(row_json["effort"], Value::Null);
         assert_eq!(row_json["speed"], Value::Null);
+        assert_eq!(row_json["seen_at_ms"], Value::Null);
+        assert_eq!(row_json["last_activity_ms"], Value::Null);
+        assert_eq!(row_json["waiting_kind"], Value::Null);
+        assert_eq!(row_json["waiting_menu_id"], Value::Null);
         assert!(!row.pinned);
         assert!(!row.title_locked);
 
@@ -858,6 +894,10 @@ mod sessions_tests {
             state_raw: Some("running".to_string()),
             effort: None,
             fast: None,
+            seen_at_ms: None,
+            last_activity_ms: None,
+            waiting_kind: None,
+            waiting_menu_id: None,
             latest_at_ms: Some(20),
         }])
         .unwrap());
@@ -950,6 +990,10 @@ mod sessions_tests {
             state_raw: Some("idle".to_string()),
             effort: None,
             fast: None,
+            seen_at_ms: None,
+            last_activity_ms: None,
+            waiting_kind: None,
+            waiting_menu_id: None,
             latest_at_ms: Some(sessions_now_ms()),
         }
     }
@@ -970,6 +1014,49 @@ mod sessions_tests {
         let connection = sessions_open_database().unwrap();
         assert!(sessions_row_by_id(&connection, "kept").is_ok());
         assert!(session_directory.exists());
+        drop(connection);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn haider_bridge_reconcile_round_trips_and_clears_attention_state() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("attention-state");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let row = sessions_test_row("attention", Path::new(""), "pinned");
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        let mut roster = haider_bridge_test_roster("provider-attention");
+        roster.seen_at_ms = Some(20);
+        roster.last_activity_ms = Some(30);
+        roster.waiting_kind = Some("permission".to_string());
+        roster.waiting_menu_id = Some("menu-936".to_string());
+        assert!(haider_bridge_reconcile(&[roster.clone()]).unwrap());
+
+        let connection = sessions_open_database().unwrap();
+        let reconciled = sessions_row_by_id(&connection, "attention").unwrap();
+        assert_eq!(reconciled.seen_at_ms, Some(20));
+        assert_eq!(reconciled.last_activity_ms, Some(30));
+        assert_eq!(reconciled.waiting_kind.as_deref(), Some("permission"));
+        assert_eq!(reconciled.waiting_menu_id.as_deref(), Some("menu-936"));
+        drop(connection);
+
+        roster.seen_at_ms = None;
+        roster.last_activity_ms = None;
+        roster.waiting_kind = None;
+        roster.waiting_menu_id = None;
+        assert!(haider_bridge_reconcile(&[roster]).unwrap());
+
+        let connection = sessions_open_database().unwrap();
+        let reconciled = sessions_row_by_id(&connection, "attention").unwrap();
+        assert_eq!(reconciled.seen_at_ms, None);
+        assert_eq!(reconciled.last_activity_ms, None);
+        assert_eq!(reconciled.waiting_kind, None);
+        assert_eq!(reconciled.waiting_menu_id, None);
         drop(connection);
 
         fs::remove_dir_all(directory).unwrap();

@@ -16,6 +16,10 @@ struct HaiderBridgeSession {
     state_raw: Option<String>,
     effort: Option<String>,
     fast: Option<bool>,
+    seen_at_ms: Option<i64>,
+    last_activity_ms: Option<i64>,
+    waiting_kind: Option<String>,
+    waiting_menu_id: Option<String>,
     latest_at_ms: Option<i64>,
 }
 
@@ -27,6 +31,10 @@ struct HaiderBridgeReconcileStamp {
     model: Option<String>,
     effort: Option<String>,
     fast: Option<bool>,
+    seen_at_ms: Option<i64>,
+    last_activity_ms: Option<i64>,
+    waiting_kind: Option<String>,
+    waiting_menu_id: Option<String>,
 }
 
 impl HaiderBridgeReconcileStamp {
@@ -38,6 +46,10 @@ impl HaiderBridgeReconcileStamp {
             model: session.model.clone(),
             effort: session.effort.clone(),
             fast: session.fast,
+            seen_at_ms: session.seen_at_ms,
+            last_activity_ms: session.last_activity_ms,
+            waiting_kind: session.waiting_kind.clone(),
+            waiting_menu_id: session.waiting_menu_id.clone(),
         }
     }
 }
@@ -211,6 +223,15 @@ fn haider_bridge_timestamp(value: &Value) -> Option<i64> {
     })
 }
 
+fn haider_bridge_milliseconds(value: &Value) -> Option<i64> {
+    let raw = match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }?;
+    i64::try_from(raw).ok()
+}
+
 fn haider_bridge_sequence(value: &Value) -> Option<i64> {
     match value {
         Value::Number(number) => number.as_i64().or_else(|| {
@@ -319,6 +340,34 @@ fn haider_bridge_parse_session(
         &["runtime", "summary", "metadata", "session"],
     )
     .and_then(haider_bridge_bool);
+    let seen_at_ms = haider_bridge_object_value(
+        object,
+        &["seen_at_ms", "seenAtMs"],
+        &["runtime", "summary", "metadata", "session"],
+    )
+    .and_then(haider_bridge_milliseconds);
+    let last_activity_ms = haider_bridge_object_value(
+        object,
+        &["last_activity_ms", "lastActivityMs"],
+        &["runtime", "summary", "metadata", "session"],
+    )
+    .and_then(haider_bridge_milliseconds);
+    let waiting_why = haider_bridge_object_value(
+        object,
+        &["waiting_why", "waitingWhy"],
+        &["runtime", "summary", "metadata", "session"],
+    )
+    .and_then(Value::as_object);
+    let waiting_kind = waiting_why
+        .and_then(|waiting_why| waiting_why.get("kind"))
+        .and_then(haider_bridge_text);
+    let waiting_menu_id = waiting_why
+        .and_then(|waiting_why| {
+            waiting_why
+                .get("pending_menu_id")
+                .or_else(|| waiting_why.get("pendingMenuId"))
+        })
+        .and_then(haider_bridge_text);
 
     let timestamp_keys = [
         "updated_at_ms",
@@ -357,6 +406,10 @@ fn haider_bridge_parse_session(
         || state_raw.is_some()
         || effort.is_some()
         || fast.is_some()
+        || seen_at_ms.is_some()
+        || last_activity_ms.is_some()
+        || waiting_kind.is_some()
+        || waiting_menu_id.is_some()
         || latest_at_ms.is_some()
         || has_lineage
         || object.contains_key("head_seq")
@@ -370,6 +423,10 @@ fn haider_bridge_parse_session(
         state_raw,
         effort,
         fast,
+        seen_at_ms,
+        last_activity_ms,
+        waiting_kind,
+        waiting_menu_id,
         latest_at_ms,
     })
 }
@@ -704,6 +761,22 @@ fn haider_bridge_reconcile_store(
                 row_changed = true;
             }
         }
+        if row.seen_at_ms != session.seen_at_ms {
+            row.seen_at_ms = session.seen_at_ms;
+            row_changed = true;
+        }
+        if row.last_activity_ms != session.last_activity_ms {
+            row.last_activity_ms = session.last_activity_ms;
+            row_changed = true;
+        }
+        if row.waiting_kind != session.waiting_kind {
+            row.waiting_kind = session.waiting_kind.clone();
+            row_changed = true;
+        }
+        if row.waiting_menu_id != session.waiting_menu_id {
+            row.waiting_menu_id = session.waiting_menu_id.clone();
+            row_changed = true;
+        }
         if session
             .latest_at_ms
             .is_some_and(|latest_at_ms| latest_at_ms > row.latest_at_ms)
@@ -717,7 +790,7 @@ fn haider_bridge_reconcile_store(
 
         transaction
             .execute(
-                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5, state_raw = ?6, model = ?7, effort = ?8, speed_fast = ?9 WHERE id = ?1",
+                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5, state_raw = ?6, model = ?7, effort = ?8, speed_fast = ?9, seen_at_ms = ?10, last_activity_ms = ?11, waiting_kind = ?12, waiting_menu_id = ?13 WHERE id = ?1",
                 rusqlite::params![
                     row.id,
                     row.title,
@@ -728,6 +801,10 @@ fn haider_bridge_reconcile_store(
                     row.model,
                     row.effort,
                     row.speed_fast,
+                    row.seen_at_ms,
+                    row.last_activity_ms,
+                    row.waiting_kind,
+                    row.waiting_menu_id,
                 ],
             )
             .map_err(|error| format!("Unable to reconcile Haider session: {error}"))?;
@@ -760,8 +837,9 @@ fn haider_bridge_reconcile_store(
                 "INSERT INTO sessions (
                     id, title, slug, dir, kind, provider, provider_session_id,
                     created_at_ms, latest_at_ms, status, state_raw,
-                    first_user_message, model, effort, speed_fast
-                 ) VALUES (?1, ?2, '', '', 'pinned', 'haider', ?3, ?4, ?5, ?6, ?7, '', ?8, ?9, ?10)",
+                    first_user_message, model, effort, speed_fast, seen_at_ms,
+                    last_activity_ms, waiting_kind, waiting_menu_id
+                 ) VALUES (?1, ?2, '', '', 'pinned', 'haider', ?3, ?4, ?5, ?6, ?7, '', ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
                     sessions_new_id(now_ms),
                     title,
@@ -773,6 +851,10 @@ fn haider_bridge_reconcile_store(
                     session.model.clone().unwrap_or_default(),
                     session.effort.clone(),
                     session.fast.map(i64::from),
+                    session.seen_at_ms,
+                    session.last_activity_ms,
+                    session.waiting_kind.clone(),
+                    session.waiting_menu_id.clone(),
                 ],
             )
             .map_err(|error| format!("Unable to import Haider session: {error}"))?;
@@ -1282,6 +1364,10 @@ mod haider_bridge_tests {
                 state_raw: Some("running_tool: cargo".to_string()),
                 effort: None,
                 fast: None,
+                seen_at_ms: None,
+                last_activity_ms: None,
+                waiting_kind: None,
+                waiting_menu_id: None,
                 latest_at_ms: Some(1_777_777_777_123),
             }]
         );
@@ -1295,12 +1381,22 @@ mod haider_bridge_tests {
             "state_raw": "idle",
             "effort": "xhigh",
             "fast": true,
+            "seen_at_ms": 1_234_i64,
+            "last_activity_ms": "2345",
+            "waiting_why": {
+                "kind": "permission",
+                "pending_menu_id": "menu-935"
+            },
             "account_alias": null
         });
         let parsed = haider_bridge_parse_session(&with_scalars, None).unwrap();
         assert_eq!(parsed.state_raw.as_deref(), Some("running"));
         assert_eq!(parsed.effort.as_deref(), Some("xhigh"));
         assert_eq!(parsed.fast, Some(true));
+        assert_eq!(parsed.seen_at_ms, Some(1_234));
+        assert_eq!(parsed.last_activity_ms, Some(2_345));
+        assert_eq!(parsed.waiting_kind.as_deref(), Some("permission"));
+        assert_eq!(parsed.waiting_menu_id.as_deref(), Some("menu-935"));
 
         let without_scalars = haider_bridge_parse_session(
             &json!({"session_id":"session-934", "state_raw":"idle"}),
@@ -1309,6 +1405,10 @@ mod haider_bridge_tests {
         .unwrap();
         assert_eq!(without_scalars.effort, None);
         assert_eq!(without_scalars.fast, None);
+        assert_eq!(without_scalars.seen_at_ms, None);
+        assert_eq!(without_scalars.last_activity_ms, None);
+        assert_eq!(without_scalars.waiting_kind, None);
+        assert_eq!(without_scalars.waiting_menu_id, None);
     }
 
     #[test]
@@ -1322,6 +1422,10 @@ mod haider_bridge_tests {
             state_raw: None,
             effort: Some("medium".to_string()),
             fast: Some(false),
+            seen_at_ms: None,
+            last_activity_ms: None,
+            waiting_kind: None,
+            waiting_menu_id: None,
             latest_at_ms: None,
         };
         let baseline = HaiderBridgeReconcileStamp::new(&session, Some(4));
@@ -1336,6 +1440,12 @@ mod haider_bridge_tests {
         assert_ne!(
             baseline,
             HaiderBridgeReconcileStamp::new(&fast_changed, Some(4))
+        );
+        let mut attention_changed = fast_changed;
+        attention_changed.seen_at_ms = Some(50);
+        assert_ne!(
+            baseline,
+            HaiderBridgeReconcileStamp::new(&attention_changed, Some(4))
         );
     }
 
@@ -1448,6 +1558,10 @@ mod haider_bridge_tests {
             state_raw: Some("idle".to_string()),
             effort: None,
             fast: None,
+            seen_at_ms: None,
+            last_activity_ms: None,
+            waiting_kind: None,
+            waiting_menu_id: None,
             latest_at_ms: Some(100),
         };
         let mut tracker = HaiderBridgeReconcileTracker::default();

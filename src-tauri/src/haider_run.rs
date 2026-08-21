@@ -900,6 +900,42 @@ async fn session_submit_prompt(
     .map_err(|error| format!("Session submit worker failed: {error}"))?
 }
 
+fn haider_run_store_seen_at_ms(session_id: String, seen_at_ms: i64) -> Result<(), String> {
+    let _write_guard = sessions_write_lock()
+        .lock()
+        .map_err(|_| "Sessions write lock is unavailable.".to_string())?;
+    let connection = sessions_open_database()?;
+    connection
+        .execute(
+            "UPDATE sessions SET seen_at_ms = CASE WHEN seen_at_ms IS NULL OR seen_at_ms < ?2 THEN ?2 ELSE seen_at_ms END WHERE id = ?1",
+            rusqlite::params![session_id, seen_at_ms],
+        )
+        .map_err(|error| format!("Unable to store session seen state: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn session_mark_seen(app: AppHandle, session_id: String) -> Result<(), String> {
+    let local_session_id = session_id.clone();
+    let provider_session_id =
+        tauri::async_runtime::spawn_blocking(move || haider_run_provider_session_id(&session_id))
+            .await
+            .map_err(|error| format!("Session seen worker failed: {error}"))??;
+    let Some(receipt) = haider_rpc_ade::session_seen_rpc(provider_session_id).await else {
+        return Ok(());
+    };
+    let receipt = receipt?;
+    let seen_at_ms = i64::try_from(receipt.seen_at_ms)
+        .map_err(|_| "Session seen receipt timestamp exceeded SQLite range.".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        haider_run_store_seen_at_ms(local_session_id, seen_at_ms)
+    })
+    .await
+    .map_err(|error| format!("Session seen worker failed: {error}"))??;
+    sessions_emit_changed(&app);
+    Ok(())
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn session_config_get(session_id: String) -> Value {
     let provider_session_id = match tauri::async_runtime::spawn_blocking(move || {

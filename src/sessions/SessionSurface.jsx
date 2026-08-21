@@ -454,6 +454,22 @@ export default function SessionSurface({
     };
   }, [sessions]);
 
+  /* session_seen_v1 (936): viewing a chat ACKS it through the daemon's
+     session.seen door — the harness owns seen-state, the ADE only reports.
+     750ms debounce (TUI precedent) so flicking through the rail doesn't
+     spray receipts; the receipt round-trips into the roster and clears the
+     rail dot everywhere. Re-arms when fresh activity lands while viewing. */
+  useEffect(() => {
+    if (!activeSessionId || activeSessionId === "draft") return undefined;
+    const row = sessions.find((entry) => entry.id === activeSessionId);
+    if (!row?.provider_session_id) return undefined;
+    if (!(Number(row.last_activity_ms) > Number(row.seen_at_ms || 0))) return undefined;
+    const timer = window.setTimeout(() => {
+      void invoke("session_mark_seen", { session_id: activeSessionId }).catch(() => {});
+    }, 750);
+    return () => window.clearTimeout(timer);
+  }, [activeSessionId, sessions]);
+
   /* tui_attach_announce_v1: the TUI told us which session its PTY now
      serves — auto-select it and re-home the live pane under it. */
   const handleTuiAttached = useCallback(({ paneId, providerSessionId, hostSessionId }) => {

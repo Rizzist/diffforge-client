@@ -44,6 +44,7 @@ const FEATURE_SESSION_EFFORT_SELECT_V1: &str = "session_effort_select_v1";
 const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
 const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
 const FEATURE_RESIDENT_TURN_SUBMIT_V1: &str = "resident_turn_submit_v1";
+const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
 const SURFACE_EVENT: &str = "session-surface";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -74,6 +75,15 @@ pub(crate) struct ResidentTurnSubmit {
     pub session_id: String,
     pub run_id: String,
     pub accepted_seq: u64,
+}
+
+/// Receipt returned when the daemon durably marks a session as seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionSeen {
+    pub session_id: String,
+    pub seen_at_ms: u64,
+    pub seen_seq: u64,
+    pub worker_generation: u64,
 }
 
 impl SurfaceCommandStatus {
@@ -274,6 +284,12 @@ enum RequestBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: String },
+    #[serde(rename = "session.seen")]
+    SessionSeen {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+    },
     #[serde(rename = "session.select_model")]
     SessionSelectModel {
         command_id: String,
@@ -353,6 +369,13 @@ enum ResponseBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: String },
+    #[serde(rename = "session.seen")]
+    SessionSeen {
+        session_id: String,
+        seen_at_ms: u64,
+        seen_seq: u64,
+        worker_generation: u64,
+    },
     #[serde(rename = "session.select_model")]
     SessionSelectModel {
         session_id: String,
@@ -1192,6 +1215,20 @@ async fn resident_turn_submit_request(body: RequestBody) -> Result<Option<Respon
 }
 
 #[cfg(unix)]
+fn session_seen_features() -> BTreeSet<String> {
+    BTreeSet::from([FEATURE_SESSION_SEEN_V1.to_string()])
+}
+
+#[cfg(unix)]
+async fn session_seen_request(body: RequestBody) -> Result<Option<ResponseBody>, String> {
+    match rpc_request(body, Capability::Control, session_seen_features()).await {
+        Some(Ok(response)) => Ok(Some(response)),
+        Some(Err(error)) => Err(error),
+        None => Ok(None),
+    }
+}
+
+#[cfg(unix)]
 async fn config_session_summary(
     session_id: &str,
     capability: Capability,
@@ -1233,6 +1270,35 @@ async fn resident_turn_submit_session_summary(session_id: &str) -> Result<Option
     loop {
         let Some(response) =
             resident_turn_submit_request(RequestBody::SessionList { cursor, limit: 256 }).await?
+        else {
+            return Ok(None);
+        };
+        let ResponseBody::SessionList {
+            sessions,
+            next_cursor,
+        } = response
+        else {
+            return Err("session.list response method mismatch".to_string());
+        };
+        if let Some(summary) = sessions
+            .into_iter()
+            .find(|summary| summary.get("session_id").and_then(Value::as_str) == Some(session_id))
+        {
+            return Ok(Some(summary));
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Err(format!("session `{session_id}` was not found"));
+        };
+        cursor = Some(next_cursor);
+    }
+}
+
+#[cfg(unix)]
+async fn session_seen_session_summary(session_id: &str) -> Result<Option<Value>, String> {
+    let mut cursor = None;
+    loop {
+        let Some(response) =
+            session_seen_request(RequestBody::SessionList { cursor, limit: 256 }).await?
         else {
             return Ok(None);
         };
@@ -1596,6 +1662,16 @@ fn resident_turn_submit_command_id() -> String {
 }
 
 #[cfg(unix)]
+fn session_seen_command_id() -> String {
+    format!("diffforge-session-seen-{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(unix)]
+fn session_seen_available(connection: &ConnectionSnapshot) -> bool {
+    connection.connected && connection.features.contains(FEATURE_SESSION_SEEN_V1)
+}
+
+#[cfg(unix)]
 async fn resident_turn_submit_rpc_inner(
     session_id: String,
     prompt: String,
@@ -1687,6 +1763,91 @@ pub(crate) async fn resident_turn_submit_rpc(
     #[cfg(not(unix))]
     {
         let _ = (session_id, prompt, attachments);
+        None
+    }
+}
+
+#[cfg(unix)]
+async fn session_seen_rpc_inner(session_id: String) -> Result<Option<SessionSeen>, String> {
+    let Some(summary) = session_seen_session_summary(&session_id).await? else {
+        return Ok(None);
+    };
+    let head_seq = config_u64(summary.get("head_seq"))
+        .ok_or_else(|| "session summary head_seq was missing".to_string())?;
+    let Some(response) = session_seen_request(RequestBody::SessionAttach {
+        session_id: session_id.clone(),
+        after_seq: head_seq,
+        mode: AttachMode::Control,
+        sealed_replay: false,
+    })
+    .await?
+    else {
+        return Ok(None);
+    };
+    let ResponseBody::SessionAttach {
+        attachment_id,
+        attach_state,
+    } = response
+    else {
+        return Err("session.attach response method mismatch".to_string());
+    };
+    if attach_state.session_id != session_id {
+        let _ = session_seen_request(RequestBody::SessionDetach { attachment_id }).await;
+        return Err("session.attach response session mismatch".to_string());
+    }
+
+    let seen = async {
+        let Some(response) = session_seen_request(RequestBody::SessionSeen {
+            command_id: session_seen_command_id(),
+            session_id: session_id.clone(),
+            worker_generation: attach_state.worker_generation,
+        })
+        .await?
+        else {
+            return Ok(None);
+        };
+        match response {
+            ResponseBody::SessionSeen {
+                session_id: seen_session,
+                seen_at_ms,
+                seen_seq,
+                worker_generation,
+            } if seen_session == session_id => Ok(Some(SessionSeen {
+                session_id: seen_session,
+                seen_at_ms,
+                seen_seq,
+                worker_generation,
+            })),
+            ResponseBody::SessionSeen { .. } => {
+                Err("session.seen response session mismatch".to_string())
+            }
+            _ => Err("session.seen response method mismatch".to_string()),
+        }
+    }
+    .await;
+
+    let _ = session_seen_request(RequestBody::SessionDetach { attachment_id }).await;
+    seen
+}
+
+/// Marks a session as seen through the daemon-owned connection. `None`
+/// means this connection cannot use the optional attention-state door.
+pub(crate) async fn session_seen_rpc(session_id: String) -> Option<Result<SessionSeen, String>> {
+    #[cfg(unix)]
+    {
+        if !session_seen_available(&actor_handle().connection.borrow()) {
+            return None;
+        }
+        return match session_seen_rpc_inner(session_id).await {
+            Ok(Some(receipt)) => Some(Ok(receipt)),
+            Ok(None) => None,
+            Err(error) if error.starts_with("missing_feature:") => None,
+            Err(error) => Some(Err(error)),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session_id;
         None
     }
 }
@@ -3054,6 +3215,31 @@ mod tests {
     }
 
     #[test]
+    fn session_seen_frame_matches_reference_json_bytes() {
+        let seen = WireFrame::Request {
+            request_id: "req-seen".to_owned(),
+            body: RequestBody::SessionSeen {
+                command_id: "diffforge-session-seen-test".to_owned(),
+                session_id: "session-1".to_owned(),
+                worker_generation: 7,
+            },
+        };
+        let framed = encode_framed(&seen, DEFAULT_FRAME_LIMIT).expect("encode session seen");
+        assert_eq!(
+            std::str::from_utf8(&framed[4..]).expect("session seen JSON"),
+            r#"{"v":1,"kind":"request","request_id":"req-seen","body":{"method":"session.seen","command_id":"diffforge-session-seen-test","session_id":"session-1","worker_generation":7}}"#
+        );
+        assert_eq!(
+            u32::from_be_bytes(framed[..4].try_into().expect("session seen prefix")) as usize,
+            framed.len() - 4
+        );
+        assert_eq!(
+            decode_body(&framed[4..], DEFAULT_FRAME_LIMIT).expect("decode session seen"),
+            seen
+        );
+    }
+
+    #[test]
     fn roster_watch_and_session_config_frames_match_reference_json_bytes() {
         let encoded = |frame: WireFrame| {
             let framed = encode_framed(&frame, DEFAULT_FRAME_LIMIT).expect("encode frame");
@@ -3280,6 +3466,26 @@ mod tests {
             &mut roster_app,
         );
         assert!(answer.try_recv().expect("fallback reply").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_seen_requires_a_live_feature_advertisement() {
+        let mut connection = ConnectionSnapshot {
+            connected: true,
+            features: BTreeSet::from([FEATURE_SESSION_SEEN_V1.to_string()]),
+            ..ConnectionSnapshot::default()
+        };
+        assert!(session_seen_available(&connection));
+
+        connection.features.clear();
+        assert!(!session_seen_available(&connection));
+
+        connection
+            .features
+            .insert(FEATURE_SESSION_SEEN_V1.to_string());
+        connection.connected = false;
+        assert!(!session_seen_available(&connection));
     }
 
     #[test]

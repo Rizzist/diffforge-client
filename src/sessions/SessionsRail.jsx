@@ -146,15 +146,22 @@ export default function SessionsRail({
   const pinned = matches.filter((session) => session.pinned);
   const recent = matches.filter((session) => !session.pinned);
 
-  /* Right-slot status (Phase 1): renders HARNESS truth only — the daemon's
-     status buckets already ride every roster summary. Attention priority:
-     needs-you (waiting) > error > working > relative time. The unseen-done
-     blue dot lands when the daemon ships seen-state (935/936 ask) — no
-     ADE-local seen store, every surface must share one attention truth. */
+  /* Right-slot status: HARNESS truth only — buckets, and with 936's
+     session_seen_v1 the typed waiting-why and the durable seen state too.
+     Attention priority: needs-you (waiting, labeled by why) > error >
+     working > unseen dot + time > time. No ADE-local seen store — every
+     surface shares one attention truth; viewing a chat acks through the
+     daemon's session.seen door. */
+  const WAITING_LABELS = {
+    permission: "permission",
+    question: "question",
+    approval: "approval",
+  };
   const statusSlot = (session) => {
     const status = session.status || "";
     if (status === "waiting") {
-      return <NeedsYouChip aria-label="Waiting on you">needs you</NeedsYouChip>;
+      const label = WAITING_LABELS[session.waiting_kind] || "needs you";
+      return <NeedsYouChip aria-label="Waiting on you">{label}</NeedsYouChip>;
     }
     if (status === "error") {
       return <StatusErrorRing aria-label="Errored">!</StatusErrorRing>;
@@ -162,8 +169,14 @@ export default function SessionsRail({
     if (status === "running") {
       return <StatusSpinner aria-label="Working" />;
     }
+    /* Settled rows: daemon-durable seen state. Activity after the last ack
+       shows the dot; the active session never does (viewing IS the ack —
+       the daemon receipt clears it moments later). */
+    const unseen = session.id !== activeSessionId
+      && Number(session.last_activity_ms) > Number(session.seen_at_ms || 0);
     return (
       <SessionRowMeta>
+        {unseen && <UnseenDot aria-label="New activity" />}
         {formatSessionRelativeTime(session.latest_at_ms, nowMs)}
       </SessionRowMeta>
     );
@@ -390,7 +403,15 @@ const SessionsRailRoot = styled.div`
 /* Collapsed rail: the list stays as a brand-dot icon strip — group labels
    and row text fold away, the marks keep their activity badges. */
 /* Right-slot status indicators — one per row, shape-distinct so color is
-   never the only signal: chip (words) / hollow ring / motion / text. */
+   never the only signal: chip (words) / hollow ring / motion / dot / text. */
+const UnseenDot = styled.i`
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--forge-accent-soft);
+`;
+
 const NeedsYouChip = styled.span`
   flex: 0 0 auto;
   padding: 1px 6px;
@@ -603,6 +624,9 @@ const SessionRowTitle = styled.span`
 `;
 
 const SessionRowMeta = styled.em`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   margin-left: auto;
   color: var(--forge-text-muted);
   font-size: 9.5px;

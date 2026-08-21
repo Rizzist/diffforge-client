@@ -6329,6 +6329,7 @@ fn run_app(daemon: bool) {
             session_projection_detach,
             session_start_with_prompt,
             session_submit_prompt,
+            session_mark_seen,
             haider_library_snapshot,
             session_config_get,
             session_item_get,
