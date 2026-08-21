@@ -729,16 +729,15 @@ const RowText = styled.div`
 
 /* ---- tool cluster styles ---------------------------------------------- */
 
+/* The card's outline stays NEUTRAL whatever happened inside — one failed
+   call among many must not paint the whole box red. Failure shows at the
+   row: the colored status word plus a thin red edge on that row alone. */
 const ClusterCard = styled.div`
   min-width: 0;
   border: 1px solid var(--forge-border);
   border-radius: 10px;
   background: var(--forge-surface);
   overflow: hidden;
-
-  &[data-failed="true"] {
-    border-color: color-mix(in srgb, var(--forge-red) 35%, var(--forge-border));
-  }
 `;
 
 const ClusterHead = styled.button`
@@ -804,6 +803,10 @@ const ClusterRow = styled.button`
   gap: 8px;
   padding: 5px 10px;
   border: 0;
+  /* Failed rows carry their own thin red edge — outline stays row-scoped. */
+  &[data-status="failed"] {
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--forge-red) 70%, transparent);
+  }
   background: transparent;
   color: var(--forge-text-soft);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
