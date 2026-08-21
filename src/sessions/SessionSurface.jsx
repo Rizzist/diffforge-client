@@ -128,7 +128,7 @@ export default function SessionSurface({
   /* ONE publish door for local composer content (typing, paste blocks, the
      post-submit clear): stamps our monotone lane, records history for
      self-echo matching, publishes under the PROVIDER session id. */
-  const publishMirror = useCallback((session, text) => {
+  const publishMirrorNow = useCallback((session, text) => {
     const providerId = (session?.provider_session_id || "").trim();
     if (!providerId) return;
     const revision = (mirrorRevisionsRef.current[session.id] || 0) + 1;
@@ -144,6 +144,28 @@ export default function SessionSurface({
       revision,
     }).catch(() => {});
   }, []);
+  /* #10: trailing-edge debounce (~40ms) — the mirror is a SNAPSHOT, not a
+     keylog, so only the last state of a burst needs the wire. The
+     submit-clear ("" text) flushes immediately and cancels any pending
+     burst so a stale keystroke can never resurrect the prompt. */
+  const mirrorDebounceRef = useRef({}); // sessionId -> timeout id
+  const publishMirror = useCallback((session, text) => {
+    const id = session?.id;
+    if (!id) return;
+    const pending = mirrorDebounceRef.current[id];
+    if (pending) {
+      window.clearTimeout(pending);
+      delete mirrorDebounceRef.current[id];
+    }
+    if (text === "") {
+      publishMirrorNow(session, "");
+      return;
+    }
+    mirrorDebounceRef.current[id] = window.setTimeout(() => {
+      delete mirrorDebounceRef.current[id];
+      publishMirrorNow(session, text);
+    }, 40);
+  }, [publishMirrorNow]);
   const [composerPrefs, setComposerPrefs] = useState({});
   const [usageMeta, setUsageMeta] = useState(null);
   const [library, setLibrary] = useState(null);
@@ -415,8 +437,13 @@ export default function SessionSurface({
       modelProvider: config?.provider
         || (prefs.model || "").split("/")[0]
         || libraryProviderFor(model),
-      effort: config?.effort || prefs.effort || "default",
-      speed: config?.speed === "fast" || prefs.speed === "fast" ? "fast" : "default",
+      /* 935 roster scalars: rows carry effort/speed once installed — the
+         summary becomes a complete chip source; null rows (934) fall back
+         exactly as before. */
+      effort: config?.effort || prefs.effort || session?.effort || "default",
+      speed: config?.speed === "fast" || prefs.speed === "fast" || session?.speed === "fast"
+        ? "fast"
+        : "default",
     };
   };
   const chipOptionsFor = (session) => {
@@ -784,9 +811,15 @@ export default function SessionSurface({
     const rawStatusLine = session && session.id !== "draft"
       ? (surfaceStatus[session.id] || "").trim()
       : "";
+    /* state_raw holds the LAST RUN'S outcome ("cancelled"/"completed") — a
+       past-tense vocabulary. It may fill the pill only while a run is
+       actually alive; on a settled session it flashed "Cancelled" for a
+       frame before the live strip arrived. Settled = the bucket word. */
+    const sessionActive = session
+      && (session.status === "running" || session.status === "waiting" || session.status === "error");
     const statusLine = session && session.id !== "draft"
       ? (compactSurfaceStatus(rawStatusLine)
-        || (session.state_raw || "").trim()
+        || (sessionActive ? (session.state_raw || "").trim() : "")
         || (session.status === "running"
           ? "Running"
           : session.status === "waiting"
