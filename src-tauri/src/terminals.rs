@@ -7032,6 +7032,7 @@ fn spawn_terminal_reader(
     prefer_output_transport: bool,
     cloud_output_observer_enabled: bool,
     rust_readiness_observer_enabled: bool,
+    harness_owned_pane: bool,
     mut reader: Box<dyn Read + Send>,
 ) {
     async fn observe_terminal_prompt_ready(
@@ -7583,7 +7584,11 @@ fn spawn_terminal_reader(
                     let auth_failure_debounce_elapsed = auth_failure_last_marked_at
                         .map(|marked_at| marked_at.elapsed() >= Duration::from_secs(30))
                         .unwrap_or(true);
-                    if auth_failure_debounce_elapsed {
+                    /* Never read a harness pane's output to infer credential
+                       state: the daemon publishes it as CredentialStatus on
+                       account.list, and a prose match here can only invent a
+                       failure that did not happen. */
+                    if !harness_owned_pane && auth_failure_debounce_elapsed {
                         if let Some(auth_error) = agent_accounts_observe_terminal_auth_output(
                             &app,
                             &reader_pane_id,
@@ -10736,12 +10741,17 @@ async fn terminal_open(
         );
     }
 
-    let cloud_output_observer_enabled =
-        !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_id)
-            && !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind);
-    let rust_readiness_observer_enabled =
-        cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_id)
-            || cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind);
+    let harness_owned_pane =
+        cloud_mcp_agent_is_harness_owned(&terminal_metadata_for_log.agent_id)
+            || cloud_mcp_agent_is_harness_owned(&terminal_metadata_for_log.agent_kind);
+    /* Three states, not two: hook-observed, scraped, or — for a pane whose
+       state the harness publishes over RPC — observed not at all. */
+    let cloud_output_observer_enabled = !harness_owned_pane
+        && !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_id)
+        && !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind);
+    let rust_readiness_observer_enabled = !harness_owned_pane
+        && (cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_id)
+            || cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind));
     spawn_terminal_reader(
         app.clone(),
         Arc::clone(&state.terminals),
@@ -10757,6 +10767,7 @@ async fn terminal_open(
         prefer_output_transport,
         cloud_output_observer_enabled,
         rust_readiness_observer_enabled,
+        harness_owned_pane,
         reader,
     );
     spawn_terminal_activity_hook_watcher(
@@ -12676,6 +12687,16 @@ async fn terminal_observe_submitted_prompt(
     instance: &TerminalInstance,
     data: &str,
 ) -> (Option<String>, Value, Value) {
+    /* Reconstructing what the user typed by emulating the TUI's input line is
+       a shadow copy of someone else's composer: any keybinding this does not
+       model desynchronizes it, and an "authoritative" submission derived that
+       way arms downstream completion reporting. The harness mirrors its real
+       composer over input_mirror_v1, so a harness pane is never inferred. */
+    if cloud_mcp_agent_is_harness_owned(&instance.metadata.agent_id)
+        || cloud_mcp_agent_is_harness_owned(&instance.metadata.agent_kind)
+    {
+        return (None, Value::Null, Value::Null);
+    }
     let mut gate = instance.input_gate.lock().await;
     let before = terminal_input_gate_diagnostic_snapshot(&gate);
     let submitted = terminal_observe_input_gate_submitted_prompt(&mut gate, data);

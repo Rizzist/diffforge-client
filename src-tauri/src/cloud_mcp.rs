@@ -42501,6 +42501,17 @@ fn cloud_mcp_terminal_output_looks_ready(text: &str) -> bool {
         || cloud_mcp_terminal_output_has_prompt_marker(&cleaned)
 }
 
+/// Agents whose state the HARNESS owns over RPC. These panes must be observed
+/// through doors — never by reading their rendered output — so they take
+/// neither the hook observer nor, crucially, the text-scraping fallback.
+///
+/// The hook predicate below is an allowlist used as a two-way switch, so
+/// anything absent from it fell through to scraping: the gate meant to protect
+/// a harness pane was what routed it into the scanner.
+pub(crate) fn cloud_mcp_agent_is_harness_owned(agent_id: &str) -> bool {
+    matches!(agent_id.trim().to_ascii_lowercase().as_str(), "haider")
+}
+
 pub(crate) fn cloud_mcp_agent_uses_activity_hooks(agent_id: &str) -> bool {
     // Keep in sync with the frontend `TERMINAL_ACTIVITY_HOOK_AGENT_KINDS`
     // (terminalActivityState.js). OpenCode owns its turn state through the
@@ -71641,6 +71652,39 @@ mod cloud_mcp_tests {
         assert!(cloud_mcp_agent_uses_activity_hooks(" OpenCode "));
         assert!(!cloud_mcp_agent_uses_activity_hooks("shell"));
         assert!(!cloud_mcp_agent_uses_activity_hooks("generic"));
+    }
+
+    #[test]
+    fn harness_owned_panes_are_never_observed_by_reading_output() {
+        /* The defect this pins: the hook predicate is an ALLOWLIST, and it was
+           used as a two-way switch — anything not in it fell through to the
+           text-scraping observer. So the harness, whose state arrives over
+           RPC, was the one agent getting scraped. Both observers must be off
+           for a harness pane, which is a third state, not the other branch. */
+        assert!(cloud_mcp_agent_is_harness_owned("haider"));
+        assert!(cloud_mcp_agent_is_harness_owned(" Haider "));
+        assert!(!cloud_mcp_agent_is_harness_owned("codex"));
+        assert!(!cloud_mcp_agent_is_harness_owned("shell"));
+
+        // A harness pane is absent from the hook set, which is exactly why the
+        // old two-state logic routed it into scraping.
+        assert!(!cloud_mcp_agent_uses_activity_hooks("haider"));
+
+        for agent in ["haider", " Haider "] {
+            let harness_owned = cloud_mcp_agent_is_harness_owned(agent);
+            let scraping_observer =
+                !harness_owned && !cloud_mcp_agent_uses_activity_hooks(agent);
+            let readiness_observer =
+                !harness_owned && cloud_mcp_agent_uses_activity_hooks(agent);
+            assert!(!scraping_observer, "{agent} must never be scraped");
+            assert!(!readiness_observer, "{agent} must not be hook-observed either");
+        }
+
+        // Non-harness agents keep exactly the behavior they had.
+        assert!(!cloud_mcp_agent_is_harness_owned("codex")
+            && cloud_mcp_agent_uses_activity_hooks("codex"));
+        assert!(!cloud_mcp_agent_is_harness_owned("shell")
+            && !cloud_mcp_agent_uses_activity_hooks("shell"));
     }
 
     #[test]
