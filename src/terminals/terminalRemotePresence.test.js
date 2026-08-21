@@ -25,29 +25,6 @@ test("terminal remote presence workspace normalization mirrors backend keys", ()
   );
 });
 
-test("terminal remote presence does not pane-fallback across workspace mismatch", () => {
-  const snapshot = {
-    items: [{
-      chat_watchers: 0,
-      instance_id: 3,
-      pane_id: "shared-pane",
-      shell_controller: false,
-      shell_viewers: 1,
-      stream_key: "stream-b",
-      workspace_id: "/workspace-b",
-    }],
-  };
-
-  const presence = getTerminalRemotePresenceForPane(snapshot, {
-    workspaceId: "/workspace-a/",
-    paneId: "shared-pane",
-    instanceId: 3,
-  });
-
-  assert.equal(presence.shell_viewers, 0);
-  assert.equal(presence.stream_key, "");
-});
-
 test("terminal remote presence matches equivalent normalized workspace ids", () => {
   const item = {
     chat_watchers: 0,

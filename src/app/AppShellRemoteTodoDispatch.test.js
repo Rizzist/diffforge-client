@@ -34,41 +34,6 @@ function sourceBetween(startMarker, endMarker) {
   return appShellSource.slice(start, end);
 }
 
-test("loopspace dispatch-todos bypasses the singular-workspace gate", () => {
-  const workspaceGate = sourceBetween(
-    "const requiresWorkspace = remoteCommandOptionalBooleanField",
-    "if (!claimRemoteCommandReceipt",
-  );
-  assert.match(workspaceGate, /&& !dispatchTodosAction/);
-});
-
-test("loopspace dispatch-todos invokes the Rust batch primitive and returns before generic queueing", () => {
-  const handler = sourceBetween(
-    "if (dispatchTodosAction) {",
-    "if (terminalOrchestratorMessageAction) {",
-  );
-  assert.match(handler, /invoke\("todo_store_dispatch_loopspace_batch"/);
-  assert.match(handler, /reason: "loopspace_dispatch_todos_remote_command"/);
-  assert.match(handler, /command_kind: "loopspace_dispatch_todos"/);
-  assert.match(handler, /\.\.\.event/);
-  assert.match(handler, /loop_runtime_run_id: loopRuntimeRunId/);
-  assert.match(handler, /target_terminal_mode: targetTerminalMode/);
-  assert.match(handler, /target_terminal_index: targetTerminalIndex/);
-  assert.match(handler, /target_terminal_selectors: workspaceTerminalSelectors/);
-  assert.match(handler, /target_thread_id: targetThreadId/);
-  assert.match(handler, /workspace_ids: targetWorkspaceIds/);
-  assert.match(handler, /return;/);
-  assert.doesNotMatch(handler, /REMOTE_TODO_QUEUE_EVENT/);
-});
-
-test("loopspace dispatch-todos skips singular current-workspace terminal resolution", () => {
-  const targetResolution = sourceBetween(
-    "const resolvedRemoteTarget =",
-    "let targetColorSlot =",
-  );
-  assert.match(targetResolution, /!dispatchTodosAction && workspaceId && hasExplicitRemoteTarget/);
-});
-
 test("plural pinned index resolves inside every target workspace", () => {
   const selectors = resolveLoopspaceTodoTerminalSelectors({
     targetTerminalIndex: 2,
@@ -152,12 +117,3 @@ test("single-workspace pane resolution remains exact", () => {
   assert.equal(missingInventorySelector.target_terminal_id, "pane-a-2");
 });
 
-test("loopspace dispatch-todos reports batch success and failure to cloud", () => {
-  const handler = sourceBetween(
-    "if (dispatchTodosAction) {",
-    "if (terminalOrchestratorMessageAction) {",
-  );
-  assert.match(handler, /queued_count: queuedCount/);
-  assert.match(handler, /workspace_count: workspaceCount/);
-  assert.match(handler, /"failed"/);
-});

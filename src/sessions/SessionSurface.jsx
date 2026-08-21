@@ -1169,6 +1169,16 @@ export default function SessionSurface({
                   <ChatHostLayer data-visible={mode === "ui" ? "true" : "false"}>
                     <SessionTranscript
                       onAnswered={onSessionsRefresh}
+                      onEnsureShell={() => {
+                        /* Mounting the shell is how a dormant session comes
+                           back up: the PTY spawns or is re-adopted and the
+                           harness connection follows. Warm, not visible —
+                           the user asked a question, not to change views. */
+                        setShellTouched((current) => (
+                          current[session.id] ? current : { ...current, [session.id]: true }
+                        ));
+                        onShellWarm?.(session.id);
+                      }}
                       onSyncingChange={(syncing) => handleTranscriptSyncing(session.id, syncing)}
                       runStatus={(() => {
                         /* The shimmer means WORK: thinking/running/tool

@@ -366,6 +366,7 @@ export default function SessionTranscript({
   runStatus = "",
   onSyncingChange,
   onAnswered = null,
+  onEnsureShell = null,
 }) {
   const sessionId = session?.id || "";
   /* Harness-owned park (937): the roster row carries the whole card, so the
@@ -559,6 +560,7 @@ export default function SessionTranscript({
           <NeedsInputCard
             card={needsInput}
             onAnswered={onAnswered}
+            onEnsureShell={onEnsureShell}
             sessionId={sessionId}
           />
         )}
@@ -659,6 +661,7 @@ export default function SessionTranscript({
         <NeedsInputCard
           card={needsInput}
           onAnswered={onAnswered}
+          onEnsureShell={onEnsureShell}
           sessionId={sessionId}
         />
       )}

@@ -36,8 +36,23 @@ function kindLabel(kind) {
   return clean ? clean.replace(/_/g, " ") : "Needs you";
 }
 
-export default function NeedsInputCard({ card, sessionId, onAnswered = null }) {
+/* Bringing a dormant session up is not instant: mounting its shell spawns or
+   adopts the PTY and the harness connection follows. Answering therefore
+   retries on a short ladder rather than failing the first time. Safe by
+   construction — the answer command derives its command_id from the fence
+   plus the chosen option, so a retry replays a committed answer instead of
+   answering twice. */
+const WAKE_ATTEMPTS = 6;
+const WAKE_BACKOFF_MS = 700;
+
+export default function NeedsInputCard({
+  card,
+  sessionId,
+  onAnswered = null,
+  onEnsureShell = null,
+}) {
   const [busyKey, setBusyKey] = useState("");
+  const [waking, setWaking] = useState(false);
   const [error, setError] = useState("");
   /* Answer state belongs to ONE park. Without this, a card replaced while an
      answer is in flight inherits the previous card's disabled buttons and
@@ -54,17 +69,36 @@ export default function NeedsInputCard({ card, sessionId, onAnswered = null }) {
     if (busyKey) return;
     setBusyKey(optionKey);
     setError("");
+    /* A parked session is usually dormant — its shell isn't mounted, so
+       there is nothing to answer THROUGH. Wake it first, then commit. */
+    onEnsureShell?.();
     try {
-      /* menu_id/request_seq/worker_generation ride VERBATIM off the card —
-         they are the daemon's staleness fence, never re-derived here. */
-      await invoke("session_answer_menu", {
-        session_id: sessionId,
-        menu_id: card.menu_id,
-        request_seq: card.request_seq,
-        worker_generation: card.worker_generation,
-        option_key: optionKey,
-      });
-      onAnswered?.();
+      let lastFailure = null;
+      for (let attempt = 0; attempt < WAKE_ATTEMPTS; attempt += 1) {
+        try {
+          /* menu_id/request_seq/worker_generation ride VERBATIM off the card
+             — they are the daemon's staleness fence, never re-derived. */
+          await invoke("session_answer_menu", {
+            session_id: sessionId,
+            menu_id: card.menu_id,
+            request_seq: card.request_seq,
+            worker_generation: card.worker_generation,
+            option_key: optionKey,
+          });
+          onAnswered?.();
+          return;
+        } catch (failure) {
+          lastFailure = failure;
+          const code = String(failure?.message || failure || "").trim();
+          /* Only "not reachable yet" is worth waiting on. A stale fence or a
+             resolved park will never succeed by trying again, and an
+             uncertain receipt must be the user's call, not a silent replay. */
+          if (code !== "haider_needs_input_unavailable") throw failure;
+          setWaking(true);
+          await new Promise((resolve) => { window.setTimeout(resolve, WAKE_BACKOFF_MS); });
+        }
+      }
+      throw lastFailure;
     } catch (failure) {
       /* Daemon codes pass through VERBATIM. Only the two states we genuinely
          know are reworded; pattern-matching the rest would rewrite codes this
@@ -72,7 +106,7 @@ export default function NeedsInputCard({ card, sessionId, onAnswered = null }) {
       const code = String(failure?.message || failure || "").trim();
       setError(
         code === "haider_needs_input_unavailable"
-          ? "The harness connection is unavailable."
+          ? "Could not reach this session — open its Shell, then try again."
           : code === "haider_needs_input_answer_uncertain"
             /* The answer may already have landed; the command id is derived,
                so pressing again replays the receipt instead of double-
@@ -86,8 +120,9 @@ export default function NeedsInputCard({ card, sessionId, onAnswered = null }) {
       );
     } finally {
       setBusyKey("");
+      setWaking(false);
     }
-  }, [busyKey, card, onAnswered, sessionId]);
+  }, [busyKey, card, onAnswered, onEnsureShell, sessionId]);
 
   /* EVERY field but kind and title is omit-when-default on the wire, so the
      minimal card is literally {kind, title} and absent always means the
@@ -141,7 +176,9 @@ export default function NeedsInputCard({ card, sessionId, onAnswered = null }) {
                   title={option.detail || undefined}
                   type="button"
                 >
-                  {busyKey === option.key ? "…" : (option.label || option.key)}
+                  {busyKey === option.key
+                    ? (waking ? "starting…" : "…")
+                    : (option.label || option.key)}
                 </OptionButton>
               ))}
             </Options>
