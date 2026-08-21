@@ -1018,11 +1018,18 @@ export default function SessionSurface({
                   <ChatHostLayer data-visible={mode === "ui" ? "true" : "false"}>
                     <SessionTranscript
                       onSyncingChange={(syncing) => handleTranscriptSyncing(session.id, syncing)}
-                      runStatus={session.status === "running"
-                        ? (compactSurfaceStatus(surfaceStatus[session.id])
-                          || (session.state_raw || "").trim()
-                          || "working…")
-                        : ""}
+                      runStatus={(() => {
+                        /* The shimmer means WORK: thinking/running/tool
+                           calls. The TUI's own strip outranks the bridge's
+                           coarse status — if it says idle (settle lag), no
+                           dot, ever. */
+                        if (session.status !== "running") return "";
+                        const compact = compactSurfaceStatus(surfaceStatus[session.id]);
+                        if (/^idle\b/i.test(compact)) return "";
+                        const fallback = (session.state_raw || "").trim();
+                        if (!compact && /^idle\b/i.test(fallback)) return "";
+                        return compact || fallback || "working…";
+                      })()}
                       session={session}
                     />
                     <SessionComposer
