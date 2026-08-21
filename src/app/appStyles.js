@@ -135,6 +135,10 @@ export const GlobalStyle = createGlobalStyle`
     --forge-border: rgba(230, 236, 245, 0.1);
     --forge-border-strong: rgba(230, 236, 245, 0.16);
     --forge-text: #f4f7fa;
+    /* Chat body sits a step below --forge-text: near-white 13px prose on the
+       near-black bg peaks ~19:1 contrast and reads harsh over long sessions;
+       this keeps emphasis (strong/headings) on --forge-text so it still pops. */
+    --forge-chat-text: #d6dee8;
     --forge-text-soft: #b6c0cc;
     --forge-text-muted: #7a8493;
     --forge-text-disabled: #505966;
@@ -209,6 +213,10 @@ export const GlobalStyle = createGlobalStyle`
     --forge-border: rgba(230, 236, 245, 0.1);
     --forge-border-strong: rgba(230, 236, 245, 0.16);
     --forge-text: #f4f7fa;
+    /* Chat body sits a step below --forge-text: near-white 13px prose on the
+       near-black bg peaks ~19:1 contrast and reads harsh over long sessions;
+       this keeps emphasis (strong/headings) on --forge-text so it still pops. */
+    --forge-chat-text: #d6dee8;
     --forge-text-soft: #b6c0cc;
     --forge-text-muted: #7a8493;
     --forge-text-disabled: #505966;
@@ -269,6 +277,7 @@ export const GlobalStyle = createGlobalStyle`
     --forge-border: rgba(0, 0, 0, 0.08);
     --forge-border-strong: rgba(0, 0, 0, 0.14);
     --forge-text: #1d1d1f;
+    --forge-chat-text: #2b2b2f;
     --forge-text-soft: #333333;
     --forge-text-muted: #7a7a7a;
     --forge-text-disabled: #a1a1a6;

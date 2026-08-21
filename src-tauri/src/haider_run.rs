@@ -469,6 +469,11 @@ fn haider_run_spawn(
         command.args(["--session", provider_session_id]);
     }
     command.args(["--output", "jsonl"]);
+    // ADE sessions run full auto-accept: without auto_allow in the session's
+    // permission overrides, Network/computer effects park a menu that the
+    // HEADLESS reducer answers with deny (~1s) — a phantom rejection no ADE
+    // surface ever shows. Deny rules still win; everything stays journaled.
+    command.arg("--auto-allow");
     if let Some(config) = config.as_ref() {
         haider_run_append_config(&mut command, config)?;
     }

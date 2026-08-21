@@ -13,6 +13,8 @@ const HAIDER_PROJECTION_PIPE_SAFETY_POLL: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_PIPE_STOP_POLL: Duration = Duration::from_millis(100);
 const HAIDER_PROJECTION_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_FRAME_TIME: Duration = Duration::from_millis(50);
+const HAIDER_PROJECTION_IMMEDIATE_IDLE: Duration = Duration::from_millis(300);
+const HAIDER_PROJECTION_EVENT_ROWS_LIMIT: usize = 32;
 const HAIDER_PROJECTION_ROWS_EVENT: &str = "session-rows-appended";
 const HAIDER_PROJECTION_PREFOLD_QUEUE_LIMIT: usize = 32;
 
@@ -58,6 +60,13 @@ struct HaiderProjectionFoldState {
     effect_summaries: HashMap<String, String>,
     seen_sequences: HashSet<(i64, i64)>,
     pipe_eof_max_seq: Option<i64>,
+    /* The daemon mirrors bare export-shaped compat records ({role, text, seq})
+       into the live pipe alongside the enveloped item stream. Once any item
+       event is seen the item stream is canonical: compat records would land
+       duplicates at fresh seqs (and empty turn-start markers). Cold loads and
+       pre-item pipes never set this flag, so export docs still fold. Persisted
+       on the pipe cursor so restarts resume with the gate intact. */
+    saw_item_stream: bool,
 }
 
 impl Default for HaiderProjectionFoldState {
@@ -72,6 +81,7 @@ impl Default for HaiderProjectionFoldState {
             effect_summaries: HashMap::new(),
             seen_sequences: HashSet::new(),
             pipe_eof_max_seq: None,
+            saw_item_stream: false,
         }
     }
 }
@@ -97,6 +107,9 @@ struct HaiderProjectionFrame {
     pipe_max_seq: Option<i64>,
     caught_up: bool,
     sync_changed: bool,
+    rows: Vec<SessionProjectionRow>,
+    start_total: Option<i64>,
+    rows_overflow: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -109,6 +122,16 @@ struct HaiderProjectionEvent {
     covered_through_seq: Option<i64>,
     head_seq: Option<i64>,
     caught_up: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rows: Option<Vec<SessionProjectionRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_total: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct HaiderProjectionPersistedRows {
+    rows: Vec<SessionProjectionRow>,
+    total_rows: i64,
 }
 
 struct HaiderProjectionWatch {
@@ -193,6 +216,10 @@ struct HaiderProjectionPipeCursor {
     generation: i64,
     covered_through_seq: i64,
     coverage_known: bool,
+    /* Rides the cursor so a restart resumes with the compat-record gate
+       intact: without it, the first compat record after resume duplicates
+       an already-persisted item row at a fresh seq. Monotone once true. */
+    saw_item_stream: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -345,7 +372,8 @@ fn haider_projection_migrate_database(connection: &mut rusqlite::Connection) -> 
                 last_ordinal INTEGER NOT NULL,
                 generation INTEGER NOT NULL,
                 covered_through_seq INTEGER NOT NULL,
-                coverage_known INTEGER NOT NULL DEFAULT 0
+                coverage_known INTEGER NOT NULL DEFAULT 0,
+                saw_item_stream INTEGER NOT NULL DEFAULT 0
              );",
         )
         .map_err(|error| format!("Unable to initialize session projection store: {error}"))?;
@@ -364,6 +392,14 @@ fn haider_projection_migrate_database(connection: &mut rusqlite::Connection) -> 
         connection
             .execute(
                 "ALTER TABLE session_pipe_cursors ADD COLUMN coverage_known INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| format!("Unable to migrate session pipe cursor schema: {error}"))?;
+    }
+    if !cursor_columns.contains("saw_item_stream") {
+        connection
+            .execute(
+                "ALTER TABLE session_pipe_cursors ADD COLUMN saw_item_stream INTEGER NOT NULL DEFAULT 0",
                 [],
             )
             .map_err(|error| format!("Unable to migrate session pipe cursor schema: {error}"))?;
@@ -1020,8 +1056,14 @@ fn haider_projection_fold_value_locked(
     }
 
     if payload_object.is_some_and(|object| object.contains_key("role")) {
-        if let Some(row) = haider_projection_export_row(state, session_id, payload) {
-            step.rows.push(row);
+        /* Once the enveloped item stream is live it is canonical: bare
+           role-shaped compat records would duplicate its content at fresh
+           seqs (and add empty turn-start markers). Cold export folds and
+           pre-item pipes never set the flag, so their rows all land. */
+        if !state.saw_item_stream {
+            if let Some(row) = haider_projection_export_row(state, session_id, payload) {
+                step.rows.push(row);
+            }
         }
         return step;
     }
@@ -1047,6 +1089,7 @@ fn haider_projection_fold_value_locked(
             ));
         }
         "item" => {
+            state.saw_item_stream = true;
             haider_projection_fold_item_event(state, session_id, value, payload, &mut step);
         }
         "tool_result" => {
@@ -1176,9 +1219,9 @@ fn haider_projection_persist_batch(
     session_id: &str,
     rows: &[SessionProjectionRow],
     cursor: Option<&HaiderProjectionPipeCursor>,
-) -> Result<(usize, i64), String> {
+) -> Result<HaiderProjectionPersistedRows, String> {
     if rows.is_empty() && cursor.is_none() {
-        return Ok((0, 0));
+        return Ok(HaiderProjectionPersistedRows::default());
     }
     let _write_guard = sessions_write_lock()
         .lock()
@@ -1189,6 +1232,7 @@ fn haider_projection_persist_batch(
             .transaction()
             .map_err(|error| format!("Unable to begin session projection write: {error}"))?;
         let mut appended = 0usize;
+        let mut persisted_rows = Vec::new();
         let mut min_inserted = None::<(i64, i64)>;
         let mut max_inserted = None::<(i64, i64)>;
         {
@@ -1215,6 +1259,7 @@ fn haider_projection_persist_batch(
                     .map_err(|error| format!("Unable to append session projection row: {error}"))?;
                 appended = appended.saturating_add(inserted);
                 if inserted > 0 {
+                    persisted_rows.push(row.clone());
                     let key = (row.seq, row.ordinal);
                     min_inserted = Some(min_inserted.map_or(key, |current| current.min(key)));
                     max_inserted = Some(max_inserted.map_or(key, |current| current.max(key)));
@@ -1226,8 +1271,8 @@ fn haider_projection_persist_batch(
                 .prepare_cached(
                     "INSERT INTO session_pipe_cursors (
                     session_id, byte_offset, last_seq, last_ordinal, generation,
-                    covered_through_seq, coverage_known
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    covered_through_seq, coverage_known, saw_item_stream
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(session_id) DO UPDATE SET
                     byte_offset = excluded.byte_offset,
                     last_seq = CASE
@@ -1245,6 +1290,10 @@ fn haider_projection_persist_batch(
                     coverage_known = MAX(
                         session_pipe_cursors.coverage_known,
                         excluded.coverage_known
+                    ),
+                    saw_item_stream = MAX(
+                        session_pipe_cursors.saw_item_stream,
+                        excluded.saw_item_stream
                     )
                  WHERE session_pipe_cursors.generation = excluded.generation
                    AND session_pipe_cursors.byte_offset <= excluded.byte_offset",
@@ -1258,6 +1307,7 @@ fn haider_projection_persist_batch(
                         cursor.generation,
                         cursor.covered_through_seq,
                         cursor.coverage_known,
+                        cursor.saw_item_stream,
                     ])
                 })
                 .map_err(|error| format!("Unable to persist session pipe cursor: {error}"))?;
@@ -1284,13 +1334,18 @@ fn haider_projection_persist_batch(
                 (None, value) | (value, None) => value,
             };
         }
-        Ok((appended, state.total_rows))
+        Ok(HaiderProjectionPersistedRows {
+            rows: persisted_rows,
+            total_rows: state.total_rows,
+        })
     })
 }
 
-fn haider_projection_persist_rows(rows: &[SessionProjectionRow]) -> Result<(usize, i64), String> {
+fn haider_projection_persist_rows(
+    rows: &[SessionProjectionRow],
+) -> Result<HaiderProjectionPersistedRows, String> {
     if rows.is_empty() {
-        return Ok((0, 0));
+        return Ok(HaiderProjectionPersistedRows::default());
     }
     haider_projection_persist_batch(&rows[0].session_id, rows, None)
 }
@@ -1302,7 +1357,7 @@ fn haider_projection_load_pipe_cursor(
         let result = connection
             .prepare_cached(
                 "SELECT session_id, byte_offset, last_seq, last_ordinal, generation,
-                        covered_through_seq, coverage_known
+                        covered_through_seq, coverage_known, saw_item_stream
                  FROM session_pipe_cursors WHERE session_id = ?1",
             )
             .and_then(|mut statement| {
@@ -1315,6 +1370,7 @@ fn haider_projection_load_pipe_cursor(
                         generation: row.get(4)?,
                         covered_through_seq: row.get(5)?,
                         coverage_known: row.get(6)?,
+                        saw_item_stream: row.get(7)?,
                     })
                 })
             });
@@ -1349,8 +1405,8 @@ fn haider_projection_reset_pipe_session(
             .prepare_cached(
                 "INSERT INTO session_pipe_cursors (
                 session_id, byte_offset, last_seq, last_ordinal, generation,
-                covered_through_seq, coverage_known
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                covered_through_seq, coverage_known, saw_item_stream
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )
             .and_then(|mut statement| {
                 statement.execute(rusqlite::params![
@@ -1361,6 +1417,7 @@ fn haider_projection_reset_pipe_session(
                     cursor.generation,
                     cursor.covered_through_seq,
                     cursor.coverage_known,
+                    cursor.saw_item_stream,
                 ])
             })
             .map_err(|error| format!("Unable to initialize session pipe cursor: {error}"))?;
@@ -1476,7 +1533,13 @@ fn haider_projection_ingest_value(
             tail_changed |= step.tail_changed;
         }
     }
-    let (appended, persisted_total) = haider_projection_persist_rows(&all_rows)?;
+    let persisted = haider_projection_persist_rows(&all_rows)?;
+    let appended = persisted.rows.len();
+    let start_total = (appended > 0).then(|| {
+        persisted
+            .total_rows
+            .saturating_sub(i64::try_from(appended).unwrap_or(i64::MAX))
+    });
     let mut states = haider_projection_states()
         .lock()
         .map_err(|_| "Session projection state is unavailable.".to_string())?;
@@ -1484,7 +1547,7 @@ fn haider_projection_ingest_value(
         .get_mut(session_id)
         .ok_or_else(|| "Session projection state was not initialized.".to_string())?;
     if !all_rows.is_empty() {
-        state.total_rows = persisted_total;
+        state.total_rows = persisted.total_rows;
     }
     let live_tail = state.tail.as_ref().map(|tail| tail.row.clone());
     let total_rows = state.total_rows;
@@ -1514,6 +1577,9 @@ fn haider_projection_ingest_value(
         pipe_max_seq: None,
         caught_up: sync.caught_up,
         sync_changed: false,
+        rows: persisted.rows,
+        start_total,
+        rows_overflow: appended > HAIDER_PROJECTION_EVENT_ROWS_LIMIT,
     })
 }
 
@@ -1528,54 +1594,93 @@ fn haider_projection_frame_sender(
                 tokio::sync::mpsc::unbounded_channel::<HaiderProjectionFrame>();
             let emit_app = app.clone();
             tauri::async_runtime::spawn(async move {
+                let mut last_emitted = HashMap::<String, Instant>::new();
                 while let Some(first) = receiver.recv().await {
-                    let mut frames = HashMap::new();
-                    frames.insert(first.session_id.clone(), first);
+                    let immediate = haider_projection_should_emit_immediately(
+                        last_emitted.get(&first.session_id).copied(),
+                        Instant::now(),
+                    );
+                    if immediate {
+                        let session_id = first.session_id.clone();
+                        haider_projection_emit_frame(&emit_app, first);
+                        last_emitted.insert(session_id, Instant::now());
+                        continue;
+                    }
+
+                    let mut frames = HashMap::from([(first.session_id.clone(), first)]);
                     sleep(HAIDER_PROJECTION_FRAME_TIME).await;
                     while let Ok(next) = receiver.try_recv() {
-                        frames
-                            .entry(next.session_id.clone())
-                            .and_modify(|frame: &mut HaiderProjectionFrame| {
-                                frame.from_seq = match (frame.from_seq, next.from_seq) {
-                                    (Some(left), Some(right)) => Some(left.min(right)),
-                                    (None, value) | (value, None) => value,
-                                };
-                                frame.appended = frame.appended.saturating_add(next.appended);
-                                frame.total_rows = next.total_rows;
-                                if next.tail_changed {
-                                    frame.live_tail = next.live_tail.clone();
-                                    frame.tail_changed = true;
-                                }
-                                if next.sync_changed {
-                                    frame.covered_through_seq = next.covered_through_seq;
-                                    frame.head_seq = next.head_seq;
-                                    frame.caught_up = next.caught_up;
-                                    frame.sync_changed = true;
-                                }
-                            })
-                            .or_insert(next);
+                        match frames.entry(next.session_id.clone()) {
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                haider_projection_merge_frame(entry.get_mut(), next);
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(next);
+                            }
+                        }
                     }
                     for (_, frame) in frames {
-                        let _ = emit_app.emit_to(
-                            "main",
-                            HAIDER_PROJECTION_ROWS_EVENT,
-                            HaiderProjectionEvent {
-                                session_id: frame.session_id,
-                                from_seq: frame.from_seq,
-                                appended: frame.appended,
-                                total_rows: frame.total_rows,
-                                live_tail: frame.live_tail,
-                                covered_through_seq: frame.covered_through_seq,
-                                head_seq: frame.head_seq,
-                                caught_up: frame.caught_up,
-                            },
-                        );
+                        let session_id = frame.session_id.clone();
+                        haider_projection_emit_frame(&emit_app, frame);
+                        last_emitted.insert(session_id, Instant::now());
                     }
                 }
             });
             sender
         })
         .clone()
+}
+
+fn haider_projection_should_emit_immediately(last_emitted: Option<Instant>, now: Instant) -> bool {
+    last_emitted.is_none_or(|last| now.duration_since(last) > HAIDER_PROJECTION_IMMEDIATE_IDLE)
+}
+
+fn haider_projection_merge_frame(frame: &mut HaiderProjectionFrame, next: HaiderProjectionFrame) {
+    frame.from_seq = match (frame.from_seq, next.from_seq) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (None, value) | (value, None) => value,
+    };
+    frame.appended = frame.appended.saturating_add(next.appended);
+    frame.total_rows = next.total_rows;
+    if next.tail_changed {
+        frame.live_tail = next.live_tail.clone();
+        frame.tail_changed = true;
+    }
+    if next.sync_changed {
+        frame.covered_through_seq = next.covered_through_seq;
+        frame.head_seq = next.head_seq;
+        frame.caught_up = next.caught_up;
+        frame.sync_changed = true;
+    }
+    frame.rows_overflow |= next.rows_overflow
+        || frame.rows.len().saturating_add(next.rows.len()) > HAIDER_PROJECTION_EVENT_ROWS_LIMIT;
+    if frame.rows_overflow {
+        frame.rows.clear();
+        frame.start_total = None;
+    } else {
+        frame.rows.extend(next.rows);
+        frame.start_total = frame.start_total.or(next.start_total);
+    }
+}
+
+fn haider_projection_emit_frame(app: &AppHandle, frame: HaiderProjectionFrame) {
+    let rows = (!frame.rows_overflow && !frame.rows.is_empty()).then_some(frame.rows);
+    let _ = app.emit_to(
+        "main",
+        HAIDER_PROJECTION_ROWS_EVENT,
+        HaiderProjectionEvent {
+            session_id: frame.session_id,
+            from_seq: frame.from_seq,
+            appended: frame.appended,
+            total_rows: frame.total_rows,
+            live_tail: frame.live_tail,
+            covered_through_seq: frame.covered_through_seq,
+            head_seq: frame.head_seq,
+            caught_up: frame.caught_up,
+            start_total: rows.as_ref().and(frame.start_total),
+            rows,
+        },
+    );
 }
 
 fn haider_projection_ingest_and_emit(app: &AppHandle, session_id: &str, value: &Value) {
@@ -1626,10 +1731,30 @@ fn haider_projection_pipe_feature(value: &Value) -> bool {
 }
 
 fn haider_projection_pipe_supported() -> bool {
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        haider_bridge_json_command("status")
-            .is_some_and(|value| haider_projection_pipe_feature(&value))
+    haider_projection_pipe_status()
+        .get_or_init(|| haider_bridge_json_command("status"))
+        .as_ref()
+        .is_some_and(haider_projection_pipe_feature)
+}
+
+fn haider_projection_pipe_status() -> &'static OnceLock<Option<Value>> {
+    static STATUS: OnceLock<Option<Value>> = OnceLock::new();
+    &STATUS
+}
+
+fn haider_projection_pipe_route_from_status(
+    status: &Value,
+    provider_session_id: &str,
+) -> Option<HaiderProjectionPipeRoute> {
+    let pipe_dir = status
+        .as_object()
+        .and_then(|object| object.get("pipe_dir"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())?;
+    Some(HaiderProjectionPipeRoute {
+        path: pipe_dir.join(format!("{provider_session_id}.pipe")),
+        head_seq: haider_bridge_head_seq(provider_session_id),
     })
 }
 
@@ -1889,7 +2014,16 @@ fn haider_projection_resolve_pipe_route(
     haider_projection_resolve_pipe_route_cached_with(
         haider_projection_pipe_routes(),
         provider_session_id,
-        haider_projection_resolve_pipe_route_rpc,
+        |provider_session_id| {
+            haider_projection_pipe_status()
+                .get_or_init(|| haider_bridge_json_command("status"))
+                .as_ref()
+                .and_then(|status| {
+                    haider_projection_pipe_route_from_status(status, provider_session_id)
+                })
+                .map(Ok)
+                .unwrap_or_else(|| haider_projection_resolve_pipe_route_rpc(provider_session_id))
+        },
     )
 }
 
@@ -2162,6 +2296,14 @@ fn haider_projection_ingest_pipe_owned(
         .seek(SeekFrom::Start(cursor.byte_offset.max(0) as u64))
         .map_err(|error| format!("Unable to resume Haider session pipe: {error}"))?;
     haider_projection_initialize_state(session_id)?;
+    if cursor.saw_item_stream {
+        let mut states = haider_projection_states()
+            .lock()
+            .map_err(|_| "Session projection state is unavailable.".to_string())?;
+        if let Some(state) = states.get_mut(session_id) {
+            state.saw_item_stream = true;
+        }
+    }
     let mut committed_state = haider_projection_state_snapshot(session_id)?;
 
     let mut rows = Vec::new();
@@ -2169,6 +2311,9 @@ fn haider_projection_ingest_pipe_owned(
     let mut appended = 0usize;
     let mut total_rows = haider_projection_state_total_rows(session_id)?;
     let mut from_seq = None;
+    let mut event_rows = Vec::new();
+    let mut event_rows_overflow = false;
+    let mut start_total = None;
     let mut advanced = false;
     let mut consumed_to_eof = false;
 
@@ -2213,7 +2358,9 @@ fn haider_projection_ingest_pipe_owned(
                 let state = states
                     .get_mut(session_id)
                     .ok_or_else(|| "Session projection state was not initialized.".to_string())?;
-                haider_projection_fold_value_locked(state, session_id, &value)
+                let step = haider_projection_fold_value_locked(state, session_id, &value);
+                cursor.saw_item_stream = cursor.saw_item_stream || state.saw_item_stream;
+                step
             };
             rows.extend(step.rows);
             if (seq, ordinal) > (cursor.last_seq, cursor.last_ordinal) {
@@ -2233,10 +2380,25 @@ fn haider_projection_ingest_pipe_owned(
                 ));
             }
             let batch_from = rows.iter().map(|row| row.seq).min();
-            let (batch_appended, persisted_total) =
-                haider_projection_persist_batch(session_id, &rows, Some(&cursor))?;
+            let persisted = haider_projection_persist_batch(session_id, &rows, Some(&cursor))?;
+            let batch_appended = persisted.rows.len();
+            if batch_appended > 0 {
+                start_total.get_or_insert_with(|| {
+                    persisted
+                        .total_rows
+                        .saturating_sub(i64::try_from(batch_appended).unwrap_or(i64::MAX))
+                });
+                if event_rows.len().saturating_add(batch_appended)
+                    > HAIDER_PROJECTION_EVENT_ROWS_LIMIT
+                {
+                    event_rows_overflow = true;
+                    event_rows.clear();
+                } else if !event_rows_overflow {
+                    event_rows.extend(persisted.rows);
+                }
+            }
             appended = appended.saturating_add(batch_appended);
-            total_rows = persisted_total;
+            total_rows = persisted.total_rows;
             from_seq = match (from_seq, batch_from.filter(|_| batch_appended > 0)) {
                 (Some(left), Some(right)) => Some(left.min(right)),
                 (None, value) | (value, None) => value,
@@ -2255,10 +2417,24 @@ fn haider_projection_ingest_pipe_owned(
     }
     if advanced && (line_count > 0 || !rows.is_empty()) {
         let batch_from = rows.iter().map(|row| row.seq).min();
-        let (batch_appended, persisted_total) =
-            haider_projection_persist_batch(session_id, &rows, Some(&cursor))?;
+        let persisted = haider_projection_persist_batch(session_id, &rows, Some(&cursor))?;
+        let batch_appended = persisted.rows.len();
+        if batch_appended > 0 {
+            start_total.get_or_insert_with(|| {
+                persisted
+                    .total_rows
+                    .saturating_sub(i64::try_from(batch_appended).unwrap_or(i64::MAX))
+            });
+            if event_rows.len().saturating_add(batch_appended) > HAIDER_PROJECTION_EVENT_ROWS_LIMIT
+            {
+                event_rows_overflow = true;
+                event_rows.clear();
+            } else if !event_rows_overflow {
+                event_rows.extend(persisted.rows);
+            }
+        }
         appended = appended.saturating_add(batch_appended);
-        total_rows = persisted_total;
+        total_rows = persisted.total_rows;
         from_seq = match (from_seq, batch_from.filter(|_| batch_appended > 0)) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (None, value) | (value, None) => value,
@@ -2293,6 +2469,9 @@ fn haider_projection_ingest_pipe_owned(
         pipe_max_seq: Some(cursor.last_seq),
         caught_up: sync.caught_up,
         sync_changed: reset || advanced,
+        rows: event_rows,
+        start_total: (!event_rows_overflow).then_some(start_total).flatten(),
+        rows_overflow: event_rows_overflow,
     })
 }
 
@@ -3700,6 +3879,102 @@ mod haider_projection_tests {
         )
     }
 
+    fn haider_projection_test_frame(
+        session_id: &str,
+        start_total: i64,
+        rows: Vec<SessionProjectionRow>,
+    ) -> HaiderProjectionFrame {
+        HaiderProjectionFrame {
+            session_id: session_id.to_string(),
+            from_seq: rows.first().map(|row| row.seq),
+            appended: rows.len(),
+            total_rows: start_total + i64::try_from(rows.len()).unwrap(),
+            live_tail: None,
+            tail_changed: false,
+            covered_through_seq: None,
+            head_seq: None,
+            pipe_max_seq: None,
+            caught_up: true,
+            sync_changed: false,
+            start_total: (!rows.is_empty()).then_some(start_total),
+            rows,
+            rows_overflow: false,
+        }
+    }
+
+    #[test]
+    fn haider_projection_emits_immediately_after_idle_then_batches_a_burst() {
+        let now = Instant::now();
+        assert!(haider_projection_should_emit_immediately(None, now));
+        assert!(!haider_projection_should_emit_immediately(
+            Some(now),
+            now + HAIDER_PROJECTION_IMMEDIATE_IDLE - Duration::from_millis(1),
+        ));
+        assert!(haider_projection_should_emit_immediately(
+            Some(now),
+            now + HAIDER_PROJECTION_IMMEDIATE_IDLE + Duration::from_millis(1),
+        ));
+        assert_eq!(HAIDER_PROJECTION_FRAME_TIME, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn haider_projection_merged_event_rows_keep_order_and_start_total() {
+        let session_id = "projection-coalesce";
+        let mut first = haider_projection_test_frame(
+            session_id,
+            7,
+            vec![haider_projection_test_row(session_id, 8, 0)],
+        );
+        let next = haider_projection_test_frame(
+            session_id,
+            8,
+            vec![haider_projection_test_row(session_id, 9, 0)],
+        );
+        haider_projection_merge_frame(&mut first, next);
+        assert_eq!(first.appended, 2);
+        assert_eq!(first.start_total, Some(7));
+        assert_eq!(
+            first.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+    }
+
+    #[test]
+    fn haider_projection_merged_event_omits_rows_above_limit() {
+        let session_id = "projection-overflow";
+        let mut first = haider_projection_test_frame(
+            session_id,
+            0,
+            (0..HAIDER_PROJECTION_EVENT_ROWS_LIMIT)
+                .map(|seq| haider_projection_test_row(session_id, seq as i64, 0))
+                .collect(),
+        );
+        let next = haider_projection_test_frame(
+            session_id,
+            HAIDER_PROJECTION_EVENT_ROWS_LIMIT as i64,
+            vec![haider_projection_test_row(
+                session_id,
+                HAIDER_PROJECTION_EVENT_ROWS_LIMIT as i64,
+                0,
+            )],
+        );
+        haider_projection_merge_frame(&mut first, next);
+        assert!(first.rows_overflow);
+        assert!(first.rows.is_empty());
+        assert_eq!(first.start_total, None);
+    }
+
+    #[test]
+    fn haider_projection_pipe_dir_short_circuits_route_probe() {
+        let status = json!({"features":["pipe_native_v2"], "pipe_dir":"/tmp/haider-pipes"});
+        let route = haider_projection_pipe_route_from_status(&status, "provider-1").unwrap();
+        assert_eq!(
+            route.path,
+            PathBuf::from("/tmp/haider-pipes/provider-1.pipe")
+        );
+        assert!(haider_projection_pipe_route_from_status(&json!({}), "provider-1").is_none());
+    }
+
     #[test]
     fn haider_projection_pipe_route_cache_reuses_and_invalidates_missing_path() {
         let root = std::env::temp_dir().join(format!(
@@ -4191,7 +4466,7 @@ mod haider_projection_tests {
             haider_projection_test_row(&test_session.session_id, 3, 1),
         ];
         for (rows, expected) in [(&first[..], 2_i64), (&second[..], 4_i64)] {
-            let (_, total) = haider_projection_persist_rows(rows).unwrap();
+            let total = haider_projection_persist_rows(rows).unwrap().total_rows;
             let ground_truth = haider_projection_with_database(|connection| {
                 connection
                     .query_row(
@@ -4214,8 +4489,9 @@ mod haider_projection_tests {
             generation: 1,
             ..HaiderProjectionPipeCursor::default()
         };
-        let (_, total) =
-            haider_projection_persist_batch(&test_session.session_id, &[], Some(&cursor)).unwrap();
+        let total = haider_projection_persist_batch(&test_session.session_id, &[], Some(&cursor))
+            .unwrap()
+            .total_rows;
         assert_eq!(total, 4);
     }
 
@@ -4235,7 +4511,7 @@ mod haider_projection_tests {
         .into_iter()
         .map(|(seq, ordinal)| haider_projection_test_row(&test_session.session_id, seq, ordinal))
         .collect::<Vec<_>>();
-        let (_, total_rows) = haider_projection_persist_rows(&rows).unwrap();
+        let total_rows = haider_projection_persist_rows(&rows).unwrap().total_rows;
         for (start_index, count) in [(0, 3), (2, 4), (5, 10), (7, 1), (8, 2), (3, 0)] {
             let (offset_rows, keyset_rows) = haider_projection_with_database(|connection| {
                 let offset_rows = connection
@@ -4365,6 +4641,40 @@ mod haider_projection_tests {
         assert_eq!((rows[1].seq, rows[1].role.as_str()), (19, "assistant"));
         assert_eq!((rows[2].seq, rows[2].kind.as_str()), (20, "tool"));
         assert_eq!(rows[2].text, "read src/parser.rs");
+    }
+
+    #[test]
+    fn haider_projection_skips_pipe_compat_records_once_items_stream() {
+        // The 0.0.935 live pipe mirrors bare export-shaped compat records
+        // alongside the enveloped item stream: the final answer repeats at a
+        // fresh seq and every turn start adds an empty assistant marker
+        // (observed live: seqs 14/45/99 empty + 295/296 duplicate answer).
+        // The item stream is canonical once seen; compat records land nothing.
+        let user_record =
+            json!({"role":"user", "text":"what?", "at_ms":1700000000004_i64, "seq":4, "ordinal":0});
+        let completed = json!({
+            "seq": 295,
+            "committed_at_ms": 1700000000295_i64,
+            "payload": {"type":"item", "event":"completed", "item_id":"item-9",
+                "item":{"item":"agent_message", "text":"Possibly the answer."}}
+        });
+        let empty_marker =
+            json!({"role":"assistant", "text":"", "at_ms":1700000000162_i64, "seq":296, "ordinal":0});
+        let duplicate = json!({"role":"assistant", "text":"Possibly the answer.",
+            "at_ms":1700000000296_i64, "seq":297, "ordinal":0});
+        let mut state = HaiderProjectionFoldState::default();
+        let mut rows = Vec::new();
+        for value in [&user_record, &completed, &empty_marker, &duplicate] {
+            rows.extend(
+                haider_projection_fold_value_locked(&mut state, "local-session", value).rows,
+            );
+        }
+        // Pre-item role records fold (cold export / pre-item pipes); once the
+        // item stream is live, compat records land nothing.
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].seq, rows[0].role.as_str()), (4, "user"));
+        assert_eq!((rows[1].seq, rows[1].text.as_str()), (295, "Possibly the answer."));
+        assert!(state.saw_item_stream);
     }
 
     #[test]

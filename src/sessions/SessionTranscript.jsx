@@ -190,8 +190,27 @@ function dayLabel(atMs) {
 function buildBlocks(rows) {
   const blocks = [];
   let lastDay = "";
+  let lastAssistantText = null;
   for (const row of rows) {
     if (row.kind === "usage") continue;
+    /* Daemon compat records leave empty assistant turn-markers and duplicate
+       final answers in older projections: an empty message row renders as a
+       blank spacer that also splits tool clusters, and an adjacent identical
+       assistant message is the same answer at a second seq. Skip both. */
+    if (row.kind === "message") {
+      const text = String(row.text || "").trim();
+      if (!text) continue;
+      if (row.role === "assistant") {
+        if (text === lastAssistantText) continue;
+        lastAssistantText = text;
+      } else {
+        lastAssistantText = null;
+      }
+    } else {
+      /* Strictly adjacent-only: any visible non-message row (tool, error)
+         between two identical assistant texts means both are legitimate. */
+      lastAssistantText = null;
+    }
     if (Number.isFinite(row.at_ms) && row.at_ms > 0) {
       const day = new Date(row.at_ms).toDateString();
       if (day !== lastDay) {
@@ -358,6 +377,13 @@ export default function SessionTranscript({ session, runStatus = "", onSyncingCh
   const heightsRef = useRef(new Map()); // seq -> measured px
   const stickBottomRef = useRef(true);
   const fetchInFlightRef = useRef(false);
+  /* #11 consumer: the appended event can carry the rows themselves — track
+     where our window ends so a contiguous batch appends in place (no 80-row
+     refetch); anything non-contiguous falls back to the fetch. */
+  const windowEndRef = useRef(0);
+  useEffect(() => {
+    windowEndRef.current = windowState.start + windowState.rows.length;
+  }, [windowState]);
 
   const fetchWindow = useCallback(async (startIndex) => {
     if (!sessionId || fetchInFlightRef.current) {
@@ -423,11 +449,33 @@ export default function SessionTranscript({ session, runStatus = "", onSyncingCh
       if (disposed || payload.session_id !== sessionId) {
         return;
       }
-      setTotalRows(Number(payload.total_rows) || 0);
+      const nextTotal = Number(payload.total_rows) || 0;
+      setTotalRows(nextTotal);
       setLiveTail(payload.live_tail || null);
       setLoadState("ready");
       if (stickBottomRef.current) {
-        void fetchWindow(Math.max(0, (Number(payload.total_rows) || 0) - WINDOW_FETCH_SIZE));
+        const rows = Array.isArray(payload.rows) ? payload.rows : null;
+        const startTotal = Number.isFinite(Number(payload.start_total))
+          && payload.start_total !== null && payload.start_total !== undefined
+          ? Number(payload.start_total)
+          : null;
+        if (rows && rows.length && startTotal === windowEndRef.current) {
+          /* Contiguous push: append in place. Dedupe by identity in case a
+             refetch raced this event; trim the front to the window size. */
+          windowEndRef.current = startTotal + rows.length;
+          setWindowState((current) => {
+            const have = new Set(current.rows.map((row) => `${row.seq}:${row.ordinal || 0}`));
+            const fresh = rows.filter((row) => !have.has(`${row.seq}:${row.ordinal || 0}`));
+            const merged = [...current.rows, ...fresh];
+            const overflow = Math.max(0, merged.length - WINDOW_FETCH_SIZE);
+            return {
+              start: current.start + overflow,
+              rows: overflow ? merged.slice(overflow) : merged,
+            };
+          });
+        } else {
+          void fetchWindow(Math.max(0, nextTotal - WINDOW_FETCH_SIZE));
+        }
       }
     }).then((fn) => {
       if (disposed) fn();
@@ -632,30 +680,31 @@ const RowBody = styled.div`
 
 /* Assistant messages render as markdown — readable measure, calm rhythm. */
 const MarkdownBody = styled.div`
-  color: var(--forge-text);
-  font-size: 13px;
-  line-height: 1.65;
+  color: var(--forge-chat-text);
+  font-size: 14px;
+  line-height: 1.7;
   overflow-wrap: anywhere;
 
   > *:first-child { margin-top: 0; }
   > *:last-child { margin-bottom: 0; }
 
-  p { margin: 0 0 10px; }
-  ul, ol { margin: 6px 0 12px; padding-left: 22px; }
-  li { margin: 3px 0; }
+  p { margin: 0 0 12px; }
+  ul, ol { margin: 8px 0 14px; padding-left: 22px; }
+  li { margin: 5px 0; }
   li > p { margin: 0; }
 
   h1, h2, h3, h4, h5, h6 {
-    margin: 16px 0 7px;
+    margin: 16px 0 8px;
+    color: var(--forge-text);
     font-weight: 700;
     line-height: 1.3;
   }
-  h1 { font-size: 16px; }
-  h2 { font-size: 15px; }
-  h3 { font-size: 14px; }
-  h4, h5, h6 { font-size: 13px; }
+  h1 { font-size: 17px; }
+  h2 { font-size: 16px; }
+  h3 { font-size: 15px; }
+  h4, h5, h6 { font-size: 14px; }
 
-  strong { font-weight: 680; }
+  strong { color: var(--forge-text); font-weight: 660; }
 
   code {
     padding: 1px 5px;
@@ -720,9 +769,9 @@ const MarkdownBody = styled.div`
 `;
 
 const RowText = styled.div`
-  color: var(--forge-text);
-  font-size: 12.5px;
-  line-height: 1.55;
+  color: var(--forge-chat-text);
+  font-size: 13.5px;
+  line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 `;

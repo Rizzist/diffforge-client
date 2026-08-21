@@ -626,7 +626,7 @@ export default function SessionSurface({
     } finally {
       submitBusyRef.current = false;
     }
-  }, [onDraftMaterialized, setComposerPastesFor, setComposerText]);
+  }, [composerPrefs, onDraftMaterialized, setComposerPastesFor, setComposerText]);
 
   const submitIntoSession = useCallback(async (session, prompt, attachments) => {
     /* Clearing is SURFACE-owned and generation-guarded: a completion that

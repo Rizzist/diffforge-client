@@ -1661,7 +1661,6 @@ struct TerminalInputGate {
     cursor_position: usize,
 }
 
-
 /// Daemon-only diagnostic tap wrapped around an agent pane's PTY writer:
 /// hex-dumps every byte that enters the agent's stdin into journald. Added
 /// for the BYOC claude exit-1 investigation — the launch envelope was fully
@@ -5511,7 +5510,6 @@ fn note_main_window_minimize_requested() -> Result<(), String> {
 
     Ok(())
 }
-
 
 #[cfg(target_os = "macos")]
 fn main_window_needs_attention(app: &AppHandle) -> bool {

@@ -2,12 +2,15 @@
 //!
 //! This module deliberately mirrors the stable JSON subset of `haider-rpc`
 //! instead of depending on the Haider workspace. Unix-domain frames are a
-//! four-byte big-endian body length followed by one JSON `WireFrame`.
+//! four-byte big-endian body length followed by one negotiated `WireFrame`.
 
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -408,6 +411,24 @@ struct VersionedFrame {
     frame: WireFrame,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireEncoding {
+    Json,
+    Msgpack,
+}
+
+impl WireEncoding {
+    fn from_welcome(welcome: &Welcome) -> std::io::Result<Self> {
+        match welcome.encoding.as_deref().unwrap_or("json") {
+            "json" => Ok(Self::Json),
+            "msgpack" => Ok(Self::Msgpack),
+            encoding => Err(invalid_data(format!(
+                "daemon selected unsupported Haider RPC encoding {encoding}"
+            ))),
+        }
+    }
+}
+
 fn versioned(frame: WireFrame) -> VersionedFrame {
     VersionedFrame {
         version: WIRE_PROTOCOL_VERSION,
@@ -416,7 +437,24 @@ fn versioned(frame: WireFrame) -> VersionedFrame {
 }
 
 fn encode_framed(frame: &WireFrame, frame_limit: usize) -> std::io::Result<Vec<u8>> {
-    let body = serde_json::to_vec(&versioned(frame.clone())).map_err(invalid_data)?;
+    encode_framed_with_encoding(frame, frame_limit, WireEncoding::Json)
+}
+
+fn encode_framed_with_encoding(
+    frame: &WireFrame,
+    frame_limit: usize,
+    encoding: WireEncoding,
+) -> std::io::Result<Vec<u8>> {
+    let body = match encoding {
+        WireEncoding::Json => {
+            serde_json::to_vec(&versioned(frame.clone())).map_err(invalid_data)?
+        }
+        // The daemon's wire_msgpack_v1 uses named struct maps. Positional
+        // tuples would make additive fields a wire break, unlike JSON.
+        WireEncoding::Msgpack => {
+            rmp_serde::to_vec_named(&versioned(frame.clone())).map_err(invalid_data)?
+        }
+    };
     if body.is_empty() || body.len() > frame_limit || body.len() > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -430,13 +468,24 @@ fn encode_framed(frame: &WireFrame, frame_limit: usize) -> std::io::Result<Vec<u
 }
 
 fn decode_body(body: &[u8], frame_limit: usize) -> std::io::Result<WireFrame> {
+    decode_body_with_encoding(body, frame_limit, WireEncoding::Json)
+}
+
+fn decode_body_with_encoding(
+    body: &[u8],
+    frame_limit: usize,
+    encoding: WireEncoding,
+) -> std::io::Result<WireFrame> {
     if body.is_empty() || body.len() > frame_limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid Haider RPC frame length",
         ));
     }
-    let decoded: VersionedFrame = serde_json::from_slice(body).map_err(invalid_data)?;
+    let decoded: VersionedFrame = match encoding {
+        WireEncoding::Json => serde_json::from_slice(body).map_err(invalid_data)?,
+        WireEncoding::Msgpack => rmp_serde::from_slice(body).map_err(invalid_data)?,
+    };
     if decoded.version != WIRE_PROTOCOL_VERSION {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -447,6 +496,42 @@ fn decode_body(body: &[u8], frame_limit: usize) -> std::io::Result<WireFrame> {
         ));
     }
     Ok(decoded.frame)
+}
+
+/// Cancellation-safe UDS frame extraction. Reads append bytes here before
+/// decoding, so a competing `select!` branch can never discard a prefix or a
+/// partially read body.
+#[derive(Debug, Default)]
+struct StreamingFrameDecoder {
+    buffered: Vec<u8>,
+}
+
+impl StreamingFrameDecoder {
+    fn push(&mut self, bytes: &[u8]) {
+        self.buffered.extend_from_slice(bytes);
+    }
+
+    fn next(
+        &mut self,
+        frame_limit: usize,
+        encoding: WireEncoding,
+    ) -> std::io::Result<Option<WireFrame>> {
+        if self.buffered.len() < 4 {
+            return Ok(None);
+        }
+        let body_len =
+            u32::from_be_bytes(self.buffered[..4].try_into().expect("prefix length")) as usize;
+        if body_len == 0 || body_len > frame_limit {
+            return Err(invalid_data("invalid Haider UDS length prefix"));
+        }
+        let frame_len = 4usize.saturating_add(body_len);
+        if self.buffered.len() < frame_len {
+            return Ok(None);
+        }
+        let body = self.buffered[4..frame_len].to_vec();
+        self.buffered.drain(..frame_len);
+        decode_body_with_encoding(&body, frame_limit, encoding).map(Some)
+    }
 }
 
 fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
@@ -463,8 +548,9 @@ fn hello_frame() -> WireFrame {
         client_kind: ClientKind::Gui,
         capabilities_requested: BTreeSet::from([Capability::View, Capability::Control]),
         max_receive_frame: DEFAULT_FRAME_LIMIT as u32,
-        // Empty is encoded by omission and keeps the post-handshake stream JSON.
-        encodings: Vec::new(),
+        // The pre-negotiation Hello itself remains JSON. An older daemon that
+        // ignores this additive field keeps its current JSON stream.
+        encodings: vec!["msgpack".to_string()],
     })
 }
 
@@ -552,6 +638,7 @@ impl RevisionGate {
 #[derive(Debug, Clone, Default)]
 struct ConnectionSnapshot {
     connected: bool,
+    roster_watch_active: bool,
     features: BTreeSet<String>,
     capabilities_granted: BTreeSet<Capability>,
     frame_limit: usize,
@@ -625,6 +712,9 @@ struct ActorHandle {
 
 #[cfg(unix)]
 static ACTOR: OnceLock<ActorHandle> = OnceLock::new();
+
+#[cfg(unix)]
+static ROSTER_WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 fn actor_handle() -> &'static ActorHandle {
@@ -761,6 +851,20 @@ pub(crate) fn roster_watch_start(app: AppHandle) {
     }
     #[cfg(not(unix))]
     let _ = app;
+}
+
+/// A full CLI reconcile may be relaxed only after the subscribed roster feed
+/// was successfully installed on a live socket.
+pub(crate) fn roster_watch_healthy() -> bool {
+    #[cfg(unix)]
+    {
+        return ACTOR.get().is_some_and(|handle| {
+            let connection = handle.connection.borrow();
+            connection.connected && ROSTER_WATCH_ACTIVE.load(Ordering::Acquire)
+        });
+    }
+    #[cfg(not(unix))]
+    false
 }
 
 #[cfg(unix)]
@@ -1249,23 +1353,39 @@ async fn run_actor(
         };
 
         reconnect_delay = Duration::from_millis(100);
-        let snapshot = ConnectionSnapshot {
+        let mut snapshot = ConnectionSnapshot {
             connected: true,
+            roster_watch_active: false,
             features: welcome.features.clone(),
             capabilities_granted: welcome.capabilities_granted.clone(),
             frame_limit: (welcome.frame_limit as usize).min(DEFAULT_FRAME_LIMIT),
         };
-        let _ = connection_tx.send(snapshot.clone());
-
+        ROSTER_WATCH_ACTIVE.store(false, Ordering::Release);
+        let encoding = match WireEncoding::from_welcome(&welcome) {
+            Ok(encoding) => encoding,
+            Err(_) => {
+                publish_disconnected(&connection_tx);
+                continue;
+            }
+        };
         let mut next_request = 1_u64;
         let mut setup_failed = false;
-        if roster_app.is_some()
-            && snapshot.can_watch_roster()
-            && send_roster_watch(&mut stream, snapshot.frame_limit, &mut next_request)
-                .await
-                .is_err()
-        {
-            setup_failed = true;
+        if roster_app.is_some() && snapshot.can_watch_roster() {
+            match send_roster_watch(
+                &mut stream,
+                snapshot.frame_limit,
+                encoding,
+                &mut next_request,
+            )
+            .await
+            {
+                // Health (ROSTER_WATCH_ACTIVE) is NOT asserted on write:
+                // a daemon-rejected watch would otherwise stretch bridge
+                // reconciliation to 30min with no live data. It flips true
+                // on the first SessionRosterDelta — proof data flows.
+                Ok(()) => snapshot.roster_watch_active = true,
+                Err(_) => setup_failed = true,
+            }
         }
         if snapshot.can_watch_surfaces() {
             let session_ids = subscriptions.keys().cloned().collect::<Vec<_>>();
@@ -1273,6 +1393,7 @@ async fn run_actor(
                 if send_surface_watch(
                     &mut stream,
                     snapshot.frame_limit,
+                    encoding,
                     &mut next_request,
                     session_id,
                 )
@@ -1285,10 +1406,13 @@ async fn run_actor(
             }
         }
 
+        let _ = connection_tx.send(snapshot.clone());
+
         if !setup_failed {
             run_connected(
                 &mut stream,
                 snapshot,
+                encoding,
                 &mut commands,
                 &mut subscriptions,
                 &mut last_published_revision,
@@ -1305,6 +1429,8 @@ async fn run_actor(
 fn publish_disconnected(connection_tx: &watch::Sender<ConnectionSnapshot>) {
     let mut snapshot = connection_tx.borrow().clone();
     snapshot.connected = false;
+    snapshot.roster_watch_active = false;
+    ROSTER_WATCH_ACTIVE.store(false, Ordering::Release);
     let _ = connection_tx.send(snapshot);
 }
 
@@ -1366,6 +1492,7 @@ fn apply_disconnected_command(
 async fn run_connected(
     stream: &mut UnixStream,
     connection: ConnectionSnapshot,
+    encoding: WireEncoding,
     commands: &mut mpsc::UnboundedReceiver<ActorCommand>,
     subscriptions: &mut HashMap<String, Subscription>,
     last_published_revision: &mut HashMap<String, u64>,
@@ -1377,91 +1504,118 @@ async fn run_connected(
     let mut ping_nonce = 1_u64;
     let mut unacked_pings: VecDeque<(u64, Instant)> = VecDeque::new();
     let mut pending_requests: HashMap<String, RpcReply> = HashMap::new();
+    let mut decoder = StreamingFrameDecoder::default();
+    let mut scratch = [0_u8; 16 * 1024];
 
     loop {
-        tokio::select! {
-            command = commands.recv() => {
-                let Some(command) = command else { return; };
-                let keep_connection = apply_connected_command(
-                    command,
-                    stream,
-                    &connection,
-                    subscriptions,
-                    last_published_revision,
-                    roster_app,
-                    &mut pending_requests,
-                    next_request,
-                ).await;
-                if !keep_connection {
-                    return;
-                }
-            }
-            frame = read_frame(stream, connection.frame_limit) => {
-                let Ok(frame) = frame else { return; };
-                match frame {
-                    WireFrame::Response { request_id, body } => {
-                        if let ResponseBody::SessionSurfaceWatching {
-                            session_id,
-                            input,
-                            status,
-                        } = body.clone()
-                        {
-                            emit_surface(subscriptions, &connection, session_id, input, status);
-                        }
-                        if let Some(reply) = pending_requests.remove(&request_id) {
-                            let _ = reply.send(Some(response_result(body)));
-                        }
-                    }
-                    WireFrame::SessionRosterDelta { summaries } => {
-                        if let Some(app) = roster_app.as_ref() {
-                            super::haider_bridge_reconcile_from_summaries(app.clone(), summaries);
-                        }
-                    }
-                    WireFrame::SessionSurfaceDelta { session_id, input, status } => {
-                        emit_surface(subscriptions, &connection, session_id, input, status);
-                    }
-                    WireFrame::Ping { nonce } => {
-                        if write_frame(stream, &WireFrame::Pong { nonce }, connection.frame_limit)
-                            .await
-                            .is_err()
-                        {
+        let frame = match decoder.next(connection.frame_limit, encoding) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                tokio::select! {
+                    command = commands.recv() => {
+                        let Some(command) = command else { return; };
+                        let keep_connection = apply_connected_command(
+                            command,
+                            stream,
+                            &connection,
+                            encoding,
+                            subscriptions,
+                            last_published_revision,
+                            roster_app,
+                            &mut pending_requests,
+                            next_request,
+                        ).await;
+                        if !keep_connection {
                             return;
                         }
                     }
-                    WireFrame::Pong { nonce } => {
-                        if let Some(position) = unacked_pings
-                            .iter()
-                            .position(|(outstanding, _)| *outstanding == nonce)
-                        {
-                            for _ in 0..=position {
-                                unacked_pings.pop_front();
-                            }
+                    read = stream.read(&mut scratch) => {
+                        let Ok(read) = read else { return; };
+                        if read == 0 {
+                            return;
                         }
+                        decoder.push(&scratch[..read]);
                     }
-                    WireFrame::ProtocolError(error) if error.fatal => return,
-                    _ => {}
+                    _ = heartbeat.tick() => {
+                        if unacked_pings
+                            .front()
+                            .is_some_and(|(_, sent)| sent.elapsed() >= PONG_DEADLINE)
+                        {
+                            return;
+                        }
+                        if write_frame(
+                            stream,
+                            &WireFrame::Ping { nonce: ping_nonce },
+                            connection.frame_limit,
+                            encoding,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                        unacked_pings.push_back((ping_nonce, Instant::now()));
+                        ping_nonce = ping_nonce.saturating_add(1);
+                    }
+                }
+                continue;
+            }
+            Err(_) => return,
+        };
+        // A decoded buffered frame gets priority over fresh commands and
+        // timers; it was already read from the socket and must be kept.
+        match frame {
+            WireFrame::Response { request_id, body } => {
+                if let ResponseBody::SessionSurfaceWatching {
+                    session_id,
+                    input,
+                    status,
+                } = body.clone()
+                {
+                    emit_surface(subscriptions, &connection, session_id, input, status);
+                }
+                if let Some(reply) = pending_requests.remove(&request_id) {
+                    let _ = reply.send(Some(response_result(body)));
                 }
             }
-            _ = heartbeat.tick() => {
-                if unacked_pings
-                    .front()
-                    .is_some_and(|(_, sent)| sent.elapsed() >= PONG_DEADLINE)
-                {
-                    return;
+            WireFrame::SessionRosterDelta { summaries } => {
+                ROSTER_WATCH_ACTIVE.store(true, Ordering::Release);
+                if let Some(app) = roster_app.as_ref() {
+                    super::haider_bridge_reconcile_from_summaries(app.clone(), summaries);
                 }
+            }
+            WireFrame::SessionSurfaceDelta {
+                session_id,
+                input,
+                status,
+            } => {
+                emit_surface(subscriptions, &connection, session_id, input, status);
+            }
+            WireFrame::Ping { nonce } => {
                 if write_frame(
                     stream,
-                    &WireFrame::Ping { nonce: ping_nonce },
+                    &WireFrame::Pong { nonce },
                     connection.frame_limit,
+                    encoding,
                 )
                 .await
                 .is_err()
                 {
                     return;
                 }
-                unacked_pings.push_back((ping_nonce, Instant::now()));
-                ping_nonce = ping_nonce.saturating_add(1);
             }
+            WireFrame::Pong { nonce } => {
+                if let Some(position) = unacked_pings
+                    .iter()
+                    .position(|(outstanding, _)| *outstanding == nonce)
+                {
+                    for _ in 0..=position {
+                        unacked_pings.pop_front();
+                    }
+                }
+            }
+            WireFrame::ProtocolError(error) if error.fatal => return,
+            _ => {}
         }
     }
 }
@@ -1471,6 +1625,7 @@ async fn apply_connected_command(
     command: ActorCommand,
     stream: &mut UnixStream,
     connection: &ConnectionSnapshot,
+    encoding: WireEncoding,
     subscriptions: &mut HashMap<String, Subscription>,
     last_published_revision: &mut HashMap<String, u64>,
     roster_app: &mut Option<AppHandle>,
@@ -1480,10 +1635,14 @@ async fn apply_connected_command(
     match command {
         ActorCommand::RosterAttach { app } => {
             *roster_app = Some(app);
-            !connection.can_watch_roster()
-                || send_roster_watch(stream, connection.frame_limit, next_request)
+            let active = connection.can_watch_roster();
+            let written = !active
+                || send_roster_watch(stream, connection.frame_limit, encoding, next_request)
                     .await
-                    .is_ok()
+                    .is_ok();
+            // Health stays pending until the first SessionRosterDelta lands.
+            ROSTER_WATCH_ACTIVE.store(false, Ordering::Release);
+            written
         }
         ActorCommand::RpcRequest {
             body,
@@ -1513,7 +1672,7 @@ async fn apply_connected_command(
                 request_id: request_id.clone(),
                 body,
             };
-            if write_frame(stream, &request, connection.frame_limit)
+            if write_frame(stream, &request, connection.frame_limit, encoding)
                 .await
                 .is_err()
             {
@@ -1537,9 +1696,15 @@ async fn apply_connected_command(
                 });
             let active = connection.can_watch_surfaces();
             let written = !active
-                || send_surface_watch(stream, connection.frame_limit, next_request, session_id)
-                    .await
-                    .is_ok();
+                || send_surface_watch(
+                    stream,
+                    connection.frame_limit,
+                    encoding,
+                    next_request,
+                    session_id,
+                )
+                .await
+                .is_ok();
             let _ = reply.send(SurfaceCommandStatus::from_connection(
                 connection, active, written,
             ));
@@ -1577,7 +1742,7 @@ async fn apply_connected_command(
                         status: None,
                     },
                 };
-                write_frame(stream, &request, connection.frame_limit)
+                write_frame(stream, &request, connection.frame_limit, encoding)
                     .await
                     .is_ok()
             } else {
@@ -1647,19 +1812,21 @@ fn response_result(body: ResponseBody) -> Result<ResponseBody, String> {
 async fn send_roster_watch(
     stream: &mut UnixStream,
     frame_limit: usize,
+    encoding: WireEncoding,
     next_request: &mut u64,
 ) -> std::io::Result<()> {
     let request = WireFrame::Request {
         request_id: request_id(next_request),
         body: RequestBody::SessionListWatch {},
     };
-    write_frame(stream, &request, frame_limit).await
+    write_frame(stream, &request, frame_limit, encoding).await
 }
 
 #[cfg(unix)]
 async fn send_surface_watch(
     stream: &mut UnixStream,
     frame_limit: usize,
+    encoding: WireEncoding,
     next_request: &mut u64,
     session_id: String,
 ) -> std::io::Result<()> {
@@ -1667,7 +1834,7 @@ async fn send_surface_watch(
         request_id: request_id(next_request),
         body: RequestBody::SessionSurfaceWatch { session_id },
     };
-    write_frame(stream, &request, frame_limit).await
+    write_frame(stream, &request, frame_limit, encoding).await
 }
 
 #[cfg(unix)]
@@ -1680,7 +1847,13 @@ fn request_id(next_request: &mut u64) -> String {
 #[cfg(unix)]
 async fn connect_and_handshake(path: &Path) -> std::io::Result<(UnixStream, Welcome)> {
     let mut stream = UnixStream::connect(path).await?;
-    write_frame(&mut stream, &hello_frame(), DEFAULT_FRAME_LIMIT).await?;
+    write_frame(
+        &mut stream,
+        &hello_frame(),
+        DEFAULT_FRAME_LIMIT,
+        WireEncoding::Json,
+    )
+    .await?;
     let welcome = match read_frame(&mut stream, DEFAULT_FRAME_LIMIT).await? {
         WireFrame::Welcome(welcome) => welcome,
         WireFrame::ProtocolError(error) => {
@@ -1694,15 +1867,7 @@ async fn connect_and_handshake(path: &Path) -> std::io::Result<(UnixStream, Welc
     if welcome.protocol != WIRE_PROTOCOL_VERSION || welcome.frame_limit == 0 {
         return Err(invalid_data("invalid Haider Welcome negotiation"));
     }
-    if welcome
-        .encoding
-        .as_deref()
-        .is_some_and(|encoding| encoding != "json")
-    {
-        return Err(invalid_data(
-            "daemon selected a non-JSON encoding that the ADE did not offer",
-        ));
-    }
+    WireEncoding::from_welcome(&welcome)?;
     Ok((stream, welcome))
 }
 
@@ -1711,8 +1876,9 @@ async fn write_frame(
     stream: &mut UnixStream,
     frame: &WireFrame,
     frame_limit: usize,
+    encoding: WireEncoding,
 ) -> std::io::Result<()> {
-    let bytes = encode_framed(frame, frame_limit)?;
+    let bytes = encode_framed_with_encoding(frame, frame_limit, encoding)?;
     stream.write_all(&bytes).await
 }
 
@@ -2057,7 +2223,7 @@ mod tests {
             hello_json["capabilities_requested"],
             serde_json::json!(["view", "control"])
         );
-        assert!(hello_json.get("encodings").is_none());
+        assert_eq!(hello_json["encodings"], serde_json::json!(["msgpack"]));
 
         let welcome = WireFrame::Welcome(Welcome {
             protocol: 1,
@@ -2078,6 +2244,115 @@ mod tests {
         assert_eq!(
             decode_body(&framed[4..], DEFAULT_FRAME_LIMIT).expect("decode Welcome"),
             welcome
+        );
+    }
+
+    #[test]
+    fn msgpack_negotiation_and_json_fallback_are_tolerant() {
+        let hello = hello_frame();
+        let hello_json = serde_json::to_value(versioned(hello)).unwrap();
+        assert_eq!(hello_json["encodings"], serde_json::json!(["msgpack"]));
+
+        let mut welcome = Welcome {
+            protocol: 1,
+            instance_id: "daemon-test".to_owned(),
+            daemon_generation: 7,
+            frame_limit: 1_048_576,
+            profile_id: String::new(),
+            daemon_version: String::new(),
+            lifecycle_phase: "ready".to_owned(),
+            capabilities_granted: BTreeSet::new(),
+            features: BTreeSet::new(),
+            encoding: Some("msgpack".to_owned()),
+        };
+        assert_eq!(
+            WireEncoding::from_welcome(&welcome).unwrap(),
+            WireEncoding::Msgpack
+        );
+        welcome.encoding = None;
+        assert_eq!(
+            WireEncoding::from_welcome(&welcome).unwrap(),
+            WireEncoding::Json
+        );
+    }
+
+    #[test]
+    fn msgpack_frames_round_trip_as_named_maps_and_ignore_extra_fields() {
+        let frame = WireFrame::Request {
+            request_id: "req-msgpack".to_owned(),
+            body: RequestBody::SessionSurfacePublish {
+                session_id: "session-1".to_owned(),
+                input: Some(SurfaceInputPublishWire {
+                    text: "hello".to_owned(),
+                    revision: 3,
+                }),
+                status: None,
+            },
+        };
+        let json = encode_framed(&frame, DEFAULT_FRAME_LIMIT).unwrap();
+        let msgpack =
+            encode_framed_with_encoding(&frame, DEFAULT_FRAME_LIMIT, WireEncoding::Msgpack)
+                .unwrap();
+        assert_eq!(
+            decode_body(&json[4..], DEFAULT_FRAME_LIMIT).unwrap(),
+            decode_body_with_encoding(&msgpack[4..], DEFAULT_FRAME_LIMIT, WireEncoding::Msgpack)
+                .unwrap()
+        );
+
+        let mut future = serde_json::to_value(versioned(frame.clone())).unwrap();
+        future
+            .as_object_mut()
+            .unwrap()
+            .insert("future_field".to_owned(), serde_json::json!({"safe": true}));
+        let future = rmp_serde::to_vec_named(&future).unwrap();
+        assert_eq!(
+            decode_body_with_encoding(&future, DEFAULT_FRAME_LIMIT, WireEncoding::Msgpack).unwrap(),
+            frame
+        );
+    }
+
+    #[test]
+    fn streaming_decoder_emits_a_partial_frame_once() {
+        let frame = WireFrame::Ping { nonce: 42 };
+        let bytes = encode_framed(&frame, DEFAULT_FRAME_LIMIT).unwrap();
+        let mut decoder = StreamingFrameDecoder::default();
+        decoder.push(&bytes[..3]);
+        assert!(decoder
+            .next(DEFAULT_FRAME_LIMIT, WireEncoding::Json)
+            .unwrap()
+            .is_none());
+        decoder.push(&bytes[3..]);
+        assert_eq!(
+            decoder
+                .next(DEFAULT_FRAME_LIMIT, WireEncoding::Json)
+                .unwrap(),
+            Some(frame)
+        );
+        assert!(decoder
+            .next(DEFAULT_FRAME_LIMIT, WireEncoding::Json)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn streaming_decoder_keeps_bytes_across_cancelled_read_iterations() {
+        let frame = WireFrame::Pong { nonce: 99 };
+        let bytes = encode_framed_with_encoding(&frame, DEFAULT_FRAME_LIMIT, WireEncoding::Msgpack)
+            .unwrap();
+        let mut decoder = StreamingFrameDecoder::default();
+        // The first chunk stands in for a read completed before another
+        // select! branch wins. The owned decoder retains it for the retry.
+        decoder.push(&bytes[..6]);
+        assert!(decoder
+            .next(DEFAULT_FRAME_LIMIT, WireEncoding::Msgpack)
+            .unwrap()
+            .is_none());
+        decoder.push(&bytes[6..]);
+        assert_eq!(
+            decoder
+                .next(DEFAULT_FRAME_LIMIT, WireEncoding::Msgpack)
+                .unwrap(),
+            Some(frame)
         );
     }
 

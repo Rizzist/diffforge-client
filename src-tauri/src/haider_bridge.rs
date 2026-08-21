@@ -1,6 +1,7 @@
 const HAIDER_BRIDGE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const HAIDER_BRIDGE_INITIAL_SYNC_DELAY: Duration = Duration::from_secs(3);
 const HAIDER_BRIDGE_FULL_RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const HAIDER_BRIDGE_WATCH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const HAIDER_BRIDGE_MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 const HAIDER_BRIDGE_GHOST_MAX_AGE_MS: i64 = 10 * 60 * 1_000;
 const HAIDER_LIBRARY_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -13,6 +14,8 @@ struct HaiderBridgeSession {
     provider: Option<String>,
     cwd: Option<PathBuf>,
     state_raw: Option<String>,
+    effort: Option<String>,
+    fast: Option<bool>,
     latest_at_ms: Option<i64>,
 }
 
@@ -22,6 +25,8 @@ struct HaiderBridgeReconcileStamp {
     state_raw: Option<String>,
     title: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
+    fast: Option<bool>,
 }
 
 impl HaiderBridgeReconcileStamp {
@@ -31,6 +36,8 @@ impl HaiderBridgeReconcileStamp {
             state_raw: session.state_raw.clone(),
             title: session.title.clone(),
             model: session.model.clone(),
+            effort: session.effort.clone(),
+            fast: session.fast,
         }
     }
 }
@@ -140,6 +147,10 @@ fn haider_bridge_text(value: &Value) -> Option<String> {
         Value::Number(number) => Some(number.to_string()),
         _ => None,
     }
+}
+
+fn haider_bridge_bool(value: &Value) -> Option<bool> {
+    value.as_bool()
 }
 
 fn haider_bridge_object_value<'a>(
@@ -275,19 +286,39 @@ fn haider_bridge_parse_session(
     )
     .and_then(haider_bridge_text)
     .map(PathBuf::from);
-    let state_raw = haider_bridge_object_value(
+    let run_state = haider_bridge_object_value(
         object,
-        &[
-            "run_state",
-            "runState",
-            "state",
-            "status",
-            "session_state",
-            "sessionState",
-        ],
+        &["run_state", "runState"],
         &["runtime", "summary", "session"],
+    );
+    let state_raw = run_state
+        .or_else(|| {
+            haider_bridge_object_value(
+                object,
+                &[
+                    "state_raw",
+                    "stateRaw",
+                    "state",
+                    "status",
+                    "session_state",
+                    "sessionState",
+                ],
+                &["runtime", "summary", "session"],
+            )
+        })
+        .and_then(haider_bridge_state_raw);
+    let effort = haider_bridge_object_value(
+        object,
+        &["effort"],
+        &["runtime", "summary", "metadata", "session"],
     )
-    .and_then(haider_bridge_state_raw);
+    .and_then(haider_bridge_text);
+    let fast = haider_bridge_object_value(
+        object,
+        &["fast"],
+        &["runtime", "summary", "metadata", "session"],
+    )
+    .and_then(haider_bridge_bool);
 
     let timestamp_keys = [
         "updated_at_ms",
@@ -324,6 +355,8 @@ fn haider_bridge_parse_session(
         || provider.is_some()
         || cwd.is_some()
         || state_raw.is_some()
+        || effort.is_some()
+        || fast.is_some()
         || latest_at_ms.is_some()
         || has_lineage
         || object.contains_key("head_seq")
@@ -335,6 +368,8 @@ fn haider_bridge_parse_session(
         provider,
         cwd,
         state_raw,
+        effort,
+        fast,
         latest_at_ms,
     })
 }
@@ -656,6 +691,19 @@ fn haider_bridge_reconcile_store(
                 row_changed = true;
             }
         }
+        if let Some(effort) = session.effort.clone() {
+            if row.effort.as_deref() != Some(effort.as_str()) {
+                row.effort = Some(effort);
+                row_changed = true;
+            }
+        }
+        if let Some(fast) = session.fast {
+            let fast = i64::from(fast);
+            if row.speed_fast != Some(fast) {
+                row.speed_fast = Some(fast);
+                row_changed = true;
+            }
+        }
         if session
             .latest_at_ms
             .is_some_and(|latest_at_ms| latest_at_ms > row.latest_at_ms)
@@ -669,7 +717,7 @@ fn haider_bridge_reconcile_store(
 
         transaction
             .execute(
-                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5, state_raw = ?6, model = ?7 WHERE id = ?1",
+                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5, state_raw = ?6, model = ?7, effort = ?8, speed_fast = ?9 WHERE id = ?1",
                 rusqlite::params![
                     row.id,
                     row.title,
@@ -678,6 +726,8 @@ fn haider_bridge_reconcile_store(
                     row.status,
                     row.state_raw,
                     row.model,
+                    row.effort,
+                    row.speed_fast,
                 ],
             )
             .map_err(|error| format!("Unable to reconcile Haider session: {error}"))?;
@@ -710,8 +760,8 @@ fn haider_bridge_reconcile_store(
                 "INSERT INTO sessions (
                     id, title, slug, dir, kind, provider, provider_session_id,
                     created_at_ms, latest_at_ms, status, state_raw,
-                    first_user_message, model
-                 ) VALUES (?1, ?2, '', '', 'pinned', 'haider', ?3, ?4, ?5, ?6, ?7, '', ?8)",
+                    first_user_message, model, effort, speed_fast
+                 ) VALUES (?1, ?2, '', '', 'pinned', 'haider', ?3, ?4, ?5, ?6, ?7, '', ?8, ?9, ?10)",
                 rusqlite::params![
                     sessions_new_id(now_ms),
                     title,
@@ -721,6 +771,8 @@ fn haider_bridge_reconcile_store(
                     status,
                     state_raw,
                     session.model.clone().unwrap_or_default(),
+                    session.effort.clone(),
+                    session.fast.map(i64::from),
                 ],
             )
             .map_err(|error| format!("Unable to import Haider session: {error}"))?;
@@ -924,6 +976,14 @@ fn haider_bridge_stop() {
     HAIDER_BRIDGE_STOPPING.store(true, Ordering::Release);
 }
 
+fn haider_bridge_full_reconcile_interval(roster_watch_healthy: bool) -> Duration {
+    if roster_watch_healthy {
+        HAIDER_BRIDGE_WATCH_RECONCILE_INTERVAL
+    } else {
+        HAIDER_BRIDGE_FULL_RECONCILE_INTERVAL
+    }
+}
+
 fn haider_bridge_start(app: AppHandle) {
     if HAIDER_BRIDGE_STARTED.swap(true, Ordering::AcqRel) {
         return;
@@ -939,7 +999,10 @@ fn haider_bridge_start(app: AppHandle) {
         sleep(HAIDER_BRIDGE_INITIAL_SYNC_DELAY).await;
         while !HAIDER_BRIDGE_STOPPING.load(Ordering::Acquire) {
             haider_bridge_sync_once(&sync_app).await;
-            sleep(HAIDER_BRIDGE_FULL_RECONCILE_INTERVAL).await;
+            sleep(haider_bridge_full_reconcile_interval(
+                haider_rpc_ade::roster_watch_healthy(),
+            ))
+            .await;
         }
     });
 }
@@ -1217,8 +1280,74 @@ mod haider_bridge_tests {
                 provider: None,
                 cwd: Some(PathBuf::from("/tmp/diffforge-project/work")),
                 state_raw: Some("running_tool: cargo".to_string()),
+                effort: None,
+                fast: None,
                 latest_at_ms: Some(1_777_777_777_123),
             }]
+        );
+    }
+
+    #[test]
+    fn haider_bridge_extracts_roster_scalars_without_storing_account_alias() {
+        let with_scalars = json!({
+            "session_id": "session-935",
+            "run_state": "running",
+            "state_raw": "idle",
+            "effort": "xhigh",
+            "fast": true,
+            "account_alias": null
+        });
+        let parsed = haider_bridge_parse_session(&with_scalars, None).unwrap();
+        assert_eq!(parsed.state_raw.as_deref(), Some("running"));
+        assert_eq!(parsed.effort.as_deref(), Some("xhigh"));
+        assert_eq!(parsed.fast, Some(true));
+
+        let without_scalars = haider_bridge_parse_session(
+            &json!({"session_id":"session-934", "state_raw":"idle"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(without_scalars.effort, None);
+        assert_eq!(without_scalars.fast, None);
+    }
+
+    #[test]
+    fn haider_bridge_reconcile_stamp_tracks_effort_and_fast_changes() {
+        let session = HaiderBridgeSession {
+            id: "session-stamp".to_string(),
+            title: None,
+            model: None,
+            provider: None,
+            cwd: None,
+            state_raw: None,
+            effort: Some("medium".to_string()),
+            fast: Some(false),
+            latest_at_ms: None,
+        };
+        let baseline = HaiderBridgeReconcileStamp::new(&session, Some(4));
+        let mut effort_changed = session.clone();
+        effort_changed.effort = Some("high".to_string());
+        assert_ne!(
+            baseline,
+            HaiderBridgeReconcileStamp::new(&effort_changed, Some(4))
+        );
+        let mut fast_changed = session;
+        fast_changed.fast = Some(true);
+        assert_ne!(
+            baseline,
+            HaiderBridgeReconcileStamp::new(&fast_changed, Some(4))
+        );
+    }
+
+    #[test]
+    fn haider_bridge_reconcile_interval_follows_roster_watch_health() {
+        assert_eq!(
+            haider_bridge_full_reconcile_interval(false),
+            HAIDER_BRIDGE_FULL_RECONCILE_INTERVAL
+        );
+        assert_eq!(
+            haider_bridge_full_reconcile_interval(true),
+            HAIDER_BRIDGE_WATCH_RECONCILE_INTERVAL
         );
     }
 
@@ -1317,6 +1446,8 @@ mod haider_bridge_tests {
             provider: Some("openai".to_string()),
             cwd: None,
             state_raw: Some("idle".to_string()),
+            effort: None,
+            fast: None,
             latest_at_ms: Some(100),
         };
         let mut tracker = HaiderBridgeReconcileTracker::default();

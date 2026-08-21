@@ -110,8 +110,7 @@ const FLOATING_SURFACE_LAYOUT_CHANGED_EVENT: &str = "forge-floating-layout-chang
 const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT: &str = "forge-audio-widget-bar-hover-changed";
 const AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT: &str = "forge-audio-widget-bubble-hover-changed";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT: &str = "forge-audio-dictation-raw-result";
-const AUDIO_FORGE_DICTATION_CLEANED_RESULT_EVENT: &str =
-    "forge-audio-dictation-cleaned-result";
+const AUDIO_FORGE_DICTATION_CLEANED_RESULT_EVENT: &str = "forge-audio-dictation-cleaned-result";
 
 fn realtime_mic_holder_get(audio_state: &AudioState) -> RealtimeMicHolder {
     audio_state
@@ -582,6 +581,8 @@ struct NativePartialFinishedCapture {
 }
 
 struct NativeAudioShared {
+    generation: u64,
+    supervisor: Option<Arc<NativeAudioWorkerControl>>,
     capture_chunk_count: u64,
     capture_input_ms: f64,
     capture_peak: f32,
@@ -597,6 +598,8 @@ struct NativeAudioShared {
     partial_finished_capture: Option<NativePartialFinishedCapture>,
     realtime_audio_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     realtime_tts_gate: bool,
+    #[cfg(target_os = "macos")]
+    voice_processing_engaged: bool,
     sample_rate: u32,
     total_samples: usize,
 }
@@ -604,6 +607,8 @@ struct NativeAudioShared {
 impl NativeAudioShared {
     fn new(sample_rate: u32) -> Self {
         Self {
+            generation: 0,
+            supervisor: None,
             capture_chunk_count: 0,
             capture_input_ms: 0.0,
             capture_peak: 0.0,
@@ -619,9 +624,22 @@ impl NativeAudioShared {
             partial_finished_capture: None,
             realtime_audio_tx: None,
             realtime_tts_gate: false,
+            #[cfg(target_os = "macos")]
+            voice_processing_engaged: false,
             sample_rate,
             total_samples: 0,
         }
+    }
+
+    fn for_generation(
+        sample_rate: u32,
+        generation: u64,
+        supervisor: Arc<NativeAudioWorkerControl>,
+    ) -> Self {
+        let mut shared = Self::new(sample_rate);
+        shared.generation = generation;
+        shared.supervisor = Some(supervisor);
+        shared
     }
 }
 
@@ -680,6 +698,7 @@ impl NativeAudioStreamHandle {
 
 struct NativeAudioSession {
     app: AppHandle,
+    generation: u64,
     device_id: String,
     engine: NativeAudioEngine,
     label: String,
@@ -689,6 +708,16 @@ struct NativeAudioSession {
     _stream: NativeAudioStreamHandle,
     #[cfg(target_os = "macos")]
     voice_processing_delivery_started_at: Option<Instant>,
+    #[cfg(target_os = "macos")]
+    voice_processing_engaged: bool,
+    #[cfg(target_os = "macos")]
+    vpio_silence_cooldown_until_ms: u64,
+    #[cfg(target_os = "macos")]
+    vpio_downgrade_last_attempt_ms: u64,
+    #[cfg(target_os = "macos")]
+    default_device_last_checked_at: Instant,
+    #[cfg(target_os = "macos")]
+    default_input_device_id: Option<coreaudio::sys::AudioDeviceID>,
 }
 
 impl NativeAudioSession {
@@ -699,6 +728,7 @@ impl NativeAudioSession {
 
 enum NativeAudioCommand {
     AttachRealtime {
+        generation: u64,
         audio_tx: mpsc::UnboundedSender<Vec<u8>>,
         // When false, skip replaying buffered capture-window audio into the
         // new consumer (used when mic arbitration resumes a paused consumer:
@@ -708,9 +738,11 @@ enum NativeAudioCommand {
         response: std::sync::mpsc::Sender<Result<AudioInputMonitorStatus, String>>,
     },
     Begin {
+        generation: u64,
         response: std::sync::mpsc::Sender<Result<(), String>>,
     },
     BeginPartial {
+        generation: u64,
         session_id: String,
         chunk_tx: mpsc::UnboundedSender<NativePartialAudioChunk>,
         min_chunk_ms: u64,
@@ -719,89 +751,214 @@ enum NativeAudioCommand {
         response: std::sync::mpsc::Sender<Result<(), String>>,
     },
     DetachRealtime {
+        generation: u64,
         response: std::sync::mpsc::Sender<Result<(), String>>,
     },
     Finish {
+        generation: u64,
         response: std::sync::mpsc::Sender<Result<AudioInputCaptureResult, String>>,
     },
     FinishPartial {
+        generation: u64,
         session_id: String,
         response: std::sync::mpsc::Sender<Result<(), String>>,
     },
     CancelPartial {
+        generation: u64,
         session_id: Option<String>,
         response: std::sync::mpsc::Sender<Result<(), String>>,
     },
     Start {
+        generation: u64,
         app: AppHandle,
         request: AudioInputMonitorRequest,
         response: std::sync::mpsc::Sender<Result<AudioInputMonitorStatus, String>>,
     },
     Stop {
+        generation: u64,
         request: Option<AudioInputMonitorRequest>,
         response: std::sync::mpsc::Sender<Result<AudioInputMonitorStatus, String>>,
     },
 }
 
 #[derive(Clone)]
+struct NativeAudioRecoveryMonitor {
+    app: AppHandle,
+    device_id: String,
+    owners: HashSet<String>,
+    #[cfg(target_os = "macos")]
+    vpio_silence_cooldown_until_ms: u64,
+}
+
+#[derive(Clone)]
+enum NativeAudioRecoveryCapture {
+    None,
+    Full,
+    Partial {
+        session_id: String,
+        chunk_tx: mpsc::UnboundedSender<NativePartialAudioChunk>,
+        min_chunk_ms: u64,
+        max_chunk_ms: u64,
+        silence_ms: u64,
+    },
+}
+
+#[derive(Default)]
+struct NativeAudioRecoverySnapshot {
+    monitor: Option<NativeAudioRecoveryMonitor>,
+    capture: NativeAudioRecoveryCapture,
+    realtime: Option<(mpsc::UnboundedSender<Vec<u8>>, bool)>,
+    handoff: Option<NativeAudioSessionHandoff>,
+}
+
+impl Default for NativeAudioRecoveryCapture {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl NativeAudioRecoverySnapshot {
+    fn clone_without_handoff(&self) -> Self {
+        Self {
+            monitor: self.monitor.clone(),
+            capture: self.capture.clone(),
+            realtime: self.realtime.clone(),
+            handoff: None,
+        }
+    }
+}
+
+struct NativeAudioWorkerRuntime {
+    state: MicSupervisorState,
+    command_tx: Option<std::sync::mpsc::Sender<NativeAudioCommand>>,
+}
+
+struct NativeAudioWorkerControl {
+    runtime: StdMutex<NativeAudioWorkerRuntime>,
+    recovery_snapshot: StdMutex<NativeAudioRecoverySnapshot>,
+}
+
+#[derive(Clone)]
 struct NativeAudioWorker {
-    command_tx: Arc<StdMutex<std::sync::mpsc::Sender<NativeAudioCommand>>>,
+    control: Arc<NativeAudioWorkerControl>,
 }
 
 impl NativeAudioWorker {
     fn new() -> Self {
-        Self {
-            command_tx: Arc::new(StdMutex::new(Self::spawn_command_tx())),
+        let control = Arc::new(NativeAudioWorkerControl {
+            runtime: StdMutex::new(NativeAudioWorkerRuntime {
+                state: MicSupervisorState::Running { generation: 1 },
+                command_tx: None,
+            }),
+            recovery_snapshot: StdMutex::new(NativeAudioRecoverySnapshot::default()),
+        });
+        let command_tx = Self::spawn_command_tx(1, control.clone(), None);
+        if let Ok(mut runtime) = control.runtime.lock() {
+            runtime.command_tx = Some(command_tx);
         }
+        Self { control }
     }
 
-    fn spawn_command_tx() -> std::sync::mpsc::Sender<NativeAudioCommand> {
+    fn spawn_command_tx(
+        generation: u64,
+        control: Arc<NativeAudioWorkerControl>,
+        recovery_snapshot: Option<NativeAudioRecoverySnapshot>,
+    ) -> std::sync::mpsc::Sender<NativeAudioCommand> {
         let (command_tx, command_rx) = std::sync::mpsc::channel::<NativeAudioCommand>();
+        let (engine_tx, engine_rx) = std::sync::mpsc::channel::<NativeAudioCommand>();
 
-        thread::spawn(move || native_audio_worker_loop(command_rx));
+        // The command dispatcher only moves Send command data.  The dedicated
+        // engine thread below exclusively owns the non-Send CoreAudio/CPAL
+        // objects, including potentially blocking VPIO toggles and teardown.
+        thread::spawn(move || native_audio_command_dispatch_loop(command_rx, engine_tx));
+        thread::spawn(move || {
+            native_audio_worker_loop(generation, engine_rx, control, recovery_snapshot)
+        });
 
         command_tx
     }
 
-    fn command_tx(&self) -> Result<std::sync::mpsc::Sender<NativeAudioCommand>, String> {
-        self.command_tx
+    fn command_target(&self) -> Result<(u64, std::sync::mpsc::Sender<NativeAudioCommand>), String> {
+        self.control
+            .runtime
             .lock()
-            .map(|command_tx| command_tx.clone())
             .map_err(|_| "Native audio worker lock is unavailable.".to_string())
+            .and_then(|runtime| match &runtime.state {
+                MicSupervisorState::Running { generation }
+                | MicSupervisorState::Recovering { generation } => runtime
+                    .command_tx
+                    .clone()
+                    .map(|command_tx| (*generation, command_tx))
+                    .ok_or_else(|| "Native audio worker is recovering.".to_string()),
+                MicSupervisorState::RecoveryFailed { .. } => Err(
+                    "Audio input engine recovery failed. Enable the microphone again to retry."
+                        .to_string(),
+                ),
+            })
     }
 
-    fn restart_after_timeout(&self, action: &'static str) {
+    fn restart_after_timeout(&self, action: &'static str, generation: u64) {
         log_whisper_local_audio_event(
             "audio.worker.restart",
             None,
             json!({
                 "reason": "command_timeout",
                 "action": action,
+                "generation": generation,
             }),
         );
+        native_audio_begin_recovery(
+            &self.control,
+            generation,
+            NativeAudioRecoveryReason::CommandTimeout,
+            None,
+        );
+    }
 
-        if let Ok(mut command_tx) = self.command_tx.lock() {
-            *command_tx = Self::spawn_command_tx();
-        }
+    /// A failed automatic rebuild is intentionally terminal: callers must not
+    /// be handed an empty worker that merely looks alive.  A subsequent
+    /// explicit Enable action is different: it is a new user request, so give
+    /// it a clean generation and let its `Start` command establish the new
+    /// desired monitor state.
+    fn retry_after_recovery_failure(&self) {
+        let Ok(mut runtime) = self.control.runtime.lock() else {
+            return;
+        };
+        let generation = match &runtime.state {
+            MicSupervisorState::RecoveryFailed { generation } => generation.saturating_add(1),
+            MicSupervisorState::Running { .. } | MicSupervisorState::Recovering { .. } => return,
+        };
+        runtime.state = MicSupervisorState::Running { generation };
+        runtime.command_tx = Some(Self::spawn_command_tx(
+            generation,
+            self.control.clone(),
+            None,
+        ));
+        log_whisper_local_audio_event(
+            "audio.worker.rebuild.retry",
+            None,
+            json!({ "generation": generation }),
+        );
     }
 
     fn run_command_with_timeout<T>(
         &self,
         action: &'static str,
         timeout_duration: Duration,
-        command: impl FnOnce(std::sync::mpsc::Sender<Result<T, String>>) -> NativeAudioCommand,
+        command: impl FnOnce(u64, std::sync::mpsc::Sender<Result<T, String>>) -> NativeAudioCommand,
     ) -> Result<T, String> {
         let (response, response_rx) = std::sync::mpsc::channel();
-        self.command_tx()?
-            .send(command(response))
+        let (generation, command_tx) = self.command_target()?;
+        command_tx
+            .send(command(generation, response))
             .map_err(|_| "Native audio worker is unavailable.".to_string())?;
 
         match response_rx.recv_timeout(timeout_duration) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                self.restart_after_timeout(action);
+                self.restart_after_timeout(action, generation);
                 Err(
-                    "Audio input engine timed out. The mic engine was reset; try again."
+                    "Audio input engine timed out. Mic recovery is rebuilding the previous session; retry when it completes."
                         .to_string(),
                 )
             }
@@ -843,7 +1000,8 @@ impl NativeAudioWorker {
         self.run_command_with_timeout(
             "attach_realtime",
             Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
-            |response| NativeAudioCommand::AttachRealtime {
+            |generation, response| NativeAudioCommand::AttachRealtime {
+                generation,
                 audio_tx,
                 replay_buffered,
                 tts_echo_gate,
@@ -856,7 +1014,10 @@ impl NativeAudioWorker {
         self.run_command_with_timeout(
             "begin_capture",
             Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
-            |response| NativeAudioCommand::Begin { response },
+            |generation, response| NativeAudioCommand::Begin {
+                generation,
+                response,
+            },
         )
     }
 
@@ -871,7 +1032,8 @@ impl NativeAudioWorker {
         self.run_command_with_timeout(
             "begin_partial_capture",
             Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
-            |response| NativeAudioCommand::BeginPartial {
+            |generation, response| NativeAudioCommand::BeginPartial {
+                generation,
                 session_id,
                 chunk_tx,
                 min_chunk_ms,
@@ -886,7 +1048,10 @@ impl NativeAudioWorker {
         self.run_command_with_timeout(
             "finish_capture",
             Duration::from_secs(NATIVE_AUDIO_FINISH_TIMEOUT_SECS),
-            |response| NativeAudioCommand::Finish { response },
+            |generation, response| NativeAudioCommand::Finish {
+                generation,
+                response,
+            },
         )
     }
 
@@ -894,7 +1059,8 @@ impl NativeAudioWorker {
         self.run_command_with_timeout(
             "finish_partial_capture",
             Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
-            |response| NativeAudioCommand::FinishPartial {
+            |generation, response| NativeAudioCommand::FinishPartial {
+                generation,
                 session_id,
                 response,
             },
@@ -905,7 +1071,8 @@ impl NativeAudioWorker {
         self.run_command_with_timeout(
             "cancel_partial_capture",
             Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
-            |response| NativeAudioCommand::CancelPartial {
+            |generation, response| NativeAudioCommand::CancelPartial {
+                generation,
                 session_id,
                 response,
             },
@@ -916,7 +1083,10 @@ impl NativeAudioWorker {
         self.run_command_with_timeout(
             "detach_realtime",
             Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
-            |response| NativeAudioCommand::DetachRealtime { response },
+            |generation, response| NativeAudioCommand::DetachRealtime {
+                generation,
+                response,
+            },
         )
     }
 
@@ -925,10 +1095,12 @@ impl NativeAudioWorker {
         app: AppHandle,
         request: AudioInputMonitorRequest,
     ) -> Result<AudioInputMonitorStatus, String> {
+        self.retry_after_recovery_failure();
         self.run_command_with_timeout(
             "start_monitor",
             Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
-            |response| NativeAudioCommand::Start {
+            |generation, response| NativeAudioCommand::Start {
+                generation,
                 app,
                 request,
                 response,
@@ -943,9 +1115,309 @@ impl NativeAudioWorker {
         self.run_command_with_timeout(
             "stop_monitor",
             Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
-            |response| NativeAudioCommand::Stop { request, response },
+            |generation, response| NativeAudioCommand::Stop {
+                generation,
+                request,
+                response,
+            },
         )
     }
+}
+
+fn native_audio_command_dispatch_loop(
+    command_rx: std::sync::mpsc::Receiver<NativeAudioCommand>,
+    engine_tx: std::sync::mpsc::Sender<NativeAudioCommand>,
+) {
+    while let Ok(command) = command_rx.recv() {
+        if let Err(error) = engine_tx.send(command) {
+            native_audio_reject_stale_command(error.0);
+            break;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NativeAudioRecoveryReason {
+    CommandTimeout,
+    DefaultDeviceChanged,
+    VoiceProcessingUnresponsive,
+    StreamError,
+}
+
+impl NativeAudioRecoveryReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandTimeout => "command_timeout",
+            Self::DefaultDeviceChanged => "default_device_changed",
+            Self::VoiceProcessingUnresponsive => "voice_processing_unresponsive",
+            Self::StreamError => "stream_error",
+        }
+    }
+}
+
+fn native_audio_worker_accepts(control: &Arc<NativeAudioWorkerControl>, generation: u64) -> bool {
+    control
+        .runtime
+        .lock()
+        .map(|runtime| mic_supervisor_accepts(&runtime.state, generation))
+        .unwrap_or(false)
+}
+
+fn native_audio_begin_recovery(
+    control: &Arc<NativeAudioWorkerControl>,
+    generation: u64,
+    reason: NativeAudioRecoveryReason,
+    handoff: Option<NativeAudioSessionHandoff>,
+) {
+    // Freeze the last known-good intent before changing generations. The old
+    // worker may be wedged in CoreAudio and is never trusted to update it
+    // after quarantine.
+    let recovery_snapshot = control
+        .recovery_snapshot
+        .lock()
+        .map(|snapshot| snapshot.clone_without_handoff())
+        .unwrap_or_default();
+
+    let Ok(mut runtime) = control.runtime.lock() else {
+        return;
+    };
+    let (next_state, actions) = match reason {
+        NativeAudioRecoveryReason::CommandTimeout => {
+            mic_supervisor_on_command_timeout(&runtime.state, generation)
+        }
+        NativeAudioRecoveryReason::DefaultDeviceChanged => {
+            mic_supervisor_on_default_device_changed(&runtime.state, true)
+        }
+        NativeAudioRecoveryReason::VoiceProcessingUnresponsive
+        | NativeAudioRecoveryReason::StreamError => {
+            mic_supervisor_recover_current(&runtime.state, generation)
+        }
+    };
+    if actions.is_empty() {
+        return;
+    }
+    runtime.state = next_state;
+
+    let mut handoff = handoff;
+    for action in actions {
+        match action {
+            MicSupervisorAction::Quarantine { generation } => {
+                log_whisper_local_audio_event(
+                    "audio.worker.quarantine",
+                    None,
+                    json!({
+                        "generation": generation,
+                        "reason": reason.as_str(),
+                    }),
+                );
+            }
+            MicSupervisorAction::Rebuild { generation } => {
+                let has_monitor = recovery_snapshot.monitor.is_some();
+                let has_realtime_consumer = recovery_snapshot.realtime.is_some();
+                let recovery_snapshot = NativeAudioRecoverySnapshot {
+                    monitor: recovery_snapshot.monitor.clone(),
+                    capture: recovery_snapshot.capture.clone(),
+                    realtime: recovery_snapshot.realtime.clone(),
+                    handoff: handoff.take(),
+                };
+                let command_tx = NativeAudioWorker::spawn_command_tx(
+                    generation,
+                    control.clone(),
+                    Some(recovery_snapshot),
+                );
+                runtime.command_tx = Some(command_tx);
+                log_whisper_local_audio_event(
+                    "audio.worker.rebuild.spawn",
+                    None,
+                    json!({
+                        "generation": generation,
+                        "reason": reason.as_str(),
+                        "has_monitor": has_monitor,
+                        "has_realtime_consumer": has_realtime_consumer,
+                    }),
+                );
+            }
+            MicSupervisorAction::ReportRecoveryFailed => {}
+        }
+    }
+}
+
+fn native_audio_finish_recovery(
+    control: &Arc<NativeAudioWorkerControl>,
+    generation: u64,
+    result: &Result<(), String>,
+) {
+    let Ok(mut runtime) = control.runtime.lock() else {
+        return;
+    };
+    let rebuilding_this_generation = matches!(
+        &runtime.state,
+        MicSupervisorState::Recovering { generation: current } if *current == generation
+    );
+    let (next_state, actions) =
+        mic_supervisor_on_rebuild_result(&runtime.state, generation, result.is_ok());
+    runtime.state = next_state;
+    if rebuilding_this_generation && result.is_err() {
+        runtime.command_tx = None;
+    }
+    if actions.contains(&MicSupervisorAction::ReportRecoveryFailed) {
+        log_whisper_local_audio_event(
+            "audio.worker.rebuild.failed",
+            None,
+            json!({
+                "generation": generation,
+                "error": result.as_ref().err().map(|error| clean_whisper_local_audio_log_text(error)),
+            }),
+        );
+    } else if rebuilding_this_generation {
+        log_whisper_local_audio_event(
+            "audio.worker.rebuild.done",
+            None,
+            json!({ "generation": generation }),
+        );
+    } else {
+        log_whisper_local_audio_event(
+            "audio.worker.rebuild.ignored",
+            None,
+            json!({ "generation": generation }),
+        );
+    }
+}
+
+fn native_audio_recovery_snapshot(
+    session: &Option<NativeAudioSession>,
+    capture_active: bool,
+) -> NativeAudioRecoverySnapshot {
+    let Some(session) = session.as_ref() else {
+        return NativeAudioRecoverySnapshot::default();
+    };
+
+    let monitor = NativeAudioRecoveryMonitor {
+        app: session.app.clone(),
+        device_id: session.device_id.clone(),
+        owners: session.owners.clone(),
+        #[cfg(target_os = "macos")]
+        vpio_silence_cooldown_until_ms: session.vpio_silence_cooldown_until_ms,
+    };
+    let (capture, realtime) = session
+        .shared
+        .lock()
+        .map(|shared| {
+            let capture = if !capture_active {
+                NativeAudioRecoveryCapture::None
+            } else if let Some(partial) = shared.partial_capture.as_ref() {
+                NativeAudioRecoveryCapture::Partial {
+                    session_id: partial.session_id.clone(),
+                    chunk_tx: partial.chunk_tx.clone(),
+                    min_chunk_ms: partial.min_chunk_ms,
+                    max_chunk_ms: partial.max_chunk_ms,
+                    silence_ms: partial.silence_cut_ms,
+                }
+            } else {
+                NativeAudioRecoveryCapture::Full
+            };
+            let realtime = shared
+                .realtime_audio_tx
+                .clone()
+                .map(|audio_tx| (audio_tx, shared.realtime_tts_gate));
+            (capture, realtime)
+        })
+        .unwrap_or((NativeAudioRecoveryCapture::None, None));
+
+    NativeAudioRecoverySnapshot {
+        monitor: Some(monitor),
+        capture,
+        realtime,
+        handoff: None,
+    }
+}
+
+fn native_audio_store_recovery_snapshot(
+    control: &Arc<NativeAudioWorkerControl>,
+    generation: u64,
+    session: &Option<NativeAudioSession>,
+    capture_active: bool,
+) {
+    if !native_audio_worker_accepts(control, generation) {
+        return;
+    }
+    if let Ok(mut snapshot) = control.recovery_snapshot.lock() {
+        *snapshot = native_audio_recovery_snapshot(session, capture_active);
+    }
+}
+
+fn restore_native_audio_recovery_snapshot(
+    snapshot: NativeAudioRecoverySnapshot,
+    session: &mut Option<NativeAudioSession>,
+    capture_active: &mut bool,
+    realtime_attached: &mut bool,
+    generation: u64,
+    control: &Arc<NativeAudioWorkerControl>,
+) -> Result<(), String> {
+    let Some(monitor) = snapshot.monitor else {
+        return Ok(());
+    };
+    let owner = monitor
+        .owners
+        .iter()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "audio".to_string());
+    let request = AudioInputMonitorRequest {
+        device_id: Some(monitor.device_id.clone()),
+        owner: Some(owner),
+    };
+    let has_handoff = snapshot.handoff.is_some();
+    start_native_audio_session(
+        session,
+        monitor.app,
+        request,
+        generation,
+        control.clone(),
+        snapshot.handoff,
+        #[cfg(target_os = "macos")]
+        monitor.vpio_silence_cooldown_until_ms,
+    )?;
+    if let Some(active_session) = session.as_mut() {
+        active_session.owners = monitor.owners;
+    }
+
+    if let Some((audio_tx, tts_echo_gate)) = snapshot.realtime {
+        attach_native_audio_realtime_stream(session.as_ref(), audio_tx, false, tts_echo_gate)?;
+        *realtime_attached = true;
+    }
+
+    match snapshot.capture {
+        NativeAudioRecoveryCapture::None => {}
+        NativeAudioRecoveryCapture::Full => {
+            if !has_handoff {
+                begin_native_audio_capture_for_session(session.as_ref())?;
+            }
+            *capture_active = true;
+        }
+        NativeAudioRecoveryCapture::Partial {
+            session_id,
+            chunk_tx,
+            min_chunk_ms,
+            max_chunk_ms,
+            silence_ms,
+        } => {
+            if !has_handoff {
+                begin_native_audio_capture_for_session(session.as_ref())?;
+                begin_native_audio_partial_capture_for_session(
+                    session.as_ref(),
+                    session_id,
+                    chunk_tx,
+                    min_chunk_ms,
+                    max_chunk_ms,
+                    silence_ms,
+                )?;
+            }
+            *capture_active = true;
+        }
+    }
+    apply_voice_processing_bypass(session, *capture_active, *realtime_attached);
+    Ok(())
 }
 
 fn inactive_native_audio_status() -> AudioInputMonitorStatus {
@@ -972,7 +1444,32 @@ fn apply_voice_processing_bypass(
     realtime_attached: bool,
 ) {
     if let Some(active) = session.as_mut() {
-        let _ = active.set_voice_processing_bypass(!(capture_active || realtime_attached));
+        let requested_active = capture_active || realtime_attached;
+        let result = active.set_voice_processing_bypass(!requested_active);
+        #[cfg(target_os = "macos")]
+        {
+            active.voice_processing_engaged =
+                mic_supervisor_bypass_flags(requested_active, result.is_ok());
+            if let Ok(mut shared) = active.shared.lock() {
+                shared.voice_processing_engaged = active.voice_processing_engaged;
+            }
+            if let Err(error) = result {
+                log_whisper_local_audio_event(
+                    "audio.voice_processing.bypass.error",
+                    None,
+                    json!({
+                        "generation": active.generation,
+                        "requested_active": requested_active,
+                        "device_id": &active.device_id,
+                        "error": clean_whisper_local_audio_log_text(&error),
+                    }),
+                );
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = result;
+        }
     }
 }
 
@@ -1029,147 +1526,248 @@ fn macos_voice_processing_dead_signal_reason(
 }
 
 #[cfg(target_os = "macos")]
-fn downgrade_macos_voice_processing_session_to_raw(
+fn macos_default_input_device_id() -> Option<coreaudio::sys::AudioDeviceID> {
+    coreaudio::audio_unit::macos_helpers::get_default_device_id(true)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_default_input_device_id_changed(
+    session_is_default: bool,
+    recorded_device_id: Option<coreaudio::sys::AudioDeviceID>,
+    current_device_id: Option<coreaudio::sys::AudioDeviceID>,
+) -> bool {
+    session_is_default
+        && matches!(
+            (recorded_device_id, current_device_id),
+            (Some(recorded), Some(current)) if recorded != current
+        )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_default_input_device_changed(session: &mut NativeAudioSession) -> bool {
+    if session.device_id != "default"
+        || session.default_device_last_checked_at.elapsed() < Duration::from_secs(1)
+    {
+        return false;
+    }
+    session.default_device_last_checked_at = Instant::now();
+    macos_default_input_device_id_changed(
+        true,
+        session.default_input_device_id,
+        macos_default_input_device_id(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn maintain_macos_native_audio_session(
     session: &mut Option<NativeAudioSession>,
-    reason: &'static str,
-    elapsed_ms: u64,
-) -> Result<AudioInputMonitorStatus, String> {
-    let started_at = Instant::now();
-    let Some(active_session) = session.as_ref() else {
-        return Err("Native audio session is not active.".to_string());
+    capture_active: bool,
+    realtime_attached: bool,
+) -> Option<NativeAudioRecoveryReason> {
+    update_macos_voice_processing_delivery_state(session, capture_active, realtime_attached);
+    let Some(active_session) = session.as_mut() else {
+        return None;
     };
-    let app = active_session.app.clone();
-    let requested_device_id = active_session.device_id.clone();
-    let previous_label = active_session.label.clone();
-    let previous_sample_rate = active_session.sample_rate;
-    let owners = active_session.owners.clone();
+    if macos_default_input_device_changed(active_session) {
+        log_whisper_local_audio_event(
+            "audio.monitor.default_device_changed",
+            None,
+            json!({
+                "generation": active_session.generation,
+                "previous_label": &active_session.label,
+            }),
+        );
+        return Some(NativeAudioRecoveryReason::DefaultDeviceChanged);
+    }
+    let Some((reason, elapsed_ms)) = macos_voice_processing_dead_signal_reason(active_session)
+    else {
+        return None;
+    };
 
-    MACOS_VPIO_SILENCE_COOLDOWN_UNTIL_MS.store(
-        audio_epoch_ms().saturating_add(MACOS_VPIO_SILENCE_COOLDOWN_MS),
-        Ordering::Release,
-    );
-
+    // This is generation-owned state. A replacement starts with the old
+    // generation's cooldown snapshot and never inherits process-global poison
+    // from a previously wedged unit.
+    let now_ms = audio_epoch_ms();
+    if now_ms.saturating_sub(active_session.vpio_downgrade_last_attempt_ms)
+        < MACOS_VPIO_DOWNGRADE_RETRY_MS
+    {
+        return None;
+    }
+    active_session.vpio_downgrade_last_attempt_ms = now_ms;
+    active_session.vpio_silence_cooldown_until_ms =
+        now_ms.saturating_add(MACOS_VPIO_SILENCE_COOLDOWN_MS);
     log_whisper_local_audio_event(
         "audio.monitor.voice_processing_silence_downgrade",
         None,
         json!({
+            "generation": active_session.generation,
             "reason": reason,
             "elapsed_ms": elapsed_ms,
-            "device_id": &requested_device_id,
-            "label": &previous_label,
-            "sample_rate": previous_sample_rate,
-            "owner_count": owners.len(),
+            "device_id": &active_session.device_id,
+            "label": &active_session.label,
         }),
     );
+    Some(NativeAudioRecoveryReason::VoiceProcessingUnresponsive)
+}
 
-    // Transactional: the (silent but alive) session is the only one there is.
-    // Build its raw replacement FIRST; any failure here keeps the current
-    // session installed instead of leaving `session = None`, which killed all
-    // audio until the next monitor start.
-    let (device, device_id, label) = cpal_input_device_by_id(&requested_device_id)?;
-    let (next_session, sample_format, channels) =
-        build_raw_native_audio_session(app, device, device_id, label, owners, None)?;
-    let handoff = native_audio_take_session_handoff(active_session)?;
-    native_audio_apply_session_handoff(&next_session.shared, handoff)?;
-    let old_session = session
-        .take()
-        .ok_or_else(|| "Native audio session is not active.".to_string())?;
-    drop(old_session);
-    let status = native_audio_status(&next_session);
-    *session = Some(next_session);
+fn native_audio_command_generation(command: &NativeAudioCommand) -> u64 {
+    match command {
+        NativeAudioCommand::AttachRealtime { generation, .. }
+        | NativeAudioCommand::Begin { generation, .. }
+        | NativeAudioCommand::BeginPartial { generation, .. }
+        | NativeAudioCommand::DetachRealtime { generation, .. }
+        | NativeAudioCommand::Finish { generation, .. }
+        | NativeAudioCommand::FinishPartial { generation, .. }
+        | NativeAudioCommand::CancelPartial { generation, .. }
+        | NativeAudioCommand::Start { generation, .. }
+        | NativeAudioCommand::Stop { generation, .. } => *generation,
+    }
+}
 
-    log_whisper_local_audio_event(
-        "audio.monitor.voice_processing_silence_downgrade.done",
-        Some(started_at.elapsed()),
-        json!({
-            "reason": reason,
-            "elapsed_ms": elapsed_ms,
-            "device_id": &status.device_id,
-            "label": &status.label,
-            "sample_rate": status.sample_rate,
-            "sample_format": sample_format,
-            "channels": channels,
-            "engine": status.engine,
-            "echo_cancellation": status.echo_cancellation,
-            "owner_count": status.owner_count,
-        }),
-    );
+fn native_audio_reject_stale_command(command: NativeAudioCommand) {
+    match command {
+        NativeAudioCommand::AttachRealtime { response, .. }
+        | NativeAudioCommand::Start { response, .. }
+        | NativeAudioCommand::Stop { response, .. } => {
+            let _ = response.send(Err(
+                "Native audio worker generation was quarantined.".to_string()
+            ));
+        }
+        NativeAudioCommand::Begin { response, .. }
+        | NativeAudioCommand::BeginPartial { response, .. }
+        | NativeAudioCommand::DetachRealtime { response, .. }
+        | NativeAudioCommand::FinishPartial { response, .. }
+        | NativeAudioCommand::CancelPartial { response, .. } => {
+            let _ = response.send(Err(
+                "Native audio worker generation was quarantined.".to_string()
+            ));
+        }
+        NativeAudioCommand::Finish { response, .. } => {
+            let _ = response.send(Err(
+                "Native audio worker generation was quarantined.".to_string()
+            ));
+        }
+    }
+}
 
-    Ok(status)
+/// A command can finish after another thread has quarantined its worker.
+/// Never let that old reply look like a successful operation on the current
+/// engine; the reply is generation-stamped just like callbacks are.
+fn native_audio_send_generation_result<T: Send>(
+    control: &Arc<NativeAudioWorkerControl>,
+    generation: u64,
+    response: std::sync::mpsc::Sender<Result<T, String>>,
+    result: Result<T, String>,
+) {
+    let result = if native_audio_worker_accepts(control, generation) {
+        result
+    } else {
+        Err("Native audio worker generation was quarantined.".to_string())
+    };
+    let _ = response.send(result);
 }
 
 #[cfg(target_os = "macos")]
-fn maintain_macos_voice_processing_session(
-    session: &mut Option<NativeAudioSession>,
-    capture_active: &mut bool,
-    realtime_attached: &mut bool,
-) {
-    update_macos_voice_processing_delivery_state(session, *capture_active, *realtime_attached);
-    let Some(active_session) = session.as_ref() else {
-        return;
-    };
-    let Some((reason, elapsed_ms)) = macos_voice_processing_dead_signal_reason(active_session)
-    else {
-        return;
-    };
-
-    // Downgrades tear down and rebuild CoreAudio state on the worker thread;
-    // space attempts out so a failing rebuild cannot hot-loop and starve
-    // command handling (a starved command gets the whole worker replaced).
-    let now_ms = audio_epoch_ms();
-    let last_attempt_ms = MACOS_VPIO_DOWNGRADE_LAST_ATTEMPT_MS.load(Ordering::Acquire);
-    if now_ms.saturating_sub(last_attempt_ms) < MACOS_VPIO_DOWNGRADE_RETRY_MS {
-        return;
-    }
-    MACOS_VPIO_DOWNGRADE_LAST_ATTEMPT_MS.store(now_ms, Ordering::Release);
-
-    if let Err(error) =
-        downgrade_macos_voice_processing_session_to_raw(session, reason, elapsed_ms)
-    {
-        if session.is_none() {
-            *capture_active = false;
-            *realtime_attached = false;
-        }
-        log_whisper_local_audio_event(
-            "audio.monitor.voice_processing_silence_downgrade.error",
-            None,
-            json!({
-                "reason": reason,
-                "elapsed_ms": elapsed_ms,
-                "error": clean_whisper_local_audio_log_text(&error),
-            }),
-        );
-    }
+fn native_audio_drop_quarantined_session(session: Option<NativeAudioSession>) {
+    // `cpal::Stream` and the CoreAudio callback machinery are intentionally
+    // not Send. Keep teardown on the worker that owns them. Recovery has
+    // already started a replacement worker, so a blocking drop cannot strand
+    // the command path behind the old generation.
+    drop(session);
 }
 
-fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCommand>) {
+#[cfg(not(target_os = "macos"))]
+fn native_audio_drop_quarantined_session(session: Option<NativeAudioSession>) {
+    drop(session);
+}
+
+fn native_audio_worker_begin_health_recovery(
+    control: &Arc<NativeAudioWorkerControl>,
+    generation: u64,
+    reason: NativeAudioRecoveryReason,
+    session: &mut Option<NativeAudioSession>,
+    capture_active: bool,
+) {
+    native_audio_store_recovery_snapshot(control, generation, session, capture_active);
+    let handoff = session
+        .as_ref()
+        .and_then(|session| native_audio_take_session_handoff(session).ok());
+    native_audio_begin_recovery(control, generation, reason, handoff);
+    native_audio_drop_quarantined_session(session.take());
+}
+
+fn native_audio_worker_loop(
+    generation: u64,
+    command_rx: std::sync::mpsc::Receiver<NativeAudioCommand>,
+    control: Arc<NativeAudioWorkerControl>,
+    recovery_snapshot: Option<NativeAudioRecoverySnapshot>,
+) {
     let mut session: Option<NativeAudioSession> = None;
     let mut capture_active = false;
     let mut realtime_attached = false;
 
+    if let Some(snapshot) = recovery_snapshot {
+        let rebuild = restore_native_audio_recovery_snapshot(
+            snapshot,
+            &mut session,
+            &mut capture_active,
+            &mut realtime_attached,
+            generation,
+            &control,
+        );
+        native_audio_finish_recovery(&control, generation, &rebuild);
+        if rebuild.is_err() {
+            native_audio_drop_quarantined_session(session.take());
+            return;
+        }
+        native_audio_store_recovery_snapshot(&control, generation, &session, capture_active);
+    }
+
     loop {
-        let command = match command_rx.recv_timeout(Duration::from_millis(NATIVE_AUDIO_WORKER_POLL_MS)) {
-            Ok(command) => command,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                #[cfg(target_os = "macos")]
-                maintain_macos_voice_processing_session(
-                    &mut session,
-                    &mut capture_active,
-                    &mut realtime_attached,
-                );
-                continue;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
+        if !native_audio_worker_accepts(&control, generation) {
+            native_audio_drop_quarantined_session(session.take());
+            break;
+        }
+        let command =
+            match command_rx.recv_timeout(Duration::from_millis(NATIVE_AUDIO_WORKER_POLL_MS)) {
+                Ok(command) => command,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    #[cfg(target_os = "macos")]
+                    if let Some(reason) = maintain_macos_native_audio_session(
+                        &mut session,
+                        capture_active,
+                        realtime_attached,
+                    ) {
+                        native_audio_worker_begin_health_recovery(
+                            &control,
+                            generation,
+                            reason,
+                            &mut session,
+                            capture_active,
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+
+        if native_audio_command_generation(&command) != generation
+            || !native_audio_worker_accepts(&control, generation)
+        {
+            native_audio_reject_stale_command(command);
+            continue;
+        }
 
         match command {
             NativeAudioCommand::AttachRealtime {
+                generation: _,
                 audio_tx,
                 replay_buffered,
                 tts_echo_gate,
                 response,
             } => {
-                let result = attach_native_audio_realtime_stream(
+                let mut result = attach_native_audio_realtime_stream(
                     session.as_ref(),
                     audio_tx,
                     replay_buffered,
@@ -1178,18 +1776,26 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                 if result.is_ok() {
                     realtime_attached = true;
                     apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
+                    result = session
+                        .as_ref()
+                        .map(native_audio_status)
+                        .ok_or_else(|| "Native audio session is not active.".to_string());
                 }
-                let _ = response.send(result);
+                native_audio_send_generation_result(&control, generation, response, result);
             }
-            NativeAudioCommand::Begin { response } => {
+            NativeAudioCommand::Begin {
+                generation: _,
+                response,
+            } => {
                 let result = begin_native_audio_capture_for_session(session.as_ref());
                 if result.is_ok() {
                     capture_active = true;
                     apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
                 }
-                let _ = response.send(result);
+                native_audio_send_generation_result(&control, generation, response, result);
             }
             NativeAudioCommand::BeginPartial {
+                generation: _,
                 session_id,
                 chunk_tx,
                 min_chunk_ms,
@@ -1209,21 +1815,28 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                     capture_active = true;
                     apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
                 }
-                let _ = response.send(result);
+                native_audio_send_generation_result(&control, generation, response, result);
             }
-            NativeAudioCommand::DetachRealtime { response } => {
+            NativeAudioCommand::DetachRealtime {
+                generation: _,
+                response,
+            } => {
                 let result = detach_native_audio_realtime_stream(session.as_ref());
                 realtime_attached = false;
                 apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
-                let _ = response.send(result);
+                native_audio_send_generation_result(&control, generation, response, result);
             }
-            NativeAudioCommand::Finish { response } => {
+            NativeAudioCommand::Finish {
+                generation: _,
+                response,
+            } => {
                 let result = finish_native_audio_capture_for_session(session.as_ref());
                 capture_active = false;
                 apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
-                let _ = response.send(result);
+                native_audio_send_generation_result(&control, generation, response, result);
             }
             NativeAudioCommand::FinishPartial {
+                generation: _,
                 session_id,
                 response,
             } => {
@@ -1233,47 +1846,79 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                     capture_active = false;
                     apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
                 }
-                let _ = response.send(result);
+                native_audio_send_generation_result(&control, generation, response, result);
             }
             NativeAudioCommand::CancelPartial {
+                generation: _,
                 session_id,
                 response,
             } => {
-                let result =
-                    cancel_native_audio_partial_capture_for_session(session.as_ref(), session_id.as_deref());
+                let result = cancel_native_audio_partial_capture_for_session(
+                    session.as_ref(),
+                    session_id.as_deref(),
+                );
                 if result.is_ok() {
                     capture_active = false;
                     apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
                 }
-                let _ = response.send(result);
+                native_audio_send_generation_result(&control, generation, response, result);
             }
             NativeAudioCommand::Start {
+                generation: _,
                 app,
                 request,
                 response,
             } => {
-                let result = start_native_audio_session(&mut session, app, request);
+                let mut result = start_native_audio_session(
+                    &mut session,
+                    app,
+                    request,
+                    generation,
+                    control.clone(),
+                    None,
+                    #[cfg(target_os = "macos")]
+                    0,
+                );
                 // The warm unit starts bypassed; re-apply in case a consumer is
                 // already active (e.g. device hot-swap mid-capture).
                 apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
-                let _ = response.send(result);
+                if result.is_ok() {
+                    result = session
+                        .as_ref()
+                        .map(native_audio_status)
+                        .ok_or_else(|| "Native audio session is not active.".to_string());
+                }
+                native_audio_send_generation_result(&control, generation, response, result);
             }
-            NativeAudioCommand::Stop { request, response } => {
+            NativeAudioCommand::Stop {
+                generation: _,
+                request,
+                response,
+            } => {
                 let result = stop_native_audio_session(&mut session, request);
                 if session.is_none() {
                     capture_active = false;
                     realtime_attached = false;
                 }
-                let _ = response.send(result);
+                native_audio_send_generation_result(&control, generation, response, result);
             }
         }
 
+        native_audio_store_recovery_snapshot(&control, generation, &session, capture_active);
+
         #[cfg(target_os = "macos")]
-        maintain_macos_voice_processing_session(
-            &mut session,
-            &mut capture_active,
-            &mut realtime_attached,
-        );
+        if let Some(reason) =
+            maintain_macos_native_audio_session(&mut session, capture_active, realtime_attached)
+        {
+            native_audio_worker_begin_health_recovery(
+                &control,
+                generation,
+                reason,
+                &mut session,
+                capture_active,
+            );
+            break;
+        }
     }
 }
 
@@ -1317,7 +1962,9 @@ fn macos_audio_input_authorization_status_raw() -> Option<isize> {
 }
 
 #[cfg(target_os = "macos")]
-fn audio_input_permission_status_for_macos_status(status: Option<isize>) -> AudioInputPermissionStatus {
+fn audio_input_permission_status_for_macos_status(
+    status: Option<isize>,
+) -> AudioInputPermissionStatus {
     match status {
         Some(3) => AudioInputPermissionStatus {
             platform: "macos",
@@ -1419,7 +2066,9 @@ fn macos_request_audio_input_permission() -> bool {
         ];
     }
 
-    receiver.recv_timeout(Duration::from_secs(60)).unwrap_or(false)
+    receiver
+        .recv_timeout(Duration::from_secs(60))
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -1818,10 +2467,9 @@ fn resample_native_audio_samples_to_rate(
         return samples.to_vec();
     }
 
-    let output_len = ((samples.len() as u64 * u64::from(target_rate)
-        + u64::from(source_rate) / 2)
+    let output_len = ((samples.len() as u64 * u64::from(target_rate) + u64::from(source_rate) / 2)
         / u64::from(source_rate))
-        .max(1) as usize;
+    .max(1) as usize;
     let step = f64::from(source_rate) / f64::from(target_rate);
     let mut output = Vec::with_capacity(output_len);
     for index in 0..output_len {
@@ -1846,7 +2494,7 @@ fn voice_tts_playback_extend_deadline(bytes: &[u8], sample_rate: u32) {
     let sample_count = (bytes.len() / 2) as u64;
     let duration_ms = (((sample_count as u128) * 1000 + u128::from(sample_rate) - 1)
         / u128::from(sample_rate))
-        .min(u128::from(u64::MAX)) as u64;
+    .min(u128::from(u64::MAX)) as u64;
     let now = audio_epoch_ms();
     let mut current = VOICE_TTS_PLAYING_UNTIL_MS.load(Ordering::Acquire);
 
@@ -2008,6 +2656,14 @@ fn process_native_audio_samples(
     engine: NativeAudioEngine,
     samples: Vec<f32>,
 ) {
+    // A CoreAudio callback can outlive its worker while that generation is
+    // being quarantined. It may observe the shared buffer, but it must never
+    // emit audio, stats, or partial chunks into the replacement generation.
+    let generation_is_current = native_audio_shared_generation_is_current(shared);
+    if !generation_is_current {
+        return;
+    }
+
     if samples.is_empty() {
         if let Ok(mut shared) = shared.lock() {
             let now = Instant::now();
@@ -2119,10 +2775,15 @@ fn process_native_audio_samples(
                 AUDIO_INPUT_WAVEFORM_SAMPLE_COUNT,
                 shared.sample_rate,
             );
+            #[cfg(target_os = "macos")]
+            let echo_cancellation =
+                engine == NativeAudioEngine::VoiceProcessing && shared.voice_processing_engaged;
+            #[cfg(not(target_os = "macos"))]
+            let echo_cancellation = engine.echo_cancellation();
             Some(AudioInputStats {
                 device_id: device_id.to_string(),
                 engine: engine.status_engine(),
-                echo_cancellation: engine.echo_cancellation(),
+                echo_cancellation,
                 rms,
                 peak,
                 buffer_ms: ((shared.total_samples as f64 / shared.sample_rate as f64) * 1000.0)
@@ -2134,19 +2795,43 @@ fn process_native_audio_samples(
     };
 
     if let Some(stats) = stats {
-        let _ = app.emit(AUDIO_INPUT_STATS_EVENT, stats);
+        if native_audio_shared_generation_is_current(shared) {
+            let _ = app.emit(AUDIO_INPUT_STATS_EVENT, stats);
+        }
     }
 
     if let (Some(audio_tx), Some(audio_bytes)) = (realtime_audio_tx, realtime_audio) {
-        let _ = audio_tx.send(audio_bytes);
+        if native_audio_shared_generation_is_current(shared) {
+            let _ = audio_tx.send(audio_bytes);
+        }
     }
 
     if let (Some(chunk_tx), Some(chunk)) = (partial_chunk_tx, partial_chunk) {
-        let _ = chunk_tx.send(chunk);
+        if native_audio_shared_generation_is_current(shared) {
+            let _ = chunk_tx.send(chunk);
+        }
     }
 }
 
-fn log_native_audio_stream_error(device_id: &str, error: cpal::StreamError) {
+fn native_audio_shared_generation_is_current(shared: &Arc<StdMutex<NativeAudioShared>>) -> bool {
+    shared
+        .lock()
+        .ok()
+        .map(|shared| {
+            shared
+                .supervisor
+                .as_ref()
+                .map(|control| native_audio_worker_accepts(control, shared.generation))
+                .unwrap_or(true)
+        })
+        .unwrap_or(false)
+}
+
+fn log_native_audio_stream_error(
+    device_id: &str,
+    error: cpal::StreamError,
+    shared: &Arc<StdMutex<NativeAudioShared>>,
+) {
     log_whisper_local_audio_event(
         "audio.stream.error",
         None,
@@ -2156,6 +2841,21 @@ fn log_native_audio_stream_error(device_id: &str, error: cpal::StreamError) {
         }),
     );
     eprintln!("Diff Forge audio input stream error for {device_id}: {error}");
+
+    let recovery_owner = shared.lock().ok().and_then(|shared| {
+        shared
+            .supervisor
+            .as_ref()
+            .map(|control| (shared.generation, control.clone()))
+    });
+    if let Some((generation, control)) = recovery_owner {
+        native_audio_begin_recovery(
+            &control,
+            generation,
+            NativeAudioRecoveryReason::StreamError,
+            None,
+        );
+    }
 }
 
 /// Client-side sample rate requested from the VoiceProcessingIO unit; the
@@ -2189,17 +2889,25 @@ const MACOS_VPIO_SILENCE_COOLDOWN_MS: u64 = 60_000;
 /// element instead of the webview, which hands the echo canceller the exact
 /// far-end signal.
 #[cfg(target_os = "macos")]
-static MACOS_VOICE_PROCESSING_ACTIVE: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "macos")]
-static MACOS_VPIO_SILENCE_COOLDOWN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
-#[cfg(target_os = "macos")]
-static MACOS_VPIO_DOWNGRADE_LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(0);
+static MACOS_VOICE_PROCESSING_OWNER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static MACOS_VOICE_PLAYBACK_QUEUE: OnceLock<Arc<StdMutex<VecDeque<f32>>>> = OnceLock::new();
 /// Hard cap on queued native playback (30s at the unit rate) so a runaway
 /// stream cannot grow the buffer unbounded.
 #[cfg(target_os = "macos")]
 const MACOS_VOICE_PLAYBACK_MAX_SAMPLES: usize = (MACOS_VOICE_PROCESSING_SAMPLE_RATE as usize) * 30;
+
+#[cfg(target_os = "macos")]
+fn macos_voice_processing_active() -> bool {
+    MACOS_VOICE_PROCESSING_OWNER.load(Ordering::Acquire) != 0
+}
+
+#[cfg(target_os = "macos")]
+fn macos_voice_processing_release_owner(owner: &AtomicU64, generation: u64) -> bool {
+    owner
+        .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 /// AUVoiceIO ducking controls are not exposed by coreaudio-rs, but they are
 /// documented in AudioToolbox/AudioUnitProperties.h. If these cannot be set,
 /// we fall back to raw cpal capture rather than letting macOS attenuate other
@@ -2321,6 +3029,7 @@ fn configure_macos_voice_processing_no_ducking(
 struct MacosVoiceProcessingCapture {
     unit: coreaudio::audio_unit::AudioUnit,
     bypassed: bool,
+    generation: u64,
     input_device: coreaudio::sys::AudioDeviceID,
     /// The device's IO buffer size before we touched it; restored on teardown
     /// and used as the low-latency size while a consumer is active.
@@ -2363,8 +3072,9 @@ impl MacosVoiceProcessingCapture {
 #[cfg(target_os = "macos")]
 impl Drop for MacosVoiceProcessingCapture {
     fn drop(&mut self) {
-        MACOS_VOICE_PROCESSING_ACTIVE.store(false, Ordering::Release);
-        macos_voice_playback_clear();
+        if macos_voice_processing_release_owner(&MACOS_VOICE_PROCESSING_OWNER, self.generation) {
+            macos_voice_playback_clear();
+        }
         // Hand the device back at its original buffer size so nothing else on
         // the system inherits our wide standby buffer.
         let _ = macos_set_device_buffer_frame_size(self.input_device, self.default_buffer_frames);
@@ -2461,6 +3171,8 @@ fn build_macos_voice_processing_capture(
     app: AppHandle,
     device_id: String,
     label: &str,
+    generation: u64,
+    supervisor: Arc<NativeAudioWorkerControl>,
 ) -> Result<
     (
         MacosVoiceProcessingCapture,
@@ -2544,8 +3256,10 @@ fn build_macos_voice_processing_capture(
     )
     .map_err(|error| describe("set render format", error))?;
 
-    let shared = Arc::new(StdMutex::new(NativeAudioShared::new(
+    let shared = Arc::new(StdMutex::new(NativeAudioShared::for_generation(
         MACOS_VOICE_PROCESSING_SAMPLE_RATE,
+        generation,
+        supervisor,
     )));
     let callback_shared = shared.clone();
     let callback_device_id = device_id;
@@ -2590,7 +3304,7 @@ fn build_macos_voice_processing_capture(
     unit.initialize()
         .map_err(|error| describe("initialize", error))?;
     unit.start().map_err(|error| describe("start", error))?;
-    MACOS_VOICE_PROCESSING_ACTIVE.store(true, Ordering::Release);
+    MACOS_VOICE_PROCESSING_OWNER.store(generation, Ordering::Release);
 
     // Park the new unit on standby before the AudioUnit starts. Starting first
     // and then immediately bypassing/widening the unit can make macOS pulse
@@ -2600,6 +3314,7 @@ fn build_macos_voice_processing_capture(
     let capture = MacosVoiceProcessingCapture {
         unit,
         bypassed: standby_bypass_applied,
+        generation,
         input_device: core_device,
         default_buffer_frames,
     };
@@ -2623,6 +3338,7 @@ fn build_native_audio_stream(
             let callback_device_id = device_id.clone();
             let callback_shared = shared.clone();
             let error_device_id = device_id.clone();
+            let error_shared = shared.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
@@ -2634,7 +3350,7 @@ fn build_native_audio_stream(
                         native_audio_mono_samples(data, channels, |sample| *sample),
                     );
                 },
-                move |error| log_native_audio_stream_error(&error_device_id, error),
+                move |error| log_native_audio_stream_error(&error_device_id, error, &error_shared),
                 None,
             )
         }
@@ -2643,6 +3359,7 @@ fn build_native_audio_stream(
             let callback_device_id = device_id.clone();
             let callback_shared = shared.clone();
             let error_device_id = device_id.clone();
+            let error_shared = shared.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[f64], _| {
@@ -2654,7 +3371,7 @@ fn build_native_audio_stream(
                         native_audio_mono_samples(data, channels, |sample| *sample as f32),
                     );
                 },
-                move |error| log_native_audio_stream_error(&error_device_id, error),
+                move |error| log_native_audio_stream_error(&error_device_id, error, &error_shared),
                 None,
             )
         }
@@ -2663,6 +3380,7 @@ fn build_native_audio_stream(
             let callback_device_id = device_id.clone();
             let callback_shared = shared.clone();
             let error_device_id = device_id.clone();
+            let error_shared = shared.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _| {
@@ -2676,7 +3394,7 @@ fn build_native_audio_stream(
                         }),
                     );
                 },
-                move |error| log_native_audio_stream_error(&error_device_id, error),
+                move |error| log_native_audio_stream_error(&error_device_id, error, &error_shared),
                 None,
             )
         }
@@ -2685,6 +3403,7 @@ fn build_native_audio_stream(
             let callback_device_id = device_id.clone();
             let callback_shared = shared.clone();
             let error_device_id = device_id.clone();
+            let error_shared = shared.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[u16], _| {
@@ -2698,7 +3417,7 @@ fn build_native_audio_stream(
                         }),
                     );
                 },
-                move |error| log_native_audio_stream_error(&error_device_id, error),
+                move |error| log_native_audio_stream_error(&error_device_id, error, &error_shared),
                 None,
             )
         }
@@ -2707,6 +3426,7 @@ fn build_native_audio_stream(
             let callback_device_id = device_id.clone();
             let callback_shared = shared.clone();
             let error_device_id = device_id.clone();
+            let error_shared = shared.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[i32], _| {
@@ -2720,7 +3440,7 @@ fn build_native_audio_stream(
                         }),
                     );
                 },
-                move |error| log_native_audio_stream_error(&error_device_id, error),
+                move |error| log_native_audio_stream_error(&error_device_id, error, &error_shared),
                 None,
             )
         }
@@ -2729,6 +3449,7 @@ fn build_native_audio_stream(
             let callback_device_id = device_id.clone();
             let callback_shared = shared.clone();
             let error_device_id = device_id.clone();
+            let error_shared = shared.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[u32], _| {
@@ -2742,7 +3463,7 @@ fn build_native_audio_stream(
                         }),
                     );
                 },
-                move |error| log_native_audio_stream_error(&error_device_id, error),
+                move |error| log_native_audio_stream_error(&error_device_id, error, &error_shared),
                 None,
             )
         }
@@ -2827,8 +3548,7 @@ fn native_bounded_whisper_samples(samples: Vec<f32>, sample_rate: u32) -> (Vec<f
     } else {
         samples
     };
-    let audio_ms =
-        ((bounded_samples.len() as f64 / sample_rate as f64) * 1000.0).round() as u64;
+    let audio_ms = ((bounded_samples.len() as f64 / sample_rate as f64) * 1000.0).round() as u64;
 
     (bounded_samples, audio_ms)
 }
@@ -2975,8 +3695,13 @@ struct NativeAudioSessionHandoff {
 fn native_audio_take_session_handoff(
     session: &NativeAudioSession,
 ) -> Result<NativeAudioSessionHandoff, String> {
-    let mut shared = session
-        .shared
+    native_audio_take_shared_handoff(&session.shared)
+}
+
+fn native_audio_take_shared_handoff(
+    shared: &Arc<StdMutex<NativeAudioShared>>,
+) -> Result<NativeAudioSessionHandoff, String> {
+    let mut shared = shared
         .lock()
         .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
     Ok(NativeAudioSessionHandoff {
@@ -3055,6 +3780,9 @@ fn build_raw_native_audio_session(
     label: String,
     owners: HashSet<String>,
     handoff: Option<NativeAudioSessionHandoff>,
+    generation: u64,
+    supervisor: Arc<NativeAudioWorkerControl>,
+    #[cfg(target_os = "macos")] vpio_silence_cooldown_until_ms: u64,
 ) -> Result<(NativeAudioSession, String, u16), String> {
     let supported_config = device
         .default_input_config()
@@ -3062,7 +3790,11 @@ fn build_raw_native_audio_session(
     let sample_rate = supported_config.sample_rate().0;
     let sample_format = format!("{:?}", supported_config.sample_format());
     let channels = supported_config.channels();
-    let shared = Arc::new(StdMutex::new(NativeAudioShared::new(sample_rate)));
+    let shared = Arc::new(StdMutex::new(NativeAudioShared::for_generation(
+        sample_rate,
+        generation,
+        supervisor,
+    )));
     let stream = build_native_audio_stream(
         app.clone(),
         device_id.clone(),
@@ -3078,10 +3810,13 @@ fn build_raw_native_audio_session(
     stream
         .play()
         .map_err(|error| native_audio_error_message(error))?;
+    #[cfg(target_os = "macos")]
+    let default_input_device_id = macos_default_input_device_id_for(&device_id);
 
     Ok((
         NativeAudioSession {
             app,
+            generation,
             device_id,
             engine: NativeAudioEngine::Raw,
             label,
@@ -3091,13 +3826,38 @@ fn build_raw_native_audio_session(
             _stream: NativeAudioStreamHandle::Cpal(stream),
             #[cfg(target_os = "macos")]
             voice_processing_delivery_started_at: None,
+            #[cfg(target_os = "macos")]
+            voice_processing_engaged: false,
+            #[cfg(target_os = "macos")]
+            vpio_silence_cooldown_until_ms,
+            #[cfg(target_os = "macos")]
+            vpio_downgrade_last_attempt_ms: 0,
+            #[cfg(target_os = "macos")]
+            default_device_last_checked_at: Instant::now(),
+            #[cfg(target_os = "macos")]
+            default_input_device_id,
         },
         sample_format,
         channels,
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn macos_default_input_device_id_for(
+    device_id: &str,
+) -> Option<coreaudio::sys::AudioDeviceID> {
+    (device_id == "default")
+        .then(macos_default_input_device_id)
+        .flatten()
+}
+
 fn native_audio_status(session: &NativeAudioSession) -> AudioInputMonitorStatus {
+    #[cfg(target_os = "macos")]
+    let echo_cancellation =
+        session.engine == NativeAudioEngine::VoiceProcessing && session.voice_processing_engaged;
+    #[cfg(not(target_os = "macos"))]
+    let echo_cancellation = session.engine.echo_cancellation();
+
     AudioInputMonitorStatus {
         monitoring: true,
         device_id: session.device_id.clone(),
@@ -3105,7 +3865,7 @@ fn native_audio_status(session: &NativeAudioSession) -> AudioInputMonitorStatus 
         sample_rate: session.sample_rate,
         owner_count: session.owners.len(),
         engine: session.engine.status_engine(),
-        echo_cancellation: session.engine.echo_cancellation(),
+        echo_cancellation,
     }
 }
 
@@ -3128,14 +3888,10 @@ fn attach_native_audio_realtime_stream(
 
         if replay_buffered {
             if let Some(capture_started_at) = shared.capture_started_at {
-                for chunk in shared
-                    .chunks
-                    .iter()
-                    .filter(|chunk| {
-                        native_audio_chunk_reaches(chunk, capture_started_at)
-                            && (!tts_echo_gate || chunk.realtime_replay_allowed)
-                    })
-                {
+                for chunk in shared.chunks.iter().filter(|chunk| {
+                    native_audio_chunk_reaches(chunk, capture_started_at)
+                        && (!tts_echo_gate || chunk.realtime_replay_allowed)
+                }) {
                     buffered_chunks += 1;
                     buffered_input_ms += chunk.duration_ms;
                     buffered_audio.push(encode_linear16_audio(&chunk.samples));
@@ -3194,6 +3950,10 @@ fn start_native_audio_session(
     session: &mut Option<NativeAudioSession>,
     app: AppHandle,
     request: AudioInputMonitorRequest,
+    generation: u64,
+    supervisor: Arc<NativeAudioWorkerControl>,
+    handoff: Option<NativeAudioSessionHandoff>,
+    #[cfg(target_os = "macos")] vpio_silence_cooldown_until_ms: u64,
 ) -> Result<AudioInputMonitorStatus, String> {
     let started_at = Instant::now();
     let owner = audio_owner_label(request.owner);
@@ -3232,6 +3992,7 @@ fn start_native_audio_session(
 
     *session = None;
     let (device, device_id, label) = cpal_input_device_by_id(&requested_device_id)?;
+    let mut handoff = handoff;
 
     // macOS: capture through the system VoiceProcessingIO unit (echo cancel +
     // noise suppression). The unit is kept warm for the session lifetime and
@@ -3240,7 +4001,7 @@ fn start_native_audio_session(
     // to cpal.
     #[cfg(target_os = "macos")]
     {
-        let cooldown_until = MACOS_VPIO_SILENCE_COOLDOWN_UNTIL_MS.load(Ordering::Acquire);
+        let cooldown_until = vpio_silence_cooldown_until_ms;
         let now_ms = audio_epoch_ms();
         if cooldown_until > now_ms {
             log_whisper_local_audio_event(
@@ -3253,12 +4014,23 @@ fn start_native_audio_session(
                 }),
             );
         } else {
-            match build_macos_voice_processing_capture(app.clone(), device_id.clone(), &label) {
+            match build_macos_voice_processing_capture(
+                app.clone(),
+                device_id.clone(),
+                &label,
+                generation,
+                supervisor.clone(),
+            ) {
                 Ok((capture, shared, sample_rate)) => {
+                    if let Some(handoff) = handoff.take() {
+                        native_audio_apply_session_handoff(&shared, handoff)?;
+                    }
                     let mut owners = HashSet::new();
                     owners.insert(owner.clone());
+                    let default_input_device_id = macos_default_input_device_id_for(&device_id);
                     let next_session = NativeAudioSession {
                         app,
+                        generation,
                         device_id,
                         engine: NativeAudioEngine::VoiceProcessing,
                         label,
@@ -3267,6 +4039,11 @@ fn start_native_audio_session(
                         shared,
                         _stream: NativeAudioStreamHandle::VoiceProcessing(capture),
                         voice_processing_delivery_started_at: None,
+                        voice_processing_engaged: false,
+                        vpio_silence_cooldown_until_ms,
+                        vpio_downgrade_last_attempt_ms: 0,
+                        default_device_last_checked_at: Instant::now(),
+                        default_input_device_id,
                     };
                     let status = native_audio_status(&next_session);
                     *session = Some(next_session);
@@ -3302,8 +4079,18 @@ fn start_native_audio_session(
 
     let mut owners = HashSet::new();
     owners.insert(owner.clone());
-    let (next_session, sample_format, channels) =
-        build_raw_native_audio_session(app, device, device_id, label, owners, None)?;
+    let (next_session, sample_format, channels) = build_raw_native_audio_session(
+        app,
+        device,
+        device_id,
+        label,
+        owners,
+        handoff,
+        generation,
+        supervisor,
+        #[cfg(target_os = "macos")]
+        vpio_silence_cooldown_until_ms,
+    )?;
     let status = native_audio_status(&next_session);
     *session = Some(next_session);
 
@@ -3437,9 +4224,7 @@ fn begin_native_audio_capture_for_session(
         preroll_peak = preroll_peak.max(chunk_peak);
         preroll_rms = preroll_rms.max(chunk_rms);
 
-        if realtime_audio_tx.is_some()
-            && (!realtime_tts_gate || chunk.realtime_replay_allowed)
-        {
+        if realtime_audio_tx.is_some() && (!realtime_tts_gate || chunk.realtime_replay_allowed) {
             preroll_audio.push(encode_linear16_audio(&chunk.samples));
         }
     }
@@ -3516,9 +4301,14 @@ fn begin_native_audio_partial_capture_for_session(
 
     for (samples, duration_ms) in candidates {
         let (rms, peak) = native_audio_stats(&samples);
-        if let Some(chunk) =
-            native_partial_ingest_samples(&mut partial, &samples, duration_ms, rms, peak, sample_rate)
-        {
+        if let Some(chunk) = native_partial_ingest_samples(
+            &mut partial,
+            &samples,
+            duration_ms,
+            rms,
+            peak,
+            sample_rate,
+        ) {
             queued_chunks.push(chunk);
         }
     }
@@ -3699,8 +4489,7 @@ fn whisper_model_definition(model_id: &str) -> Option<&'static WhisperModelDefin
 }
 
 fn whisper_default_model_definition() -> &'static WhisperModelDefinition {
-    whisper_model_definition(WHISPER_DEFAULT_MODEL_ID)
-        .unwrap_or_else(|| &WHISPER_MODEL_OPTIONS[0])
+    whisper_model_definition(WHISPER_DEFAULT_MODEL_ID).unwrap_or_else(|| &WHISPER_MODEL_OPTIONS[0])
 }
 
 fn whisper_selected_model_file_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -4053,8 +4842,8 @@ fn emit_audio_download_progress(app: &AppHandle, progress: WhisperModelDownloadP
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path)
-        .map_err(|error| format!("Unable to verify Whisper asset: {error}"))?;
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("Unable to verify Whisper asset: {error}"))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
 
@@ -4978,7 +5767,10 @@ fn local_whisper_partial_join_text(existing: &str, next: &str) -> String {
         .join(" ");
     if suffix.is_empty() {
         existing.to_string()
-    } else if matches!(suffix.chars().next(), Some('.' | ',' | ';' | ':' | '?' | '!')) {
+    } else if matches!(
+        suffix.chars().next(),
+        Some('.' | ',' | ';' | ':' | '?' | '!')
+    ) {
         format!("{existing}{suffix}")
     } else {
         format!("{existing} {suffix}")
@@ -5094,6 +5886,84 @@ mod local_whisper_partial_tests {
         assert!(shared.capture_started_at.is_none());
         assert_eq!(shared.capture_chunk_count, 0);
     }
+
+    #[test]
+    fn audio_session_handoff_preserves_active_capture_prefix_and_partial_state() {
+        let sample_rate = AUDIO_TARGET_SAMPLE_RATE;
+        let source = Arc::new(StdMutex::new(NativeAudioShared::new(sample_rate)));
+        let (chunk_tx, _chunk_rx) = mpsc::unbounded_channel();
+        let capture_started_at = Instant::now() - Duration::from_secs(2);
+
+        {
+            let mut shared = source.lock().expect("source buffer should lock");
+            shared.capture_started_at = Some(capture_started_at);
+            shared.capture_chunk_count = 2;
+            shared.capture_input_ms = 2_000.0;
+            shared.capture_peak = 0.08;
+            shared.capture_rms = 0.04;
+            shared.input_chunk_count = 5;
+            shared.total_samples = 320;
+            shared.chunks.push_back(NativeAudioChunk {
+                duration_ms: 20.0,
+                realtime_replay_allowed: true,
+                samples: vec![0.04; 320],
+                timestamp: capture_started_at,
+            });
+            shared.partial_capture = Some(NativePartialCaptureState {
+                session_id: "partial-session".to_string(),
+                chunk_tx,
+                next_index: 3,
+                buffered_samples: vec![0.06; 160],
+                buffered_start_ms: 1_500.0,
+                buffered_ms: 10.0,
+                total_ms: 2_000.0,
+                silence_ms: 0.0,
+                noise_floor_db: -50.0,
+                peak: 0.06,
+                rms: 0.06,
+                has_speech: true,
+                min_chunk_ms: 3_000,
+                max_chunk_ms: 35_000,
+                silence_cut_ms: 750,
+            });
+            shared.partial_finished_capture = Some(NativePartialFinishedCapture {
+                session_id: "finished-session".to_string(),
+                sample_rate,
+                samples: vec![0.02; 160],
+                candidate_chunks: 1,
+                capture_chunk_count: 1,
+                capture_input_ms: 10.0,
+                capture_peak: 0.02,
+                capture_rms: 0.02,
+            });
+        }
+
+        let handoff = native_audio_take_shared_handoff(&source).expect("handoff should take");
+        let target = Arc::new(StdMutex::new(NativeAudioShared::new(sample_rate)));
+        native_audio_apply_session_handoff(&target, handoff).expect("handoff should apply");
+
+        let shared = target.lock().expect("target buffer should lock");
+        assert_eq!(shared.capture_started_at, Some(capture_started_at));
+        assert_eq!(shared.capture_chunk_count, 2);
+        assert_eq!(shared.capture_input_ms, 2_000.0);
+        assert_eq!(shared.chunks.len(), 1);
+        assert_eq!(shared.chunks.front().map(|chunk| chunk.samples.len()), Some(320));
+        let partial = shared
+            .partial_capture
+            .as_ref()
+            .expect("active partial capture should survive handoff");
+        assert_eq!(partial.session_id, "partial-session");
+        assert_eq!(partial.next_index, 3);
+        assert_eq!(partial.buffered_samples.len(), 160);
+        assert_eq!(partial.total_ms, 2_000.0);
+        assert_eq!(
+            shared
+                .partial_finished_capture
+                .as_ref()
+                .map(|finished| finished.session_id.as_str()),
+            Some("finished-session")
+        );
+    }
 }
 
 fn emit_local_whisper_partial_transcript(
@@ -5194,7 +6064,9 @@ async fn run_local_whisper_partial_session(
                 if cancel_flag.load(Ordering::Acquire) {
                     break;
                 }
-                last_error = Some(format!("Unable to run local Whisper partial transcription: {error}"));
+                last_error = Some(format!(
+                    "Unable to run local Whisper partial transcription: {error}"
+                ));
             }
         }
     }
@@ -5701,8 +6573,7 @@ fn audio_widget_rect_nearly_matches(
     (current.origin.x - target.origin.x).abs() <= AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON
         && (current.origin.y - target.origin.y).abs() <= AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON
         && (current.size.width - target.size.width).abs() <= AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON
-        && (current.size.height - target.size.height).abs()
-            <= AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON
+        && (current.size.height - target.size.height).abs() <= AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON
 }
 
 #[cfg(target_os = "macos")]
@@ -5976,11 +6847,14 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
                             None,
                             json!({ "notification": notification_name }),
                         );
-                        let should_clear_full_monitor_sticky =
-                            notification_name == "NSWorkspaceActiveSpaceDidChangeNotification"
-                                || notification_name == "NSApplicationDidChangeScreenParametersNotification";
+                        let should_clear_full_monitor_sticky = notification_name
+                            == "NSWorkspaceActiveSpaceDidChangeNotification"
+                            || notification_name
+                                == "NSApplicationDidChangeScreenParametersNotification";
                         if should_clear_full_monitor_sticky {
-                            macos_clear_active_space_full_monitor_sticky("workspace_or_screen_change");
+                            macos_clear_active_space_full_monitor_sticky(
+                                "workspace_or_screen_change",
+                            );
                             // A Space switch kills any in-flight NSWindow
                             // animator mid-slide, but the stored animation
                             // record keeps claiming the slide is running for
@@ -6082,8 +6956,7 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
                         if widget_ptr.is_null() {
                             return;
                         }
-                        let Some(notification_object) =
-                            unsafe { notification.as_ref() }.object()
+                        let Some(notification_object) = unsafe { notification.as_ref() }.object()
                         else {
                             return;
                         };
@@ -6638,7 +7511,8 @@ fn audio_widget_queue_bottom_bar_position(
             applied: false,
             superseded: false,
         };
-        let current_generation = AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire);
+        let current_generation =
+            AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire);
         let current_invalidation_generation =
             AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION.load(Ordering::Acquire);
         if audio_widget_bottom_bar_generation_is_stale(generation, current_generation)
@@ -6744,7 +7618,8 @@ fn audio_widget_queue_bottom_bar_position(
             applied: false,
             superseded: false,
         };
-        let result = audio_widget_fallback_bottom_bar_position_result(Some(&schedule_error_request));
+        let result =
+            audio_widget_fallback_bottom_bar_position_result(Some(&schedule_error_request));
         audio_widget_emit_bottom_bar_layout_event(app, &result, &metadata);
         log_audio_widget_bottom_bar_debug_event(
             "audio.widget.bottom_bar.position.queue.schedule_error",
@@ -6794,7 +7669,8 @@ fn audio_widget_queue_stored_bottom_bar_position(
             applied: false,
             superseded: false,
         };
-        let current_generation = AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire);
+        let current_generation =
+            AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire);
         let current_invalidation_generation =
             AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION.load(Ordering::Acquire);
         // Command-priority staleness only applies to delayed/stored
@@ -7167,7 +8043,9 @@ where
                     "exception": clean_whisper_local_audio_log_text(&exception),
                 }),
             );
-            Err(format!("Audio widget action failed on macOS: {action_name}"))
+            Err(format!(
+                "Audio widget action failed on macOS: {action_name}"
+            ))
         }
     }
 }
@@ -7234,8 +8112,7 @@ where
                 "action": action_name,
             }),
         );
-        let result =
-            audio_widget_run_action_catching_objc(action_name, || action(&app_for_task));
+        let result = audio_widget_run_action_catching_objc(action_name, || action(&app_for_task));
         match &result {
             Ok(_) => log_audio_diagnostic_event(
                 "audio.widget.main_thread.action_done",
@@ -7751,8 +8628,9 @@ impl AudioWidgetBottomBarLayout {
 
 static AUDIO_WIDGET_BOTTOM_BAR_LAYOUT: OnceLock<StdMutex<Option<AudioWidgetBottomBarLayout>>> =
     OnceLock::new();
-static AUDIO_WIDGET_ERROR_OVERLAY_LAYOUT: OnceLock<StdMutex<Option<AudioWidgetErrorOverlayLayout>>> =
-    OnceLock::new();
+static AUDIO_WIDGET_ERROR_OVERLAY_LAYOUT: OnceLock<
+    StdMutex<Option<AudioWidgetErrorOverlayLayout>>,
+> = OnceLock::new();
 
 fn audio_widget_bottom_bar_layout_slot() -> &'static StdMutex<Option<AudioWidgetBottomBarLayout>> {
     AUDIO_WIDGET_BOTTOM_BAR_LAYOUT.get_or_init(|| StdMutex::new(None))
@@ -7877,7 +8755,8 @@ struct AudioWidgetBottomBarPositionResult {
 fn audio_widget_fallback_bottom_bar_position_result(
     request: Option<&AudioWidgetBottomBarPositionRequest>,
 ) -> AudioWidgetBottomBarPositionResult {
-    let width = audio_widget_positive_dimension(request.map(|request| request.width).unwrap_or(0.0), 64.0);
+    let width =
+        audio_widget_positive_dimension(request.map(|request| request.width).unwrap_or(0.0), 64.0);
     let height =
         audio_widget_positive_dimension(request.map(|request| request.height).unwrap_or(0.0), 64.0);
     AudioWidgetBottomBarPositionResult {
@@ -7968,11 +8847,9 @@ fn audio_widget_emit_bottom_bar_layout_resolution_on_main_thread(
     metadata: &AudioWidgetBottomBarLayoutEventMetadata,
     prefer_stored_screen: bool,
 ) {
-    let result = audio_widget_current_bottom_bar_position_result_on_main_thread(
-        app,
-        prefer_stored_screen,
-    )
-    .unwrap_or_else(|| audio_widget_fallback_bottom_bar_position_result(request));
+    let result =
+        audio_widget_current_bottom_bar_position_result_on_main_thread(app, prefer_stored_screen)
+            .unwrap_or_else(|| audio_widget_fallback_bottom_bar_position_result(request));
     audio_widget_emit_bottom_bar_layout_event(app, &result, metadata);
 }
 
@@ -8053,7 +8930,10 @@ mod audio_widget_bottom_bar_protocol_tests {
         audio_widget_store_frame_animation(&slot, Some(animation));
         let active = audio_widget_active_frame_animation(&slot).expect("animation active");
         let target = active.target_rect();
-        assert!(audio_widget_rect_nearly_matches(&target, &animation.target_rect()));
+        assert!(audio_widget_rect_nearly_matches(
+            &target,
+            &animation.target_rect()
+        ));
         assert!(active.remaining_secs() <= 0.3);
 
         // An animation whose duration + slack has elapsed no longer counts.
@@ -8156,7 +9036,10 @@ mod audio_widget_bottom_bar_protocol_tests {
         assert_eq!(payload["position_source"], "appkit-visible-frame");
         assert_eq!(payload["use_full_monitor_bounds"], false);
         assert_eq!(payload["scale_factor"], 2.0);
-        assert_eq!(payload["frame"], json!({"x": 12.0, "y": 34.0, "width": 320.0, "height": 44.0}));
+        assert_eq!(
+            payload["frame"],
+            json!({"x": 12.0, "y": 34.0, "width": 320.0, "height": 44.0})
+        );
         assert_eq!(
             payload["anchor"],
             json!({"x": 0.0, "y": 20.0, "width": 1440.0, "height": 880.0})
@@ -8312,7 +9195,9 @@ fn audio_widget_position_error_overlay_on_main_thread(
         let _ = overlay.set_ignore_cursor_events(true);
 
         let Some(main_thread_marker) = objc2::MainThreadMarker::new() else {
-            return Err("Audio widget error overlay placement must run on the main thread.".to_string());
+            return Err(
+                "Audio widget error overlay placement must run on the main thread.".to_string(),
+            );
         };
         let stored_layout = audio_widget_last_bottom_bar_layout();
         let Some(screen) = audio_widget_macos_target_screen_for_bottom_bar(
@@ -8359,8 +9244,7 @@ fn audio_widget_position_error_overlay_on_main_thread(
             objc2_core_foundation::CGPoint::new(x, y),
             objc2_core_foundation::CGSize::new(width, height),
         );
-        let frame_matches_target =
-            audio_widget_rect_nearly_matches(&frame_before, &target_frame);
+        let frame_matches_target = audio_widget_rect_nearly_matches(&frame_before, &target_frame);
         let overlay_in_flight =
             audio_widget_active_frame_animation(&AUDIO_WIDGET_ERROR_OVERLAY_FRAME_ANIMATION);
         let animation_matches_target = overlay_in_flight
@@ -8462,8 +9346,7 @@ fn audio_widget_position_error_overlay_for(
     let scale = overlay.scale_factor().unwrap_or(1.0);
     if let Some(bar_window) = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
         if let (Ok(position), Ok(size)) = (bar_window.outer_position(), bar_window.outer_size()) {
-            let x = position.x
-                + ((size.width as f64 - (width * scale)) / 2.0).round() as i32;
+            let x = position.x + ((size.width as f64 - (width * scale)) / 2.0).round() as i32;
             let y = position.y - ((height + gap) * scale).round() as i32;
             overlay
                 .set_position(tauri::PhysicalPosition::new(x, y))
@@ -8566,9 +9449,7 @@ extern "C" {
     #[link_name = "AXIsProcessTrusted"]
     fn audio_widget_ax_is_process_trusted() -> std::os::raw::c_uchar;
     #[link_name = "AXUIElementCreateApplication"]
-    fn audio_widget_ax_ui_element_create_application(
-        pid: i32,
-    ) -> *const std::ffi::c_void;
+    fn audio_widget_ax_ui_element_create_application(pid: i32) -> *const std::ffi::c_void;
     #[link_name = "AXUIElementCopyAttributeValue"]
     fn audio_widget_ax_ui_element_copy_attribute_value(
         element: *const std::ffi::c_void,
@@ -8640,15 +9521,10 @@ fn audio_widget_ax_copy_attribute_value(
     }
 
     let attribute_string = objc2_core_foundation::CFString::from_static_str(attribute);
-    let attribute_ref =
-        attribute_string.as_ref() as *const objc2_core_foundation::CFString;
+    let attribute_ref = attribute_string.as_ref() as *const objc2_core_foundation::CFString;
     let mut value: *const std::ffi::c_void = std::ptr::null();
     let error = unsafe {
-        audio_widget_ax_ui_element_copy_attribute_value(
-            element,
-            attribute_ref.cast(),
-            &mut value,
-        )
+        audio_widget_ax_ui_element_copy_attribute_value(element, attribute_ref.cast(), &mut value)
     };
     if error == MACOS_AX_ERROR_SUCCESS && !value.is_null() {
         Ok(value)
@@ -9167,8 +10043,7 @@ fn audio_widget_position_bottom_bar_on_main_thread(
             objc2_core_foundation::CGSize::new(width, height),
         );
 
-        let frame_matches_target =
-            audio_widget_rect_nearly_matches(&frame_before, &target_frame);
+        let frame_matches_target = audio_widget_rect_nearly_matches(&frame_before, &target_frame);
         let in_flight_animation =
             audio_widget_active_frame_animation(&AUDIO_WIDGET_BOTTOM_BAR_FRAME_ANIMATION);
         let animation_matches_target = in_flight_animation
@@ -9382,8 +10257,11 @@ fn audio_widget_position_bottom_bar_for(
             "request_id": request.request_id.as_str(),
         }),
     );
-    let result =
-        audio_widget_queue_bottom_bar_position(app, request, AudioWidgetBottomBarPlacementReason::Command);
+    let result = audio_widget_queue_bottom_bar_position(
+        app,
+        request,
+        AudioWidgetBottomBarPlacementReason::Command,
+    );
     match &result {
         Ok(()) => log_audio_widget_bottom_bar_debug_snapshot_for(
             app,
@@ -10000,7 +10878,9 @@ async fn start_local_whisper_partial_transcription(
     let prepare_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || prepare_whisper_model_for(&prepare_app, &engine))
         .await
-        .map_err(|error| format!("Unable to prepare local Whisper partial transcription: {error}"))??;
+        .map_err(|error| {
+            format!("Unable to prepare local Whisper partial transcription: {error}")
+        })??;
 
     let previous_session = {
         let mut session_guard = audio_state.local_whisper_partial.lock().await;
@@ -10293,7 +11173,7 @@ fn cloud_voice_agent_route_tts_playback(payload: Value) -> Value {
         match cloud_voice_agent_event_kind(&payload) {
             "voice_agent_tts_audio" => {
                 let audio_payload = cloud_voice_agent_tts_audio_payload(&payload);
-                if MACOS_VOICE_PROCESSING_ACTIVE.load(Ordering::Acquire) {
+                if macos_voice_processing_active() {
                     if let Some((bytes, sample_rate)) = audio_payload {
                         macos_voice_playback_enqueue_linear16(&bytes, sample_rate);
                         if let Some(audio) = payload.get_mut("audio") {
@@ -10362,9 +11242,7 @@ fn cloud_voice_agent_llm_orchestrator_policy() -> Value {
     })
 }
 
-fn resolve_cloud_voice_agent_origin_directory(
-    workspace_root: &str,
-) -> Result<PathBuf, String> {
+fn resolve_cloud_voice_agent_origin_directory(workspace_root: &str) -> Result<PathBuf, String> {
     let workspace_root = workspace_root.trim();
     resolve_app_control_terminal_working_directory(
         (!workspace_root.is_empty()).then_some(workspace_root),
@@ -10397,15 +11275,14 @@ mod cloud_voice_agent_origin_tests {
         );
 
         for origin in origins {
-            let resolved = resolve_cloud_voice_agent_origin_directory(
-                origin.to_string_lossy().as_ref(),
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "device voice origin {} should bypass workspace policy: {error}",
-                    origin.display()
-                )
-            });
+            let resolved =
+                resolve_cloud_voice_agent_origin_directory(origin.to_string_lossy().as_ref())
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "device voice origin {} should bypass workspace policy: {error}",
+                            origin.display()
+                        )
+                    });
             assert!(resolved.is_dir());
         }
     }
@@ -12892,8 +13769,8 @@ async fn stop_deepgram_realtime_transcription(
             return Err(error);
         }
         Ok(Err(_closed)) => {
-            let message = "Deepgram realtime transcription stopped before a result was returned."
-                .to_string();
+            let message =
+                "Deepgram realtime transcription stopped before a result was returned.".to_string();
             session.stream_task.abort();
             log_audio_diagnostic_event(
                 "audio.deepgram.stop.error",
@@ -13135,7 +14012,10 @@ fn audio_payload_u64(payload: &Value, keys: &[&str]) -> Option<u64> {
                 return Some(value.round() as u64);
             }
         }
-        if let Some(value) = value.as_str().and_then(|value| value.trim().parse::<u64>().ok()) {
+        if let Some(value) = value
+            .as_str()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
             return Some(value);
         }
     }
@@ -13143,8 +14023,11 @@ fn audio_payload_u64(payload: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 fn audio_payload_timing_u64(payload: &Value, keys: &[&str]) -> Option<u64> {
-    audio_payload_u64(payload, keys)
-        .or_else(|| payload.get("timings").and_then(|timings| audio_payload_u64(timings, keys)))
+    audio_payload_u64(payload, keys).or_else(|| {
+        payload
+            .get("timings")
+            .and_then(|timings| audio_payload_u64(timings, keys))
+    })
 }
 
 fn forge_dictation_result_from_payload(
@@ -13177,10 +14060,7 @@ fn forge_dictation_result_from_payload(
 
     let cleanup = payload.get("cleanup").unwrap_or(&Value::Null);
     let cleanup_provider = {
-        let provider = audio_payload_text(
-            payload,
-            &["cleanup_provider", "llm_cleanup_provider"],
-        );
+        let provider = audio_payload_text(payload, &["cleanup_provider", "llm_cleanup_provider"]);
         if provider.is_empty() {
             audio_payload_text(cleanup, &["provider"])
         } else {
@@ -13188,25 +14068,16 @@ fn forge_dictation_result_from_payload(
         }
     };
     let cleanup_model = {
-        let model = audio_payload_text(
-            payload,
-            &["cleanup_model", "llm_cleanup_model"],
-        );
+        let model = audio_payload_text(payload, &["cleanup_model", "llm_cleanup_model"]);
         if model.is_empty() {
             audio_payload_text(cleanup, &["model"])
         } else {
             model
         }
     };
-    let cleanup_ms =
-        audio_payload_timing_u64(payload, &["cleanup_ms"]).unwrap_or(0);
-    let stt_ms = audio_payload_timing_u64(
-        payload,
-        &["stt_ms", "finish_to_raw_ms"],
-    )
-    .unwrap_or(0);
-    let llm_ms =
-        audio_payload_timing_u64(payload, &["llm_ms"]).unwrap_or(cleanup_ms);
+    let cleanup_ms = audio_payload_timing_u64(payload, &["cleanup_ms"]).unwrap_or(0);
+    let stt_ms = audio_payload_timing_u64(payload, &["stt_ms", "finish_to_raw_ms"]).unwrap_or(0);
+    let llm_ms = audio_payload_timing_u64(payload, &["llm_ms"]).unwrap_or(cleanup_ms);
     let total_ms = audio_payload_timing_u64(payload, &["total_ms"])
         .unwrap_or_else(|| stt_ms.saturating_add(llm_ms));
 
@@ -13261,44 +14132,34 @@ fn apply_forge_dictation_cleaned_payload(result: &mut ForgeDictationResult, fram
         .get("llm_cleaned")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if let Some(provider) = [
-        "cleanup_provider",
-        "llm_cleanup_provider",
-    ]
-    .iter()
-    .find_map(|key| {
-        frame
-            .get(*key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    }) {
+    if let Some(provider) = ["cleanup_provider", "llm_cleanup_provider"]
+        .iter()
+        .find_map(|key| {
+            frame
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+    {
         result.cleanup_provider = provider.to_string();
     }
-    if let Some(model) = [
-        "cleanup_model",
-        "llm_cleanup_model",
-    ]
-    .iter()
-    .find_map(|key| {
-        frame
-            .get(*key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    }) {
+    if let Some(model) = ["cleanup_model", "llm_cleanup_model"]
+        .iter()
+        .find_map(|key| {
+            frame
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+    {
         result.cleanup_model = model.to_string();
     }
     result.cleanup_ms =
         audio_payload_timing_u64(frame, &["cleanup_ms"]).unwrap_or(result.cleanup_ms);
-    result.stt_ms = audio_payload_timing_u64(
-        frame,
-        &[
-            "stt_ms",
-            "finish_to_raw_ms",
-        ],
-    )
-    .unwrap_or(result.stt_ms);
+    result.stt_ms =
+        audio_payload_timing_u64(frame, &["stt_ms", "finish_to_raw_ms"]).unwrap_or(result.stt_ms);
     result.llm_ms = audio_payload_timing_u64(frame, &["llm_ms"]).unwrap_or_else(|| {
         if result.cleanup_ms > 0 {
             result.cleanup_ms
@@ -13306,10 +14167,8 @@ fn apply_forge_dictation_cleaned_payload(result: &mut ForgeDictationResult, fram
             result.llm_ms
         }
     });
-    result.total_ms =
-        audio_payload_timing_u64(frame, &["total_ms"]).unwrap_or_else(|| {
-            result.stt_ms.saturating_add(result.llm_ms)
-        });
+    result.total_ms = audio_payload_timing_u64(frame, &["total_ms"])
+        .unwrap_or_else(|| result.stt_ms.saturating_add(result.llm_ms));
 }
 
 /// How the dictation stream task reaches Diff Forge Cloud: a warm parked
@@ -13499,7 +14358,9 @@ async fn polish_audio_transcription(
                 let snippet = cloud_audio_response_snippet(&body_text);
                 (!snippet.is_empty()).then_some(snippet)
             })
-            .unwrap_or_else(|| "Cloud transcript polish failed with an empty response.".to_string());
+            .unwrap_or_else(|| {
+                "Cloud transcript polish failed with an empty response.".to_string()
+            });
         return Err(format!(
             "Cloud transcript polish failed ({status}): {message}"
         ));
@@ -13532,17 +14393,16 @@ async fn polish_audio_transcription(
     write_audio_transcription_polish_clipboard_text(&polished_text)?;
 
     let cleanup_ms = audio_payload_timing_u64(data, &["cleanup_ms"]).unwrap_or(0);
-    let stt_ms = audio_payload_timing_u64(
-        data,
-        &["stt_ms", "finish_to_raw_ms"],
-    )
-    .unwrap_or(0);
+    let stt_ms = audio_payload_timing_u64(data, &["stt_ms", "finish_to_raw_ms"]).unwrap_or(0);
     let llm_ms = audio_payload_timing_u64(data, &["llm_ms"]).unwrap_or(cleanup_ms);
-    let total_ms = audio_payload_timing_u64(data, &["total_ms"])
-        .unwrap_or_else(|| {
-            let total = stt_ms.saturating_add(llm_ms);
-            if total > 0 { total } else { cleanup_ms }
-        });
+    let total_ms = audio_payload_timing_u64(data, &["total_ms"]).unwrap_or_else(|| {
+        let total = stt_ms.saturating_add(llm_ms);
+        if total > 0 {
+            total
+        } else {
+            cleanup_ms
+        }
+    });
     let provider = {
         let provider = audio_payload_text(
             data,
@@ -13556,10 +14416,7 @@ async fn polish_audio_transcription(
         }
     };
     let model = {
-        let model = audio_payload_text(
-            data,
-            &["model", "cleanup_model", "llm_cleanup_model"],
-        );
+        let model = audio_payload_text(data, &["model", "cleanup_model", "llm_cleanup_model"]);
         if model.is_empty() {
             clean_audio_cleanup_selector_field(request.cleanup_model.as_deref()).unwrap_or_default()
         } else {
@@ -14303,8 +15160,7 @@ async fn start_forge_dictation_transcription(
     let command_started_at = Instant::now();
     let llm_cleanup = request.llm_cleanup.unwrap_or(true);
     let language = clean_deepgram_language(request.language)?;
-    let polishing_prompt =
-        clean_audio_polishing_system_prompt(request.polishing_prompt.as_deref());
+    let polishing_prompt = clean_audio_polishing_system_prompt(request.polishing_prompt.as_deref());
     let cleanup_engine = clean_audio_cleanup_selector_field(request.cleanup_engine.as_deref());
     let cleanup_provider = clean_audio_cleanup_selector_field(request.cleanup_provider.as_deref());
     let cleanup_model = clean_audio_cleanup_selector_field(request.cleanup_model.as_deref());
@@ -15145,4 +16001,246 @@ async fn hyperframe_transcribe_audio(
     })
     .await
     .map_err(|error| format!("Local Whisper transcription task failed: {error}"))?
+}
+
+// ---------------------------------------------------------------------------
+// Mic engine supervisor (rev-audit 2026-08-21): the command-timeout "reset"
+// previously swapped in an EMPTY worker while the wedged stream lived on in
+// the abandoned one — "try again" talked to nothing. This pure state machine
+// owns recovery truth: generations quarantine stale workers, a timeout leads
+// to rebuilt-running or an explicit recovery-failed (never a silent empty
+// worker), and default-device/bypass events are honest transitions. The
+// worker wiring drives it; the machine itself is platform-free and testable.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MicSupervisorState {
+    /// A generation owns a live engine.
+    Running { generation: u64 },
+    /// A rebuild for `generation` is in flight; the prior generation is
+    /// quarantined and must not touch the engine again.
+    Recovering { generation: u64 },
+    /// Recovery failed and the caller was told the truth.
+    RecoveryFailed { generation: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MicSupervisorAction {
+    /// Tear down / ignore everything owned by this stale generation.
+    Quarantine { generation: u64 },
+    /// Rebuild the engine off the command worker, restoring saved
+    /// monitor/consumer state, as this new generation.
+    Rebuild { generation: u64 },
+    /// Surface an honest failure to the caller (no "was reset" fiction).
+    ReportRecoveryFailed,
+}
+
+/// A command deadline expired for `generation`.
+pub(crate) fn mic_supervisor_on_command_timeout(
+    state: &MicSupervisorState,
+    timed_out_generation: u64,
+) -> (MicSupervisorState, Vec<MicSupervisorAction>) {
+    mic_supervisor_recover_current(state, timed_out_generation)
+}
+
+/// The off-worker rebuild for `generation` finished.
+pub(crate) fn mic_supervisor_on_rebuild_result(
+    state: &MicSupervisorState,
+    generation: u64,
+    rebuilt_ok: bool,
+) -> (MicSupervisorState, Vec<MicSupervisorAction>) {
+    match state {
+        MicSupervisorState::Recovering {
+            generation: recovering_generation,
+        } if *recovering_generation == generation => {
+            if rebuilt_ok {
+                (MicSupervisorState::Running { generation }, Vec::new())
+            } else {
+                (
+                    MicSupervisorState::RecoveryFailed { generation },
+                    vec![MicSupervisorAction::ReportRecoveryFailed],
+                )
+            }
+        }
+        _ => (state.clone(), Vec::new()),
+    }
+}
+
+/// May a reply/callback from `from_generation` mutate the engine?
+pub(crate) fn mic_supervisor_accepts(state: &MicSupervisorState, from_generation: u64) -> bool {
+    matches!(
+        state,
+        MicSupervisorState::Running { generation }
+            | MicSupervisorState::Recovering { generation }
+            if *generation == from_generation
+    )
+}
+
+/// The OS default input device changed while a "default" session is live.
+pub(crate) fn mic_supervisor_on_default_device_changed(
+    state: &MicSupervisorState,
+    session_is_default_device: bool,
+) -> (MicSupervisorState, Vec<MicSupervisorAction>) {
+    if !session_is_default_device {
+        return (state.clone(), Vec::new());
+    }
+    match state {
+        MicSupervisorState::Running { generation } => mic_supervisor_start_recovery(*generation),
+        MicSupervisorState::Recovering { .. } | MicSupervisorState::RecoveryFailed { .. } => {
+            (state.clone(), Vec::new())
+        }
+    }
+}
+
+/// A VPIO bypass/engage attempt settled; flags must tell the truth.
+pub(crate) fn mic_supervisor_bypass_flags(requested_active: bool, engage_succeeded: bool) -> bool {
+    requested_active && engage_succeeded
+}
+
+fn mic_supervisor_recover_current(
+    state: &MicSupervisorState,
+    generation: u64,
+) -> (MicSupervisorState, Vec<MicSupervisorAction>) {
+    match state {
+        MicSupervisorState::Running {
+            generation: current_generation,
+        } if *current_generation == generation => {
+            mic_supervisor_start_recovery(*current_generation)
+        }
+        // A recovery owns its replacement generation already. A late timeout
+        // from either generation must not fork a second rebuild.
+        MicSupervisorState::Recovering { .. }
+        | MicSupervisorState::Running { .. }
+        | MicSupervisorState::RecoveryFailed { .. } => (state.clone(), Vec::new()),
+    }
+}
+
+fn mic_supervisor_start_recovery(
+    generation: u64,
+) -> (MicSupervisorState, Vec<MicSupervisorAction>) {
+    let replacement_generation = generation.saturating_add(1);
+    (
+        MicSupervisorState::Recovering {
+            generation: replacement_generation,
+        },
+        vec![
+            MicSupervisorAction::Quarantine { generation },
+            MicSupervisorAction::Rebuild {
+                generation: replacement_generation,
+            },
+        ],
+    )
+}
+
+#[cfg(test)]
+mod mic_supervisor_contract_tests {
+    use super::*;
+
+    // Contract 1: a timed-out live generation must end in a rebuild of a NEW
+    // generation with the old one quarantined — never a no-op that strands
+    // the wedged stream behind a fresh empty worker.
+    #[test]
+    fn command_timeout_quarantines_and_rebuilds_never_a_fresh_empty_worker() {
+        let state = MicSupervisorState::Running { generation: 3 };
+        let (next, actions) = mic_supervisor_on_command_timeout(&state, 3);
+        assert_eq!(next, MicSupervisorState::Recovering { generation: 4 });
+        assert!(actions.contains(&MicSupervisorAction::Quarantine { generation: 3 }));
+        assert!(actions.contains(&MicSupervisorAction::Rebuild { generation: 4 }));
+    }
+
+    // Contract 1b: rebuild failure is reported honestly.
+    #[test]
+    fn failed_rebuild_reports_recovery_failed() {
+        let state = MicSupervisorState::Recovering { generation: 4 };
+        let (next, actions) = mic_supervisor_on_rebuild_result(&state, 4, false);
+        assert_eq!(next, MicSupervisorState::RecoveryFailed { generation: 4 });
+        assert!(actions.contains(&MicSupervisorAction::ReportRecoveryFailed));
+    }
+
+    #[test]
+    fn successful_rebuild_returns_to_running() {
+        let state = MicSupervisorState::Recovering { generation: 4 };
+        let (next, actions) = mic_supervisor_on_rebuild_result(&state, 4, true);
+        assert_eq!(next, MicSupervisorState::Running { generation: 4 });
+        assert!(actions.is_empty());
+    }
+
+    // Contract 2: stale-generation replies can never mutate the current
+    // engine; the live generation's replies can.
+    #[test]
+    fn stale_generation_replies_are_quarantined() {
+        let state = MicSupervisorState::Recovering { generation: 4 };
+        assert!(!mic_supervisor_accepts(&state, 3));
+        assert!(mic_supervisor_accepts(&state, 4));
+        let running = MicSupervisorState::Running { generation: 4 };
+        assert!(!mic_supervisor_accepts(&running, 3));
+        assert!(mic_supervisor_accepts(&running, 4));
+    }
+
+    // Contract 3: a timeout DURING recovery does not fork ownership — the
+    // in-flight generation keeps it (no second rebuild of the same gen).
+    #[test]
+    fn timeout_during_recovery_keeps_single_ownership() {
+        let state = MicSupervisorState::Recovering { generation: 4 };
+        let (next, actions) = mic_supervisor_on_command_timeout(&state, 3);
+        assert_eq!(next, MicSupervisorState::Recovering { generation: 4 });
+        assert!(actions.is_empty(), "stale timeout must not fork recovery");
+    }
+
+    // Contract 4: a default-device change invalidates a "default" session
+    // (quarantine + rebuild), and leaves pinned-device sessions alone.
+    #[test]
+    fn default_device_change_rebuilds_default_sessions_only() {
+        let state = MicSupervisorState::Running { generation: 7 };
+        let (next, actions) = mic_supervisor_on_default_device_changed(&state, true);
+        assert_eq!(next, MicSupervisorState::Recovering { generation: 8 });
+        assert!(actions.contains(&MicSupervisorAction::Quarantine { generation: 7 }));
+        assert!(actions.contains(&MicSupervisorAction::Rebuild { generation: 8 }));
+        let (same, none) = mic_supervisor_on_default_device_changed(&state, false);
+        assert_eq!(same, state);
+        assert!(none.is_empty());
+    }
+
+    // Contract 5: bypass/engage flags tell the truth — a failed engage never
+    // reports active.
+    #[test]
+    fn bypass_flags_are_truthful() {
+        assert!(mic_supervisor_bypass_flags(true, true));
+        assert!(!mic_supervisor_bypass_flags(true, false));
+        assert!(!mic_supervisor_bypass_flags(false, true));
+        assert!(!mic_supervisor_bypass_flags(false, false));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_native_audio_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn vpio_drop_cannot_clear_a_replacement_generation_owner() {
+        let owner = AtomicU64::new(4);
+
+        assert!(!macos_voice_processing_release_owner(&owner, 3));
+        assert_eq!(owner.load(Ordering::Acquire), 4);
+        assert!(macos_voice_processing_release_owner(&owner, 4));
+        assert_eq!(owner.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn default_device_id_change_detects_same_named_devices() {
+        let previous = Some(41 as coreaudio::sys::AudioDeviceID);
+        let replacement = Some(42 as coreaudio::sys::AudioDeviceID);
+
+        assert!(macos_default_input_device_id_changed(
+            true,
+            previous,
+            replacement
+        ));
+        assert!(!macos_default_input_device_id_changed(true, previous, previous));
+        assert!(!macos_default_input_device_id_changed(
+            false,
+            previous,
+            replacement
+        ));
+    }
 }

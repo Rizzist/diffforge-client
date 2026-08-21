@@ -16,8 +16,22 @@ struct SessionRow {
     state_raw: String,
     first_user_message: String,
     model: String,
+    effort: Option<String>,
+    #[serde(rename = "speed", serialize_with = "sessions_serialize_speed")]
+    speed_fast: Option<i64>,
     pinned: bool,
     title_locked: bool,
+}
+
+fn sessions_serialize_speed<S>(speed_fast: &Option<i64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if speed_fast == &Some(1) {
+        serializer.serialize_some("fast")
+    } else {
+        serializer.serialize_none()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,6 +240,8 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
                 state_raw TEXT NOT NULL DEFAULT '',
                 first_user_message TEXT NOT NULL DEFAULT '',
                 model TEXT NOT NULL DEFAULT '',
+                effort TEXT,
+                speed_fast INTEGER,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 title_locked INTEGER NOT NULL DEFAULT 0
              );
@@ -238,6 +254,8 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
         ("pinned", "INTEGER NOT NULL DEFAULT 0"),
         ("title_locked", "INTEGER NOT NULL DEFAULT 0"),
         ("state_raw", "TEXT NOT NULL DEFAULT ''"),
+        ("effort", "TEXT"),
+        ("speed_fast", "INTEGER"),
     ];
     let columns = sessions_table_columns(connection)?;
     if migrations
@@ -292,13 +310,15 @@ fn sessions_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> 
         state_raw: row.get(10)?,
         first_user_message: row.get(11)?,
         model: row.get(12)?,
-        pinned: row.get(13)?,
-        title_locked: row.get(14)?,
+        effort: row.get(13)?,
+        speed_fast: row.get(14)?,
+        pinned: row.get(15)?,
+        title_locked: row.get(16)?,
     })
 }
 
 const SESSIONS_SELECT_COLUMNS: &str =
-    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, state_raw, first_user_message, model, pinned, title_locked";
+    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, state_raw, first_user_message, model, effort, speed_fast, pinned, title_locked";
 
 fn sessions_row_by_id(connection: &rusqlite::Connection, id: &str) -> Result<SessionRow, String> {
     let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions WHERE id = ?1");
@@ -368,6 +388,8 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
         state_raw: String::new(),
         first_user_message: String::new(),
         model: String::new(),
+        effort: None,
+        speed_fast: None,
         pinned: false,
         title_locked: false,
     };
@@ -663,6 +685,8 @@ mod sessions_tests {
             state_raw: "idle".to_string(),
             first_user_message: String::new(),
             model: String::new(),
+            effort: None,
+            speed_fast: None,
             pinned: false,
             title_locked: false,
         }
@@ -781,12 +805,24 @@ mod sessions_tests {
                 .unwrap();
             columns
         };
-        for column in ["model", "pinned", "title_locked", "state_raw"] {
+        for column in [
+            "model",
+            "pinned",
+            "title_locked",
+            "state_raw",
+            "effort",
+            "speed_fast",
+        ] {
             assert_eq!(columns.iter().filter(|name| *name == column).count(), 1);
         }
         let row = sessions_row_by_id(&connection, "old-row").unwrap();
         assert_eq!(row.model, "");
         assert_eq!(row.state_raw, "");
+        assert_eq!(row.effort, None);
+        assert_eq!(row.speed_fast, None);
+        let row_json = serde_json::to_value(&row).unwrap();
+        assert_eq!(row_json["effort"], Value::Null);
+        assert_eq!(row_json["speed"], Value::Null);
         assert!(!row.pinned);
         assert!(!row.title_locked);
 
@@ -820,6 +856,8 @@ mod sessions_tests {
             provider: Some("openai".to_string()),
             cwd: None,
             state_raw: Some("running".to_string()),
+            effort: None,
+            fast: None,
             latest_at_ms: Some(20),
         }])
         .unwrap());
@@ -910,6 +948,8 @@ mod sessions_tests {
             provider: Some("openai".to_string()),
             cwd: None,
             state_raw: Some("idle".to_string()),
+            effort: None,
+            fast: None,
             latest_at_ms: Some(sessions_now_ms()),
         }
     }
