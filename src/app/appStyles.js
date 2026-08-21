@@ -2747,7 +2747,8 @@ export const RailWindowControls = styled(WindowControls)`
   /* The titlebar's 12px inset is too wide for the rail — tighten it so the
      pills keep their width. */
   &[data-platform="macos"] {
-    padding: 0 4px 0 8px;
+    padding: 0 2px 0 6px;
+    gap: 6px;
   }
 
   &[data-platform="windows"] ${WindowControlButton},
@@ -2816,7 +2817,7 @@ export const RailBrandButton = styled.button`
   border-radius: 6px;
   color: var(--forge-text);
   background: transparent;
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 760;
   letter-spacing: -0.01em;
   cursor: pointer;
@@ -2857,9 +2858,9 @@ export const RailModeTag = styled.span`
   min-width: 0;
   overflow: hidden;
   margin-left: auto;
-  padding: 1px 5px;
+  padding: 1px 4px;
   border-radius: 5px;
-  font-size: 7.5px;
+  font-size: 7px;
   font-weight: 800;
   letter-spacing: 0.05em;
   text-overflow: ellipsis;
@@ -3051,11 +3052,11 @@ export const RailBackgroundPill = styled.button`
   display: inline-flex;
   min-width: 0;
   flex: 0 1 auto;
-  height: 20px;
+  height: 18px;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  padding: 0 8px;
+  gap: 3px;
+  padding: 0 7px;
 
   > span {
     min-width: 0;
@@ -3075,7 +3076,7 @@ export const RailBackgroundPill = styled.button`
     background: color-mix(in srgb, var(--forge-ember) 10%, transparent);
   }
 
-  font-size: 9px;
+  font-size: 8.5px;
   font-weight: 750;
   letter-spacing: 0.02em;
   white-space: nowrap;
@@ -25308,10 +25309,12 @@ export const WindowSyncPill = styled.button`
 export const RailSyncPill = styled(WindowSyncPill)`
   min-width: 0;
   flex: 0 1 auto;
-  height: 20px;
-  padding: 0 8px;
+  height: 18px;
+  padding: 0 7px;
   justify-content: center;
-  font-size: 9px;
+  font-size: 8.5px;
+  /* Click target again: opens the sync inbox/outbox (networking) UI. */
+  cursor: pointer;
 
   > span {
     min-width: 0;
@@ -25319,8 +25322,6 @@ export const RailSyncPill = styled(WindowSyncPill)`
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* Informational (session-history sync) — not a click target. */
-  cursor: default;
 
   ${WorkspaceRail}[data-collapsed="true"] & {
     width: 100%;

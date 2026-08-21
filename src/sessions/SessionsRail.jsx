@@ -4,6 +4,7 @@ import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Edit } from "@styled-icons/material-rounded/Edit";
+import { Movie } from "@styled-icons/material-rounded/Movie";
 
 import {
   SettingsNavGroupLabel,
@@ -28,6 +29,7 @@ export default function SessionsRail({
   sessions,
   activeSessionId,
   onNewChat,
+  onNewMedia = null,
   onSearchChange = null,
   onSelectSession,
   searchQuery = "",
@@ -175,16 +177,27 @@ export default function SessionsRail({
 
   return (
     <SessionsRailRoot onClick={(event) => event.stopPropagation()}>
-      <RailComposeRow
-        aria-label="New chat"
-        onClick={onNewChat}
-        title="New chat (⌘N)"
-        type="button"
-      >
-        <ButtonEditIcon aria-hidden="true" />
-        <span>New chat</span>
-        <em aria-hidden="true">＋</em>
-      </RailComposeRow>
+      {/* New chat | New media: half-width pair (collapsed: stacked icons). */}
+      <ComposePairRow>
+        <RailComposeRow
+          aria-label="New chat"
+          onClick={onNewChat}
+          title="New chat (⌘N)"
+          type="button"
+        >
+          <ButtonEditIcon aria-hidden="true" />
+          <span>New chat</span>
+        </RailComposeRow>
+        <RailComposeRow
+          aria-label="New media"
+          onClick={onNewMedia || undefined}
+          title="New media — transcribe, translate, summarize, convert"
+          type="button"
+        >
+          <Movie aria-hidden="true" size={13} />
+          <span>New media</span>
+        </RailComposeRow>
+      </ComposePairRow>
 
       {/* Persistent chat search under New chat (folds away when the rail is
           collapsed — RailSearchRow hides itself). */}
@@ -282,6 +295,29 @@ const SessionsRailRoot = styled.div`
 
 /* Collapsed rail: the list stays as a brand-dot icon strip — group labels
    and row text fold away, the marks keep their activity badges. */
+/* The compose pair: two half-width rows; collapsed rail stacks them as
+   icon squares (each row's own collapsed styling applies). */
+const ComposePairRow = styled.div`
+  display: flex;
+  gap: 6px;
+
+  > button {
+    flex: 1;
+    min-width: 0;
+  }
+
+  > button span {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  [data-collapsed="true"] & {
+    flex-direction: column;
+    gap: 4px;
+  }
+`;
+
 const SessionListArea = styled.div`
   display: flex;
   min-height: 0;

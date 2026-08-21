@@ -33,6 +33,7 @@ import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import { AuthFlow, SUCCESS_HOLD_MS as AUTH_SUCCESS_HOLD_MS } from "../auth";
 import SessionsRail from "../sessions/SessionsRail.jsx";
 import SessionSurface from "../sessions/SessionSurface.jsx";
+import MediaDeck from "../media/MediaDeck.jsx";
 import { listSessions, sessionWorkingDirectory } from "../sessions/sessionsModel.js";
 import { listenShared, waitSharedListenerReady } from "./sharedTauriEvents.js";
 import { resolveLoopspaceTodoTerminalSelectors } from "./loopspaceTodoDispatchTargets.js";
@@ -18414,24 +18415,42 @@ export default function App() {
       // Store not available yet (first boot before Rust lane) — rail stays empty.
     }
   }, []);
+  /* Media Deck (demo): a session-less workspace for media objects —
+     transcribe / translate / summarize / convert. Opening it deselects
+     chat surfaces; opening any chat surface closes it. */
+  const [mediaDeckOpen, setMediaDeckOpen] = useState(false);
   const openSessionFromRail = useCallback((session) => {
     if (!session?.id) {
       return;
     }
+    setMediaDeckOpen(false);
     setSessionDraftOpen(false);
     setActiveSessionId(session.id);
     setOpenSessionIds((ids) => (ids.includes(session.id) ? ids : [...ids, session.id]));
     showView(DEFAULT_WORKSPACE_VIEW);
   }, [showView]);
   const startNewSessionChat = useCallback(() => {
+    setMediaDeckOpen(false);
     setSessionDraftOpen(true);
     setActiveSessionId("");
     showView(DEFAULT_WORKSPACE_VIEW);
   }, [showView]);
   const deselectSessionToHome = useCallback(() => {
+    setMediaDeckOpen(false);
     setSessionDraftOpen(false);
     setActiveSessionId("");
   }, []);
+  /* New Media is a toggle like New chat: click again to fall back home. */
+  const toggleMediaDeck = useCallback(() => {
+    if (mediaDeckOpen) {
+      setMediaDeckOpen(false);
+      return;
+    }
+    setSessionDraftOpen(false);
+    setActiveSessionId("");
+    showView(DEFAULT_WORKSPACE_VIEW);
+    setMediaDeckOpen(true);
+  }, [mediaDeckOpen, showView]);
   /* Rail "New chat" is a toggle: first click opens the draft; clicking it
      again while the draft is showing deselects back to the home (flame)
      view. ⌘N stays open-only. */
@@ -24222,12 +24241,13 @@ export default function App() {
                             Informational, never faked. */}
                         <RailSyncPill
                           aria-label={sessionHistorySyncing
-                            ? "Syncing session history"
-                            : "Session history synced"}
+                            ? "Syncing session history — open sync activity"
+                            : "Session history synced — open sync activity"}
                           data-state={sessionHistorySyncing ? "syncing" : undefined}
+                          onClick={openNetworkingOverlay}
                           title={sessionHistorySyncing
-                            ? "Syncing this session's history from the harness…"
-                            : "Session history synced"}
+                            ? "Syncing this session's history — click for the sync inbox/outbox"
+                            : "Synced — click for the sync inbox/outbox"}
                           type="button"
                         >
                           <WindowSyncPillIndicator
@@ -24477,6 +24497,7 @@ export default function App() {
                         <SessionsRail
                           activeSessionId={activeSessionId}
                           onNewChat={toggleNewSessionChat}
+                          onNewMedia={toggleMediaDeck}
                           onSearchChange={setRailSearchQuery}
                           onSelectSession={openSessionFromRail}
                           /* Collapsed hides the search box, so the filter
@@ -24890,7 +24911,8 @@ export default function App() {
                       </WorkspaceCreateSurface>
                     )}
                   </WorkspaceCreateLayer>
-                  {!loopspacesModeActive && (
+                  {!loopspacesModeActive && mediaDeckOpen && <MediaDeck />}
+                  {!loopspacesModeActive && !mediaDeckOpen && (
                     <SessionSurface
                       activeSessionId={activeSessionId}
                       appThemeIsLight={activeAppTheme === APP_THEME_LIGHT}
