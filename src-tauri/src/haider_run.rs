@@ -834,6 +834,72 @@ async fn session_config_get(session_id: String) -> Value {
     )
 }
 
+/// Discard a staged paste file. Guarded to OUR staging prefix inside the
+/// temp dir — this command can never delete anything else.
+#[tauri::command(rename_all = "snake_case")]
+fn discard_staged_attachment(path: String) -> Result<(), String> {
+    // Canonical-path law: the file must resolve to a DIRECT child of the
+    // canonical temp dir with our staging prefix — lexical prefix checks
+    // fall to `..` traversal and symlinked directories.
+    let candidate = std::path::PathBuf::from(&path);
+    let canonical = match candidate.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Staged paste could not be resolved: {error}")),
+    };
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|error| format!("Temp dir could not be resolved: {error}"))?;
+    let name = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if canonical.parent() != Some(temp_root.as_path()) || !name.starts_with("diffforge-paste-") {
+        return Err("Path is not a staged paste file.".to_string());
+    }
+    match std::fs::remove_file(&canonical) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Staged paste could not be discarded: {error}")),
+    }
+}
+
+/// Stage a pasted clipboard image as a temp file so it can ride the run's
+/// --attach lane like any picked file. Returns the staged path.
+#[tauri::command(rename_all = "snake_case")]
+fn stage_pasted_image(bytes: String, mime: String) -> Result<String, String> {
+    use base64::Engine as _;
+    // The UI caps/allowlists too, but the server enforces its own limits —
+    // the frontend is not a trust boundary.
+    const STAGE_MAX_BYTES: usize = 12 * 1024 * 1024;
+    let extension = match mime.as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        other => return Err(format!("Unsupported pasted image type: {other}")),
+    };
+    if bytes.len() > STAGE_MAX_BYTES.saturating_mul(4) / 3 + 4 {
+        return Err("Pasted image is too large.".to_string());
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(bytes.as_bytes())
+        .map_err(|error| format!("Pasted image could not be decoded: {error}"))?;
+    if decoded.is_empty() {
+        return Err("Pasted image was empty.".to_string());
+    }
+    if decoded.len() > STAGE_MAX_BYTES {
+        return Err("Pasted image is too large.".to_string());
+    }
+    let path = std::env::temp_dir().join(format!(
+        "diffforge-paste-{}.{extension}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&path, decoded)
+        .map_err(|error| format!("Pasted image could not be staged: {error}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 /// Item detail door (0.0.934, `haider.item.v1`): fetch ONE full journal item
 /// for the chat drawer — cold sidecar rows carry only the envelope; the door
 /// has the joined args/result.
@@ -1066,6 +1132,61 @@ mod haider_run_tests {
             });
         assert!(!used_cli);
         assert_eq!(result.unwrap(), json!({"ok":true}));
+    }
+
+    #[test]
+    fn discard_staged_attachment_guards_prefix_and_traversal() {
+        // A real staged file (direct temp child, right prefix) is removed.
+        let staged = std::env::temp_dir().join(format!(
+            "diffforge-paste-{}.png",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&staged, b"x").unwrap();
+        discard_staged_attachment(staged.to_string_lossy().to_string()).unwrap();
+        assert!(!staged.exists());
+        // Wrong prefix in a nested dir is refused even when the path string
+        // routes through temp with traversal.
+        let nested = std::env::temp_dir().join(format!(
+            "dfp-nest-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&nested).unwrap();
+        let victim = nested.join("diffforge-paste-victim.png");
+        std::fs::write(&victim, b"x").unwrap();
+        let sneaky = std::env::temp_dir()
+            .join("..")
+            .join(
+                std::env::temp_dir()
+                    .file_name()
+                    .map(|name| name.to_os_string())
+                    .unwrap_or_default(),
+            )
+            .join(nested.file_name().unwrap())
+            .join("diffforge-paste-victim.png");
+        assert!(discard_staged_attachment(sneaky.to_string_lossy().to_string()).is_err());
+        assert!(victim.exists());
+        std::fs::remove_dir_all(&nested).unwrap();
+        // Missing files are a quiet Ok.
+        discard_staged_attachment(
+            std::env::temp_dir()
+                .join("diffforge-paste-never-existed.png")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stage_pasted_image_enforces_mime_and_size() {
+        assert!(stage_pasted_image("aGk=".to_string(), "image/tiff".to_string()).is_err());
+        assert!(stage_pasted_image(String::new(), "image/png".to_string()).is_err());
+        // Encoded-length precheck rejects oversized input without decoding.
+        let oversized = "A".repeat(17 * 1024 * 1024);
+        assert!(stage_pasted_image(oversized, "image/png".to_string()).is_err());
+        let path = stage_pasted_image("aGk=".to_string(), "image/png".to_string()).unwrap();
+        assert!(path.ends_with(".png"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"hi");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

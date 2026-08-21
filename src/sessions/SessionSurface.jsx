@@ -44,6 +44,27 @@ import { formatSessionRelativeTime } from "./sessionsModel.js";
    - "New chat" is a draft; the first prompt materializes it. */
 
 
+/* The TUI's status strip arrives whole ("[ ‖ IDLE (i) ] 3.7k tok · …"):
+   extract the state word for the pill, drop key-hint parentheticals, keep
+   the full line for the tooltip. Falls back to a trimmed head for lines
+   without the bracket form. */
+function compactSurfaceStatus(line) {
+  const trimmed = (line || "").trim();
+  if (!trimmed) return "";
+  // Unicode-aware: the first LETTER (any script) starts the state; key-hint
+  // parentheticals go first so "[ ⏳ 运行中 (i) ]" yields "运行中", not "I)".
+  const bracket = /\[\s*[^\p{L}\]]*([\p{L}][^\]]*?)\s*\]/u.exec(trimmed);
+  if (bracket) {
+    const state = bracket[1].replace(/\s*\([^)]*\)/g, "").trim();
+    if (state) {
+      return /^[A-Za-z][A-Za-z\s-]*$/.test(state)
+        ? state.charAt(0).toUpperCase() + state.slice(1).toLowerCase()
+        : state;
+    }
+  }
+  return trimmed.length > 26 ? `${trimmed.slice(0, 26)}…` : trimmed;
+}
+
 const PANEL_KINDS = {
   web: { label: "Web", Icon: Language },
   pcb: { label: "PCB Design", Icon: Memory },
@@ -75,16 +96,53 @@ export default function SessionSurface({
      the text must outlive it. Daemon revision lanes are PER-CONNECTION
      (rev934 P1-1), so frames are discriminated by OWNER, never by comparing
      revisions across lanes: mirrorRevisionsRef stamps only OUR publishes;
-     mirrorPublishedRef remembers the last publish so our own echo (revision
-     AND text match) teaches us our owner id; foreign lanes keep per-owner
-     applied floors in mirrorForeignRef. A fresh TUI's revision 1 applies. */
+     mirrorHistoryRef remembers our recent publishes so any pending echo
+     (revision AND text match) teaches us our owner id; foreign lanes keep
+     per-owner applied floors in mirrorForeignRef. A fresh TUI's revision 1
+     applies. */
   const [composerTexts, setComposerTexts] = useState({});
+  /* Paste blocks are surface-owned like the text — they must survive the
+     composer unmounting on view/session switches, or the mirror and the
+     submit diverge from what the chips show. */
+  const [composerPastes, setComposerPastes] = useState({});
+  /* Edit generation per session: a submit's success-clear applies only if
+     the user hasn't edited since — a stale completion from a session the
+     user switched away from must never wipe fresh text. */
+  const editGenRef = useRef({});
+  const setComposerPastesFor = useCallback((sessionId, blocks) => {
+    editGenRef.current[sessionId] = (editGenRef.current[sessionId] || 0) + 1;
+    setComposerPastes((current) => ({ ...current, [sessionId]: blocks }));
+  }, []);
   const mirrorRevisionsRef = useRef({});
-  const mirrorPublishedRef = useRef({}); // sessionId -> {text, revision}
+  /* Bounded history of OUR recent publishes (revision → text) per session:
+     self-echo matching must survive multiple in-flight publishes — a
+     single-slot "latest" let an older echo resurrect a just-cleared prompt
+     by masquerading as foreign. Cleared once the owner id is learned. */
+  const mirrorHistoryRef = useRef({}); // sessionId -> Map(revision -> text)
   const mirrorSelfOwnerRef = useRef(""); // learned daemon connection id
   const mirrorForeignRef = useRef({}); // sessionId -> {owner -> floor}
   const setComposerText = useCallback((sessionId, text) => {
+    editGenRef.current[sessionId] = (editGenRef.current[sessionId] || 0) + 1;
     setComposerTexts((current) => ({ ...current, [sessionId]: text }));
+  }, []);
+  /* ONE publish door for local composer content (typing, paste blocks, the
+     post-submit clear): stamps our monotone lane, records history for
+     self-echo matching, publishes under the PROVIDER session id. */
+  const publishMirror = useCallback((session, text) => {
+    const providerId = (session?.provider_session_id || "").trim();
+    if (!providerId) return;
+    const revision = (mirrorRevisionsRef.current[session.id] || 0) + 1;
+    mirrorRevisionsRef.current[session.id] = revision;
+    const history = (mirrorHistoryRef.current[session.id] ||= new Map());
+    history.set(revision, text);
+    while (history.size > 32) {
+      history.delete(history.keys().next().value);
+    }
+    void invoke("surface_publish_input", {
+      session_id: providerId,
+      text,
+      revision,
+    }).catch(() => {});
   }, []);
   const [composerPrefs, setComposerPrefs] = useState({});
   const [usageMeta, setUsageMeta] = useState(null);
@@ -203,11 +261,33 @@ export default function SessionSurface({
   /* Click path stays LOCAL: chips render from the roster row the bridge
      already mirrors (model/provider ride every summary) — the config fetch
      moved to chip-menu-open, the one moment that tolerates a beat. The only
-     daemon touch on click is the cheap surface_attach frame. */
+     daemon touch on click is the cheap surface_attach frame.
+     Surfaces are keyed by the DAEMON'S session ids: always attach/publish
+     with provider_session_id, never the local row id — a local id names a
+     phantom surface the TUI will never touch (the "empty TUI on open" bug:
+     ADE-born sessions have local id ≠ provider id). */
   useEffect(() => {
     if (activeSessionId && activeSessionId !== "draft") {
-      void invoke("surface_attach", { session_id: activeSessionId }).catch(() => {});
+      const providerId = (sessions.find((row) => row.id === activeSessionId)
+        ?.provider_session_id || "").trim();
+      if (providerId) {
+        void invoke("surface_attach", { session_id: providerId }).catch(() => {});
+      }
     }
+  }, [activeSessionId, sessions]);
+
+  /* Shell pre-warm: the click itself spawns nothing, but once a selection
+     SETTLES (~1.2s of dwell) the terminal mounts hidden so the PTY spawn +
+     TUI attach replay happen while the user reads the chat — the first
+     Shell flip then feels instant. */
+  useEffect(() => {
+    if (!activeSessionId || activeSessionId === "draft") return undefined;
+    const timer = window.setTimeout(() => {
+      setShellTouched((current) => (
+        current[activeSessionId] ? current : { ...current, [activeSessionId]: true }
+      ));
+    }, 1200);
+    return () => window.clearTimeout(timer);
   }, [activeSessionId]);
 
   /* Daemon-owned volatile surfaces (input mirror + status segment): events
@@ -233,17 +313,33 @@ export default function SessionSurface({
            publisher's revision 1 is newer than nothing of ours. */
         const { text, owner = "" } = payload.input;
         const revision = payload.input.revision || 0;
-        const published = mirrorPublishedRef.current[local.id];
-        if (published && published.revision === revision && published.text === text) {
-          if (owner) mirrorSelfOwnerRef.current = owner;
+        const history = mirrorHistoryRef.current[local.id];
+        if (history && history.get(revision) === text) {
+          /* One of OUR publishes echoed back (any pending one, not just the
+             latest) — learn the owner and drop. */
+          if (owner) {
+            mirrorSelfOwnerRef.current = owner;
+            history.clear();
+          }
         } else if (!owner || owner !== mirrorSelfOwnerRef.current) {
           const floors = (mirrorForeignRef.current[local.id] ||= {});
           if (!(owner in floors) || revision > floors[owner]) {
             floors[owner] = revision;
+            /* A remote apply IS an edit for generation purposes: a pending
+               submit's success-clear must not wipe TUI-typed text that
+               arrived while the submit was in flight. */
+            editGenRef.current[local.id] = (editGenRef.current[local.id] || 0) + 1;
             setComposerTexts((current) => (
               (current[local.id] || "") === text
                 ? current
                 : { ...current, [local.id]: text }
+            ));
+            /* A remote frame is the FULL composer truth: local paste blocks
+               would double into the composite — clear them. */
+            setComposerPastes((current) => (
+              (current[local.id] || []).length
+                ? { ...current, [local.id]: [] }
+                : current
             ));
           }
         }
@@ -476,6 +572,9 @@ export default function SessionSurface({
     }
     submitBusyRef.current = true;
     setDraftError("");
+    /* Same generation guard as bound submits: the draft's clear applies only
+       if the user hasn't typed again while materialization ran. */
+    const gen = editGenRef.current.draft || 0;
     try {
       const config = runConfigFromPrefs(composerPrefs.draft || {});
       const row = await invoke("session_start_with_prompt", {
@@ -485,6 +584,10 @@ export default function SessionSurface({
         config,
       });
       if (row?.id) {
+        if ((editGenRef.current.draft || 0) === gen) {
+          setComposerText("draft", "");
+          setComposerPastesFor("draft", []);
+        }
         onDraftMaterialized(row);
         return true;
       }
@@ -496,15 +599,25 @@ export default function SessionSurface({
     } finally {
       submitBusyRef.current = false;
     }
-  }, [onDraftMaterialized]);
+  }, [onDraftMaterialized, setComposerPastesFor, setComposerText]);
 
   const submitIntoSession = useCallback(async (session, prompt, attachments) => {
+    /* Clearing is SURFACE-owned and generation-guarded: a completion that
+       lands after the user edited again (or switched away and back) clears
+       nothing. The empty mirror publish rides the same history-recording
+       door, so its echo can never resurrect the prompt. */
+    const gen = editGenRef.current[session.id] || 0;
     try {
       await invoke("session_submit_prompt", {
         session_id: session.id,
         prompt,
         attachments: attachments?.length ? attachments : null,
       });
+      if ((editGenRef.current[session.id] || 0) === gen) {
+        setComposerText(session.id, "");
+        setComposerPastesFor(session.id, []);
+        publishMirror(session, "");
+      }
       return true;
     } catch (error) {
       const message = String(error?.message || error || "");
@@ -514,7 +627,7 @@ export default function SessionSurface({
       }
       return false;
     }
-  }, [setModeFor]);
+  }, [publishMirror, setComposerPastesFor, setComposerText, setModeFor]);
 
   /* Session title chrome: the title is the workspace's first content line;
      its ellipsis menu carries Pin/Unpin + Rename (the same harness doors the
@@ -665,8 +778,14 @@ export default function SessionSurface({
     /* status_segment_v1: the pill mirrors the TUI's bottom-left strip
        byte-for-byte when the daemon publishes it; state_raw and the buckets
        are the fallbacks. */
+    /* status_segment_v1 publishes the TUI's ENTIRE bottom strip — byte-exact
+       is the wire contract, not the pill's: compact to the state word (full
+       line lives in the tooltip). Structured segment = 935 harness ask. */
+    const rawStatusLine = session && session.id !== "draft"
+      ? (surfaceStatus[session.id] || "").trim()
+      : "";
     const statusLine = session && session.id !== "draft"
-      ? ((surfaceStatus[session.id] || "").trim()
+      ? (compactSurfaceStatus(rawStatusLine)
         || (session.state_raw || "").trim()
         || (session.status === "running"
           ? "Running"
@@ -756,7 +875,7 @@ export default function SessionSurface({
         </SessionViewToggle>
         )}
         {session && session.id !== "draft" && (
-          <StatusPill data-status={session.status} title={statusLine}>
+          <StatusPill data-status={session.status} title={rawStatusLine || statusLine}>
             <i aria-hidden="true" />
             <span>{statusLine}</span>
           </StatusPill>
@@ -815,7 +934,9 @@ export default function SessionSurface({
                 chipValues={chipValuesFor(null)}
                 onChipChange={(key, option) => handleChipChange("draft", key, option)}
                 onSubmit={submitDraft}
+                onPastedBlocksChange={(blocks) => setComposerPastesFor("draft", blocks)}
                 onValueChange={(text) => setComposerText("draft", text)}
+                pastedBlocks={composerPastes.draft || []}
                 placeholder="Message Haider…"
                 value={composerTexts.draft || ""}
               />
@@ -898,7 +1019,7 @@ export default function SessionSurface({
                     <SessionTranscript
                       onSyncingChange={(syncing) => handleTranscriptSyncing(session.id, syncing)}
                       runStatus={session.status === "running"
-                        ? ((surfaceStatus[session.id] || "").trim()
+                        ? (compactSurfaceStatus(surfaceStatus[session.id])
                           || (session.state_raw || "").trim()
                           || "working…")
                         : ""}
@@ -910,21 +1031,11 @@ export default function SessionSurface({
                       chipValues={chipValuesFor(session)}
                       onChipChange={(key, option) => handleChipChange(session.id, key, option)}
                       onChipMenuOpen={() => refreshConfig(session.id)}
-                      onMirrorType={(text) => {
-                        /* Local typing publishes on OUR monotone lane; the
-                           remembered (text, revision) lets the echo teach us
-                           our daemon-assigned owner id. */
-                        const revision = (mirrorRevisionsRef.current[session.id] || 0) + 1;
-                        mirrorRevisionsRef.current[session.id] = revision;
-                        mirrorPublishedRef.current[session.id] = { text, revision };
-                        void invoke("surface_publish_input", {
-                          session_id: session.id,
-                          text,
-                          revision,
-                        }).catch(() => {});
-                      }}
+                      onMirrorType={(text) => publishMirror(session, text)}
                       onSubmit={(prompt, attachments) => submitIntoSession(session, prompt, attachments)}
+                      onPastedBlocksChange={(blocks) => setComposerPastesFor(session.id, blocks)}
                       onValueChange={(text) => setComposerText(session.id, text)}
+                      pastedBlocks={composerPastes[session.id] || []}
                       value={composerTexts[session.id] || ""}
                     />
                   </ChatHostLayer>

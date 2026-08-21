@@ -317,6 +317,11 @@ static APP_PANIC_LOG_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 static DAEMON_MODE: AtomicBool = AtomicBool::new(false);
 static DAEMON_LOCK_PATH: OnceLock<PathBuf> = OnceLock::new();
 static APP_CLOSE_SHUTDOWN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Close-confirm contract: a native exit request (Cmd-Q) with running or
+/// waiting sessions first raises the frontend modal; the modal's Close sets
+/// this flag so the SAME request path proceeds on the second pass.
+static APP_CLOSE_CONFIRMED: AtomicBool = AtomicBool::new(false);
+static APP_CLOSE_LISTENER_READY: AtomicBool = AtomicBool::new(false);
 static APP_CLOSE_FORCE_EXIT_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static APP_CLOSE_FORCE_EXIT_STARTED: AtomicBool = AtomicBool::new(false);
 static APP_SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(APP_SHUTDOWN_PHASE_RUNNING);
@@ -458,6 +463,20 @@ unsafe extern "system" {
 
 pub(crate) fn app_shutdown_requested() -> bool {
     APP_SHUTDOWN_PHASE.load(Ordering::Acquire) >= APP_SHUTDOWN_PHASE_QUIESCING
+}
+
+/// The close-confirm modal's Close: let the next exit request through the
+/// ExitRequested gate instead of re-raising the modal. Consumed per attempt.
+#[tauri::command]
+fn app_confirm_close() {
+    APP_CLOSE_CONFIRMED.store(true, Ordering::Release);
+}
+
+/// The frontend's close-request listener announces itself: until this flag
+/// is set, an exit request must NOT be parked on a modal nobody can show.
+#[tauri::command]
+fn app_close_listener_ready() {
+    APP_CLOSE_LISTENER_READY.store(true, Ordering::Release);
 }
 
 fn app_shutdown_phase_label_for(phase: u8) -> &'static str {
@@ -6315,6 +6334,10 @@ fn run_app(daemon: bool) {
             haider_library_snapshot,
             session_config_get,
             session_item_get,
+            stage_pasted_image,
+            discard_staged_attachment,
+            app_confirm_close,
+            app_close_listener_ready,
             session_config_set,
             haider_rpc_ade::rpc_features,
             haider_rpc_ade::surface_attach,
@@ -6778,6 +6801,30 @@ fn run_app(daemon: bool) {
             let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
 
             if phase == APP_SHUTDOWN_PHASE_RUNNING {
+                // Close-confirm gate: an unconfirmed native exit (Cmd-Q) with
+                // a live, LISTENING frontend raises the modal instead of
+                // shutting down. The confirm is consumed per attempt (a force
+                // close authorizes that attempt only), and every trap door is
+                // held open: daemon builds, background mode (user already
+                // chose it — a quit from there is deliberate), a webview that
+                // is absent or never announced its listener, or a failed emit
+                // all proceed straight to shutdown.
+                let confirmed = APP_CLOSE_CONFIRMED.swap(false, Ordering::AcqRel);
+                if !daemon
+                    && !confirmed
+                    && !app_is_in_background_mode()
+                    && APP_CLOSE_LISTENER_READY.load(Ordering::Acquire)
+                    && !app.webview_windows().is_empty()
+                    && app
+                        .emit(
+                            "forge-app-close-requested",
+                            serde_json::json!({ "source": "exit-request" }),
+                        )
+                        .is_ok()
+                {
+                    api.prevent_exit();
+                    return;
+                }
                 api.prevent_exit();
                 let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
                 return;

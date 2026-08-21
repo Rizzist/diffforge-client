@@ -2962,6 +2962,72 @@ export const RailSearchField = styled.input`
   }
 `;
 
+/* Close-confirm modal (the v0.9.38 contract, session-native): Close /
+   Background / Go back, shown when non-idle sessions would be interrupted. */
+export const CloseConfirmScrim = styled.div`
+  position: fixed;
+  inset: 0;
+  z-index: 220;
+  display: grid;
+  place-items: center;
+  background: rgba(3, 6, 10, 0.62);
+  backdrop-filter: blur(3px);
+`;
+
+export const CloseConfirmCard = styled.div`
+  width: min(380px, calc(100vw - 48px));
+  padding: 18px 20px 16px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 14px;
+  background: var(--forge-surface-raised);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.5);
+
+  h2 {
+    margin: 0 0 6px;
+    color: var(--forge-text);
+    font-size: 14px;
+    font-weight: 720;
+  }
+
+  p {
+    margin: 0 0 14px;
+    color: var(--forge-text-soft);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+`;
+
+export const CloseConfirmActions = styled.div`
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+`;
+
+export const CloseConfirmButton = styled.button`
+  padding: 6px 14px;
+  border: 1px solid var(--forge-border);
+  border-radius: 9px;
+  color: var(--forge-text);
+  background: var(--forge-surface);
+  font-size: 12px;
+  font-weight: 640;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--forge-surface-hover);
+  }
+
+  &[data-variant="background"] {
+    border-color: color-mix(in srgb, var(--forge-blue, #2f80ff) 40%, transparent);
+    color: var(--forge-blue, #62a0ff);
+  }
+
+  &[data-variant="close"] {
+    border-color: color-mix(in srgb, var(--forge-red) 45%, transparent);
+    color: var(--forge-red);
+  }
+`;
+
 /* Rail-owned utility pills (Background + cloud sync) — app-level state lives
    in the rail with the brand, never floating over the session content. */
 export const RailUtilityRow = styled.div`

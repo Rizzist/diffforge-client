@@ -265,6 +265,10 @@ import {
   RailUtilityRow,
   RailBackgroundPill,
   RailSyncPill,
+  CloseConfirmScrim,
+  CloseConfirmCard,
+  CloseConfirmActions,
+  CloseConfirmButton,
   RailComposeRow,
   RailDeviceCard,
   RailDeviceDot,
@@ -20213,10 +20217,38 @@ export default function App() {
 
 
 
+  /* Close contract (v0.9.38, session-native): closing with non-idle
+     sessions raises the Close / Background / Go back modal — the count is
+     sessions the harness reports as running or waiting. Idle app closes
+     directly; "force" (a modal's Close, or a repeat close request) skips. */
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
+  useEffect(() => {
+    if (!closeConfirmOpen) return undefined;
+    const onKey = (event) => {
+      if (event.key === "Escape") setCloseConfirmOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [closeConfirmOpen]);
+  /* Native Web panes float above the DOM — the close modal must suppress
+     them or it renders underneath an unclickable child webview. */
+  useEffect(() => {
+    setNativeWebviewsSuppressed("close-confirm", closeConfirmOpen);
+    return () => {
+      setNativeWebviewsSuppressed("close-confirm", false);
+    };
+  }, [closeConfirmOpen]);
+  const nonIdleSessionCount = useMemo(
+    () => sessions.filter(
+      (row) => row.status === "running" || row.status === "waiting",
+    ).length,
+    [sessions],
+  );
   const closeWindow = useCallback((eventOrOptions = null) => {
     const event = eventOrOptions && typeof eventOrOptions.stopPropagation === "function"
       ? eventOrOptions
       : null;
+    const force = Boolean(eventOrOptions && eventOrOptions.force === true);
     event?.preventDefault?.();
     event?.stopPropagation?.();
 
@@ -20224,11 +20256,19 @@ export default function App() {
       setNetworkingOverlayOpen(false);
       return;
     }
+    if (!force && nonIdleSessionCount > 0) {
+      setCloseConfirmOpen(true);
+      return;
+    }
 
+    setCloseConfirmOpen(false);
     runWindowAction(async () => {
+      /* Mark the close CONFIRMED so the Rust ExitRequested gate lets the
+         shutdown proceed instead of re-raising the modal. */
+      await invoke("app_confirm_close").catch(() => {});
       await getSafeCurrentWindow()?.close();
     });
-  }, [networkingOverlayOpen]);
+  }, [networkingOverlayOpen, nonIdleSessionCount]);
 
 
 
@@ -20241,6 +20281,12 @@ export default function App() {
         reason: payload.reason || payload.source || "app_exit_requested",
       });
     });
+    /* Tell Rust the listener exists only once the NATIVE registration has
+       resolved — announcing on JS-handler add alone leaves a window where
+       Rust parks the exit on a modal that can never arrive. */
+    void waitSharedListenerReady(APP_CLOSE_REQUESTED_EVENT)
+      .then(() => invoke("app_close_listener_ready"))
+      .catch(() => {});
 
     return () => {
       unsubscribe();
@@ -26232,6 +26278,55 @@ export default function App() {
                 </ResizePanelGroup>
               </WorkspaceAppToolLayout>
               </DashboardShell>
+              {closeConfirmOpen && (
+                <CloseConfirmScrim
+                  onClick={(event) => {
+                    if (event.target === event.currentTarget) {
+                      setCloseConfirmOpen(false);
+                    }
+                  }}
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="Close Diff Forge"
+                >
+                  <CloseConfirmCard>
+                    <h2>Close Diff Forge?</h2>
+                    <p>
+                      {nonIdleSessionCount === 1
+                        ? "1 session is still working."
+                        : `${nonIdleSessionCount} sessions are still working.`}
+                      {" "}Background keeps the agents running with the window
+                      folded away.
+                    </p>
+                    <CloseConfirmActions>
+                      <CloseConfirmButton
+                        autoFocus
+                        onClick={() => setCloseConfirmOpen(false)}
+                        type="button"
+                      >
+                        Go back
+                      </CloseConfirmButton>
+                      <CloseConfirmButton
+                        data-variant="background"
+                        onClick={(event) => {
+                          setCloseConfirmOpen(false);
+                          enterBackgroundMode(event);
+                        }}
+                        type="button"
+                      >
+                        Background
+                      </CloseConfirmButton>
+                      <CloseConfirmButton
+                        data-variant="close"
+                        onClick={() => closeWindow({ force: true })}
+                        type="button"
+                      >
+                        Close
+                      </CloseConfirmButton>
+                    </CloseConfirmActions>
+                  </CloseConfirmCard>
+                </CloseConfirmScrim>
+              )}
               {networkingOverlayOpen && (
                 <NetworkingInspector
                   diagnostics={networkingDiagnostics}

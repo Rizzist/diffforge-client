@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
@@ -40,6 +41,12 @@ export default function SessionComposer({
   chipCapabilities = {},
   value = "",
   onValueChange = null,
+  /* Large text pastes collapse into blocks ABOVE the input (Next.js chat
+     behavior) — SURFACE-owned like the draft text so they survive view and
+     session switches; the MIRRORED text and the submitted prompt carry the
+     full content (blocks + typed). */
+  pastedBlocks = [],
+  onPastedBlocksChange = null,
   onMirrorType = null,
   onChipChange = null,
   onChipMenuOpen = null,
@@ -53,8 +60,15 @@ export default function SessionComposer({
   const [busy, setBusy] = useState(false);
   const [openMenu, setOpenMenu] = useState("");
   const [attachments, setAttachments] = useState([]);
+  const pasteIdRef = useRef(0);
   const textareaRef = useRef(null);
   const rootRef = useRef(null);
+
+  const compositeText = useCallback((blocks, typed) => {
+    const parts = blocks.map((block) => block.text);
+    if (typed.trim() || !parts.length) parts.push(typed);
+    return parts.join("\n\n");
+  }, []);
 
   const pickAttachments = useCallback(async () => {
     try {
@@ -98,23 +112,106 @@ export default function SessionComposer({
     return () => window.removeEventListener("mousedown", onPointerDown);
   }, []);
 
+  /* Image stages are async: Send holds until every pending stage has landed
+     in `attachments`, or a paste-then-instant-Enter submits without its
+     image and ghosts it onto the next prompt. */
+  const [pendingStages, setPendingStages] = useState(0);
   const submit = useCallback(async () => {
-    const prompt = value.trim();
-    if (!prompt || busy || disabled) {
+    const prompt = compositeText(pastedBlocks, value).trim();
+    if (!prompt || busy || disabled || pendingStages > 0) {
       return;
     }
     setBusy(true);
     try {
+      /* Text/blocks/mirror clearing is SURFACE-owned (generation-guarded in
+         submitIntoSession) — a stale completion after a session switch must
+         never wipe fresh edits. Attachments are ours; clear locally. */
       const accepted = await onSubmit(prompt, attachments);
       if (accepted !== false) {
-        onValueChange?.("");
         setAttachments([]);
       }
     } finally {
       setBusy(false);
       textareaRef.current?.focus();
     }
-  }, [attachments, busy, disabled, onSubmit, onValueChange, value]);
+  }, [attachments, busy, compositeText, disabled, onSubmit, pastedBlocks, value]);
+
+  /* Paste routing: image clipboard items stage to temp files and join the
+     attachments; oversized text pastes become blocks above the input. Both
+     republish the mirror so the TUI sees the same full text. */
+  const PASTE_BLOCK_THRESHOLD = 1500;
+  const PASTE_IMAGE_MAX_BYTES = 12 * 1024 * 1024;
+  const PASTE_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+  const handlePaste = useCallback((event) => {
+    const items = Array.from(event.clipboardData?.items || []);
+    const imageItems = items.filter(
+      (item) => item.kind === "file" && PASTE_IMAGE_MIMES.has(item.type),
+    );
+    if (imageItems.length) {
+      event.preventDefault();
+      for (const item of imageItems) {
+        const file = item.getAsFile();
+        if (!file || file.size === 0 || file.size > PASTE_IMAGE_MAX_BYTES) continue;
+        /* readAsDataURL: the browser produces base64 natively — no per-byte
+           JS array, bounded by the size cap above. */
+        setPendingStages((count) => count + 1);
+        const settle = () => setPendingStages((count) => Math.max(0, count - 1));
+        const reader = new FileReader();
+        reader.onerror = settle;
+        reader.onload = () => {
+          const result = String(reader.result || "");
+          const comma = result.indexOf(",");
+          const bytes = comma >= 0 ? result.slice(comma + 1) : "";
+          if (!bytes) {
+            settle();
+            return;
+          }
+          void invoke("stage_pasted_image", { bytes, mime: file.type })
+            .then((path) => {
+              if (typeof path === "string" && path) {
+                setAttachments((current) => (
+                  current.includes(path) ? current : [...current, path]
+                ));
+              }
+            })
+            .catch(() => {})
+            .finally(settle);
+        };
+        reader.readAsDataURL(file);
+      }
+      return;
+    }
+    const text = event.clipboardData?.getData("text/plain") || "";
+    if (text.length > PASTE_BLOCK_THRESHOLD) {
+      event.preventDefault();
+      pasteIdRef.current += 1;
+      const block = {
+        id: `paste-${Date.now()}-${pasteIdRef.current}`,
+        text,
+        lines: text.split("\n").length,
+        chars: text.length,
+      };
+      const next = [...pastedBlocks, block];
+      onPastedBlocksChange?.(next);
+      onMirrorType?.(compositeText(next, value));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compositeText, onMirrorType, onPastedBlocksChange, pastedBlocks, value]);
+
+  const removePastedBlock = useCallback((id) => {
+    const next = pastedBlocks.filter((block) => block.id !== id);
+    onPastedBlocksChange?.(next);
+    onMirrorType?.(compositeText(next, value));
+  }, [compositeText, onMirrorType, onPastedBlocksChange, pastedBlocks, value]);
+
+  /* Staged paste images are OURS to clean: removing the chip deletes the
+     temp file (guarded server-side to the staging prefix). */
+  const removeAttachment = useCallback((path) => {
+    setAttachments((current) => current.filter((entry) => entry !== path));
+    if (path.includes("diffforge-paste-")) {
+      void invoke("discard_staged_attachment", { path }).catch(() => {});
+    }
+  }, []);
 
   const chip = (key, label, fallbackOptions = []) => {
     const current = String(chipValues[key] || "default");
@@ -257,6 +354,23 @@ export default function SessionComposer({
             ))}
           </SlashPalette>
         )}
+        {pastedBlocks.length > 0 && (
+          <AttachmentChips>
+            {pastedBlocks.map((block) => (
+              <PastedBlockChip key={block.id} title={`${block.chars} characters`}>
+                <PastedBlockGlyph aria-hidden="true">¶</PastedBlockGlyph>
+                <span>Pasted · {block.lines} lines</span>
+                <AttachmentRemove
+                  aria-label="Remove pasted block"
+                  onClick={() => removePastedBlock(block.id)}
+                  type="button"
+                >
+                  <Close aria-hidden="true" />
+                </AttachmentRemove>
+              </PastedBlockChip>
+            ))}
+          </AttachmentChips>
+        )}
         {attachments.length > 0 && (
           <AttachmentChips>
             {attachments.map((path) => (
@@ -264,7 +378,7 @@ export default function SessionComposer({
                 <span>{path.split("/").pop()}</span>
                 <AttachmentRemove
                   aria-label="Remove attachment"
-                  onClick={() => setAttachments((current) => current.filter((entry) => entry !== path))}
+                  onClick={() => removeAttachment(path)}
                   type="button"
                 >
                   <Close aria-hidden="true" />
@@ -289,8 +403,11 @@ export default function SessionComposer({
             onChange={(event) => {
               const text = event.target.value;
               onValueChange?.(text);
-              onMirrorType?.(text);
+              /* The mirror carries the FULL composer content — paste blocks
+                 included — so the TUI input line matches what will submit. */
+              onMirrorType?.(compositeText(pastedBlocks, text));
             }}
+            onPaste={handlePaste}
             onKeyDown={(event) => {
               if (event.key === "Escape" && slashActive) {
                 onValueChange?.("");
@@ -324,7 +441,7 @@ export default function SessionComposer({
           <ComposerRoundButton
             aria-label="Send"
             data-variant="send"
-            disabled={disabled || busy || !value.trim()}
+            disabled={disabled || busy || pendingStages > 0 || !compositeText(pastedBlocks, value).trim()}
             onClick={() => void submit()}
             type="button"
           >
@@ -512,6 +629,20 @@ const AttachmentChip = styled.span`
     white-space: nowrap;
     text-overflow: ellipsis;
   }
+`;
+
+/* Big-paste block: same chip family, tinted so it reads as content-to-send
+   rather than a file. */
+const PastedBlockChip = styled(AttachmentChip)`
+  border-color: rgba(var(--forge-tint-soft-rgb), 0.4);
+  background: rgba(var(--forge-tint-rgb), 0.1);
+`;
+
+const PastedBlockGlyph = styled.em`
+  flex: 0 0 auto;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-style: normal;
 `;
 
 const AttachmentRemove = styled.button`
