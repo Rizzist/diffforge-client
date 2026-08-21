@@ -2784,8 +2784,8 @@ export const RailBrandRow = styled.div`
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 8px;
-  padding: 4px 6px 0;
+  gap: 5px;
+  padding: 4px 4px 0;
 
   /* Collapsed: the mark stacks over the expand toggle — the toggle must
      survive collapse or there is no way back. */
@@ -2799,8 +2799,8 @@ export const RailBrandRow = styled.div`
 
 export const RailBrandMark = styled.img`
   display: block;
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   flex: 0 0 auto;
   border-radius: 6px;
   object-fit: cover;
@@ -2858,11 +2858,11 @@ export const RailModeTag = styled.span`
   min-width: 0;
   overflow: hidden;
   margin-left: auto;
-  padding: 1px 4px;
-  border-radius: 5px;
-  font-size: 7px;
+  padding: 1px 3px;
+  border-radius: 4px;
+  font-size: 6.5px;
   font-weight: 800;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.02em;
   text-overflow: ellipsis;
   text-transform: uppercase;
   white-space: nowrap;

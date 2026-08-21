@@ -479,8 +479,30 @@ function MediaCard({ item, queueLabel, onQueue, onRemove, onRerun, onOptionChang
 
 /* ---- deck ------------------------------------------------------------- */
 
-export default function MediaDeck() {
-  const [items, setItems] = useState([]);
+/* Per-media-session item cache: decks keep their cards across session
+   switches within an app run (demo scope — restart persistence lands with
+   the real backend). */
+const mediaDeckCache = new Map();
+
+export default function MediaDeck({ sessionId = "media-default", onActivity = null }) {
+  const [items, setItems] = useState(() => mediaDeckCache.get(sessionId) || []);
+  const onActivityRef = useRef(onActivity);
+  onActivityRef.current = onActivity;
+  /* Item changes cache AND report upward (rail row re-orders on latest edit,
+     titles itself from the first file). The mount run is skipped — merely
+     OPENING a media session is not an edit and must not move its clock. */
+  const activityMountRef = useRef(true);
+  useEffect(() => {
+    mediaDeckCache.set(sessionId, items);
+    if (activityMountRef.current) {
+      activityMountRef.current = false;
+      return;
+    }
+    onActivityRef.current?.({
+      title: items[0]?.name || "",
+      count: items.length,
+    });
+  }, [items, sessionId]);
   const [dragActive, setDragActive] = useState(false);
   const scrollerRef = useRef(null);
   const idRef = useRef(0);

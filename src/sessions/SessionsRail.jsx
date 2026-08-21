@@ -28,9 +28,12 @@ import { ModelBrandIcon } from "./modelBrand.jsx";
 export default function SessionsRail({
   sessions,
   activeSessionId,
+  activeMediaId = "",
+  mediaSessions = [],
   onNewChat,
   onNewMedia = null,
   onSearchChange = null,
+  onSelectMedia = null,
   onSelectSession,
   searchQuery = "",
 }) {
@@ -111,11 +114,12 @@ export default function SessionsRail({
     }
   }, [renameDraft, renamingId]);
 
-  const sorted = [...sessions].sort(
+  /* AI sessions and media sessions (kind: "media", local demo rows) share
+     ONE recency ordering; media rows are visually distinct + DEV-badged. */
+  const sorted = [...sessions, ...mediaSessions].sort(
     (a, b) => (b.latest_at_ms || 0) - (a.latest_at_ms || 0),
   );
-  /* Rail search (the head's magnifier) narrows both groups by title or the
-     opening user message. */
+  /* Rail search narrows both groups by title or the opening user message. */
   const query = searchQuery.trim().toLowerCase();
   const matches = query
     ? sorted.filter((session) => (
@@ -123,10 +127,30 @@ export default function SessionsRail({
       || String(session.first_user_message || "").toLowerCase().includes(query)
     ))
     : sorted;
-  const pinned = matches.filter((session) => session.pinned);
-  const recent = matches.filter((session) => !session.pinned);
+  const pinned = matches.filter((session) => session.pinned && session.kind !== "media");
+  const recent = matches.filter((session) => !session.pinned || session.kind === "media");
 
   const renderRow = (session) => {
+    if (session.kind === "media") {
+      return (
+        <SessionRowButton
+          data-active={session.id === activeMediaId ? "true" : undefined}
+          key={session.id}
+          onClick={() => onSelectMedia?.(session)}
+          title={`${session.title} — media session (under development)`}
+          type="button"
+        >
+          <MediaRowGlyph aria-hidden="true">
+            <Movie size={13} />
+          </MediaRowGlyph>
+          <SessionRowTitle>{session.title}</SessionRowTitle>
+          <MediaDevTag aria-label="Under development">dev</MediaDevTag>
+          <SessionRowMeta>
+            {formatSessionRelativeTime(session.latest_at_ms, nowMs)}
+          </SessionRowMeta>
+        </SessionRowButton>
+      );
+    }
     if (session.id === renamingId) {
       return (
         <SessionRenameRow key={session.id}>
@@ -295,6 +319,34 @@ const SessionsRailRoot = styled.div`
 
 /* Collapsed rail: the list stays as a brand-dot icon strip — group labels
    and row text fold away, the marks keep their activity badges. */
+/* Media session rows: distinct glyph + an honest "dev" tag. */
+const MediaRowGlyph = styled.span`
+  display: grid;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border-radius: 5px;
+  color: var(--forge-tint-soft, var(--forge-blue, #62a0ff));
+  background: rgba(var(--forge-tint-rgb), 0.14);
+`;
+
+const MediaDevTag = styled.span`
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 1px solid color-mix(in srgb, var(--forge-amber) 45%, transparent);
+  border-radius: 4px;
+  color: var(--forge-amber);
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+
+  [data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
 /* The compose pair: two half-width rows; collapsed rail stacks them as
    icon squares (each row's own collapsed styling applies). */
 const ComposePairRow = styled.div`

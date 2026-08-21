@@ -2331,6 +2331,7 @@ const WORKSPACE_RAIL_STORAGE_KEY = "diffforge.workspaceRail.v1";
 // Session Deck rail: the collapse choice persists across app opens. A fresh
 // key — the legacy v1 rail-density key above is actively cleaned up.
 const WORKSPACE_RAIL_COLLAPSED_STORAGE_KEY = "diffforge.railCollapsed.v1";
+const MEDIA_SESSIONS_STORAGE_KEY = "diffforge.mediaSessions.v1";
 const APP_APPEARANCE_STORAGE_KEY = "diffforge.appearance.v1";
 const APP_SPACE_MODE_STORAGE_KEY = "diffforge.app.spaceMode";
 const LOOPSPACE_CACHE_STORAGE_KEY = "diffforge.loopspaces.cache.v1";
@@ -18415,10 +18416,48 @@ export default function App() {
       // Store not available yet (first boot before Rust lane) — rail stays empty.
     }
   }, []);
-  /* Media Deck (demo): a session-less workspace for media objects —
-     transcribe / translate / summarize / convert. Opening it deselects
-     chat surfaces; opening any chat surface closes it. */
-  const [mediaDeckOpen, setMediaDeckOpen] = useState(false);
+  /* Media sessions (demo, under development): first-class rail entries
+     SEPARATE from AI sessions but ordered with them on latest edit. Rows
+     persist locally; deck items are in-run only until the real backend. */
+  const [mediaSessions, setMediaSessions] = useState(() => {
+    try {
+      const raw = window.localStorage.getItem(MEDIA_SESSIONS_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(MEDIA_SESSIONS_STORAGE_KEY, JSON.stringify(mediaSessions));
+    } catch {
+      // Storage full/unavailable — rows survive the run only.
+    }
+  }, [mediaSessions]);
+  const [activeMediaId, setActiveMediaId] = useState("");
+  const mediaDeckOpen = Boolean(activeMediaId);
+  const setMediaDeckOpen = useCallback((open) => {
+    if (!open) setActiveMediaId("");
+  }, []);
+  const handleMediaActivity = useCallback((mediaId, activity) => {
+    setMediaSessions((current) => current.map((row) => (
+      row.id === mediaId
+        ? {
+          ...row,
+          title: activity?.title || row.title,
+          latest_at_ms: Date.now(),
+        }
+        : row
+    )));
+  }, []);
+  const openMediaSession = useCallback((row) => {
+    if (!row?.id) return;
+    setSessionDraftOpen(false);
+    setActiveSessionId("");
+    setActiveMediaId(row.id);
+    showView(DEFAULT_WORKSPACE_VIEW);
+  }, [showView]);
   const openSessionFromRail = useCallback((session) => {
     if (!session?.id) {
       return;
@@ -18440,16 +18479,26 @@ export default function App() {
     setSessionDraftOpen(false);
     setActiveSessionId("");
   }, []);
-  /* New Media is a toggle like New chat: click again to fall back home. */
+  /* New Media CREATES a media session and opens it; clicking while one is
+     open falls back home (same toggle contract as New chat). */
   const toggleMediaDeck = useCallback(() => {
     if (mediaDeckOpen) {
-      setMediaDeckOpen(false);
+      setActiveMediaId("");
       return;
     }
+    const now = Date.now();
+    const row = {
+      id: `media-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: "media",
+      title: "New media",
+      created_at_ms: now,
+      latest_at_ms: now,
+    };
+    setMediaSessions((current) => [row, ...current]);
     setSessionDraftOpen(false);
     setActiveSessionId("");
+    setActiveMediaId(row.id);
     showView(DEFAULT_WORKSPACE_VIEW);
-    setMediaDeckOpen(true);
   }, [mediaDeckOpen, showView]);
   /* Rail "New chat" is a toggle: first click opens the draft; clicking it
      again while the draft is showing deselects back to the home (flame)
@@ -24495,10 +24544,13 @@ export default function App() {
                         </>
                       ) : (
                         <SessionsRail
+                          activeMediaId={activeMediaId}
                           activeSessionId={activeSessionId}
+                          mediaSessions={mediaSessions}
                           onNewChat={toggleNewSessionChat}
                           onNewMedia={toggleMediaDeck}
                           onSearchChange={setRailSearchQuery}
+                          onSelectMedia={openMediaSession}
                           onSelectSession={openSessionFromRail}
                           /* Collapsed hides the search box, so the filter
                              must not keep acting invisibly. */
@@ -24911,7 +24963,13 @@ export default function App() {
                       </WorkspaceCreateSurface>
                     )}
                   </WorkspaceCreateLayer>
-                  {!loopspacesModeActive && mediaDeckOpen && <MediaDeck />}
+                  {!loopspacesModeActive && mediaDeckOpen && (
+                    <MediaDeck
+                      key={activeMediaId}
+                      onActivity={(activity) => handleMediaActivity(activeMediaId, activity)}
+                      sessionId={activeMediaId}
+                    />
+                  )}
                   {!loopspacesModeActive && !mediaDeckOpen && (
                     <SessionSurface
                       activeSessionId={activeSessionId}
