@@ -1500,6 +1500,9 @@ const HomeLogo = styled.img`
   width: 84px;
   height: 84px;
   margin-bottom: 4px;
+  /* App-icon rounding (~22% of edge), matching WorkspaceIdleLogo — the
+     square logo art reads hard-cornered against both themes. */
+  border-radius: 18px;
   filter: drop-shadow(0 10px 30px rgba(47, 128, 255, 0.25));
 `;
 

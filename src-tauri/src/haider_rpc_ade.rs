@@ -40,6 +40,7 @@ const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
 const FEATURE_SESSION_EFFORT_SELECT_V1: &str = "session_effort_select_v1";
 const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
 const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
+const FEATURE_RESIDENT_TURN_SUBMIT_V1: &str = "resident_turn_submit_v1";
 const SURFACE_EVENT: &str = "session-surface";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -62,6 +63,14 @@ pub struct SurfaceCommandStatus {
     pub accepted: bool,
     pub input_mirror: bool,
     pub status_segment: bool,
+}
+
+/// Receipt returned when the daemon durably admits a resident turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResidentTurnSubmit {
+    pub session_id: String,
+    pub run_id: String,
+    pub accepted_seq: u64,
 }
 
 impl SurfaceCommandStatus {
@@ -263,6 +272,15 @@ enum RequestBody {
     },
     #[serde(rename = "session.surface_watch")]
     SessionSurfaceWatch { session_id: String },
+    #[serde(rename = "turn.submit_from_cli")]
+    TurnSubmitFromCli {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        text: String,
+        attachments: Vec<Value>,
+        mode: DeliveryMode,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -330,6 +348,12 @@ enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<SurfaceStatusWire>,
     },
+    #[serde(rename = "turn.submit")]
+    TurnSubmit {
+        session_id: String,
+        run_id: String,
+        accepted_seq: u64,
+    },
     #[serde(rename = "error")]
     Error {
         code: String,
@@ -392,6 +416,12 @@ fn is_false(value: &bool) -> bool {
 #[serde(rename_all = "snake_case")]
 enum AttachMode {
     Control,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeliveryMode {
+    Queue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -912,6 +942,20 @@ async fn config_request(
 }
 
 #[cfg(unix)]
+fn resident_turn_submit_features() -> BTreeSet<String> {
+    BTreeSet::from([FEATURE_RESIDENT_TURN_SUBMIT_V1.to_string()])
+}
+
+#[cfg(unix)]
+async fn resident_turn_submit_request(body: RequestBody) -> Result<Option<ResponseBody>, String> {
+    match rpc_request(body, Capability::Control, resident_turn_submit_features()).await {
+        Some(Ok(response)) => Ok(Some(response)),
+        Some(Err(error)) => Err(error),
+        None => Ok(None),
+    }
+}
+
+#[cfg(unix)]
 async fn config_session_summary(
     session_id: &str,
     capability: Capability,
@@ -924,6 +968,35 @@ async fn config_session_summary(
             &[],
         )
         .await?
+        else {
+            return Ok(None);
+        };
+        let ResponseBody::SessionList {
+            sessions,
+            next_cursor,
+        } = response
+        else {
+            return Err("session.list response method mismatch".to_string());
+        };
+        if let Some(summary) = sessions
+            .into_iter()
+            .find(|summary| summary.get("session_id").and_then(Value::as_str) == Some(session_id))
+        {
+            return Ok(Some(summary));
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Err(format!("session `{session_id}` was not found"));
+        };
+        cursor = Some(next_cursor);
+    }
+}
+
+#[cfg(unix)]
+async fn resident_turn_submit_session_summary(session_id: &str) -> Result<Option<Value>, String> {
+    let mut cursor = None;
+    loop {
+        let Some(response) =
+            resident_turn_submit_request(RequestBody::SessionList { cursor, limit: 256 }).await?
         else {
             return Ok(None);
         };
@@ -1277,6 +1350,107 @@ pub(crate) async fn session_config_set_rpc(
     #[cfg(not(unix))]
     {
         let _ = (session_id, model, effort, speed, account);
+        None
+    }
+}
+
+#[cfg(unix)]
+fn resident_turn_submit_command_id() -> String {
+    format!("diffforge-resident-turn-{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(unix)]
+async fn resident_turn_submit_rpc_inner(
+    session_id: String,
+    prompt: String,
+) -> Result<Option<ResidentTurnSubmit>, String> {
+    let Some(summary) = resident_turn_submit_session_summary(&session_id).await? else {
+        return Ok(None);
+    };
+    let head_seq = config_u64(summary.get("head_seq"))
+        .ok_or_else(|| "session summary head_seq was missing".to_string())?;
+    let Some(response) = resident_turn_submit_request(RequestBody::SessionAttach {
+        session_id: session_id.clone(),
+        after_seq: head_seq,
+        mode: AttachMode::Control,
+        sealed_replay: false,
+    })
+    .await?
+    else {
+        return Ok(None);
+    };
+    let ResponseBody::SessionAttach {
+        attachment_id,
+        attach_state,
+    } = response
+    else {
+        return Err("session.attach response method mismatch".to_string());
+    };
+    if attach_state.session_id != session_id {
+        let _ = resident_turn_submit_request(RequestBody::SessionDetach { attachment_id }).await;
+        return Err("session.attach response session mismatch".to_string());
+    }
+
+    let submit = async {
+        let Some(response) = resident_turn_submit_request(RequestBody::TurnSubmitFromCli {
+            command_id: resident_turn_submit_command_id(),
+            session_id: session_id.clone(),
+            worker_generation: attach_state.worker_generation,
+            text: prompt,
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+        })
+        .await?
+        else {
+            return Ok(None);
+        };
+        match response {
+            ResponseBody::TurnSubmit {
+                session_id: accepted_session,
+                run_id,
+                accepted_seq,
+            } if accepted_session == session_id => Ok(Some(ResidentTurnSubmit {
+                session_id: accepted_session,
+                run_id,
+                accepted_seq,
+            })),
+            ResponseBody::TurnSubmit { .. } => {
+                Err("turn.submit response session mismatch".to_string())
+            }
+            _ => Err("turn.submit response method mismatch".to_string()),
+        }
+    }
+    .await;
+
+    let _ = resident_turn_submit_request(RequestBody::SessionDetach { attachment_id }).await;
+    submit
+}
+
+/// Submits a text-only follow-up turn through the daemon-owned resident
+/// connection. `None` means this connection cannot use the optional door;
+/// callers must preserve the CLI submit fallback in that case.
+pub(crate) async fn resident_turn_submit_rpc(
+    session_id: String,
+    prompt: String,
+    attachments: Vec<String>,
+) -> Option<Result<ResidentTurnSubmit, String>> {
+    #[cfg(unix)]
+    {
+        if attachments
+            .iter()
+            .any(|attachment| !attachment.trim().is_empty())
+        {
+            return None;
+        }
+        return match resident_turn_submit_rpc_inner(session_id, prompt).await {
+            Ok(Some(receipt)) => Some(Ok(receipt)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, prompt, attachments);
         None
     }
 }
@@ -1802,7 +1976,7 @@ fn response_result(body: ResponseBody) -> Result<ResponseBody, String> {
             retryable,
             ..
         } => Err(format!(
-            "daemon rejected session config ({code}, retryable={retryable}): {message}"
+            "daemon rejected RPC request ({code}, retryable={retryable}): {message}"
         )),
         response => Ok(response),
     }
@@ -2389,6 +2563,34 @@ mod tests {
         assert_eq!(
             u32::from_be_bytes(framed[..4].try_into().expect("publish prefix")) as usize,
             framed.len() - 4
+        );
+    }
+
+    #[test]
+    fn resident_turn_submit_frame_matches_reference_json_bytes() {
+        let submit = WireFrame::Request {
+            request_id: "req-resident".to_owned(),
+            body: RequestBody::TurnSubmitFromCli {
+                command_id: "diffforge-resident-turn-test".to_owned(),
+                session_id: "session-1".to_owned(),
+                worker_generation: 7,
+                text: "continue the work".to_owned(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+        };
+        let framed = encode_framed(&submit, DEFAULT_FRAME_LIMIT).expect("encode resident submit");
+        assert_eq!(
+            std::str::from_utf8(&framed[4..]).expect("resident submit JSON"),
+            r#"{"v":1,"kind":"request","request_id":"req-resident","body":{"method":"turn.submit_from_cli","command_id":"diffforge-resident-turn-test","session_id":"session-1","worker_generation":7,"text":"continue the work","attachments":[],"mode":"queue"}}"#
+        );
+        assert_eq!(
+            u32::from_be_bytes(framed[..4].try_into().expect("resident submit prefix")) as usize,
+            framed.len() - 4
+        );
+        assert_eq!(
+            decode_body(&framed[4..], DEFAULT_FRAME_LIMIT).expect("decode resident submit"),
+            submit
         );
     }
 

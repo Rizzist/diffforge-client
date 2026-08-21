@@ -19,6 +19,20 @@ struct HaiderRunAccepted {
     head_seq: i64,
 }
 
+struct HaiderRunSubmitRequest {
+    row: SessionRow,
+    prompt: String,
+    attachments: Vec<String>,
+    config: Option<RunConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HaiderRunSubmitRoute {
+    RejectUnbound,
+    ResidentRpc,
+    Spawn,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 struct RunConfig {
@@ -43,6 +57,35 @@ fn haider_run_prompt(prompt: String) -> Result<String, String> {
         ));
     }
     Ok(prompt)
+}
+
+fn haider_run_has_path_attachments(attachments: &[String]) -> bool {
+    attachments
+        .iter()
+        .any(|attachment| !attachment.trim().is_empty())
+}
+
+fn haider_run_select_session_submit_route(
+    is_bound: bool,
+    resident_turn_submit_available: bool,
+    attachments: &[String],
+) -> HaiderRunSubmitRoute {
+    if !is_bound {
+        HaiderRunSubmitRoute::RejectUnbound
+    } else if resident_turn_submit_available && !haider_run_has_path_attachments(attachments) {
+        HaiderRunSubmitRoute::ResidentRpc
+    } else {
+        HaiderRunSubmitRoute::Spawn
+    }
+}
+
+fn haider_run_config_has_overrides(config: Option<&RunConfig>) -> bool {
+    config.is_some_and(|config| {
+        config.model.is_some()
+            || config.effort.is_some()
+            || config.speed.is_some()
+            || config.account.is_some()
+    })
 }
 
 fn haider_run_validate_config_value(field: &str, value: &str) -> Result<(), String> {
@@ -744,6 +787,38 @@ async fn session_start_with_prompt(
     .map_err(|error| format!("Session start worker failed: {error}"))?
 }
 
+fn haider_run_prepare_session_submit(
+    session_id: String,
+    prompt: String,
+    attachments: Option<Vec<String>>,
+    config: Option<RunConfig>,
+) -> Result<HaiderRunSubmitRequest, String> {
+    let prompt = haider_run_prompt(prompt)?;
+    if let Some(config) = config.as_ref() {
+        haider_run_validate_config(config)?;
+    }
+    let connection = sessions_open_database()?;
+    let row = sessions_row_by_id(&connection, session_id.trim())?;
+    drop(connection);
+    let active = haider_run_is_active(&row.id)?;
+    if row.provider_session_id.trim().is_empty() {
+        return Err(if active {
+            "Haider session is still starting; its provider session id is not bound yet.".to_string()
+        } else {
+            "Haider session id is not bound yet.".to_string()
+        });
+    }
+    if active {
+        return Err("A Haider run is already active for this session.".to_string());
+    }
+    Ok(HaiderRunSubmitRequest {
+        row,
+        prompt,
+        attachments: attachments.unwrap_or_default(),
+        config,
+    })
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn session_submit_prompt(
     app: AppHandle,
@@ -752,59 +827,71 @@ async fn session_submit_prompt(
     attachments: Option<Vec<String>>,
     config: Option<RunConfig>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let prompt = haider_run_prompt(prompt)?;
-        if let Some(config) = config.as_ref() {
-            haider_run_validate_config(config)?;
+    let submit = tauri::async_runtime::spawn_blocking(move || {
+        haider_run_prepare_session_submit(session_id, prompt, attachments, config)
+    })
+    .await
+    .map_err(|error| format!("Session submit worker failed: {error}"))??;
+
+    let try_resident = matches!(
+        haider_run_select_session_submit_route(true, true, &submit.attachments),
+        HaiderRunSubmitRoute::ResidentRpc
+    ) && !haider_run_config_has_overrides(submit.config.as_ref());
+    if try_resident {
+        if let Some(Ok(receipt)) = haider_rpc_ade::resident_turn_submit_rpc(
+            submit.row.provider_session_id.clone(),
+            submit.prompt.clone(),
+            submit.attachments.clone(),
+        )
+        .await
+        {
+            if let Ok(head_seq) = i64::try_from(receipt.accepted_seq) {
+                haider_bridge_note_head_seq(&receipt.session_id, head_seq);
+            }
+            let app = app.clone();
+            let local_session_id = submit.row.id.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                haider_run_update_session(&app, &local_session_id, Some("running"), None, None)
+            })
+            .await;
+            return Ok(());
         }
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
         if !haider_run_supports_session() {
             return Err("haider_run_session_unsupported".to_string());
         }
-        let connection = sessions_open_database()?;
-        let row = sessions_row_by_id(&connection, session_id.trim())?;
-        drop(connection);
-        let active = haider_run_is_active(&row.id)?;
-        if row.provider_session_id.trim().is_empty() {
-            return Err(if active {
-                "Haider session is still starting; its provider session id is not bound yet."
-                    .to_string()
-            } else {
-                "Haider session id is not bound yet.".to_string()
-            });
-        }
-        if active {
-            return Err("A Haider run is already active for this session.".to_string());
-        }
-        let cwd = haider_run_working_directory(&row);
+        let cwd = haider_run_working_directory(&submit.row);
         let (binding_sender, binding_receiver) = std::sync::mpsc::sync_channel(1);
         if let Err(error) = haider_run_spawn(
             app.clone(),
-            row.id.clone(),
-            Some(row.provider_session_id.clone()),
-            prompt,
+            submit.row.id.clone(),
+            Some(submit.row.provider_session_id.clone()),
+            submit.prompt,
             cwd,
-            attachments.unwrap_or_default(),
-            config,
+            submit.attachments,
+            submit.config,
             Some(binding_sender),
         ) {
-            let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
+            let _ = haider_run_update_session(&app, &submit.row.id, Some("error"), None, None);
             return Err(error);
         }
         match binding_receiver.recv_timeout(HAIDER_RUN_BIND_TIMEOUT) {
             Ok(Ok(_bound_row)) => Ok(()),
             Ok(Err(error)) => {
-                haider_run_kill_active(&row.id);
-                let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
+                haider_run_kill_active(&submit.row.id);
+                let _ = haider_run_update_session(&app, &submit.row.id, Some("error"), None, None);
                 Err(error)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                haider_run_kill_active(&row.id);
-                let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
+                haider_run_kill_active(&submit.row.id);
+                let _ = haider_run_update_session(&app, &submit.row.id, Some("error"), None, None);
                 Err("Timed out waiting for Haider to accept the session prompt.".to_string())
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                haider_run_kill_active(&row.id);
-                let _ = haider_run_update_session(&app, &row.id, Some("error"), None, None);
+                haider_run_kill_active(&submit.row.id);
+                let _ = haider_run_update_session(&app, &submit.row.id, Some("error"), None, None);
                 Err("Haider run ended before accepting the session prompt.".to_string())
             }
         }
@@ -1062,6 +1149,30 @@ mod haider_run_tests {
         assert!(haider_run_selects_session_submit(false, Some(true)));
         assert!(!haider_run_selects_session_submit(false, Some(false)));
         assert!(!haider_run_selects_session_submit(false, None));
+    }
+
+    #[test]
+    fn haider_run_routes_resident_submit_only_for_bound_text_turns() {
+        assert_eq!(
+            haider_run_select_session_submit_route(true, true, &[]),
+            HaiderRunSubmitRoute::ResidentRpc
+        );
+        assert_eq!(
+            haider_run_select_session_submit_route(true, false, &[]),
+            HaiderRunSubmitRoute::Spawn
+        );
+        assert_eq!(
+            haider_run_select_session_submit_route(true, true, &["/tmp/image.png".to_string()]),
+            HaiderRunSubmitRoute::Spawn
+        );
+        assert_eq!(
+            haider_run_select_session_submit_route(false, true, &[]),
+            HaiderRunSubmitRoute::RejectUnbound
+        );
+        assert_eq!(
+            haider_run_select_session_submit_route(true, true, &["  ".to_string()]),
+            HaiderRunSubmitRoute::ResidentRpc
+        );
     }
 
     #[test]
