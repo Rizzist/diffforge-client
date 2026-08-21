@@ -501,6 +501,7 @@ export default function MediaDeck({ sessionId = "media-default", onActivity = nu
     onActivityRef.current?.({
       title: items[0]?.name || "",
       count: items.length,
+      busy: items.some((item) => item.status === "processing" || item.status === "queued"),
     });
   }, [items, sessionId]);
   const [dragActive, setDragActive] = useState(false);

@@ -18446,11 +18446,17 @@ export default function App() {
         ? {
           ...row,
           title: activity?.title || row.title,
+          status: activity?.busy ? "running" : "idle",
           latest_at_ms: Date.now(),
         }
         : row
     )));
   }, []);
+
+  /* Seen/attention state is HARNESS-owned (daemon truth shared by every
+     surface — the TUI viewing a session marks it seen for the ADE too).
+     The ADE renders summary attention fields and acks "seen" through the
+     daemon door when it lands (935/936 ask) — no local seen store. */
   const openMediaSession = useCallback((row) => {
     if (!row?.id) return;
     setSessionDraftOpen(false);

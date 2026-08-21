@@ -146,6 +146,29 @@ export default function SessionsRail({
   const pinned = matches.filter((session) => session.pinned);
   const recent = matches.filter((session) => !session.pinned);
 
+  /* Right-slot status (Phase 1): renders HARNESS truth only — the daemon's
+     status buckets already ride every roster summary. Attention priority:
+     needs-you (waiting) > error > working > relative time. The unseen-done
+     blue dot lands when the daemon ships seen-state (935/936 ask) — no
+     ADE-local seen store, every surface must share one attention truth. */
+  const statusSlot = (session) => {
+    const status = session.status || "";
+    if (status === "waiting") {
+      return <NeedsYouChip aria-label="Waiting on you">needs you</NeedsYouChip>;
+    }
+    if (status === "error") {
+      return <StatusErrorRing aria-label="Errored">!</StatusErrorRing>;
+    }
+    if (status === "running") {
+      return <StatusSpinner aria-label="Working" />;
+    }
+    return (
+      <SessionRowMeta>
+        {formatSessionRelativeTime(session.latest_at_ms, nowMs)}
+      </SessionRowMeta>
+    );
+  };
+
   const renderRow = (session) => {
     if (session.kind === "media") {
       if (session.id === renamingId) {
@@ -186,9 +209,7 @@ export default function SessionsRail({
           </MediaRowGlyph>
           <SessionRowTitle>{session.title}</SessionRowTitle>
           <MediaDevTag aria-label="Under development">dev</MediaDevTag>
-          <SessionRowMeta>
-            {formatSessionRelativeTime(session.latest_at_ms, nowMs)}
-          </SessionRowMeta>
+          {statusSlot(session)}
         </SessionRowButton>
       );
     }
@@ -233,9 +254,7 @@ export default function SessionsRail({
           status={session.status}
         />
         <SessionRowTitle>{session.title}</SessionRowTitle>
-        <SessionRowMeta>
-          {formatSessionRelativeTime(session.latest_at_ms, nowMs)}
-        </SessionRowMeta>
+        {statusSlot(session)}
       </SessionRowButton>
     );
   };
@@ -370,6 +389,56 @@ const SessionsRailRoot = styled.div`
 
 /* Collapsed rail: the list stays as a brand-dot icon strip — group labels
    and row text fold away, the marks keep their activity badges. */
+/* Right-slot status indicators — one per row, shape-distinct so color is
+   never the only signal: chip (words) / hollow ring / motion / text. */
+const NeedsYouChip = styled.span`
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--forge-amber) 50%, transparent);
+  border-radius: 999px;
+  color: var(--forge-amber);
+  background: color-mix(in srgb, var(--forge-amber) 10%, transparent);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  [data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
+const StatusErrorRing = styled.span`
+  display: grid;
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  place-items: center;
+  border: 1.5px solid var(--forge-red);
+  border-radius: 50%;
+  color: var(--forge-red);
+  font-size: 8px;
+  font-weight: 800;
+  line-height: 1;
+`;
+
+const StatusSpinner = styled.span`
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid rgba(var(--forge-tint-soft-rgb), 0.25);
+  border-top-color: var(--forge-amber);
+  border-radius: 50%;
+  animation: rail-status-spin 1.2s linear infinite;
+
+  @keyframes rail-status-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+`;
+
 /* Media session rows: distinct glyph + an honest "dev" tag. */
 const MediaRowGlyph = styled.span`
   display: grid;
