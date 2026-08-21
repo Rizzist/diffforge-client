@@ -629,6 +629,25 @@ export default function SessionSurface({
     }
   }, []);
 
+  /* Shell keep-warm (owner-approved LRU of 3): the last three shells the
+     user actually VIEWED stay mounted hidden when their session goes
+     inactive, so switching back skips xterm re-instantiation + scrollback
+     replay (the 0.2-0.8s flip cost). PTYs were always daemon-persistent;
+     this only keeps the view alive. */
+  const [warmShells, setWarmShells] = useState([]);
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft") return;
+    if ((viewModes[id] || "ui") !== "terminal") return;
+    const { tabs, activeTabId } = sessionTabs[id] || { tabs: [{ id: "chat" }], activeTabId: "chat" };
+    if ((tabs.find((tab) => tab.id === activeTabId) || tabs[0]).id !== "chat") return;
+    setWarmShells((current) => (
+      current[0] === id
+        ? current
+        : [id, ...current.filter((entry) => entry !== id)].slice(0, 3)
+    ));
+  }, [activeSessionId, viewModes, sessionTabs]);
+
   /* Session-history sync, lifted from the transcript's additive callback
      (projection caught_up + cold-load state) and reported upward for the
      rail's syncing pill. Keyed per session; only the ACTIVE session's state
@@ -1191,17 +1210,24 @@ export default function SessionSurface({
                       <SessionTrajectory session={session} />
                     </TrajectoryHostLayer>
                   )}
-                  {(mode === "terminal" || shellTouched[session.id]) && (
-                    <TerminalHostLayer data-visible={mode === "terminal" ? "true" : "false"}>
-                      <SessionTerminal
-                        active={mode === "terminal"}
-                        onTuiAttached={handleTuiAttached}
-                        paneIdOverride={paneOverrides[session.id]}
-                        session={session}
-                      />
-                    </TerminalHostLayer>
-                  )}
                 </>
+              )}
+              {/* Shell mounts for the active session's chat tab as before,
+                  AND stays mounted hidden for the 3 most-recently-viewed
+                  shells (owner-approved keep-warm) — switching back skips
+                  the xterm re-instantiation + replay cost entirely. */}
+              {((chatTabActive && active && (mode === "terminal" || shellTouched[session.id]))
+                || warmShells.includes(session.id)) && (
+                <TerminalHostLayer
+                  data-visible={chatTabActive && active && mode === "terminal" ? "true" : "false"}
+                >
+                  <SessionTerminal
+                    active={chatTabActive && active && mode === "terminal"}
+                    onTuiAttached={handleTuiAttached}
+                    paneIdOverride={paneOverrides[session.id]}
+                    session={session}
+                  />
+                </TerminalHostLayer>
               )}
 
               {/* Panel tabs: picker, then staged panel stubs. */}
