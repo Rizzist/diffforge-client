@@ -176,9 +176,15 @@ export default function NeedsInputCard({
                   title={option.detail || undefined}
                   type="button"
                 >
-                  {busyKey === option.key
-                    ? (waking ? "starting…" : "…")
-                    : (option.label || option.key)}
+                  <span>
+                    {busyKey === option.key
+                      ? (waking ? "starting…" : "…")
+                      : (option.label || option.key)}
+                  </span>
+                  {/* The consequence the daemon wrote for this choice. It was
+                      tooltip-only, which hides the one thing that makes the
+                      choice informed — an answer is not reversible. */}
+                  {option.detail && <OptionDetail>{option.detail}</OptionDetail>}
                 </OptionButton>
               ))}
             </Options>
@@ -245,7 +251,16 @@ const Options = styled.div`
   margin-top: 11px;
 `;
 
+const OptionDetail = styled.span`
+  color: var(--forge-text-muted);
+  font-size: 10.5px;
+  font-weight: 500;
+`;
+
 const OptionButton = styled.button`
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
   padding: 4px 13px;
   border: 1px solid color-mix(in srgb, var(--forge-amber) 45%, transparent);
   border-radius: 999px;
@@ -253,7 +268,12 @@ const OptionButton = styled.button`
   color: var(--forge-text);
   font-size: 11.5px;
   font-weight: 640;
+  text-align: left;
   cursor: pointer;
+
+  &:hover:not(:disabled) ${OptionDetail} {
+    color: var(--forge-text-soft);
+  }
 
   &:hover:not(:disabled) {
     background: color-mix(in srgb, var(--forge-amber) 16%, transparent);

@@ -10,7 +10,10 @@ import {
   TERMINAL_DARK_THEME,
   TERMINAL_LIGHT_THEME,
 } from "../terminals/WorkspaceTerminal/terminalCore.js";
+import { sessionPaneId, sessionPaneToken } from "./sessionPaneOwnership.js";
 import { sessionWorkingDirectory } from "./sessionsModel.js";
+
+export { sessionPaneId, sessionPaneToken } from "./sessionPaneOwnership.js";
 
 /* Lean single-PTY host for a Haider session pane. Deliberately NOT the
    19k-line WorkspaceTerminal: one terminal, one PTY, no thread overlay, no
@@ -70,19 +73,6 @@ function measureSessionTerminalGrid({ container, term }) {
   };
 }
 
-export function sessionPaneToken(sessionId) {
-  return String(sessionId || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "session";
-}
-
-export function sessionPaneId(sessionId) {
-  // Keeps the pane-id shape the backend already parses:
-  // workspace-terminal-{token}-{index}-{role}.
-  return `workspace-terminal-${sessionPaneToken(sessionId)}-0-haider`;
-}
-
 export default function SessionTerminal({ session, active, paneIdOverride, onTuiAttached }) {
   const onTuiAttachedRef = useRef(onTuiAttached);
   onTuiAttachedRef.current = onTuiAttached;
@@ -114,6 +104,13 @@ export default function SessionTerminal({ session, active, paneIdOverride, onTui
     let resizeObserver = null;
     let themeObserver = null;
     let detachPushToTalk = () => {};
+    const announceTuiAttached = (providerSessionId) => {
+      onTuiAttachedRef.current?.({
+        paneId,
+        providerSessionId: providerSessionId || null,
+        hostSessionId: session.id,
+      });
+    };
 
     // Recency is DAEMON-owned: reconcile syncs latest_at_ms from the
     // harness's updated_at. Local touches on open/keystrokes made merely
@@ -235,11 +232,7 @@ export default function SessionTerminal({ session, active, paneIdOverride, onTui
           return false;
         }
         const providerId = text.slice("haider;attached=".length).trim();
-        onTuiAttachedRef.current?.({
-          paneId,
-          providerSessionId: providerId || null,
-          hostSessionId: session.id,
-        });
+        announceTuiAttached(providerId);
         return true;
       });
 
@@ -308,6 +301,13 @@ export default function SessionTerminal({ session, active, paneIdOverride, onTui
       }
       if (result && Number(result.instance_id)) {
         instanceIdRef.current = Number(result.instance_id);
+      }
+      /* Adoption returns the live binding, which can differ from the request.
+         Treat it exactly like an OSC announcement: a replay ring need not
+         still contain the TUI's last 7791 frame. */
+      const liveProviderId = String(result?.provider_session_id || "").trim();
+      if (liveProviderId) {
+        announceTuiAttached(liveProviderId);
       }
       fitTerminal();
       // Font metrics settle after the face loads and after xterm's first

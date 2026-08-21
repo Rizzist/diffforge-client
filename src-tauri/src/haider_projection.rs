@@ -7,7 +7,7 @@ const HAIDER_PROJECTION_MAX_EXPORT_BYTES: u64 = 32 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_WINDOW_ROWS: i64 = 1_000;
 const HAIDER_PROJECTION_WATCH_LIMIT: usize = 6;
-const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 2;
+const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 3;
 const HAIDER_PROJECTION_PIPE_BATCH_LINES: usize = 256;
 const HAIDER_PROJECTION_PIPE_SAFETY_POLL: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_PIPE_STOP_POLL: Duration = Duration::from_millis(100);
@@ -60,12 +60,9 @@ struct HaiderProjectionFoldState {
     effect_summaries: HashMap<String, String>,
     seen_sequences: HashSet<(i64, i64)>,
     pipe_eof_max_seq: Option<i64>,
-    /* The daemon mirrors bare export-shaped compat records ({role, text, seq})
-       into the live pipe alongside the enveloped item stream. Once any item
-       event is seen the item stream is canonical: compat records would land
-       duplicates at fresh seqs (and empty turn-start markers). Cold loads and
-       pre-item pipes never set this flag, so export docs still fold. Persisted
-       on the pipe cursor so restarts resume with the gate intact. */
+    /* Enveloped watch/run items are canonical over compat records from those
+       same sources. Native pipes have a separate fold door because their
+       role-shaped rows are the canonical stream. */
     saw_item_stream: bool,
 }
 
@@ -216,9 +213,8 @@ struct HaiderProjectionPipeCursor {
     generation: i64,
     covered_through_seq: i64,
     coverage_known: bool,
-    /* Rides the cursor so a restart resumes with the compat-record gate
-       intact: without it, the first compat record after resume duplicates
-       an already-persisted item row at a fresh seq. Monotone once true. */
+    /* Retained in the cursor schema for compatibility with v2 stores. Native
+       pipe folding no longer reads this cross-source bit. */
     saw_item_stream: bool,
 }
 
@@ -1206,6 +1202,31 @@ fn haider_projection_fold_value_locked(
                 step.rows.push(row);
             }
         }
+    }
+    step
+}
+
+fn haider_projection_fold_pipe_value_locked(
+    state: &mut HaiderProjectionFoldState,
+    session_id: &str,
+    value: &Value,
+) -> HaiderProjectionFoldStep {
+    let payload = haider_projection_payload(value);
+    let compat_role = payload
+        .as_object()
+        .and_then(|object| object.get("role"))
+        .and_then(Value::as_str)
+        .is_some_and(|role| matches!(role, "user" | "assistant" | "tool" | "error"));
+    if !compat_role {
+        return haider_projection_fold_value_locked(state, session_id, value);
+    }
+
+    /* 0.0.937 native pipes contain only bare compat rows. An item envelope
+       observed through run/watch/export must not suppress later pipe growth:
+       doing so advanced the byte cursor while silently dropping the row. */
+    let mut step = HaiderProjectionFoldStep::default();
+    if let Some(row) = haider_projection_export_row(state, session_id, payload) {
+        step.rows.push(row);
     }
     step
 }
@@ -2305,14 +2326,6 @@ fn haider_projection_ingest_pipe_owned(
         .seek(SeekFrom::Start(cursor.byte_offset.max(0) as u64))
         .map_err(|error| format!("Unable to resume Haider session pipe: {error}"))?;
     haider_projection_initialize_state(session_id)?;
-    if cursor.saw_item_stream {
-        let mut states = haider_projection_states()
-            .lock()
-            .map_err(|_| "Session projection state is unavailable.".to_string())?;
-        if let Some(state) = states.get_mut(session_id) {
-            state.saw_item_stream = true;
-        }
-    }
     let mut committed_state = haider_projection_state_snapshot(session_id)?;
 
     let mut rows = Vec::new();
@@ -2367,9 +2380,7 @@ fn haider_projection_ingest_pipe_owned(
                 let state = states
                     .get_mut(session_id)
                     .ok_or_else(|| "Session projection state was not initialized.".to_string())?;
-                let step = haider_projection_fold_value_locked(state, session_id, &value);
-                cursor.saw_item_stream = cursor.saw_item_stream || state.saw_item_stream;
-                step
+                haider_projection_fold_pipe_value_locked(state, session_id, &value)
             };
             rows.extend(step.rows);
             if (seq, ordinal) > (cursor.last_seq, cursor.last_ordinal) {
@@ -4679,12 +4690,11 @@ mod haider_projection_tests {
     }
 
     #[test]
-    fn haider_projection_skips_pipe_compat_records_once_items_stream() {
-        // The 0.0.935 live pipe mirrors bare export-shaped compat records
-        // alongside the enveloped item stream: the final answer repeats at a
-        // fresh seq and every turn start adds an empty assistant marker
-        // (observed live: seqs 14/45/99 empty + 295/296 duplicate answer).
-        // The item stream is canonical once seen; compat records land nothing.
+    fn haider_projection_skips_watch_compat_records_once_items_stream() {
+        // Watch/run streams can carry a bare export-shaped compatibility row
+        // after the richer enveloped item. The item stream is canonical for
+        // those sources, so their later compat record lands nothing. Native
+        // pipes use haider_projection_fold_pipe_value_locked instead.
         let user_record =
             json!({"role":"user", "text":"what?", "at_ms":1700000000004_i64, "seq":4, "ordinal":0});
         let completed = json!({
@@ -5024,6 +5034,98 @@ mod haider_projection_tests {
         assert_eq!(frame.from_seq, Some(1));
 
         drop(watcher);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn haider_projection_pipe_growth_survives_non_pipe_item_state() {
+        let test_session = haider_projection_test_session();
+        let root = std::env::temp_dir().join(format!(
+            "haider-pipe-compat-growth-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}{}\n",
+                haider_projection_test_pipe_header(&test_session.provider_session_id, 1),
+                json!({
+                    "seq":4,
+                    "ordinal":0,
+                    "role":"user",
+                    "text":"first turn"
+                })
+            ),
+        )
+        .unwrap();
+        let route = HaiderProjectionPipeRoute {
+            path: path.clone(),
+            head_seq: None,
+        };
+        let first = haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &route,
+        )
+        .unwrap();
+        assert_eq!(first.appended, 1);
+
+        let item = json!({
+            "seq":10,
+            "committed_at_ms":1700000000010_i64,
+            "payload": {"type":"item", "event":"completed", "item_id":"item-10",
+                "item":{"item":"agent_message", "text":"richer first answer"}}
+        });
+        assert_eq!(
+            haider_projection_ingest_value(None, &test_session.session_id, &item)
+                .unwrap()
+                .appended,
+            1
+        );
+        assert!(haider_projection_states()
+            .lock()
+            .unwrap()
+            .get(&test_session.session_id)
+            .is_some_and(|state| state.saw_item_stream));
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"seq":11,"ordinal":0,"role":"user","text":"second turn"})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"seq":12,"ordinal":0,"role":"assistant","text":"second answer"})
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+
+        let growth = haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &route,
+        )
+        .unwrap();
+        assert_eq!(growth.appended, 2);
+        assert_eq!(
+            growth
+                .rows
+                .iter()
+                .map(|row| (row.seq, row.role.as_str(), row.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(11, "user", "second turn"), (12, "assistant", "second answer")]
+        );
+        let cursor = haider_projection_load_pipe_cursor(&test_session.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.last_seq, 12);
+        assert_eq!(cursor.byte_offset, fs::metadata(&path).unwrap().len() as i64);
+
         fs::remove_dir_all(root).unwrap();
     }
 

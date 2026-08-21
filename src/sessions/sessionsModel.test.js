@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import {
+  effectiveSessionPaneId,
+  rehomeSessionPane,
+  sessionPaneId,
+} from "./sessionPaneOwnership.js";
 import { normalizeSessionRow } from "./sessionsModel.js";
 
 /* normalizeSessionRow builds a FRESH row object, so any harness field it does
@@ -87,4 +92,41 @@ test("absent harness fields normalize to null, never to a fabricated default", (
   assert.equal(row.waiting_kind, null);
   assert.equal(row.waiting_menu_id, null);
   assert.equal(row.needs_input, null);
+});
+
+test("session pane rehome swaps identities instead of aliasing one pane", () => {
+  const panes = rehomeSessionPane({}, {
+    paneId: sessionPaneId("session-a"),
+    hostSessionId: "session-a",
+    targetSessionId: "session-b",
+  });
+
+  assert.equal(effectiveSessionPaneId(panes, "session-a"), sessionPaneId("session-b"));
+  assert.equal(effectiveSessionPaneId(panes, "session-b"), sessionPaneId("session-a"));
+  assert.equal(new Set([
+    effectiveSessionPaneId(panes, "session-a"),
+    effectiveSessionPaneId(panes, "session-b"),
+  ]).size, 2);
+});
+
+test("chained pane rehomes stay bijective and reject stale announcements", () => {
+  const first = rehomeSessionPane({}, {
+    paneId: sessionPaneId("session-a"),
+    hostSessionId: "session-a",
+    targetSessionId: "session-b",
+  });
+  const second = rehomeSessionPane(first, {
+    paneId: effectiveSessionPaneId(first, "session-b"),
+    hostSessionId: "session-b",
+    targetSessionId: "session-c",
+  });
+  const effective = ["session-a", "session-b", "session-c"]
+    .map((sessionId) => effectiveSessionPaneId(second, sessionId));
+
+  assert.equal(new Set(effective).size, effective.length);
+  assert.strictEqual(rehomeSessionPane(second, {
+    paneId: sessionPaneId("session-a"),
+    hostSessionId: "session-b",
+    targetSessionId: "session-a",
+  }), second);
 });

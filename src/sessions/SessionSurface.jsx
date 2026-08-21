@@ -20,6 +20,7 @@ import {
 } from "../app/appStyles.js";
 import { PlanFlame } from "../app/PlanFlame.jsx";
 import SessionComposer from "./SessionComposer.jsx";
+import { rehomeSessionPane } from "./sessionPaneOwnership.js";
 import SessionTerminal from "./SessionTerminal.jsx";
 import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
@@ -246,6 +247,8 @@ export default function SessionSurface({
      applied through session_config_set; chips reflect the daemon's truth. */
   const [sessionConfigs, setSessionConfigs] = useState({});
   const [paneOverrides, setPaneOverrides] = useState({});
+  const paneOverridesRef = useRef(paneOverrides);
+  paneOverridesRef.current = paneOverrides;
   const [surfaceStatus, setSurfaceStatus] = useState({});
 
   /* Config fetches are LATEST-WINS per session: a slow menu-open GET must
@@ -485,14 +488,15 @@ export default function SessionSurface({
     if (!target || target.id === hostSessionId) {
       return;
     }
-    setPaneOverrides((current) => {
-      const next = { ...current };
-      for (const key of Object.keys(next)) {
-        if (next[key] === paneId) delete next[key];
-      }
-      next[target.id] = paneId;
-      return next;
+    const currentPanes = paneOverridesRef.current;
+    const nextPanes = rehomeSessionPane(currentPanes, {
+      paneId,
+      hostSessionId,
+      targetSessionId: target.id,
     });
+    if (nextPanes === currentPanes) return;
+    paneOverridesRef.current = nextPanes;
+    setPaneOverrides(nextPanes);
     /* Land where the user actually was: a hop driven from a live Shell keeps
        the Shell; materializing from the Chat composer (the warm hidden TUI
        announcing the bind) must land in Chat. */
