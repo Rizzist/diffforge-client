@@ -803,10 +803,6 @@ const ClusterRow = styled.button`
   gap: 8px;
   padding: 5px 10px;
   border: 0;
-  /* Failed rows carry their own thin red edge — outline stays row-scoped. */
-  &[data-status="failed"] {
-    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--forge-red) 70%, transparent);
-  }
   background: transparent;
   color: var(--forge-text-soft);
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
