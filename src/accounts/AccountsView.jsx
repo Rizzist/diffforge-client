@@ -31,6 +31,228 @@ const STATUS_LABELS = {
   needs_attention: "needs attention",
 };
 
+/* Direct-CLI terminal logins (codex/claude/opencode), captured from the
+   profile dirs by the Rust watcher. Separate from the harness vault: these
+   authenticate raw CLI terminals, not harness sessions. */
+const CLI_KINDS = [
+  { kind: "claude", label: "Claude Code" },
+  { kind: "codex", label: "Codex" },
+  { kind: "opencode", label: "OpenCode" },
+];
+
+/* One machine login can appear under several profile ids; the email is the
+   identity, so fold duplicates and let an active row win. */
+function collapseProfilesByEmail(profiles) {
+  const byEmail = new Map();
+  const visible = [];
+  for (const profile of Array.isArray(profiles) ? profiles : []) {
+    const email = String(profile?.identity?.email || profile?.email || "").trim().toLowerCase();
+    if (!email) {
+      visible.push(profile);
+      continue;
+    }
+    const existing = byEmail.get(email);
+    if (!existing) {
+      byEmail.set(email, profile);
+      visible.push(profile);
+      continue;
+    }
+    if (profile?.is_active && !existing.is_active) {
+      const index = visible.indexOf(existing);
+      const merged = { ...profile, alias: profile.alias || existing.alias };
+      if (index >= 0) visible[index] = merged;
+      byEmail.set(email, merged);
+    }
+  }
+  return visible;
+}
+
+function CliProfilesSection() {
+  const [agents, setAgents] = useState(null);
+  const [error, setError] = useState("");
+  const [pendingKind, setPendingKind] = useState("");
+  const [confirmKey, setConfirmKey] = useState("");
+  const pendingRef = useRef("");
+  const pendingTimerRef = useRef(null);
+
+  const refresh = useCallback(() => {
+    invoke("agent_accounts_state")
+      .then((state) => setAgents(state?.agents || null))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    /* Logins inside profile dirs change identity without emitting an event,
+       so a slow poll backs up the capture watcher. */
+    const timer = window.setInterval(refresh, 6000);
+    return () => {
+      window.clearInterval(timer);
+      if (pendingTimerRef.current) window.clearTimeout(pendingTimerRef.current);
+    };
+  }, [refresh]);
+
+  /* Logging in opens a terminal and finishes out of band — hold the kind
+     busy briefly so the row reads as pending, and let the watcher settle. */
+  const holdPending = useCallback((kind) => {
+    pendingRef.current = kind;
+    setPendingKind(kind);
+    if (pendingTimerRef.current) window.clearTimeout(pendingTimerRef.current);
+    pendingTimerRef.current = window.setTimeout(() => {
+      pendingRef.current = "";
+      setPendingKind("");
+    }, 30000);
+  }, []);
+
+  const beginLogin = useCallback((kind) => {
+    if (pendingRef.current) return;
+    setError("");
+    holdPending(kind);
+    invoke("start_agent_account_login", { provider: kind })
+      .catch((failure) => {
+        pendingRef.current = "";
+        setPendingKind("");
+        setError(String(failure?.message || failure || "Unable to open the login terminal."));
+      });
+  }, [holdPending]);
+
+  const beginProfileLogin = useCallback((kind, profileId) => {
+    if (pendingRef.current) return;
+    setError("");
+    holdPending(kind);
+    invoke("agent_accounts_start_profile_login", { agent_kind: kind, profile_id: profileId })
+      .then(refresh)
+      .catch((failure) => {
+        pendingRef.current = "";
+        setPendingKind("");
+        setError(String(failure?.message || failure || "Unable to open the account login terminal."));
+      });
+  }, [holdPending, refresh]);
+
+  /* Codex re-authenticates on switch rather than swapping a stored profile,
+     so its "use this" path is the login door. */
+  const setActiveProfile = useCallback((kind, profileId) => {
+    setError("");
+    if (kind === "codex") {
+      beginProfileLogin(kind, profileId);
+      return;
+    }
+    invoke("agent_accounts_set_active", { agent_kind: kind, profile_id: profileId })
+      .then(refresh)
+      .catch((failure) => setError(String(failure?.message || failure || "Unable to switch account.")));
+  }, [beginProfileLogin, refresh]);
+
+  const removeProfile = useCallback((kind, profileId) => {
+    setConfirmKey("");
+    setError("");
+    invoke("agent_accounts_remove", { agent_kind: kind, profile_id: profileId })
+      .then(refresh)
+      .catch((failure) => setError(String(failure?.message || failure || "Unable to delete the profile.")));
+  }, [refresh]);
+
+  if (!agents) return null;
+
+  return (
+    <>
+      <SectionTitle>CLI profiles</SectionTitle>
+      <SectionNote>
+        Logins for direct CLI terminals. Sign into another account in any
+        terminal and it is captured here automatically.
+      </SectionNote>
+      {error && <Notice data-tone="error" role="status"><span>{error}</span></Notice>}
+      {CLI_KINDS.map(({ kind, label }) => {
+        const entry = agents[kind];
+        if (!entry) return null;
+        const profiles = collapseProfilesByEmail(entry.profiles);
+        return (
+          <ProviderGroup key={kind}>
+            <ProviderHeadRow>
+              <ProviderName>{label}</ProviderName>
+              <GhostButton
+                aria-label={`Add a ${label} account`}
+                disabled={Boolean(pendingKind)}
+                onClick={() => beginLogin(kind)}
+                title={`Open the ${label} login in a terminal`}
+                type="button"
+              >
+                <Add aria-hidden="true" />
+                Add
+              </GhostButton>
+            </ProviderHeadRow>
+            {!profiles.length ? (
+              <EmptyState>No {label} logins captured yet.</EmptyState>
+            ) : profiles.map((profile) => {
+              const email = profile.identity?.email || "";
+              const alias = String(profile.alias || "").trim();
+              const name = profile.is_default
+                ? (profile.label || "Default")
+                : (alias || profile.label || "Account");
+              const detail = profile.is_default ? (alias || email) : (alias ? "" : email);
+              const needsLogin = Boolean(
+                profile.auth_status?.needs_login || !profile.identity?.auth_ready,
+              );
+              const canDelete = !profile.is_default && !profile.is_active;
+              return (
+                <AccountRow data-busy={pendingKind === kind ? "true" : undefined} key={profile.id}>
+                  <AccountIdentity>
+                    <strong>{name}</strong>
+                    <span>{detail || kind}</span>
+                  </AccountIdentity>
+                  {needsLogin ? (
+                    <GhostButton
+                      disabled={Boolean(pendingKind)}
+                      onClick={() => beginProfileLogin(kind, profile.id)}
+                      title={profile.auth_status?.message || "Sign in again for this account"}
+                      type="button"
+                    >
+                      Log in
+                    </GhostButton>
+                  ) : profile.is_active ? (
+                    <ActiveTag>Active</ActiveTag>
+                  ) : (
+                    <GhostButton
+                      disabled={Boolean(pendingKind)}
+                      onClick={() => setActiveProfile(kind, profile.id)}
+                      title={`Use this account for new ${label} terminals`}
+                      type="button"
+                    >
+                      Set active
+                    </GhostButton>
+                  )}
+                  {canDelete && (
+                    confirmKey === `${kind}:${profile.id}` ? (
+                      <InlineConfirm data-danger="true">
+                        <span>Deletes the saved login.</span>
+                        <ConfirmButton
+                          data-danger="true"
+                          onClick={() => removeProfile(kind, profile.id)}
+                          type="button"
+                        >
+                          Delete
+                        </ConfirmButton>
+                        <GhostButton onClick={() => setConfirmKey("")} type="button">Keep</GhostButton>
+                      </InlineConfirm>
+                    ) : (
+                      <RowIconButton
+                        aria-label={`Delete ${name}`}
+                        onClick={() => setConfirmKey(`${kind}:${profile.id}`)}
+                        title="Delete this profile and its saved login"
+                        type="button"
+                      >
+                        <Close aria-hidden="true" />
+                      </RowIconButton>
+                    )
+                  )}
+                </AccountRow>
+              );
+            })}
+          </ProviderGroup>
+        );
+      })}
+    </>
+  );
+}
+
 function statusOf(descriptor) {
   return String(descriptor?.status?.status || descriptor?.status || "ok");
 }
@@ -567,6 +789,8 @@ export default function AccountsView({ active = false }) {
         </OauthCard>
       )}
 
+      <CliProfilesSection />
+
       {candidates && (
         <>
           <SectionTitle>Device logins</SectionTitle>
@@ -684,6 +908,22 @@ const ProviderName = styled.h2`
   text-transform: uppercase;
 `;
 
+const ProviderHeadRow = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+
+  ${ProviderName} { margin-bottom: 6px; }
+`;
+
+const SectionNote = styled.p`
+  margin: -2px 0 8px;
+  color: var(--forge-text-muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+`;
+
 const AccountRow = styled.div`
   display: flex;
   align-items: center;
@@ -694,6 +934,8 @@ const AccountRow = styled.div`
   background: var(--forge-surface);
 
   & + & { margin-top: 6px; }
+
+  &[data-busy="true"] { opacity: 0.6; }
 `;
 
 const AccountIdentity = styled.div`
