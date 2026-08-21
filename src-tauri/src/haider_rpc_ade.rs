@@ -3295,7 +3295,10 @@ async fn run_actor(
             );
         }
 
-        let Some(socket_path) = resolve_socket_path() else {
+        let resolved = resolve_socket_path();
+        #[cfg(debug_assertions)]
+        eprintln!("[ade-rpc] resolve -> {resolved:?}");
+        let Some(socket_path) = resolved else {
             publish_disconnected(&connection_tx);
             if !wait_disconnected(
                 &mut commands,
@@ -3312,11 +3315,18 @@ async fn run_actor(
             continue;
         };
 
-        let connected =
-            tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_and_handshake(&socket_path))
-                .await
-                .ok()
-                .and_then(Result::ok);
+        let attempt = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_and_handshake(&socket_path)).await;
+        #[cfg(debug_assertions)]
+        match &attempt {
+            Err(_) => eprintln!("[ade-rpc] handshake TIMEOUT on {socket_path:?}"),
+            Ok(Err(error)) => eprintln!("[ade-rpc] handshake FAILED on {socket_path:?}: {error}"),
+            Ok(Ok((_, welcome))) => eprintln!(
+                "[ade-rpc] connected, {} features, needs_input={}",
+                welcome.features.len(),
+                welcome.features.contains(FEATURE_SESSION_NEEDS_INPUT_V1)
+            ),
+        }
+        let connected = attempt.ok().and_then(Result::ok);
         let Some((mut stream, welcome)) = connected else {
             publish_disconnected(&connection_tx);
             if !wait_disconnected(
@@ -3994,12 +4004,16 @@ fn resolve_socket_path() -> Option<PathBuf> {
             std::env::var_os("HOME").as_deref().map(Path::new),
             &runtime_dir,
         );
-        if deterministic.as_ref().is_some_and(|path| path.exists()) {
+        /* `exists()` was the original test and it is the wrong one: a stale
+           socket file from a dead daemon exists just as well as a live one,
+           so a single unlucky leftover pinned the ADE to an endpoint that
+           could never answer. Require that it actually accepts. */
+        if deterministic.as_ref().is_some_and(|path| socket_is_live(path)) {
             return deterministic;
         }
         let fallback_dir = PathBuf::from("/tmp").join(format!("haider-{uid}"));
-        newest_staging_socket(&fallback_dir)
-            .or_else(|| newest_staging_socket(&runtime_dir))
+        newest_live_endpoint(&fallback_dir)
+            .or_else(|| newest_live_endpoint(&runtime_dir))
             .or(deterministic)
     }
     #[cfg(not(unix))]
@@ -4057,6 +4071,66 @@ fn deterministic_endpoint(
     Some(runtime_dir.join(format!("haider-{}.sock", &endpoint_digest[..32])))
 }
 
+/// A socket FILE proves nothing: the runtime dir accumulates one leftover per
+/// daemon that ever ran (1259 of them on this machine), and a stale entry is
+/// indistinguishable from a live one by name, mtime or metadata. Only a
+/// connect answers the question, so candidates are probed newest-first and the
+/// first one that accepts is the endpoint.
+fn socket_is_live(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Endpoints appear under BOTH names: the daemon binds `.haiderd-<random>`
+/// and renames it to `haider-<digest>.sock`, so at rest the staging name is
+/// gone. Scanning only for staging found nothing and left the ADE permanently
+/// unable to reach a running daemon.
+fn endpoint_candidates(runtime_dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let named = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with(".haiderd-")
+                    || (name.starts_with("haider-") && name.ends_with(".sock"))
+            });
+        if !named {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        found.push((modified, path));
+    }
+    found.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Newest-first, but bounded: probing every leftover would mean up to a
+/// thousand connects on a cold resolve.
+const ENDPOINT_PROBE_LIMIT: usize = 8;
+
+fn newest_live_endpoint(runtime_dir: &Path) -> Option<PathBuf> {
+    endpoint_candidates(runtime_dir)
+        .into_iter()
+        .take(ENDPOINT_PROBE_LIMIT)
+        .find(|path| socket_is_live(path))
+}
+
+#[allow(dead_code)]
 fn newest_staging_socket(runtime_dir: &Path) -> Option<PathBuf> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(runtime_dir).ok()?.flatten() {

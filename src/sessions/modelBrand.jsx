@@ -195,10 +195,14 @@ function brandGlyph(family) {
 /* Rail marker: the brand mark of the session's current model, with a tiny
    activity badge (pulsing green/amber, solid red) only while non-idle.
    Unknown model families keep the classic status dot. */
-export function ModelBrandIcon({ model, provider, status }) {
+export function ModelBrandIcon({ model, provider, status, park = false }) {
+  /* A park outranks the run bucket: a session waiting on a human reads amber
+     here rather than as a word elsewhere in the row, so the mark carries the
+     whole state and nothing competes with the title for space. */
+  const state = park ? "waiting" : status;
   const family = modelBrandFor(model, provider);
   if (!family) {
-    return <FallbackDot aria-hidden="true" data-status={status} />;
+    return <FallbackDot aria-hidden="true" data-status={state} />;
   }
   return (
     <BrandWrap
@@ -208,8 +212,8 @@ export function ModelBrandIcon({ model, provider, status }) {
       title={family.label}
     >
       {brandGlyph(family)}
-      {(status === "running" || status === "waiting" || status === "error") && (
-        <ActivityBadge data-status={status} />
+      {(state === "running" || state === "waiting" || state === "error") && (
+        <ActivityBadge data-status={state} />
       )}
     </BrandWrap>
   );

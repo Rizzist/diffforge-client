@@ -106,7 +106,7 @@ export default function AuthFlow({
 
       <AuthLayer $leaving={launching}>
         <LogoAnchor ref={anchorRef} />
-        <Wordmark $show={phase !== PHASES.BOOT}>DIFF FORGE</Wordmark>
+        <Wordmark $show={phase !== PHASES.BOOT}>DIFF FORGE AI</Wordmark>
 
         <CardZone>
           {phase === PHASES.ENTRY && (

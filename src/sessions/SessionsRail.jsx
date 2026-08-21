@@ -149,41 +149,15 @@ export default function SessionsRail({
   const pinned = matches.filter((session) => session.pinned);
   const recent = matches.filter((session) => !session.pinned);
 
-  /* Right-slot status: HARNESS truth only — buckets, and with 936's
-     session_seen_v1 the typed waiting-why and the durable seen state too.
-     Attention priority: needs-you (waiting, labeled by why) > error >
-     working > unseen dot + time > time. No ADE-local seen store — every
-     surface shares one attention truth; viewing a chat acks through the
-     daemon's session.seen door. */
-  const WAITING_LABELS = {
-    permission: "permission",
-    question: "question",
-    approval: "approval",
-    recovery: "recovery",
-    update: "update",
-    secret: "secret",
-    trust_hook: "trust",
-    choice: "choose",
-    conflict: "conflict",
-    file: "file",
-    exhausted: "limit",
-    unknown: "needs you",
-  };
+  /* Parked = the harness says a human is needed: 937's typed card, or 936's
+     frozen waiting_why on an older daemon. */
+  const parkOf = (session) => Boolean(session.needs_input?.kind)
+    || session.status === "waiting";
   const statusSlot = (session) => {
     const status = session.status || "";
     /* 937 needs_input carries the park's own typed kind and can name kinds
        this build predates — prefer it, humanise anything unrecognised, and
        keep 936's waiting_why (frozen at three kinds) as the fallback. */
-    const parkKind = session.needs_input?.kind || "";
-    if (parkKind || status === "waiting") {
-      /* A present park kind WINS outright — falling back to waiting_why for
-         a kind this build predates would label a "biometric_scan" park
-         "approval", which is worse than humanising the real one. */
-      const label = parkKind
-        ? (WAITING_LABELS[parkKind] || parkKind.replace(/_/g, " "))
-        : (WAITING_LABELS[session.waiting_kind] || "needs you");
-      return <NeedsYouChip aria-label="Waiting on you">{label}</NeedsYouChip>;
-    }
     if (status === "error") {
       return <StatusErrorRing aria-label="Errored">!</StatusErrorRing>;
     }
@@ -284,18 +258,13 @@ export default function SessionsRail({
       >
         <ModelBrandIcon
           model={session.model}
+          park={parkOf(session)}
           provider={session.provider}
           status={session.status}
         />
-        <SessionRowTitle>{session.title}</SessionRowTitle>
-        {/* A live shell is worth knowing about without being shouted at: a
-            dim glyph, no color, that only sharpens on hover where it also
-            becomes the switch. */}
-        {shellPrefs[session.id] === true && (
-          <ShellMark aria-label="Shell running" title="Shell is running">
-            <TerminalGlyph aria-hidden="true" />
-          </ShellMark>
-        )}
+        <SessionRowTitle data-shell={shellPrefs[session.id] === true ? "on" : undefined}>
+          {session.title}
+        </SessionRowTitle>
         {statusSlot(session)}
         {/* Row actions replace the time on hover — same slot, so the row
             never reflows under the pointer. */}
@@ -501,24 +470,6 @@ const UnseenDot = styled.i`
   background: var(--forge-accent-soft);
 `;
 
-const NeedsYouChip = styled.span`
-  flex: 0 0 auto;
-  padding: 1px 6px;
-  border: 1px solid color-mix(in srgb, var(--forge-amber) 50%, transparent);
-  border-radius: 999px;
-  color: var(--forge-amber);
-  background: color-mix(in srgb, var(--forge-amber) 10%, transparent);
-  font-size: 8px;
-  font-weight: 800;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  white-space: nowrap;
-
-  [data-collapsed="true"] & {
-    display: none;
-  }
-`;
-
 const StatusErrorRing = styled.span`
   display: grid;
   flex: 0 0 auto;
@@ -643,6 +594,7 @@ const SessionGroup = styled.div`
 /* Dedicated row: shared rail buttons wrap a three-part row (mark · title ·
    meta) on the Session Deck's 284px measure — 30px rows, 12px type. */
 const SessionRowButton = styled.button`
+  position: relative;
   display: flex;
   width: 100%;
   min-width: 0;
@@ -689,32 +641,26 @@ const TerminalGlyph = styled(Terminal)`
   height: 12px;
 `;
 
-/* A running shell, stated quietly: no color, low opacity, and it steps aside
-   entirely while the row's actions are showing. */
-const ShellMark = styled.span`
-  display: inline-flex;
-  flex: 0 0 auto;
-  color: var(--forge-text-muted);
-  opacity: 0.45;
-
-  svg { width: 11px; height: 11px; }
-
-  ${SessionRowButton}:hover & { display: none; }
-  [data-collapsed="true"] & { display: none; }
-`;
-
 /* Hover actions occupy the same right slot as the time, so the row keeps its
-   width and nothing shifts under the pointer. */
+   width and nothing shifts under the pointer. They fade and slide rather than
+   snapping, so the pointer crossing a long list doesn't strobe. */
 const RowActions = styled.span`
-  display: none;
-  flex: 0 0 auto;
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  display: inline-flex;
   align-items: center;
   gap: 2px;
-  margin-left: auto;
+  opacity: 0;
+  transform: translateY(-50%) translateX(4px);
+  pointer-events: none;
+  transition: opacity 140ms ease, transform 140ms ease;
 
   ${SessionRowButton}:hover &,
   ${SessionRowButton}:focus-within & {
-    display: inline-flex;
+    opacity: 1;
+    transform: translateY(-50%);
+    pointer-events: auto;
   }
 
   [data-collapsed="true"] & { display: none; }
@@ -775,6 +721,15 @@ const SessionRowTitle = styled.span`
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+  /* A live shell is stated by the title's own weight of presence rather than
+     another glyph competing in the row: shells that are running read at full
+     strength, everything else sits a step back. */
+  opacity: 0.72;
+  transition: opacity 160ms ease;
+
+  &[data-shell="on"] {
+    opacity: 1;
+  }
 
   [data-collapsed="true"] & {
     display: none;
@@ -786,6 +741,12 @@ const SessionRowMeta = styled.em`
   align-items: center;
   gap: 5px;
   margin-left: auto;
+  transition: opacity 140ms ease;
+
+  ${SessionRowButton}:hover &,
+  ${SessionRowButton}:focus-within & {
+    opacity: 0;
+  }
   color: var(--forge-text-muted);
   font-size: 9.5px;
   font-style: normal;
