@@ -44,6 +44,11 @@ function kindLabel(kind) {
    answering twice. */
 const WAKE_ATTEMPTS = 6;
 const WAKE_BACKOFF_MS = 700;
+const OS_PERMISSION_PREFIX = "computer-os-permission-";
+/* SystemPermission::as_str in the harness protocol. Adding one here is a
+   deliberate act, which is the point. */
+const OS_PERMISSIONS = ["screen_recording", "accessibility"];
+const OPEN_SETTINGS_KEY = "__open_settings__";
 
 export default function NeedsInputCard({
   card,
@@ -143,6 +148,40 @@ export default function NeedsInputCard({
   /* secret_answer absent means false. Those cards are badge-only by design —
      answered where the vault input lives, never here. */
   const secret = card?.secret_answer === true;
+  /* An OS permission park. The daemon builds the menu id as
+     `computer-os-permission-{effect}-{permission}` (worker.rs), and keys the
+     open-settings door by the FULL menu id, so the only thing to derive is
+     the trailing permission name. */
+  const osPermission = (() => {
+    const menuId = String(card?.menu_id || "");
+    if (card?.kind !== "permission" || !menuId.startsWith(OS_PERMISSION_PREFIX)) return "";
+    /* Match KNOWN names rather than taking everything after the last dash:
+       today no permission contains a dash, but the day one does, splitting
+       would send a wrong permission SILENTLY — and this door opens system
+       panes. An unrecognised name yields no button, so the card degrades to
+       "you can still Retry" instead of guessing which pane to open. */
+    return OS_PERMISSIONS.find((name) => menuId.endsWith(`-${name}`)) || "";
+  })();
+
+  const openSettings = useCallback(async () => {
+    if (busyKey || !osPermission) return;
+    setBusyKey(OPEN_SETTINGS_KEY);
+    setError("");
+    try {
+      await invoke("computer_permission_open_settings", {
+        session_id: sessionId,
+        menu_id: card.menu_id,
+        permission: osPermission,
+      });
+    } catch (failure) {
+      const code = String(failure?.message || failure || "").trim();
+      setError(code === "haider_needs_input_unavailable"
+        ? "Could not reach this session — open its Shell, then try again."
+        : code || "System Settings did not open.");
+    } finally {
+      setBusyKey("");
+    }
+  }, [busyKey, card?.menu_id, osPermission, sessionId]);
 
   return (
     <Card data-kind={card?.kind || "unknown"} role="group">
@@ -168,6 +207,21 @@ export default function NeedsInputCard({
           )}
           {answerable && (
             <Options>
+              {/* An OS permission park cannot be answered by the menu alone:
+                  macOS needs a real grant, so the card's own option can only
+                  re-check. This opens the right pane on the machine running
+                  the DAEMON — the one missing the permission — which stays
+                  correct even when this UI is somewhere else entirely. */}
+              {osPermission && (
+                <OptionButton
+                  disabled={Boolean(busyKey)}
+                  onClick={() => void openSettings()}
+                  type="button"
+                >
+                  <span>{busyKey === OPEN_SETTINGS_KEY ? "opening…" : "Open Settings"}</span>
+                  <OptionDetail>Grant it, then re-check.</OptionDetail>
+                </OptionButton>
+              )}
               {options.map((option) => (
                 <OptionButton
                   disabled={Boolean(busyKey)}

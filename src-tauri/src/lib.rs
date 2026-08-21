@@ -6343,6 +6343,7 @@ fn run_app(daemon: bool) {
             haider_rpc_ade::surface_detach,
             haider_rpc_ade::surface_publish_input,
             haider_rpc_ade::session_answer_menu,
+            haider_rpc_ade::computer_permission_open_settings,
             haider_rpc_ade::account_list,
             haider_rpc_ade::account_add_api_key,
             haider_rpc_ade::account_oauth_start,

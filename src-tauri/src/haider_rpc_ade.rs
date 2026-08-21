@@ -424,6 +424,15 @@ enum AccountAddMethod {
 enum RequestBody {
     #[serde(rename = "artifact.put")]
     ArtifactPut { data_base64: String },
+    /// Opens the System Settings pane for an unresolved OS permission park.
+    /// The daemon knows the pane; no URL is ever sent by a client. It opens on
+    /// the machine running the DAEMON, which is the machine needing the grant.
+    #[serde(rename = "computer.permission_open_settings")]
+    ComputerPermissionOpenSettings {
+        session_id: String,
+        request_id: String,
+        permission: String,
+    },
     #[serde(rename = "session.list")]
     SessionList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -659,6 +668,8 @@ enum ResponseBody {
     },
     #[serde(rename = "menu.answer")]
     MenuAnswer { resolution_seq: u64 },
+    #[serde(rename = "computer.permission_open_settings")]
+    ComputerPermissionOpenSettings { permission: String },
     #[serde(rename = "account.list")]
     AccountList {
         #[serde(default)]
@@ -3013,6 +3024,102 @@ async fn session_answer_menu_rpc_inner(
 
     let _ = session_needs_input_request(RequestBody::SessionDetach { attachment_id }).await;
     answer
+}
+
+/// Opens the System Settings pane for an OS-permission park. macOS requires a
+/// real user grant that no wire action can perform, so this is the side action
+/// that makes the park's own option (a re-check) able to succeed. It opens on
+/// the machine running the DAEMON — the one whose permission is missing —
+/// which stays correct when the UI is somewhere else entirely.
+///
+/// The daemon keys the request by the FULL menu id (worker.rs stores
+/// `request_id: menu.id`), and derives the pane itself; no client ever sends a
+/// URL. Needs a control attachment, so it borrows one for the call.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn computer_permission_open_settings(
+    session_id: String,
+    menu_id: String,
+    permission: String,
+) -> Result<Value, String> {
+    #[cfg(unix)]
+    {
+        if !session_needs_input_available(&actor_handle().connection.borrow()) {
+            return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
+        }
+        let context_session_id = session_id.clone();
+        let provider_session_id = tauri::async_runtime::spawn_blocking(move || {
+            let connection = super::sessions_open_database()?;
+            let row = super::sessions_row_by_id(&connection, context_session_id.trim())?;
+            let provider_session_id = row.provider_session_id.trim();
+            if provider_session_id.is_empty() {
+                return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
+            }
+            Ok::<String, String>(provider_session_id.to_string())
+        })
+        .await
+        .map_err(|error| format!("Permission settings worker failed: {error}"))??;
+        return computer_permission_open_settings_rpc(provider_session_id, menu_id, permission)
+            .await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, menu_id, permission);
+        Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string())
+    }
+}
+
+#[cfg(unix)]
+async fn computer_permission_open_settings_rpc(
+    session_id: String,
+    menu_id: String,
+    permission: String,
+) -> Result<Value, String> {
+    let Some(summary) = session_needs_input_summary(&session_id).await? else {
+        return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
+    };
+    let head_seq = config_u64(summary.get("head_seq"))
+        .ok_or_else(|| "session summary head_seq was missing".to_string())?;
+    let Some(response) = session_needs_input_request(RequestBody::SessionAttach {
+        session_id: session_id.clone(),
+        after_seq: head_seq,
+        mode: AttachMode::Control,
+        sealed_replay: false,
+    })
+    .await?
+    else {
+        return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
+    };
+    let ResponseBody::SessionAttach {
+        attachment_id,
+        attach_state,
+    } = response
+    else {
+        return Err("session.attach response method mismatch".to_string());
+    };
+    if attach_state.session_id != session_id {
+        let _ = session_needs_input_request(RequestBody::SessionDetach { attachment_id }).await;
+        return Err("session.attach response session mismatch".to_string());
+    }
+
+    let opened = async {
+        match session_needs_input_request(RequestBody::ComputerPermissionOpenSettings {
+            session_id,
+            request_id: menu_id,
+            permission,
+        })
+        .await?
+        {
+            Some(ResponseBody::ComputerPermissionOpenSettings { permission }) => {
+                Ok(serde_json::json!({ "permission": permission }))
+            }
+            Some(_) => Err("computer.permission_open_settings response method mismatch".to_string()),
+            None => Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string()),
+        }
+    }
+    .await;
+
+    let _ = session_needs_input_request(RequestBody::SessionDetach { attachment_id }).await;
+    opened
 }
 
 /// Resolves a daemon-owned needs-input card using the exact staleness fence
