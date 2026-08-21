@@ -101,6 +101,8 @@ export default function SessionSurface({
      per-owner applied floors in mirrorForeignRef. A fresh TUI's revision 1
      applies. */
   const [composerTexts, setComposerTexts] = useState({});
+  const composerTextsRef = useRef(composerTexts);
+  composerTextsRef.current = composerTexts;
   /* Paste blocks are surface-owned like the text — they must survive the
      composer unmounting on view/session switches, or the mirror and the
      submit diverge from what the chips show. */
@@ -138,12 +140,55 @@ export default function SessionSurface({
     while (history.size > 32) {
       history.delete(history.keys().next().value);
     }
+    /* input_mirror_attachments_v1: PASTE-staged files ride the publish as
+       artifact refs (uploaded backend-side; feature-gated there too). Only
+       our own staged temp files qualify — dialog-picked paths are submit
+       attachments, not mirror refs. The ""-clear never carries refs: a
+       cleared composer has no attachments, and the consumed temp files may
+       already be gone. */
+    const staged = text === ""
+      ? []
+      : (composerAttachmentsRef.current[session.id] || [])
+        .filter((path) => path.includes("diffforge-paste-"));
     void invoke("surface_publish_input", {
       session_id: providerId,
       text,
+      attachments: staged.length ? staged : null,
       revision,
     }).catch(() => {});
   }, []);
+  /* Composer attachments are SURFACE-owned (the composer unmounts on view
+     switches, which silently dropped them from submits AND the mirror). The
+     ref is the synchronous authority — async stage callbacks compute from it
+     through updater functions, and state changes NEVER run side effects
+     inside a React updater (deferred-replay hazard). The mirrored text is
+     the same blocks-plus-typed composite the composer sends, so a publish
+     triggered by a stage landing cannot wipe paste blocks from the TUI. */
+  const [composerAttachments, setComposerAttachments] = useState({});
+  const composerAttachmentsRef = useRef({});
+  const composerPastesRef = useRef(composerPastes);
+  composerPastesRef.current = composerPastes;
+  const compositeMirrorText = useCallback((id) => {
+    const blocks = composerPastesRef.current[id] || [];
+    const typed = composerTextsRef.current[id] ?? "";
+    const parts = blocks.map((block) => block.text);
+    if (typed.trim() || !parts.length) parts.push(typed);
+    return parts.join("\n\n");
+  }, []);
+  const handleAttachmentsChange = useCallback((session, next) => {
+    const id = session?.id;
+    if (!id) return;
+    const previous = composerAttachmentsRef.current[id] || [];
+    const resolved = typeof next === "function" ? next(previous) : next;
+    const unchanged = resolved.length === previous.length
+      && resolved.every((path, index) => path === previous[index]);
+    if (unchanged) return;
+    composerAttachmentsRef.current[id] = resolved;
+    setComposerAttachments((current) => ({ ...current, [id]: resolved }));
+    if (id !== "draft") {
+      publishMirrorNow(session, compositeMirrorText(id));
+    }
+  }, [compositeMirrorText, publishMirrorNow]);
   /* #10: trailing-edge debounce (~40ms) — the mirror is a SNAPSHOT, not a
      keylog, so only the last state of a burst needs the wire. The
      submit-clear ("" text) flushes immediately and cancels any pending
@@ -167,6 +212,7 @@ export default function SessionSurface({
     }, 40);
   }, [publishMirrorNow]);
   const [composerPrefs, setComposerPrefs] = useState({});
+  const [mirrorAttachments, setMirrorAttachments] = useState({});
   const [usageMeta, setUsageMeta] = useState(null);
   const [library, setLibrary] = useState(null);
   const [draftError, setDraftError] = useState("");
@@ -325,7 +371,17 @@ export default function SessionSurface({
       );
       if (!local) return;
       if (payload.status?.line != null) {
-        setSurfaceStatus((current) => ({ ...current, [local.id]: payload.status.line }));
+        /* status_segment_structured_v1: {state, detail} ride additively —
+           stored whole; consumers prefer them and fall back to parsing the
+           raw strip (pre-structured daemons). */
+        setSurfaceStatus((current) => ({
+          ...current,
+          [local.id]: {
+            line: payload.status.line,
+            state: payload.status.state || "",
+            detail: payload.status.detail || "",
+          },
+        }));
       }
       if (payload.input?.text != null) {
         /* input_mirror_v1, owner-aware (rev934 P1-1): our own accepted
@@ -338,11 +394,18 @@ export default function SessionSurface({
         const history = mirrorHistoryRef.current[local.id];
         if (history && history.get(revision) === text) {
           /* One of OUR publishes echoed back (any pending one, not just the
-             latest) — learn the owner and drop. */
+             latest) — learn the owner and drop. Our own refs already render
+             as LOCAL chips: an echo must not leave them up as stale
+             read-only "TUI" chips. */
           if (owner) {
             mirrorSelfOwnerRef.current = owner;
             history.clear();
           }
+          setMirrorAttachments((current) => (
+            (current[local.id] || []).length
+              ? { ...current, [local.id]: [] }
+              : current
+          ));
         } else if (!owner || owner !== mirrorSelfOwnerRef.current) {
           const floors = (mirrorForeignRef.current[local.id] ||= {});
           if (!(owner in floors) || revision > floors[owner]) {
@@ -357,10 +420,25 @@ export default function SessionSurface({
                 : { ...current, [local.id]: text }
             ));
             /* A remote frame is the FULL composer truth: local paste blocks
-               would double into the composite — clear them. */
+               AND local staged attachments would mix stale content into the
+               newer draft — clear both. */
             setComposerPastes((current) => (
               (current[local.id] || []).length
                 ? { ...current, [local.id]: [] }
+                : current
+            ));
+            if ((composerAttachmentsRef.current[local.id] || []).length) {
+              composerAttachmentsRef.current[local.id] = [];
+              setComposerAttachments((current) => ({ ...current, [local.id]: [] }));
+            }
+            /* input_mirror_attachments_v1: refs from the owning surface
+               render as read-only chips (metadata only — no bytes). */
+            const refs = Array.isArray(payload.input.attachments)
+              ? payload.input.attachments
+              : [];
+            setMirrorAttachments((current) => (
+              (current[local.id] || []).length || refs.length
+                ? { ...current, [local.id]: refs }
                 : current
             ));
           }
@@ -808,9 +886,13 @@ export default function SessionSurface({
     /* status_segment_v1 publishes the TUI's ENTIRE bottom strip — byte-exact
        is the wire contract, not the pill's: compact to the state word (full
        line lives in the tooltip). Structured segment = 935 harness ask. */
-    const rawStatusLine = session && session.id !== "draft"
-      ? (surfaceStatus[session.id] || "").trim()
-      : "";
+    const surfaceEntry = session && session.id !== "draft"
+      ? surfaceStatus[session.id] || null
+      : null;
+    const rawStatusLine = (surfaceEntry?.line || "").trim();
+    /* status_segment_structured_v1: {state, detail} skip the strip parser
+       entirely; the unicode compactor stays as the pre-structured fallback. */
+    const structuredStatus = (surfaceEntry?.detail || surfaceEntry?.state || "").trim();
     /* state_raw holds the LAST RUN'S outcome ("cancelled"/"completed") — a
        past-tense vocabulary. It may fill the pill only while a run is
        actually alive; on a settled session it flashed "Cancelled" for a
@@ -818,7 +900,8 @@ export default function SessionSurface({
     const sessionActive = session
       && (session.status === "running" || session.status === "waiting" || session.status === "error");
     const statusLine = session && session.id !== "draft"
-      ? (compactSurfaceStatus(rawStatusLine)
+      ? (structuredStatus
+        || compactSurfaceStatus(rawStatusLine)
         || (sessionActive ? (session.state_raw || "").trim() : "")
         || (session.status === "running"
           ? "Running"
@@ -961,10 +1044,12 @@ export default function SessionSurface({
                 </EmptyState>
               </DraftBody>
               <SessionComposer
+                attachments={composerAttachments.draft || []}
                 autoFocus
                 chipCapabilities={library?.capabilities || {}}
                 chipOptions={chipOptionsFor(null)}
                 chipValues={chipValuesFor(null)}
+                onAttachmentsChange={(next) => handleAttachmentsChange({ id: "draft" }, next)}
                 onChipChange={(key, option) => handleChipChange("draft", key, option)}
                 onSubmit={submitDraft}
                 onPastedBlocksChange={(blocks) => setComposerPastesFor("draft", blocks)}
@@ -1057,7 +1142,10 @@ export default function SessionSurface({
                            coarse status — if it says idle (settle lag), no
                            dot, ever. */
                         if (session.status !== "running") return "";
-                        const compact = compactSurfaceStatus(surfaceStatus[session.id]);
+                        const entry = surfaceStatus[session.id] || null;
+                        if ((entry?.state || "").toLowerCase() === "idle") return "";
+                        const structured = (entry?.detail || entry?.state || "").trim();
+                        const compact = structured || compactSurfaceStatus(entry?.line || "");
                         if (/^idle\b/i.test(compact)) return "";
                         const fallback = (session.state_raw || "").trim();
                         if (!compact && /^idle\b/i.test(fallback)) return "";
@@ -1071,6 +1159,9 @@ export default function SessionSurface({
                       chipValues={chipValuesFor(session)}
                       onChipChange={(key, option) => handleChipChange(session.id, key, option)}
                       onChipMenuOpen={() => refreshConfig(session.id)}
+                      attachments={composerAttachments[session.id] || []}
+                      mirrorAttachments={mirrorAttachments[session.id] || []}
+                      onAttachmentsChange={(next) => handleAttachmentsChange(session, next)}
                       onMirrorType={(text) => publishMirror(session, text)}
                       onSubmit={(prompt, attachments) => submitIntoSession(session, prompt, attachments)}
                       onPastedBlocksChange={(blocks) => setComposerPastesFor(session.id, blocks)}

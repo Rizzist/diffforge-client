@@ -51,6 +51,15 @@ export default function SessionComposer({
   onChipChange = null,
   onChipMenuOpen = null,
   slashCommands = null,
+  /* input_mirror_attachments_v1: refs staged on ANOTHER surface (the TUI)
+     render as read-only chips. Local attachments are SURFACE-owned like the
+     paste blocks (the composer unmounts on every view switch — local state
+     silently dropped them from both the submit and the mirror); change
+     callbacks accept updater functions so async stage callbacks can't
+     clobber each other. */
+  mirrorAttachments = [],
+  attachments = [],
+  onAttachmentsChange = null,
 }) {
   /* The draft text is SURFACE-owned (value/onValueChange): the composer
      unmounts on every view/session switch, so component-local text would be
@@ -59,7 +68,14 @@ export default function SessionComposer({
      the daemon surface through onMirrorType. */
   const [busy, setBusy] = useState(false);
   const [openMenu, setOpenMenu] = useState("");
-  const [attachments, setAttachments] = useState([]);
+  /* Ref-backed stable identity: the surface passes a fresh inline callback
+     every render, and several callers live inside memoized callbacks whose
+     dependency arrays must not need to track it. */
+  const onAttachmentsChangeRef = useRef(onAttachmentsChange);
+  onAttachmentsChangeRef.current = onAttachmentsChange;
+  const setAttachments = useCallback((next) => {
+    onAttachmentsChangeRef.current?.(next);
+  }, []);
   const pasteIdRef = useRef(0);
   const textareaRef = useRef(null);
   const rootRef = useRef(null);
@@ -387,6 +403,21 @@ export default function SessionComposer({
             ))}
           </AttachmentChips>
         )}
+        {mirrorAttachments.length > 0 && (
+          <AttachmentChips>
+            {mirrorAttachments.map((ref) => (
+              <AttachmentChip
+                data-mirror="true"
+                key={ref.artifact || ref.name}
+                title={ref.mime ? `${ref.mime} · staged in the TUI` : "staged in the TUI"}
+              >
+                <span>
+                  {(ref.name || ref.artifact || "attachment").slice(0, 18)}
+                </span>
+              </AttachmentChip>
+            ))}
+          </AttachmentChips>
+        )}
         <ComposerField data-busy={busy ? "true" : undefined}>
           <ComposerRoundButton
             aria-label="Attach files"
@@ -628,6 +659,13 @@ const AttachmentChip = styled.span`
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
+  }
+
+  /* Read-only refs mirrored from another surface (TUI): dimmed, no remove. */
+  &[data-mirror="true"] {
+    padding-right: 10px;
+    border-style: dashed;
+    color: var(--forge-text-muted);
   }
 `;
 

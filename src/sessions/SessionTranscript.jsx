@@ -191,8 +191,16 @@ function buildBlocks(rows) {
   const blocks = [];
   let lastDay = "";
   let lastAssistantText = null;
-  for (const row of rows) {
+  for (let row of rows) {
     if (row.kind === "usage") continue;
+    /* Historical projections hold streaming-fallback rows that leaked into
+       the chat column as prose: args/output deltas that arrived on a tail
+       classified as a message. The text prefix is proof of tool-ness —
+       re-home them into the cluster (new rows are re-kinded at ingest). */
+    if (row.kind === "message" && /^(tool arguments|command output) · /.test(row.text || "")) {
+      row = { ...row, kind: "tool", role: "tool" };
+    }
+    if (row.kind === "thinking" && !String(row.text || "").trim()) continue;
     /* Daemon compat records leave empty assistant turn-markers and duplicate
        final answers in older projections: an empty message row renders as a
        blank spacer that also splits tool clusters, and an adjacent identical
@@ -580,6 +588,8 @@ export default function SessionTranscript({ session, runStatus = "", onSyncingCh
                   <ErrorTag>run failed</ErrorTag>
                   <RowText>{row.text}</RowText>
                 </ErrorCard>
+              ) : row.kind === "thinking" ? (
+                <ThinkingFold text={row.text} />
               ) : row.role === "assistant" ? (
                 <MarkdownBody>
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{row.text}</ReactMarkdown>
@@ -591,17 +601,28 @@ export default function SessionTranscript({ session, runStatus = "", onSyncingCh
           </TranscriptRow>
         );
       })}
-      {liveTail && (
+      {/* Streaming tool tails carry raw args fallback text — the shimmer
+          status already shows activity, so they render nothing here. */}
+      {liveTail && liveTail.kind !== "tool" && (
         <TranscriptRow data-kind="live" data-role={liveTail.role || "assistant"}>
-          <RowBody data-kind="message" data-role={liveTail.role || "assistant"}>
-            <MarkdownBody>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{liveTail.text}</ReactMarkdown>
-              <LiveCaret aria-hidden="true" />
-            </MarkdownBody>
+          <RowBody
+            data-kind={liveTail.kind === "thinking" ? "thinking" : "message"}
+            data-role={liveTail.role || "assistant"}
+          >
+            {liveTail.kind === "thinking" ? (
+              <ThinkingFold live text={liveTail.text} />
+            ) : (
+              <MarkdownBody>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{liveTail.text}</ReactMarkdown>
+                <LiveCaret aria-hidden="true" />
+              </MarkdownBody>
+            )}
           </RowBody>
         </TranscriptRow>
       )}
-      {!liveTail && runStatus && (
+      {/* A suppressed tool tail must not also swallow the shimmer — the
+          status line is then the only sign the stream is alive. */}
+      {(!liveTail || liveTail.kind === "tool") && runStatus && (
         <ShimmerRow aria-live="polite">
           <ShimmerDot aria-hidden="true" />
           <span>{runStatus}</span>
@@ -673,10 +694,67 @@ const RowBody = styled.div`
     flex: 1;
   }
 
+  &[data-kind="thinking"] {
+    max-width: min(76%, 72ch);
+  }
+
   &[data-kind="error"] {
     max-width: min(76%, 72ch);
   }
 `;
+
+/* ---- reasoning fold ---------------------------------------------------- */
+
+/* Open chains of thought (DeepSeek et al) are context, not the answer:
+   collapsed to a quiet toggle by default, dimmed prose when opened. */
+const ThinkingToggle = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--forge-text-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--forge-text-soft);
+  }
+`;
+
+const ThinkingBody = styled.div`
+  margin-top: 4px;
+  padding-left: 12px;
+  border-left: 2px solid var(--forge-border);
+  color: var(--forge-text-soft);
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+
+  p { margin: 0 0 8px; }
+  > *:last-child { margin-bottom: 0; }
+`;
+
+function ThinkingFold({ text, live = false }) {
+  const [open, setOpen] = useState(live);
+  return (
+    <div>
+      <ThinkingToggle onClick={() => setOpen((current) => !current)} type="button">
+        <Chevron data-open={open} aria-hidden="true" />
+        <span>Thinking</span>
+      </ThinkingToggle>
+      {open && (
+        <ThinkingBody>
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+          {live && <LiveCaret aria-hidden="true" />}
+        </ThinkingBody>
+      )}
+    </div>
+  );
+}
 
 /* Assistant messages render as markdown — readable measure, calm rhythm. */
 const MarkdownBody = styled.div`

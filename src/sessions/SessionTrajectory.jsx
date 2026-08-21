@@ -230,7 +230,10 @@ export default function SessionTrajectory({ session }) {
       /* Row identity is (seq, ordinal); ordinal defaults to 0 pre-pipe. */
       const entry = { ...point, key: `${point.seq}:${point.ordinal || 0}`, tokens: null };
       events.push(entry);
-      if (point.kind === "message" && point.role === "assistant") {
+      if (
+        (point.kind === "message" || point.kind === "thinking")
+        && point.role === "assistant"
+      ) {
         lastAssistant = entry;
       }
     }

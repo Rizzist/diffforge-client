@@ -777,7 +777,9 @@ fn haider_projection_item_class(item: &Value) -> (&'static str, &'static str) {
             ("message", "assistant")
         }
         "incomplete_agent_message" => ("message", "assistant"),
-        "reasoning" | "plan" => ("message", "assistant"),
+        /* Reasoning renders as its own collapsed block, never as the answer —
+           DeepSeek-style open chains of thought otherwise read as the reply. */
+        "reasoning" | "plan" => ("thinking", "assistant"),
         "refusal" => ("error", "assistant"),
         "tool_call" | "command_execution" | "file_change" | "child_spawn" | "child_result"
         | "context_compaction" | "extension" => ("tool", "tool"),
@@ -915,10 +917,10 @@ fn haider_projection_fold_item_event(
                         seq,
                         haider_projection_ordinal(envelope, delta),
                         haider_projection_branch_id(envelope, delta),
-                        if matches!(delta_kind.as_str(), "tool_args" | "command_output") {
-                            "tool"
-                        } else {
-                            "message"
+                        match delta_kind.as_str() {
+                            "tool_args" | "command_output" => "tool",
+                            "reasoning" => "thinking",
+                            _ => "message",
                         },
                         if matches!(delta_kind.as_str(), "tool_args" | "command_output") {
                             "tool"
@@ -944,6 +946,11 @@ fn haider_projection_fold_item_event(
                     }
                 }
                 "tool_args" => {
+                    // Args deltas are proof this is a tool call: a tail that
+                    // opened as prose must re-home into the tool cluster, or
+                    // the raw fallback text leaks into the chat column.
+                    tail.row.kind = "tool".to_string();
+                    tail.row.role = "tool".to_string();
                     if let Some(fragment) = delta
                         .as_object()
                         .and_then(|object| haider_projection_text(object.get("fragment")))
@@ -953,6 +960,8 @@ fn haider_projection_fold_item_event(
                     }
                 }
                 "command_output" => {
+                    tail.row.kind = "tool".to_string();
+                    tail.row.role = "tool".to_string();
                     let stream = haider_projection_kind(delta, "stream")
                         .unwrap_or_else(|| "output".to_string());
                     tail.row.text = format!("command output · {stream}");

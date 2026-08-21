@@ -32,7 +32,10 @@ use tokio::{
 const WIRE_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_FRAME_LIMIT: usize = 48 * 1024 * 1024;
 const FEATURE_INPUT_MIRROR_V1: &str = "input_mirror_v1";
+const FEATURE_INPUT_MIRROR_ATTACHMENTS_V1: &str = "input_mirror_attachments_v1";
 const FEATURE_STATUS_SEGMENT_V1: &str = "status_segment_v1";
+const FEATURE_STATUS_SEGMENT_STRUCTURED_V1: &str = "status_segment_structured_v1";
+const FEATURE_ARTIFACT_PUT_V1: &str = "artifact_put_v1";
 const FEATURE_SESSION_LIST_WATCH_V1: &str = "session_list_watch_v1";
 const FEATURE_SESSION_CONFIG_V1: &str = "session_config_v1";
 const FEATURE_SESSION_OBSERVE_V1: &str = "session_observe_v1";
@@ -99,6 +102,10 @@ impl SurfaceCommandStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurfaceInput {
     pub text: String,
+    /// Metadata-only refs for ready composer attachments. The daemon does not
+    /// retain local file names, so `name` is the stable artifact ref.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<SurfaceAttachment>,
     pub revision: u64,
     /// Daemon-stamped publisher connection id. Revision lanes are
     /// PER-CONNECTION, so the UI must discriminate self/foreign by owner —
@@ -107,8 +114,20 @@ pub struct SurfaceInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceAttachment {
+    pub artifact: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurfaceStatus {
     pub line: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub revision: u64,
 }
 
@@ -179,18 +198,35 @@ struct Welcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SurfaceInputPublishWire {
     text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<SurfaceAttachmentWire>,
     revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SurfaceStatusPublishWire {
     line: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     revision: u64,
+}
+
+/// The daemon's metadata-only attachment shape. Names are intentionally not
+/// on the wire: attachments are content-addressed CAS objects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SurfaceAttachmentWire {
+    mime: String,
+    bytes: u64,
+    artifact: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SurfaceInputWire {
     text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<SurfaceAttachmentWire>,
     revision: u64,
     #[serde(default)]
     owner: String,
@@ -199,6 +235,10 @@ struct SurfaceInputWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SurfaceStatusWire {
     line: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     revision: u64,
     #[serde(default)]
     owner: String,
@@ -207,6 +247,8 @@ struct SurfaceStatusWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method")]
 enum RequestBody {
+    #[serde(rename = "artifact.put")]
+    ArtifactPut { data_base64: String },
     #[serde(rename = "session.list")]
     SessionList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,6 +328,8 @@ enum RequestBody {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method")]
 enum ResponseBody {
+    #[serde(rename = "artifact.put")]
+    ArtifactPut { artifact: String, bytes: u64 },
     #[serde(rename = "session.list")]
     SessionList {
         #[serde(default)]
@@ -620,6 +664,16 @@ impl RevisionGate {
                 self.input_owner = Some(input.owner.clone());
                 self.input = Some(SurfaceInput {
                     text: input.text,
+                    attachments: input
+                        .attachments
+                        .into_iter()
+                        .map(|attachment| SurfaceAttachment {
+                            name: attachment.artifact.clone(),
+                            artifact: attachment.artifact,
+                            mime: attachment.mime,
+                            size: attachment.bytes,
+                        })
+                        .collect(),
                     revision: input.revision,
                     owner: input.owner,
                 });
@@ -646,6 +700,8 @@ impl RevisionGate {
                 self.status_owner = Some(status.owner);
                 self.status = Some(SurfaceStatus {
                     line: status.line,
+                    state: status.state,
+                    detail: status.detail,
                     revision: status.revision,
                 });
                 changed = true;
@@ -689,6 +745,12 @@ impl ConnectionSnapshot {
             && self.features.contains(FEATURE_INPUT_MIRROR_V1)
     }
 
+    fn can_publish_input_attachments(&self) -> bool {
+        self.can_publish_input()
+            && self.features.contains(FEATURE_INPUT_MIRROR_ATTACHMENTS_V1)
+            && self.features.contains(FEATURE_ARTIFACT_PUT_V1)
+    }
+
     fn can_watch_roster(&self) -> bool {
         self.connected
             && self.capabilities_granted.contains(&Capability::View)
@@ -728,6 +790,7 @@ enum ActorCommand {
     PublishInput {
         session_id: String,
         text: String,
+        attachments: Vec<SurfaceAttachmentWire>,
         revision: u64,
         reply: oneshot::Sender<SurfaceCommandStatus>,
     },
@@ -845,17 +908,27 @@ pub async fn surface_detach(session_id: String) -> Result<SurfaceCommandStatus, 
 pub async fn surface_publish_input(
     session_id: String,
     text: String,
+    attachments: Option<Vec<String>>,
     revision: u64,
 ) -> Result<SurfaceCommandStatus, String> {
     #[cfg(unix)]
     {
         let handle = actor_handle();
+        let attachments = attachments.unwrap_or_default();
+        let attachments = if attachments.is_empty()
+            || !handle.connection.borrow().can_publish_input_attachments()
+        {
+            Vec::new()
+        } else {
+            attachment_upload_or_text_only(upload_staged_paste_attachments(attachments).await)
+        };
         let (reply, answer) = oneshot::channel();
         if handle
             .commands
             .send(ActorCommand::PublishInput {
                 session_id,
                 text,
+                attachments,
                 revision,
                 reply,
             })
@@ -867,7 +940,7 @@ pub async fn surface_publish_input(
     }
     #[cfg(not(unix))]
     {
-        let _ = (session_id, text, revision);
+        let _ = (session_id, text, attachments, revision);
         Ok(SurfaceCommandStatus::inactive(false))
     }
 }
@@ -917,6 +990,169 @@ async fn rpc_request(
         .await
         .ok()?
         .ok()?
+}
+
+#[cfg(unix)]
+async fn upload_staged_paste_attachments(
+    paths: Vec<String>,
+) -> Result<Vec<SurfaceAttachmentWire>, String> {
+    let mut attachments = Vec::with_capacity(paths.len());
+    for path in paths {
+        attachments.push(upload_staged_paste_attachment(path).await?);
+    }
+    Ok(attachments)
+}
+
+#[cfg(unix)]
+fn attachment_upload_or_text_only(
+    upload: Result<Vec<SurfaceAttachmentWire>, String>,
+) -> Vec<SurfaceAttachmentWire> {
+    match upload {
+        Ok(attachments) => attachments,
+        Err(error) => {
+            // The input mirror is volatile and the frontend does not await
+            // this command. Preserve the text mirror when attachment upload
+            // fails rather than silently dropping the whole publish.
+            eprintln!("Could not upload staged paste attachment; publishing text only: {error}");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn upload_staged_paste_attachment(path: String) -> Result<SurfaceAttachmentWire, String> {
+    let (bytes, mime) =
+        tauri::async_runtime::spawn_blocking(move || read_staged_paste_attachment(&path))
+            .await
+            .map_err(|error| format!("Staged paste attachment worker failed: {error}"))??;
+    let expected_bytes = u64::try_from(bytes.len())
+        .map_err(|_| "Staged paste attachment is too large to publish.".to_string())?;
+    let data_base64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
+    let response = rpc_request(
+        RequestBody::ArtifactPut { data_base64 },
+        Capability::Control,
+        BTreeSet::from([FEATURE_ARTIFACT_PUT_V1.to_string()]),
+    )
+    .await
+    .ok_or_else(|| {
+        "Haider RPC connection closed while uploading composer attachment.".to_string()
+    })??;
+    let ResponseBody::ArtifactPut { artifact, bytes } = response else {
+        return Err("artifact.put response method mismatch".to_string());
+    };
+    if bytes != expected_bytes {
+        return Err("artifact.put response byte count mismatch".to_string());
+    }
+    Ok(SurfaceAttachmentWire {
+        mime,
+        bytes,
+        artifact,
+    })
+}
+
+#[cfg(unix)]
+fn read_staged_paste_attachment(path: &str) -> Result<(Vec<u8>, String), String> {
+    use std::{
+        ffi::CString,
+        fs::File,
+        io::Read,
+        os::unix::{
+            ffi::OsStrExt as _,
+            fs::MetadataExt as _,
+            io::{AsRawFd as _, FromRawFd as _},
+        },
+    };
+
+    let candidate = Path::new(path);
+    let staged_name = candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| name.starts_with("diffforge-paste-"))
+        .ok_or_else(|| "Path is not a staged paste attachment.".to_string())?;
+    let temp_root = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve temporary directory: {error}"))?;
+    let candidate_parent = candidate
+        .parent()
+        .ok_or_else(|| "Path is not a staged paste attachment.".to_string())?;
+    let canonical_parent = candidate_parent
+        .canonicalize()
+        .map_err(|error| format!("Staged paste attachment is unavailable: {error}"))?;
+    if canonical_parent != temp_root {
+        return Err("Path is not a staged paste attachment.".to_string());
+    }
+
+    // Keep the parent directory and staged file bound to file descriptors:
+    // another process may replace either pathname after the ownership check.
+    // `openat` pins the child to the checked parent and `O_NOFOLLOW` refuses a
+    // swapped-in symlink, so the bytes below come from the validated handle.
+    let temp_root_dir = File::open(&temp_root)
+        .map_err(|error| format!("Could not open temporary directory: {error}"))?;
+    let candidate_parent_dir = File::open(candidate_parent)
+        .map_err(|error| format!("Staged paste attachment is unavailable: {error}"))?;
+    let temp_root_metadata = temp_root_dir
+        .metadata()
+        .map_err(|error| format!("Could not inspect temporary directory: {error}"))?;
+    let candidate_parent_metadata = candidate_parent_dir
+        .metadata()
+        .map_err(|error| format!("Could not inspect staged paste directory: {error}"))?;
+    if candidate_parent_metadata.dev() != temp_root_metadata.dev()
+        || candidate_parent_metadata.ino() != temp_root_metadata.ino()
+    {
+        return Err("Path is not a staged paste attachment.".to_string());
+    }
+
+    let name = CString::new(staged_name)
+        .map_err(|_| "Path is not a staged paste attachment.".to_string())?;
+    let fd = unsafe {
+        libc::openat(
+            candidate_parent_dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "Staged paste attachment is unavailable: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("Could not inspect staged paste attachment: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Path is not a staged paste attachment.".to_string());
+    }
+
+    let mime = match Path::new(staged_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => return Err("Staged paste attachment has an unsupported image type.".to_string()),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("Could not read staged paste attachment: {error}"))?;
+    Ok((bytes, mime.to_string()))
+}
+
+#[cfg(unix)]
+fn attachments_for_current_connection(
+    connection: &ConnectionSnapshot,
+    attachments: Vec<SurfaceAttachmentWire>,
+) -> Vec<SurfaceAttachmentWire> {
+    connection
+        .can_publish_input_attachments()
+        .then_some(attachments)
+        .unwrap_or_default()
 }
 
 #[cfg(unix)]
@@ -1900,6 +2136,7 @@ async fn apply_connected_command(
         ActorCommand::PublishInput {
             session_id,
             text,
+            attachments,
             revision,
             reply,
         } => {
@@ -1908,11 +2145,19 @@ async fn apply_connected_command(
                 .get(&session_id)
                 .is_none_or(|previous| revision > *previous);
             let written = if active && fresh {
+                // Upload may have completed on an older connection. Re-check
+                // the actor's current negotiated features immediately before
+                // encoding so legacy daemons receive their exact old frame.
+                let attachments = attachments_for_current_connection(connection, attachments);
                 let request = WireFrame::Request {
                     request_id: request_id(next_request),
                     body: RequestBody::SessionSurfacePublish {
                         session_id: session_id.clone(),
-                        input: Some(SurfaceInputPublishWire { text, revision }),
+                        input: Some(SurfaceInputPublishWire {
+                            text,
+                            attachments,
+                            revision,
+                        }),
                         status: None,
                     },
                 };
@@ -1944,16 +2189,7 @@ fn emit_surface(
     let Some(subscription) = subscriptions.get_mut(&session_id) else {
         return;
     };
-    let input = connection
-        .features
-        .contains(FEATURE_INPUT_MIRROR_V1)
-        .then_some(input)
-        .flatten();
-    let status = connection
-        .features
-        .contains(FEATURE_STATUS_SEGMENT_V1)
-        .then_some(status)
-        .flatten();
+    let (input, status) = gated_surface_snapshot(&connection.features, input, status);
     let Some((input, status)) = subscription.revision_gate.accept(input, status) else {
         return;
     };
@@ -1965,6 +2201,35 @@ fn emit_surface(
             status,
         },
     );
+}
+
+fn gated_surface_snapshot(
+    features: &BTreeSet<String>,
+    input: Option<SurfaceInputWire>,
+    status: Option<SurfaceStatusWire>,
+) -> (Option<SurfaceInputWire>, Option<SurfaceStatusWire>) {
+    let input = features
+        .contains(FEATURE_INPUT_MIRROR_V1)
+        .then_some(input)
+        .flatten()
+        .map(|mut input| {
+            if !features.contains(FEATURE_INPUT_MIRROR_ATTACHMENTS_V1) {
+                input.attachments.clear();
+            }
+            input
+        });
+    let status = features
+        .contains(FEATURE_STATUS_SEGMENT_V1)
+        .then_some(status)
+        .flatten()
+        .map(|mut status| {
+            if !features.contains(FEATURE_STATUS_SEGMENT_STRUCTURED_V1) {
+                status.state = None;
+                status.detail = None;
+            }
+            status
+        });
+    (input, status)
 }
 
 #[cfg(unix)]
@@ -2458,6 +2723,7 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 input: Some(SurfaceInputPublishWire {
                     text: "hello".to_owned(),
+                    attachments: Vec::new(),
                     revision: 3,
                 }),
                 status: None,
@@ -2550,6 +2816,7 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 input: Some(SurfaceInputPublishWire {
                     text: "full composer text".to_owned(),
+                    attachments: Vec::new(),
                     revision: 8,
                 }),
                 status: None,
@@ -2564,6 +2831,198 @@ mod tests {
             u32::from_be_bytes(framed[..4].try_into().expect("publish prefix")) as usize,
             framed.len() - 4
         );
+
+        let attached_publish = WireFrame::Request {
+            request_id: "req-publish-attachments".to_owned(),
+            body: RequestBody::SessionSurfacePublish {
+                session_id: "session-1".to_owned(),
+                input: Some(SurfaceInputPublishWire {
+                    text: "full composer text".to_owned(),
+                    attachments: vec![SurfaceAttachmentWire {
+                        mime: "image/png".to_owned(),
+                        bytes: 2,
+                        artifact: "blake3:paste-image".to_owned(),
+                    }],
+                    revision: 9,
+                }),
+                status: None,
+            },
+        };
+        let framed =
+            encode_framed(&attached_publish, DEFAULT_FRAME_LIMIT).expect("encode attached publish");
+        assert_eq!(
+            std::str::from_utf8(&framed[4..]).expect("attached publish JSON"),
+            r#"{"v":1,"kind":"request","request_id":"req-publish-attachments","body":{"method":"session.surface_publish","session_id":"session-1","input":{"text":"full composer text","attachments":[{"mime":"image/png","bytes":2,"artifact":"blake3:paste-image"}],"revision":9}}}"#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_paste_attachment_read_rejects_a_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp_root = std::env::temp_dir();
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let target = temp_root.join(format!("diffforge-paste-target-{id}.png"));
+        let staged = temp_root.join(format!("diffforge-paste-link-{id}.png"));
+        std::fs::write(&target, b"must not follow this").expect("write staged target");
+        symlink(&target, &staged).expect("create staged symlink");
+
+        assert!(read_staged_paste_attachment(staged.to_str().expect("UTF-8 path")).is_err());
+
+        std::fs::remove_file(&staged).expect("remove staged symlink");
+        std::fs::remove_file(&target).expect("remove staged target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_paste_attachment_read_accepts_every_staged_image_mime() {
+        let temp_root = std::env::temp_dir();
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        for (extension, expected_mime) in [
+            ("png", "image/png"),
+            ("jpg", "image/jpeg"),
+            ("gif", "image/gif"),
+            ("webp", "image/webp"),
+        ] {
+            let staged = temp_root.join(format!("diffforge-paste-{id}.{extension}"));
+            std::fs::write(&staged, b"pasted image").expect("write staged image");
+            let (bytes, mime) = read_staged_paste_attachment(staged.to_str().expect("UTF-8 path"))
+                .expect("read staged image");
+            assert_eq!(bytes, b"pasted image");
+            assert_eq!(mime, expected_mime);
+            std::fs::remove_file(staged).expect("remove staged image");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_upload_failure_degrades_to_text_only() {
+        let attachment = SurfaceAttachmentWire {
+            mime: "image/png".to_owned(),
+            bytes: 2,
+            artifact: "blake3:paste-image".to_owned(),
+        };
+        assert_eq!(
+            attachment_upload_or_text_only(Ok(vec![attachment.clone()])),
+            vec![attachment]
+        );
+        assert!(
+            attachment_upload_or_text_only(Err("artifact.put unavailable".to_owned())).is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_connection_without_attachment_feature_writes_legacy_publish_bytes() {
+        let attachment = SurfaceAttachmentWire {
+            mime: "image/png".to_owned(),
+            bytes: 2,
+            artifact: "blake3:paste-image".to_owned(),
+        };
+        let legacy_connection = ConnectionSnapshot {
+            connected: true,
+            capabilities_granted: BTreeSet::from([Capability::Control]),
+            features: BTreeSet::from([
+                FEATURE_INPUT_MIRROR_V1.to_owned(),
+                FEATURE_ARTIFACT_PUT_V1.to_owned(),
+            ]),
+            ..ConnectionSnapshot::default()
+        };
+        let current_connection = ConnectionSnapshot {
+            features: BTreeSet::from([
+                FEATURE_INPUT_MIRROR_V1.to_owned(),
+                FEATURE_INPUT_MIRROR_ATTACHMENTS_V1.to_owned(),
+                FEATURE_ARTIFACT_PUT_V1.to_owned(),
+            ]),
+            ..legacy_connection.clone()
+        };
+        assert_eq!(
+            attachments_for_current_connection(&current_connection, vec![attachment.clone()]),
+            vec![attachment.clone()]
+        );
+
+        let gated = WireFrame::Request {
+            request_id: "req-publish".to_owned(),
+            body: RequestBody::SessionSurfacePublish {
+                session_id: "session-1".to_owned(),
+                input: Some(SurfaceInputPublishWire {
+                    text: "full composer text".to_owned(),
+                    attachments: attachments_for_current_connection(
+                        &legacy_connection,
+                        vec![attachment],
+                    ),
+                    revision: 8,
+                }),
+                status: None,
+            },
+        };
+        let legacy = WireFrame::Request {
+            request_id: "req-publish".to_owned(),
+            body: RequestBody::SessionSurfacePublish {
+                session_id: "session-1".to_owned(),
+                input: Some(SurfaceInputPublishWire {
+                    text: "full composer text".to_owned(),
+                    attachments: Vec::new(),
+                    revision: 8,
+                }),
+                status: None,
+            },
+        };
+        assert_eq!(
+            encode_framed(&gated, DEFAULT_FRAME_LIMIT).expect("encode gated publish"),
+            encode_framed(&legacy, DEFAULT_FRAME_LIMIT).expect("encode legacy publish")
+        );
+    }
+
+    #[test]
+    fn surface_attachment_refs_and_structured_status_follow_feature_gates() {
+        let frame = br#"{"v":1,"kind":"session_surface_delta","session_id":"session-1","input":{"text":"inspect this image","attachments":[{"mime":"image/png","bytes":2,"artifact":"blake3:paste-image"}],"revision":9,"owner":"tui-connection"},"status":{"line":"[ RUNNING ] 3k tok","state":"running","detail":"applying patch 3/5","revision":4,"owner":"tui-connection"}}"#;
+        let WireFrame::SessionSurfaceDelta {
+            input: wire_input,
+            status: wire_status,
+            ..
+        } = decode_body(frame, DEFAULT_FRAME_LIMIT).expect("decode Lane S surface fixture")
+        else {
+            panic!("expected SessionSurfaceDelta");
+        };
+
+        let present = BTreeSet::from([
+            FEATURE_INPUT_MIRROR_V1.to_owned(),
+            FEATURE_INPUT_MIRROR_ATTACHMENTS_V1.to_owned(),
+            FEATURE_STATUS_SEGMENT_V1.to_owned(),
+            FEATURE_STATUS_SEGMENT_STRUCTURED_V1.to_owned(),
+        ]);
+        let (present_input, present_status) =
+            gated_surface_snapshot(&present, wire_input.clone(), wire_status.clone());
+        let (input, status) = RevisionGate::default()
+            .accept(present_input, present_status)
+            .expect("present fixture emits a snapshot");
+        let input = input.expect("input mirror");
+        assert_eq!(input.attachments.len(), 1);
+        assert_eq!(input.attachments[0].artifact, "blake3:paste-image");
+        assert_eq!(input.attachments[0].name, "blake3:paste-image");
+        assert_eq!(input.attachments[0].mime, "image/png");
+        assert_eq!(input.attachments[0].size, 2);
+        let status = status.expect("status segment");
+        assert_eq!(status.line, "[ RUNNING ] 3k tok");
+        assert_eq!(status.state.as_deref(), Some("running"));
+        assert_eq!(status.detail.as_deref(), Some("applying patch 3/5"));
+
+        let absent = BTreeSet::from([
+            FEATURE_INPUT_MIRROR_V1.to_owned(),
+            FEATURE_STATUS_SEGMENT_V1.to_owned(),
+        ]);
+        let (absent_input, absent_status) =
+            gated_surface_snapshot(&absent, wire_input, wire_status);
+        let (input, status) = RevisionGate::default()
+            .accept(absent_input, absent_status)
+            .expect("legacy fixture still emits raw surfaces");
+        assert!(input.expect("input mirror").attachments.is_empty());
+        let status = status.expect("status segment");
+        assert_eq!(status.line, "[ RUNNING ] 3k tok");
+        assert!(status.state.is_none());
+        assert!(status.detail.is_none());
     }
 
     #[test]
@@ -2711,11 +3170,14 @@ mod tests {
         let fresh = gate.accept(
             Some(SurfaceInputWire {
                 text: "first".to_owned(),
+                attachments: Vec::new(),
                 revision: 4,
                 owner: "tui".to_owned(),
             }),
             Some(SurfaceStatusWire {
                 line: "working".to_owned(),
+                state: None,
+                detail: None,
                 revision: 9,
                 owner: "tui".to_owned(),
             }),
@@ -2726,11 +3188,14 @@ mod tests {
             .accept(
                 Some(SurfaceInputWire {
                     text: "equal".to_owned(),
+                    attachments: Vec::new(),
                     revision: 4,
                     owner: "tui".to_owned(),
                 }),
                 Some(SurfaceStatusWire {
                     line: "older".to_owned(),
+                    state: None,
+                    detail: None,
                     revision: 8,
                     owner: "tui".to_owned(),
                 }),
@@ -2741,11 +3206,14 @@ mod tests {
             .accept(
                 Some(SurfaceInputWire {
                     text: "new".to_owned(),
+                    attachments: Vec::new(),
                     revision: 5,
                     owner: "tui".to_owned(),
                 }),
                 Some(SurfaceStatusWire {
                     line: "still stale".to_owned(),
+                    state: None,
+                    detail: None,
                     revision: 9,
                     owner: "tui".to_owned(),
                 }),
@@ -2758,11 +3226,14 @@ mod tests {
             .accept(
                 Some(SurfaceInputWire {
                     text: "new owner".to_owned(),
+                    attachments: Vec::new(),
                     revision: 1,
                     owner: "ade".to_owned(),
                 }),
                 Some(SurfaceStatusWire {
                     line: "still stale".to_owned(),
+                    state: None,
+                    detail: None,
                     revision: 9,
                     owner: "tui".to_owned(),
                 }),
@@ -2776,6 +3247,8 @@ mod tests {
                 None,
                 Some(SurfaceStatusWire {
                     line: "done".to_owned(),
+                    state: None,
+                    detail: None,
                     revision: 10,
                     owner: "tui".to_owned(),
                 }),
