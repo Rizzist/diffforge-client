@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Movie } from "@styled-icons/material-rounded/Movie";
+import { Close } from "@styled-icons/material-rounded/Close";
 
 import {
   SettingsNavGroupLabel,
@@ -30,11 +31,13 @@ export default function SessionsRail({
   activeSessionId,
   activeMediaId = "",
   mediaSessions = [],
+  onDeleteMedia = null,
   onNewChat,
   onNewMedia = null,
   onSearchChange = null,
   onSelectMedia = null,
   onSelectSession,
+  onUpdateMedia = null,
   searchQuery = "",
 }) {
   /* Relative times tick once a minute while the rail is mounted. */
@@ -84,6 +87,10 @@ export default function SessionsRail({
 
   const togglePin = useCallback(async (session) => {
     setMenu(null);
+    if (session.kind === "media") {
+      onUpdateMedia?.(session.id, { pinned: !session.pinned });
+      return;
+    }
     try {
       await invoke("session_set_pinned", {
         session_id: session.id,
@@ -92,7 +99,12 @@ export default function SessionsRail({
     } catch {
       // Store predates pinning — the rail simply keeps the flat list.
     }
-  }, []);
+  }, [onUpdateMedia]);
+
+  const deleteMedia = useCallback((session) => {
+    setMenu(null);
+    onDeleteMedia?.(session.id);
+  }, [onDeleteMedia]);
 
   const beginRename = useCallback((session) => {
     setMenu(null);
@@ -107,12 +119,16 @@ export default function SessionsRail({
     if (!id || !title) {
       return;
     }
+    if (mediaSessions.some((row) => row.id === id)) {
+      onUpdateMedia?.(id, { title });
+      return;
+    }
     try {
       await invoke("session_rename", { session_id: id, title });
     } catch {
       // Store predates renaming — leave the daemon title in place.
     }
-  }, [renameDraft, renamingId]);
+  }, [mediaSessions, onUpdateMedia, renameDraft, renamingId]);
 
   /* AI sessions and media sessions (kind: "media", local demo rows) share
      ONE recency ordering; media rows are visually distinct + DEV-badged. */
@@ -127,16 +143,41 @@ export default function SessionsRail({
       || String(session.first_user_message || "").toLowerCase().includes(query)
     ))
     : sorted;
-  const pinned = matches.filter((session) => session.pinned && session.kind !== "media");
-  const recent = matches.filter((session) => !session.pinned || session.kind === "media");
+  const pinned = matches.filter((session) => session.pinned);
+  const recent = matches.filter((session) => !session.pinned);
 
   const renderRow = (session) => {
     if (session.kind === "media") {
+      if (session.id === renamingId) {
+        return (
+          <SessionRenameRow key={session.id}>
+            <MediaRowGlyph aria-hidden="true">
+              <Movie size={13} />
+            </MediaRowGlyph>
+            <SessionRenameInput
+              autoFocus
+              onBlur={() => void commitRename()}
+              onChange={(event) => setRenameDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void commitRename();
+                } else if (event.key === "Escape") {
+                  event.preventDefault();
+                  setRenamingId("");
+                }
+              }}
+              value={renameDraft}
+            />
+          </SessionRenameRow>
+        );
+      }
       return (
         <SessionRowButton
           data-active={session.id === activeMediaId ? "true" : undefined}
           key={session.id}
           onClick={() => onSelectMedia?.(session)}
+          onContextMenu={(event) => openMenu(event, session)}
           title={`${session.title} — media session (under development)`}
           type="button"
         >
@@ -288,6 +329,16 @@ export default function SessionsRail({
             <Edit aria-hidden="true" />
             <span>Rename</span>
           </SessionContextItem>
+          {menu.session.kind === "media" && (
+            <SessionContextItem
+              data-danger="true"
+              onClick={() => deleteMedia(menu.session)}
+              type="button"
+            >
+              <Close aria-hidden="true" />
+              <span>Delete</span>
+            </SessionContextItem>
+          )}
         </SessionContextMenu>,
         document.body,
       )}
@@ -529,6 +580,15 @@ const SessionContextItem = styled.button`
   &:hover {
     color: var(--forge-text);
     background: var(--forge-surface-hover);
+  }
+
+  &[data-danger="true"] {
+    color: var(--forge-red);
+  }
+
+  &[data-danger="true"]:hover {
+    color: var(--forge-red);
+    background: color-mix(in srgb, var(--forge-red) 12%, transparent);
   }
 `;
 

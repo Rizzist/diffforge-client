@@ -18458,6 +18458,18 @@ export default function App() {
     setActiveMediaId(row.id);
     showView(DEFAULT_WORKSPACE_VIEW);
   }, [showView]);
+  /* Pin/rename patch a row in place (renames lock nothing — local rows have
+     no daemon reconcile to fight); delete removes it and falls back home if
+     it was the open one. */
+  const updateMediaSession = useCallback((mediaId, patch) => {
+    setMediaSessions((current) => current.map((row) => (
+      row.id === mediaId ? { ...row, ...patch } : row
+    )));
+  }, []);
+  const deleteMediaSession = useCallback((mediaId) => {
+    setMediaSessions((current) => current.filter((row) => row.id !== mediaId));
+    setActiveMediaId((current) => (current === mediaId ? "" : current));
+  }, []);
   const openSessionFromRail = useCallback((session) => {
     if (!session?.id) {
       return;
@@ -24547,10 +24559,12 @@ export default function App() {
                           activeMediaId={activeMediaId}
                           activeSessionId={activeSessionId}
                           mediaSessions={mediaSessions}
+                          onDeleteMedia={deleteMediaSession}
                           onNewChat={toggleNewSessionChat}
                           onNewMedia={toggleMediaDeck}
                           onSearchChange={setRailSearchQuery}
                           onSelectMedia={openMediaSession}
+                          onUpdateMedia={updateMediaSession}
                           onSelectSession={openSessionFromRail}
                           /* Collapsed hides the search box, so the filter
                              must not keep acting invisibly. */

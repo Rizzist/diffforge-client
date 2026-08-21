@@ -46,9 +46,13 @@ const PaneErrorFallback = styled.div`
 
   &[data-variant="shell"] {
     border: none;
-    border-radius: 0;
+    /* The shell fallback replaces AppFrame entirely — it must carry the
+       frameless window's own corner rounding or the error screen renders
+       square against the desktop. */
+    border-radius: 12px;
     height: 100vh;
     width: 100vw;
+    overflow: hidden;
   }
 `;
 
