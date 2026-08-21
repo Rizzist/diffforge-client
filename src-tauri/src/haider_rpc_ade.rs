@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot, watch};
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(unix)]
 use std::collections::VecDeque;
@@ -45,6 +46,18 @@ const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
 const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
 const FEATURE_RESIDENT_TURN_SUBMIT_V1: &str = "resident_turn_submit_v1";
 const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
+const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
+const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
+const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
+const FEATURE_ACCOUNT_OAUTH_DEVICE_V1: &str = "account_oauth_device_v1";
+const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
+const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
+const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
+const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
+const MAX_ACCOUNT_RESTAGE_RETRIES: usize = 3;
+/// `busy` is mailbox backpressure: retrying in the same microsecond spends
+/// the whole ladder before the daemon can drain. One short breath per rung.
+const ACCOUNT_RETRY_BACKOFF: Duration = Duration::from_millis(120);
 const SURFACE_EVENT: &str = "session-surface";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -84,6 +97,81 @@ pub(crate) struct SessionSeen {
     pub seen_at_ms: u64,
     pub seen_seq: u64,
     pub worker_generation: u64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AccountListResult {
+    pub descriptors: Vec<Value>,
+    pub revision: Option<u64>,
+    pub provider_active: Vec<Value>,
+    pub provider_defaults: Vec<Value>,
+}
+
+impl AccountListResult {
+    fn subsystem_absent() -> Self {
+        Self {
+            descriptors: Vec::new(),
+            revision: None,
+            provider_active: Vec::new(),
+            provider_defaults: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct AccountOauthStartResult {
+    pub availability: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loopback_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    pub attempt_id: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AccountOauthFlowResult {
+    pub flow_id: String,
+    pub status: Value,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AccountImportResult {
+    pub descriptor: Value,
+    pub revision: u64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AccountDeviceCandidatesResult {
+    pub discovery_disabled: bool,
+    pub candidates: Vec<Value>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AccountSetActiveResult {
+    pub descriptor: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_alias: Option<String>,
+    pub revision: u64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AccountRemoveResult {
+    pub removed_alias: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement_active_alias: Option<String>,
+    pub revision: u64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AccountSetDefaultModelResult {
+    pub provider_summary: Value,
+    pub revision: u64,
 }
 
 impl SurfaceCommandStatus {
@@ -254,6 +342,75 @@ struct SurfaceStatusWire {
     owner: String,
 }
 
+/// A secret value is serialised as the daemon's transparent `SecretWire`, but
+/// remains redacted in diagnostics and is zeroized when the request is done.
+/// It must only be used on the authenticated local UDS actor path.
+struct SecretWire(Zeroizing<String>);
+
+impl SecretWire {
+    fn new(secret: String) -> Self {
+        Self(Zeroizing::new(secret))
+    }
+
+    fn wipe(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Clone for SecretWire {
+    fn clone(&self) -> Self {
+        Self(Zeroizing::new(self.0.to_string()))
+    }
+}
+
+impl PartialEq for SecretWire {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for SecretWire {}
+
+impl std::fmt::Debug for SecretWire {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretWire(REDACTED)")
+    }
+}
+
+impl Serialize for SecretWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StagePurpose {
+    ApiKey,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AccountAddMethod {
+    Oauth,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method")]
 enum RequestBody {
@@ -339,6 +496,77 @@ enum RequestBody {
         attachments: Vec<Value>,
         mode: DeliveryMode,
     },
+    #[serde(rename = "account.list")]
+    AccountList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    #[serde(rename = "vault.stage")]
+    VaultStage {
+        stage_id: String,
+        purpose: StagePurpose,
+        secret: SecretWire,
+    },
+    #[serde(rename = "account.login_api")]
+    AccountLoginApi {
+        command_id: String,
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+        vault_reference: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        validation_model: Option<String>,
+    },
+    #[serde(rename = "account.oauth_start")]
+    AccountOauthStart {
+        provider: String,
+        desired_alias: String,
+        attempt_id: String,
+    },
+    #[serde(rename = "account.oauth_status")]
+    AccountOauthStatus { flow_id: String, attempt_id: String },
+    #[serde(rename = "account.oauth_cancel")]
+    AccountOauthCancel { flow_id: String, attempt_id: String },
+    #[serde(rename = "account.add")]
+    AccountAdd {
+        command_id: String,
+        provider: String,
+        alias: String,
+        auth_method: AccountAddMethod,
+        flow_id: String,
+        attempt_id: String,
+        oauth_reference: String,
+    },
+    #[serde(rename = "account.oauth_import")]
+    AccountOauthImport { command_id: String, source: String },
+    #[serde(rename = "account.device_candidates")]
+    AccountDeviceCandidates {},
+    #[serde(rename = "account.import_device")]
+    AccountImportDevice {
+        command_id: String,
+        candidate: String,
+    },
+    #[serde(rename = "account.set_active")]
+    AccountSetActive {
+        command_id: String,
+        alias: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        confirm_new_epoch: bool,
+    },
+    #[serde(rename = "account.remove")]
+    AccountRemove {
+        command_id: String,
+        alias: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_revision: Option<u64>,
+    },
+    #[serde(rename = "account.set_default_model")]
+    AccountSetDefaultModel {
+        command_id: String,
+        provider: String,
+        model: String,
+        expected_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -420,6 +648,74 @@ enum ResponseBody {
         session_id: String,
         run_id: String,
         accepted_seq: u64,
+    },
+    #[serde(rename = "account.list")]
+    AccountList {
+        #[serde(default)]
+        descriptors: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        provider_active: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        provider_defaults: Vec<Value>,
+    },
+    #[serde(rename = "vault.stage")]
+    VaultStage {
+        stage_id: String,
+        vault_reference: String,
+        expires_at_ms: u64,
+    },
+    #[serde(rename = "account.login_api")]
+    AccountLoginApi { descriptor: Value },
+    #[serde(rename = "account.oauth_start")]
+    AccountOauthStart {
+        availability: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flow_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authorization_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_origin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loopback_port: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<u64>,
+    },
+    #[serde(rename = "account.oauth_status")]
+    AccountOauthStatus { flow_id: String, status: Value },
+    #[serde(rename = "account.oauth_cancel")]
+    AccountOauthCancel { flow_id: String, status: Value },
+    #[serde(rename = "account.add")]
+    AccountAdd { descriptor: Value },
+    #[serde(rename = "account.oauth_import")]
+    AccountOauthImport { descriptor: Value, revision: u64 },
+    #[serde(rename = "account.device_candidates")]
+    AccountDeviceCandidates {
+        discovery_disabled: bool,
+        #[serde(default)]
+        candidates: Vec<Value>,
+    },
+    #[serde(rename = "account.import_device")]
+    AccountImportDevice { descriptor: Value, revision: u64 },
+    #[serde(rename = "account.set_active")]
+    AccountSetActive {
+        descriptor: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prior_alias: Option<String>,
+        revision: u64,
+    },
+    #[serde(rename = "account.remove")]
+    AccountRemove {
+        removed_alias: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement_active_alias: Option<String>,
+        revision: u64,
+    },
+    #[serde(rename = "account.set_default_model")]
+    AccountSetDefaultModel {
+        provider_summary: Value,
+        revision: u64,
     },
     #[serde(rename = "error")]
     Error {
@@ -542,7 +838,7 @@ fn encode_framed_with_encoding(
     frame_limit: usize,
     encoding: WireEncoding,
 ) -> std::io::Result<Vec<u8>> {
-    let body = match encoding {
+    let mut body = match encoding {
         WireEncoding::Json => {
             serde_json::to_vec(&versioned(frame.clone())).map_err(invalid_data)?
         }
@@ -553,6 +849,7 @@ fn encode_framed_with_encoding(
         }
     };
     if body.is_empty() || body.len() > frame_limit || body.len() > u32::MAX as usize {
+        body.zeroize();
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Haider RPC frame exceeds the negotiated limit",
@@ -561,6 +858,7 @@ fn encode_framed_with_encoding(
     let mut framed = Vec::with_capacity(4 + body.len());
     framed.extend_from_slice(&(body.len() as u32).to_be_bytes());
     framed.extend_from_slice(&body);
+    body.zeroize();
     Ok(framed)
 }
 
@@ -755,9 +1053,20 @@ struct ConnectionSnapshot {
 
 #[cfg(unix)]
 impl ConnectionSnapshot {
+    fn grants(&self, capability: Capability) -> bool {
+        match capability {
+            Capability::View => {
+                self.capabilities_granted.contains(&Capability::View)
+                    || self.capabilities_granted.contains(&Capability::Control)
+            }
+            Capability::Control => self.capabilities_granted.contains(&Capability::Control),
+            Capability::Unknown => false,
+        }
+    }
+
     fn can_watch_surfaces(&self) -> bool {
         self.connected
-            && self.capabilities_granted.contains(&Capability::View)
+            && self.grants(Capability::View)
             && (self.features.contains(FEATURE_INPUT_MIRROR_V1)
                 || self.features.contains(FEATURE_STATUS_SEGMENT_V1))
     }
@@ -776,8 +1085,40 @@ impl ConnectionSnapshot {
 
     fn can_watch_roster(&self) -> bool {
         self.connected
-            && self.capabilities_granted.contains(&Capability::View)
+            && self.grants(Capability::View)
             && self.features.contains(FEATURE_SESSION_LIST_WATCH_V1)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+enum FeatureGate {
+    All(BTreeSet<String>),
+    Any(BTreeSet<String>),
+}
+
+#[cfg(unix)]
+impl FeatureGate {
+    fn all(features: BTreeSet<String>) -> Self {
+        Self::All(features)
+    }
+
+    fn any(features: BTreeSet<String>) -> Self {
+        Self::Any(features)
+    }
+
+    fn is_satisfied_by(&self, advertised: &BTreeSet<String>) -> bool {
+        match self {
+            Self::All(required) => required.is_subset(advertised),
+            Self::Any(required) => required.iter().any(|feature| advertised.contains(feature)),
+        }
+    }
+
+    fn unavailable_features(&self, advertised: &BTreeSet<String>) -> Vec<String> {
+        match self {
+            Self::All(required) => required.difference(advertised).cloned().collect(),
+            Self::Any(required) => required.iter().cloned().collect(),
+        }
     }
 }
 
@@ -791,6 +1132,9 @@ struct Subscription {
 type RpcReply = oneshot::Sender<Option<Result<ResponseBody, String>>>;
 
 #[cfg(unix)]
+type PendingRpcRequest = (RpcReply, bool);
+
+#[cfg(unix)]
 enum ActorCommand {
     RosterAttach {
         app: AppHandle,
@@ -798,7 +1142,8 @@ enum ActorCommand {
     RpcRequest {
         body: RequestBody,
         capability: Capability,
-        features: BTreeSet<String>,
+        features: FeatureGate,
+        public_errors: bool,
         reply: RpcReply,
     },
     Attach {
@@ -999,6 +1344,16 @@ async fn rpc_request(
     capability: Capability,
     features: BTreeSet<String>,
 ) -> Option<Result<ResponseBody, String>> {
+    rpc_request_with_feature_gate(body, capability, FeatureGate::all(features), false).await
+}
+
+#[cfg(unix)]
+async fn rpc_request_with_feature_gate(
+    body: RequestBody,
+    capability: Capability,
+    features: FeatureGate,
+    public_errors: bool,
+) -> Option<Result<ResponseBody, String>> {
     let (reply, answer) = oneshot::channel();
     actor_handle()
         .commands
@@ -1006,6 +1361,7 @@ async fn rpc_request(
             body,
             capability,
             features,
+            public_errors,
             reply,
         })
         .ok()?;
@@ -1013,6 +1369,578 @@ async fn rpc_request(
         .await
         .ok()?
         .ok()?
+}
+
+#[cfg(unix)]
+fn account_feature_gate(features: &[&str]) -> FeatureGate {
+    FeatureGate::all(
+        features
+            .iter()
+            .map(|feature| (*feature).to_string())
+            .collect(),
+    )
+}
+
+#[cfg(unix)]
+fn account_oauth_feature_gate(provider: &str) -> FeatureGate {
+    match provider {
+        "openai-oauth" | "anthropic-oauth" => {
+            account_feature_gate(&[FEATURE_ACCOUNT_OAUTH_PKCE_V1])
+        }
+        "kimi-oauth" | "grok-oauth" => account_feature_gate(&[FEATURE_ACCOUNT_OAUTH_DEVICE_V1]),
+        // The daemon returns `available: false` for unsupported registrations.
+        // An unrecognised provider therefore needs either supported OAuth mode
+        // to reach that honest availability response.
+        _ => FeatureGate::any(BTreeSet::from([
+            FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_string(),
+            FEATURE_ACCOUNT_OAUTH_DEVICE_V1.to_string(),
+        ])),
+    }
+}
+
+#[cfg(unix)]
+fn account_oauth_flow_feature_gate() -> FeatureGate {
+    FeatureGate::any(BTreeSet::from([
+        FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_string(),
+        FEATURE_ACCOUNT_OAUTH_DEVICE_V1.to_string(),
+    ]))
+}
+
+#[cfg(unix)]
+fn account_command_id(label: &str) -> String {
+    format!("diffforge-{label}-{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(unix)]
+fn account_stage_id() -> String {
+    format!("diffforge-vault-stage-{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(unix)]
+fn account_error(error: String) -> String {
+    error
+        .starts_with("missing_feature:")
+        .then_some(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+        .unwrap_or(error)
+}
+
+#[cfg(unix)]
+async fn account_request(
+    body: RequestBody,
+    capability: Capability,
+    features: FeatureGate,
+) -> Result<ResponseBody, String> {
+    match rpc_request_with_feature_gate(body, capability, features, true).await {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) => Err(account_error(error)),
+        None => Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyRetryDecision {
+    Restage,
+    Terminal,
+}
+
+fn public_error_code(error: &str) -> &str {
+    error.split_once(':').map_or(error, |(code, _)| code)
+}
+
+fn add_api_key_retry_decision(error: &str, retries: usize) -> ApiKeyRetryDecision {
+    if retries < MAX_ACCOUNT_RESTAGE_RETRIES
+        && matches!(public_error_code(error), "restage_required" | "busy")
+    {
+        ApiKeyRetryDecision::Restage
+    } else {
+        ApiKeyRetryDecision::Terminal
+    }
+}
+
+fn add_api_key_restage_command_id<'a>(
+    command_id: &'a str,
+    error: &str,
+    retries: usize,
+) -> Option<&'a str> {
+    matches!(
+        add_api_key_retry_decision(error, retries),
+        ApiKeyRetryDecision::Restage
+    )
+    .then_some(command_id)
+}
+
+#[cfg(unix)]
+async fn stage_api_key(secret: &SecretWire) -> Result<String, String> {
+    let stage_id = account_stage_id();
+    let response = account_request(
+        RequestBody::VaultStage {
+            stage_id: stage_id.clone(),
+            purpose: StagePurpose::ApiKey,
+            secret: secret.clone(),
+        },
+        Capability::Control,
+        account_feature_gate(&[FEATURE_VAULT_STAGE_V1]),
+    )
+    .await?;
+    match response {
+        ResponseBody::VaultStage {
+            stage_id: returned_stage_id,
+            vault_reference,
+            ..
+        } if returned_stage_id == stage_id => Ok(vault_reference),
+        ResponseBody::VaultStage { .. } => {
+            Err("vault.stage response stage_id mismatch".to_string())
+        }
+        _ => Err("vault.stage response method mismatch".to_string()),
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_list(provider: Option<String>) -> Result<AccountListResult, String> {
+    #[cfg(unix)]
+    {
+        return match rpc_request_with_feature_gate(
+            RequestBody::AccountList { provider },
+            Capability::View,
+            account_feature_gate(&[FEATURE_ACCOUNT_MANAGEMENT_V1]),
+            true,
+        )
+        .await
+        {
+            Some(Ok(ResponseBody::AccountList {
+                descriptors,
+                revision,
+                provider_active,
+                provider_defaults,
+            })) => Ok(AccountListResult {
+                descriptors,
+                revision,
+                provider_active,
+                provider_defaults,
+            }),
+            Some(Ok(_)) => Err("account.list response method mismatch".to_string()),
+            Some(Err(error)) if error.starts_with("missing_feature:") => {
+                Ok(AccountListResult::subsystem_absent())
+            }
+            Some(Err(error)) => Err(error),
+            None => Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = provider;
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_add_api_key(
+    provider: String,
+    alias: Option<String>,
+    api_key: String,
+    validation_model: Option<String>,
+) -> Result<Value, String> {
+    #[cfg(unix)]
+    {
+        let mut secret = SecretWire::new(api_key);
+        let result = async {
+            let command_id = account_command_id("account-login-api");
+            let mut retries = 0;
+            loop {
+                let vault_reference = stage_api_key(&secret).await?;
+                let response = account_request(
+                    RequestBody::AccountLoginApi {
+                        command_id: command_id.clone(),
+                        provider: provider.clone(),
+                        alias: alias.clone(),
+                        vault_reference,
+                        validation_model: validation_model.clone(),
+                    },
+                    Capability::Control,
+                    account_feature_gate(&[FEATURE_VAULT_STAGE_V1, FEATURE_ACCOUNT_LOGIN_API_V1]),
+                )
+                .await;
+                match response {
+                    Ok(ResponseBody::AccountLoginApi { descriptor }) => return Ok(descriptor),
+                    Ok(_) => return Err("account.login_api response method mismatch".to_string()),
+                    Err(error) => {
+                        if add_api_key_restage_command_id(&command_id, &error, retries).is_some() {
+                            retries += 1;
+                            tokio::time::sleep(ACCOUNT_RETRY_BACKOFF).await;
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+        .await;
+        secret.wipe();
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (provider, alias, validation_model);
+        let mut secret = SecretWire::new(api_key);
+        secret.wipe();
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_oauth_start(
+    provider: String,
+    desired_alias: String,
+) -> Result<AccountOauthStartResult, String> {
+    #[cfg(unix)]
+    {
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let response = account_request(
+            RequestBody::AccountOauthStart {
+                provider: provider.clone(),
+                desired_alias,
+                attempt_id: attempt_id.clone(),
+            },
+            Capability::Control,
+            account_oauth_feature_gate(&provider),
+        )
+        .await?;
+        return match response {
+            ResponseBody::AccountOauthStart {
+                availability,
+                flow_id,
+                authorization_url,
+                provider_origin,
+                loopback_port,
+                expires_at_ms,
+            } => Ok(AccountOauthStartResult {
+                availability,
+                flow_id,
+                authorization_url,
+                provider_origin,
+                loopback_port,
+                expires_at_ms,
+                attempt_id,
+            }),
+            _ => Err("account.oauth_start response method mismatch".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (provider, desired_alias);
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_oauth_status(
+    flow_id: String,
+    attempt_id: String,
+) -> Result<AccountOauthFlowResult, String> {
+    #[cfg(unix)]
+    {
+        let response = account_request(
+            RequestBody::AccountOauthStatus {
+                flow_id,
+                attempt_id,
+            },
+            Capability::Control,
+            account_oauth_flow_feature_gate(),
+        )
+        .await?;
+        return match response {
+            ResponseBody::AccountOauthStatus { flow_id, status } => {
+                Ok(AccountOauthFlowResult { flow_id, status })
+            }
+            _ => Err("account.oauth_status response method mismatch".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (flow_id, attempt_id);
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_oauth_cancel(
+    flow_id: String,
+    attempt_id: String,
+) -> Result<AccountOauthFlowResult, String> {
+    #[cfg(unix)]
+    {
+        let response = account_request(
+            RequestBody::AccountOauthCancel {
+                flow_id,
+                attempt_id,
+            },
+            Capability::Control,
+            account_oauth_flow_feature_gate(),
+        )
+        .await?;
+        return match response {
+            ResponseBody::AccountOauthCancel { flow_id, status } => {
+                Ok(AccountOauthFlowResult { flow_id, status })
+            }
+            _ => Err("account.oauth_cancel response method mismatch".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (flow_id, attempt_id);
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_oauth_add(
+    provider: String,
+    alias: String,
+    flow_id: String,
+    attempt_id: String,
+    oauth_reference: String,
+) -> Result<Value, String> {
+    #[cfg(unix)]
+    {
+        let command_id = account_command_id("account-oauth-add");
+        let mut retries = 0;
+        loop {
+            let response = account_request(
+                RequestBody::AccountAdd {
+                    command_id: command_id.clone(),
+                    provider: provider.clone(),
+                    alias: alias.clone(),
+                    auth_method: AccountAddMethod::Oauth,
+                    flow_id: flow_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    oauth_reference: oauth_reference.clone(),
+                },
+                Capability::Control,
+                account_feature_gate(&[FEATURE_ACCOUNT_MANAGEMENT_V1]),
+            )
+            .await;
+            match response {
+                Ok(ResponseBody::AccountAdd { descriptor }) => return Ok(descriptor),
+                Ok(_) => return Err("account.add response method mismatch".to_string()),
+                Err(error)
+                    if public_error_code(&error) == "busy"
+                        && retries < MAX_ACCOUNT_RESTAGE_RETRIES =>
+                {
+                    retries += 1;
+                    tokio::time::sleep(ACCOUNT_RETRY_BACKOFF).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (provider, alias, flow_id, attempt_id, oauth_reference);
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_oauth_import(source: String) -> Result<AccountImportResult, String> {
+    if !matches!(source.as_str(), "codex" | "claude-code" | "kimi-code") {
+        return Err("invalid_argument".to_string());
+    }
+    #[cfg(unix)]
+    {
+        let response = account_request(
+            RequestBody::AccountOauthImport {
+                command_id: account_command_id("account-oauth-import"),
+                source,
+            },
+            Capability::Control,
+            account_feature_gate(&[FEATURE_ACCOUNT_OAUTH_IMPORT_V1]),
+        )
+        .await?;
+        return match response {
+            ResponseBody::AccountOauthImport {
+                descriptor,
+                revision,
+            } => Ok(AccountImportResult {
+                descriptor,
+                revision,
+            }),
+            _ => Err("account.oauth_import response method mismatch".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source;
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_device_candidates() -> Result<AccountDeviceCandidatesResult, String> {
+    #[cfg(unix)]
+    {
+        let response = account_request(
+            RequestBody::AccountDeviceCandidates {},
+            Capability::View,
+            account_feature_gate(&[FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1]),
+        )
+        .await?;
+        return match response {
+            ResponseBody::AccountDeviceCandidates {
+                discovery_disabled,
+                candidates,
+            } => Ok(AccountDeviceCandidatesResult {
+                discovery_disabled,
+                candidates,
+            }),
+            _ => Err("account.device_candidates response method mismatch".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_import_device(candidate: String) -> Result<AccountImportResult, String> {
+    #[cfg(unix)]
+    {
+        let response = account_request(
+            RequestBody::AccountImportDevice {
+                command_id: account_command_id("account-import-device"),
+                candidate,
+            },
+            Capability::Control,
+            account_feature_gate(&[FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1]),
+        )
+        .await?;
+        return match response {
+            ResponseBody::AccountImportDevice {
+                descriptor,
+                revision,
+            } => Ok(AccountImportResult {
+                descriptor,
+                revision,
+            }),
+            _ => Err("account.import_device response method mismatch".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = candidate;
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_set_active(
+    alias: String,
+    confirm_new_epoch: bool,
+) -> Result<AccountSetActiveResult, String> {
+    #[cfg(unix)]
+    {
+        let response = account_request(
+            RequestBody::AccountSetActive {
+                command_id: account_command_id("account-set-active"),
+                alias,
+                confirm_new_epoch,
+            },
+            Capability::Control,
+            account_feature_gate(&[FEATURE_ACCOUNT_MANAGEMENT_V1]),
+        )
+        .await?;
+        return match response {
+            ResponseBody::AccountSetActive {
+                descriptor,
+                prior_alias,
+                revision,
+            } => Ok(AccountSetActiveResult {
+                descriptor,
+                prior_alias,
+                revision,
+            }),
+            _ => Err("account.set_active response method mismatch".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (alias, confirm_new_epoch);
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_remove(
+    alias: String,
+    expected_revision: Option<u64>,
+) -> Result<AccountRemoveResult, String> {
+    #[cfg(unix)]
+    {
+        let response = account_request(
+            RequestBody::AccountRemove {
+                command_id: account_command_id("account-remove"),
+                alias,
+                expected_revision,
+            },
+            Capability::Control,
+            account_feature_gate(&[FEATURE_ACCOUNT_MANAGEMENT_V1]),
+        )
+        .await?;
+        return match response {
+            ResponseBody::AccountRemove {
+                removed_alias,
+                replacement_active_alias,
+                revision,
+            } => Ok(AccountRemoveResult {
+                removed_alias,
+                replacement_active_alias,
+                revision,
+            }),
+            _ => Err("account.remove response method mismatch".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (alias, expected_revision);
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_set_default_model(
+    provider: String,
+    model: String,
+    expected_revision: u64,
+) -> Result<AccountSetDefaultModelResult, String> {
+    #[cfg(unix)]
+    {
+        let response = account_request(
+            RequestBody::AccountSetDefaultModel {
+                command_id: account_command_id("account-set-default-model"),
+                provider,
+                model,
+                expected_revision,
+            },
+            Capability::Control,
+            account_feature_gate(&[FEATURE_ACCOUNT_MANAGEMENT_V1]),
+        )
+        .await?;
+        return match response {
+            ResponseBody::AccountSetDefaultModel {
+                provider_summary,
+                revision,
+            } => Ok(AccountSetDefaultModelResult {
+                provider_summary,
+                revision,
+            }),
+            _ => Err("account.set_default_model response method mismatch".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (provider, model, expected_revision);
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
 }
 
 #[cfg(unix)]
@@ -2074,7 +3002,7 @@ async fn run_connected(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut ping_nonce = 1_u64;
     let mut unacked_pings: VecDeque<(u64, Instant)> = VecDeque::new();
-    let mut pending_requests: HashMap<String, RpcReply> = HashMap::new();
+    let mut pending_requests: HashMap<String, PendingRpcRequest> = HashMap::new();
     let mut decoder = StreamingFrameDecoder::default();
     let mut scratch = [0_u8; 16 * 1024];
 
@@ -2145,8 +3073,8 @@ async fn run_connected(
                 {
                     emit_surface(subscriptions, &connection, session_id, input, status);
                 }
-                if let Some(reply) = pending_requests.remove(&request_id) {
-                    let _ = reply.send(Some(response_result(body)));
+                if let Some((reply, public_errors)) = pending_requests.remove(&request_id) {
+                    let _ = reply.send(Some(response_result(body, public_errors)));
                 }
             }
             WireFrame::SessionRosterDelta { summaries } => {
@@ -2200,7 +3128,7 @@ async fn apply_connected_command(
     subscriptions: &mut HashMap<String, Subscription>,
     last_published_revision: &mut HashMap<String, u64>,
     roster_app: &mut Option<AppHandle>,
-    pending_requests: &mut HashMap<String, RpcReply>,
+    pending_requests: &mut HashMap<String, PendingRpcRequest>,
     next_request: &mut u64,
 ) -> bool {
     match command {
@@ -2219,19 +3147,16 @@ async fn apply_connected_command(
             body,
             capability,
             features,
+            public_errors,
             reply,
         } => {
-            if !connection.capabilities_granted.contains(&capability) {
-                let _ = reply.send(Some(Err(format!(
-                    "Haider RPC connection does not grant {capability:?} capability"
-                ))));
+            if !connection.grants(capability) {
+                let _ = reply.send(Some(Err("capability_denied".to_string())));
                 return true;
             }
-            if !features.is_subset(&connection.features) {
+            if !features.is_satisfied_by(&connection.features) {
                 let missing = features
-                    .difference(&connection.features)
-                    .cloned()
-                    .collect::<Vec<_>>()
+                    .unavailable_features(&connection.features)
                     .join(", ");
                 let _ = reply.send(Some(Err(format!(
                     "missing_feature: daemon does not advertise {missing}"
@@ -2250,7 +3175,7 @@ async fn apply_connected_command(
                 let _ = reply.send(None);
                 return false;
             }
-            pending_requests.insert(request_id, reply);
+            pending_requests.insert(request_id, (reply, public_errors));
             true
         }
         ActorCommand::Attach {
@@ -2394,8 +3319,11 @@ fn gated_surface_snapshot(
 }
 
 #[cfg(unix)]
-fn response_result(body: ResponseBody) -> Result<ResponseBody, String> {
+fn response_result(body: ResponseBody, public_errors: bool) -> Result<ResponseBody, String> {
     match body {
+        ResponseBody::Error { code, data, .. } if public_errors => {
+            Err(public_rpc_error(code, data))
+        }
         ResponseBody::Error {
             code,
             message,
@@ -2406,6 +3334,26 @@ fn response_result(body: ResponseBody) -> Result<ResponseBody, String> {
         )),
         response => Ok(response),
     }
+}
+
+#[cfg(unix)]
+fn public_rpc_error(code: String, data: Option<Value>) -> String {
+    if code == "revision_conflict" {
+        let expected = data
+            .as_ref()
+            .and_then(|value| value.get("expected_revision"))
+            .and_then(Value::as_u64);
+        let current = data
+            .as_ref()
+            .and_then(|value| value.get("current_revision"))
+            .and_then(Value::as_u64);
+        if let (Some(expected), Some(current)) = (expected, current) {
+            return format!(
+                "revision_conflict: expected_revision={expected}, current_revision={current}"
+            );
+        }
+    }
+    code
 }
 
 #[cfg(unix)]
@@ -2478,8 +3426,10 @@ async fn write_frame(
     frame_limit: usize,
     encoding: WireEncoding,
 ) -> std::io::Result<()> {
-    let bytes = encode_framed_with_encoding(frame, frame_limit, encoding)?;
-    stream.write_all(&bytes).await
+    let mut bytes = encode_framed_with_encoding(frame, frame_limit, encoding)?;
+    let write = stream.write_all(&bytes).await;
+    bytes.zeroize();
+    write
 }
 
 #[cfg(unix)]
@@ -3215,6 +4165,155 @@ mod tests {
     }
 
     #[test]
+    fn account_management_frames_match_reference_json_bytes() {
+        let encoded = |frame: WireFrame| {
+            let framed = encode_framed(&frame, DEFAULT_FRAME_LIMIT).expect("encode account frame");
+            assert_eq!(
+                u32::from_be_bytes(framed[..4].try_into().expect("account prefix")) as usize,
+                framed.len() - 4
+            );
+            assert_eq!(
+                decode_body(&framed[4..], DEFAULT_FRAME_LIMIT).expect("decode account frame"),
+                frame
+            );
+            std::str::from_utf8(&framed[4..])
+                .expect("account JSON")
+                .to_string()
+        };
+
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-account-list".to_owned(),
+                body: RequestBody::AccountList {
+                    provider: Some("openai".to_owned()),
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-account-list","body":{"method":"account.list","provider":"openai"}}"#
+        );
+
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-vault-stage".to_owned(),
+                body: RequestBody::VaultStage {
+                    stage_id: "stage-1".to_owned(),
+                    purpose: StagePurpose::ApiKey,
+                    secret: SecretWire::new("test-api-key".to_owned()),
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-vault-stage","body":{"method":"vault.stage","stage_id":"stage-1","purpose":"api_key","secret":"test-api-key"}}"#
+        );
+
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-login-api".to_owned(),
+                body: RequestBody::AccountLoginApi {
+                    command_id: "command-login-api".to_owned(),
+                    provider: "openai".to_owned(),
+                    alias: Some("work".to_owned()),
+                    vault_reference: "vault-reference-1".to_owned(),
+                    validation_model: Some("gpt-5".to_owned()),
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-login-api","body":{"method":"account.login_api","command_id":"command-login-api","provider":"openai","alias":"work","vault_reference":"vault-reference-1","validation_model":"gpt-5"}}"#
+        );
+
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-oauth-start".to_owned(),
+                body: RequestBody::AccountOauthStart {
+                    provider: "openai-oauth".to_owned(),
+                    desired_alias: "personal".to_owned(),
+                    attempt_id: "attempt-1".to_owned(),
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-oauth-start","body":{"method":"account.oauth_start","provider":"openai-oauth","desired_alias":"personal","attempt_id":"attempt-1"}}"#
+        );
+
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-oauth-status".to_owned(),
+                body: RequestBody::AccountOauthStatus {
+                    flow_id: "flow-1".to_owned(),
+                    attempt_id: "attempt-1".to_owned(),
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-oauth-status","body":{"method":"account.oauth_status","flow_id":"flow-1","attempt_id":"attempt-1"}}"#
+        );
+
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-oauth-add".to_owned(),
+                body: RequestBody::AccountAdd {
+                    command_id: "command-oauth-add".to_owned(),
+                    provider: "openai-oauth".to_owned(),
+                    alias: "personal".to_owned(),
+                    auth_method: AccountAddMethod::Oauth,
+                    flow_id: "flow-1".to_owned(),
+                    attempt_id: "attempt-1".to_owned(),
+                    oauth_reference: "oauth-reference-1".to_owned(),
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-oauth-add","body":{"method":"account.add","command_id":"command-oauth-add","provider":"openai-oauth","alias":"personal","auth_method":"oauth","flow_id":"flow-1","attempt_id":"attempt-1","oauth_reference":"oauth-reference-1"}}"#
+        );
+
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-set-active".to_owned(),
+                body: RequestBody::AccountSetActive {
+                    command_id: "command-set-active".to_owned(),
+                    alias: "personal".to_owned(),
+                    confirm_new_epoch: true,
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-set-active","body":{"method":"account.set_active","command_id":"command-set-active","alias":"personal","confirm_new_epoch":true}}"#
+        );
+
+        assert_eq!(
+            encoded(WireFrame::Request {
+                request_id: "req-remove".to_owned(),
+                body: RequestBody::AccountRemove {
+                    command_id: "command-remove".to_owned(),
+                    alias: "personal".to_owned(),
+                    expected_revision: Some(42),
+                },
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-remove","body":{"method":"account.remove","command_id":"command-remove","alias":"personal","expected_revision":42}}"#
+        );
+    }
+
+    #[test]
+    fn add_api_key_retries_restage_with_the_same_command_id() {
+        let command_id = "command-login-api";
+        assert_eq!(
+            add_api_key_restage_command_id(command_id, "restage_required", 0),
+            Some(command_id)
+        );
+
+        // A retry changes only the stage/reference. Its durable command id
+        // remains the logical login's original UUID.
+        assert_eq!(
+            add_api_key_restage_command_id(command_id, "busy", 2),
+            Some(command_id)
+        );
+        assert_eq!(
+            add_api_key_restage_command_id(
+                command_id,
+                "restage_required",
+                MAX_ACCOUNT_RESTAGE_RETRIES
+            ),
+            None
+        );
+        assert_eq!(
+            add_api_key_retry_decision("restage_required", MAX_ACCOUNT_RESTAGE_RETRIES),
+            ApiKeyRetryDecision::Terminal
+        );
+        assert_eq!(
+            add_api_key_retry_decision("unauthorized", 0),
+            ApiKeyRetryDecision::Terminal
+        );
+    }
+
+    #[test]
     fn session_seen_frame_matches_reference_json_bytes() {
         let seen = WireFrame::Request {
             request_id: "req-seen".to_owned(),
@@ -3458,7 +4557,8 @@ mod tests {
                     limit: 256,
                 },
                 capability: Capability::View,
-                features: config_features(&[]),
+                features: FeatureGate::all(config_features(&[])),
+                public_errors: false,
                 reply,
             },
             &mut subscriptions,

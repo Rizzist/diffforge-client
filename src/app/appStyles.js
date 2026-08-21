@@ -25054,6 +25054,10 @@ export const RailDevicesIcon = styled(RailDevicesGlyph)`
   ${railActionIconSize}
 `;
 
+export const RailAccountsIcon = styled(Key)`
+  ${railActionIconSize}
+`;
+
 export const RailSettingsIcon = styled(Settings)`
   ${railActionIconSize}
 `;

@@ -306,6 +306,7 @@ import {
   RailAudioIcon,
   RailDevicesIcon,
   RailFilesIcon,
+  RailAccountsIcon,
   RailHelpIcon,
   RailSettingsIcon,
   RailSignOutIcon,
@@ -643,6 +644,7 @@ import SnippingQuickAccess, {
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
 import AccountTokenomicsView, { warmAccountTokenomics } from "../tokenomics/AccountTokenomicsView.jsx";
+import AccountsView from "../accounts/AccountsView.jsx";
 import DevicesView from "../devices/DevicesView.jsx";
 
 const AuraMode = lazy(() => import("../aura/AuraMode.jsx"));
@@ -21100,6 +21102,8 @@ export default function App() {
   const audioViewVisible = visibleView === "audio";
   const snippingViewVisible = visibleView === "snipping";
   const tokenomicsViewVisible = visibleView === "tokenomics";
+  const accountsViewVisible = visibleView === "accounts";
+  const accountsViewActive = accountsViewVisible && viewMotion !== "exiting";
   const devicesViewVisible = visibleView === "devices";
   const accountKeepAliveViewVisible = audioViewVisible || tokenomicsViewVisible || devicesViewVisible;
   const audioViewActive = audioViewVisible && viewMotion !== "exiting";
@@ -24704,6 +24708,18 @@ export default function App() {
                             onClick={(event) => {
                               event.stopPropagation();
                               setAccountMenuOpen(false);
+                              showView("accounts");
+                            }}
+                            role="menuitem"
+                            type="button"
+                          >
+                            <RailAccountsIcon aria-hidden="true" />
+                            <span>Accounts</span>
+                          </AccountMenuRow>
+                          <AccountMenuRow
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setAccountMenuOpen(false);
                               showView("settings");
                             }}
                             role="menuitem"
@@ -26133,6 +26149,19 @@ export default function App() {
                         motion={viewMotion}
                         storage_usage={cloudWorkspaceProgress.storage_usage}
                       />
+                    </WorkspaceRuntimeLayer>
+                  ) : null}
+                  {accountsViewVisible ? (
+                    <WorkspaceRuntimeLayer
+                      aria-hidden={!accountsViewVisible}
+                      data-visible={accountsViewVisible}
+                    >
+                      <ForgeWorkspace
+                        aria-label="Accounts"
+                        data-motion={accountsViewActive ? viewMotion : "entered"}
+                      >
+                        <AccountsView active={accountsViewVisible} />
+                      </ForgeWorkspace>
                     </WorkspaceRuntimeLayer>
                   ) : null}
                   {devicesViewMounted ? (
