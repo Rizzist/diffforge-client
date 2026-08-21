@@ -20,6 +20,7 @@ struct HaiderBridgeSession {
     last_activity_ms: Option<i64>,
     waiting_kind: Option<String>,
     waiting_menu_id: Option<String>,
+    needs_input: Value,
     latest_at_ms: Option<i64>,
 }
 
@@ -35,6 +36,7 @@ struct HaiderBridgeReconcileStamp {
     last_activity_ms: Option<i64>,
     waiting_kind: Option<String>,
     waiting_menu_id: Option<String>,
+    needs_input: Value,
 }
 
 impl HaiderBridgeReconcileStamp {
@@ -50,6 +52,7 @@ impl HaiderBridgeReconcileStamp {
             last_activity_ms: session.last_activity_ms,
             waiting_kind: session.waiting_kind.clone(),
             waiting_menu_id: session.waiting_menu_id.clone(),
+            needs_input: session.needs_input.clone(),
         }
     }
 }
@@ -368,6 +371,13 @@ fn haider_bridge_parse_session(
                 .or_else(|| waiting_why.get("pendingMenuId"))
         })
         .and_then(haider_bridge_text);
+    let needs_input = haider_bridge_object_value(
+        object,
+        &["needs_input", "needsInput"],
+        &["runtime", "summary", "metadata", "session"],
+    )
+    .cloned()
+    .unwrap_or(Value::Null);
 
     let timestamp_keys = [
         "updated_at_ms",
@@ -410,6 +420,7 @@ fn haider_bridge_parse_session(
         || last_activity_ms.is_some()
         || waiting_kind.is_some()
         || waiting_menu_id.is_some()
+        || !needs_input.is_null()
         || latest_at_ms.is_some()
         || has_lineage
         || object.contains_key("head_seq")
@@ -427,6 +438,7 @@ fn haider_bridge_parse_session(
         last_activity_ms,
         waiting_kind,
         waiting_menu_id,
+        needs_input,
         latest_at_ms,
     })
 }
@@ -777,6 +789,10 @@ fn haider_bridge_reconcile_store(
             row.waiting_menu_id = session.waiting_menu_id.clone();
             row_changed = true;
         }
+        if row.needs_input != session.needs_input {
+            row.needs_input = session.needs_input.clone();
+            row_changed = true;
+        }
         if session
             .latest_at_ms
             .is_some_and(|latest_at_ms| latest_at_ms > row.latest_at_ms)
@@ -787,10 +803,14 @@ fn haider_bridge_reconcile_store(
         if !row_changed {
             continue;
         }
+        let needs_input_json = (!row.needs_input.is_null())
+            .then(|| serde_json::to_string(&row.needs_input))
+            .transpose()
+            .map_err(|error| format!("Unable to encode Haider needs_input state: {error}"))?;
 
         transaction
             .execute(
-                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5, state_raw = ?6, model = ?7, effort = ?8, speed_fast = ?9, seen_at_ms = ?10, last_activity_ms = ?11, waiting_kind = ?12, waiting_menu_id = ?13 WHERE id = ?1",
+                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5, state_raw = ?6, model = ?7, effort = ?8, speed_fast = ?9, seen_at_ms = ?10, last_activity_ms = ?11, waiting_kind = ?12, waiting_menu_id = ?13, needs_input_json = ?14 WHERE id = ?1",
                 rusqlite::params![
                     row.id,
                     row.title,
@@ -805,6 +825,7 @@ fn haider_bridge_reconcile_store(
                     row.last_activity_ms,
                     row.waiting_kind,
                     row.waiting_menu_id,
+                    needs_input_json,
                 ],
             )
             .map_err(|error| format!("Unable to reconcile Haider session: {error}"))?;
@@ -832,14 +853,18 @@ fn haider_bridge_reconcile_store(
             .unwrap_or_else(|| "Haider session".to_string());
         let state_raw = session.state_raw.clone().unwrap_or_default();
         let status = haider_bridge_store_status(Some(&state_raw));
+        let needs_input_json = (!session.needs_input.is_null())
+            .then(|| serde_json::to_string(&session.needs_input))
+            .transpose()
+            .map_err(|error| format!("Unable to encode Haider needs_input state: {error}"))?;
         transaction
             .execute(
                 "INSERT INTO sessions (
                     id, title, slug, dir, kind, provider, provider_session_id,
                     created_at_ms, latest_at_ms, status, state_raw,
                     first_user_message, model, effort, speed_fast, seen_at_ms,
-                    last_activity_ms, waiting_kind, waiting_menu_id
-                 ) VALUES (?1, ?2, '', '', 'pinned', 'haider', ?3, ?4, ?5, ?6, ?7, '', ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    last_activity_ms, waiting_kind, waiting_menu_id, needs_input_json
+                 ) VALUES (?1, ?2, '', '', 'pinned', 'haider', ?3, ?4, ?5, ?6, ?7, '', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     sessions_new_id(now_ms),
                     title,
@@ -855,6 +880,7 @@ fn haider_bridge_reconcile_store(
                     session.last_activity_ms,
                     session.waiting_kind.clone(),
                     session.waiting_menu_id.clone(),
+                    needs_input_json,
                 ],
             )
             .map_err(|error| format!("Unable to import Haider session: {error}"))?;
@@ -1368,6 +1394,7 @@ mod haider_bridge_tests {
                 last_activity_ms: None,
                 waiting_kind: None,
                 waiting_menu_id: None,
+                needs_input: Value::Null,
                 latest_at_ms: Some(1_777_777_777_123),
             }]
         );
@@ -1412,6 +1439,37 @@ mod haider_bridge_tests {
     }
 
     #[test]
+    fn haider_bridge_preserves_unknown_needs_input_kind_verbatim() {
+        let needs_input = json!({
+            "kind": "future_daemon_prompt",
+            "title": "A future prompt",
+            "safe_body": ["Only daemon-redacted text is present."],
+            "menu_id": "menu-future",
+            "request_seq": 1843_u64,
+            "worker_generation": 122_u64,
+            "since_ms": 1_777_777_777_123_i64,
+            "options": [{
+                "key": "continue",
+                "label": "Continue",
+                "detail": "Use the generic frontend arm."
+            }],
+            "future_additive_field": {"preserved": true}
+        });
+        let parsed = haider_bridge_parse_session(
+            &json!({
+                "session_id": "session-future-needs-input",
+                "head_seq": 9,
+                "needs_input": needs_input
+            }),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.needs_input, needs_input);
+        assert_eq!(parsed.needs_input["kind"], "future_daemon_prompt");
+    }
+
+    #[test]
     fn haider_bridge_reconcile_stamp_tracks_effort_and_fast_changes() {
         let session = HaiderBridgeSession {
             id: "session-stamp".to_string(),
@@ -1426,6 +1484,7 @@ mod haider_bridge_tests {
             last_activity_ms: None,
             waiting_kind: None,
             waiting_menu_id: None,
+            needs_input: Value::Null,
             latest_at_ms: None,
         };
         let baseline = HaiderBridgeReconcileStamp::new(&session, Some(4));
@@ -1440,6 +1499,13 @@ mod haider_bridge_tests {
         assert_ne!(
             baseline,
             HaiderBridgeReconcileStamp::new(&fast_changed, Some(4))
+        );
+
+        let mut needs_input_changed = fast_changed.clone();
+        needs_input_changed.needs_input = json!({"kind":"future_kind"});
+        assert_ne!(
+            baseline,
+            HaiderBridgeReconcileStamp::new(&needs_input_changed, Some(4))
         );
         let mut attention_changed = fast_changed;
         attention_changed.seen_at_ms = Some(50);
@@ -1562,6 +1628,7 @@ mod haider_bridge_tests {
             last_activity_ms: None,
             waiting_kind: None,
             waiting_menu_id: None,
+            needs_input: Value::Null,
             latest_at_ms: Some(100),
         };
         let mut tracker = HaiderBridgeReconcileTracker::default();

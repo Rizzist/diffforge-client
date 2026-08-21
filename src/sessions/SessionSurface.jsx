@@ -79,7 +79,10 @@ export default function SessionSurface({
   onHeaderDragStart = null,
   onOpenSession,
   onResetToDraft,
+  onSessionsRefresh = null,
+  onShellWarm = null,
   onSyncingChange,
+  shellPrefs = {},
   onToggleTheme,
   openSessions,
   planKey = "free",
@@ -629,24 +632,19 @@ export default function SessionSurface({
     }
   }, []);
 
-  /* Shell keep-warm (owner-approved LRU of 3): the last three shells the
-     user actually VIEWED stay mounted hidden when their session goes
-     inactive, so switching back skips xterm re-instantiation + scrollback
-     replay (the 0.2-0.8s flip cost). PTYs were always daemon-persistent;
-     this only keeps the view alive. */
-  const [warmShells, setWarmShells] = useState([]);
+  /* Shell keep-warm: viewing a shell reports it warm to the shell, and it
+     STAYS mounted until the user turns it off from the rail — so switching
+     back never pays xterm re-instantiation + scrollback replay again (the
+     0.2-0.8s flip cost). PTYs were always daemon-persistent; this only keeps
+     the VIEW alive. Ownership sits above so the rail can toggle it. */
   useEffect(() => {
     const id = activeSessionId;
     if (!id || id === "draft") return;
     if ((viewModes[id] || "ui") !== "terminal") return;
     const { tabs, activeTabId } = sessionTabs[id] || { tabs: [{ id: "chat" }], activeTabId: "chat" };
     if ((tabs.find((tab) => tab.id === activeTabId) || tabs[0]).id !== "chat") return;
-    setWarmShells((current) => (
-      current[0] === id
-        ? current
-        : [id, ...current.filter((entry) => entry !== id)].slice(0, 3)
-    ));
-  }, [activeSessionId, viewModes, sessionTabs]);
+    onShellWarm?.(id);
+  }, [activeSessionId, viewModes, sessionTabs, onShellWarm]);
 
   /* Session-history sync, lifted from the transcript's additive callback
      (projection caught_up + cold-load state) and reported upward for the
@@ -1170,6 +1168,7 @@ export default function SessionSurface({
                 <>
                   <ChatHostLayer data-visible={mode === "ui" ? "true" : "false"}>
                     <SessionTranscript
+                      onAnswered={onSessionsRefresh}
                       onSyncingChange={(syncing) => handleTranscriptSyncing(session.id, syncing)}
                       runStatus={(() => {
                         /* The shimmer means WORK: thinking/running/tool
@@ -1212,12 +1211,18 @@ export default function SessionSurface({
                   )}
                 </>
               )}
-              {/* Shell mounts for the active session's chat tab as before,
-                  AND stays mounted hidden for the 3 most-recently-viewed
-                  shells (owner-approved keep-warm) — switching back skips
-                  the xterm re-instantiation + replay cost entirely. */}
-              {((chatTabActive && active && (mode === "terminal" || shellTouched[session.id]))
-                || warmShells.includes(session.id)) && (
+              {/* Three honest reasons to mount: you are looking at it; it is
+                  kept warm (stays mounted while you work elsewhere, so
+                  switching back skips xterm re-instantiation + replay); or
+                  it is pre-warming for an open session. Turning it OFF from
+                  the rail suppresses the last two, so off means off. */}
+              {(() => {
+                const pref = shellPrefs[session.id];
+                const viewing = chatTabActive && active && mode === "terminal";
+                const preWarm = chatTabActive && active
+                  && shellTouched[session.id] && pref !== false;
+                return viewing || preWarm || pref === true;
+              })() && (
                 <TerminalHostLayer
                   data-visible={chatTabActive && active && mode === "terminal" ? "true" : "false"}
                 >

@@ -30,6 +30,21 @@ export function normalizeSessionRow(row) {
     pinned: row.pinned === true || row.pinned === 1,
     title_locked: row.title_locked === true || row.title_locked === 1,
     state_raw: String(row.state_raw || ""),
+    /* HARNESS-OWNED fields pass through UNCHANGED — this normalizer builds a
+       fresh object, so anything omitted here is silently discarded no matter
+       what Rust sends. Every additive roster field the daemon gains must be
+       added here too, or the surface that renders it is dead on arrival.
+       Nullable stays null (absent means "the daemon didn't say", which is
+       NOT the same as zero or empty). */
+    effort: row.effort ?? null,
+    speed: row.speed ?? null,
+    seen_at_ms: row.seen_at_ms ?? null,
+    last_activity_ms: row.last_activity_ms ?? null,
+    waiting_kind: row.waiting_kind ?? null,
+    waiting_menu_id: row.waiting_menu_id ?? null,
+    /* The needs_input card is rendered verbatim (kinds and fields can grow),
+       so it is never reshaped here. */
+    needs_input: row.needs_input ?? null,
   };
 }
 

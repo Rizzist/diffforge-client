@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
+import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Movie } from "@styled-icons/material-rounded/Movie";
 import { Close } from "@styled-icons/material-rounded/Close";
@@ -37,8 +38,10 @@ export default function SessionsRail({
   onSearchChange = null,
   onSelectMedia = null,
   onSelectSession,
+  onToggleShell = null,
   onUpdateMedia = null,
   searchQuery = "",
+  shellPrefs = {},
 }) {
   /* Relative times tick once a minute while the rail is mounted. */
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -156,11 +159,29 @@ export default function SessionsRail({
     permission: "permission",
     question: "question",
     approval: "approval",
+    recovery: "recovery",
+    update: "update",
+    secret: "secret",
+    trust_hook: "trust",
+    choice: "choose",
+    conflict: "conflict",
+    file: "file",
+    exhausted: "limit",
+    unknown: "needs you",
   };
   const statusSlot = (session) => {
     const status = session.status || "";
-    if (status === "waiting") {
-      const label = WAITING_LABELS[session.waiting_kind] || "needs you";
+    /* 937 needs_input carries the park's own typed kind and can name kinds
+       this build predates — prefer it, humanise anything unrecognised, and
+       keep 936's waiting_why (frozen at three kinds) as the fallback. */
+    const parkKind = session.needs_input?.kind || "";
+    if (parkKind || status === "waiting") {
+      /* A present park kind WINS outright — falling back to waiting_why for
+         a kind this build predates would label a "biometric_scan" park
+         "approval", which is worse than humanising the real one. */
+      const label = parkKind
+        ? (WAITING_LABELS[parkKind] || parkKind.replace(/_/g, " "))
+        : (WAITING_LABELS[session.waiting_kind] || "needs you");
       return <NeedsYouChip aria-label="Waiting on you">{label}</NeedsYouChip>;
     }
     if (status === "error") {
@@ -267,7 +288,74 @@ export default function SessionsRail({
           status={session.status}
         />
         <SessionRowTitle>{session.title}</SessionRowTitle>
+        {/* A live shell is worth knowing about without being shouted at: a
+            dim glyph, no color, that only sharpens on hover where it also
+            becomes the switch. */}
+        {shellPrefs[session.id] === true && (
+          <ShellMark aria-label="Shell running" title="Shell is running">
+            <TerminalGlyph aria-hidden="true" />
+          </ShellMark>
+        )}
         {statusSlot(session)}
+        {/* Row actions replace the time on hover — same slot, so the row
+            never reflows under the pointer. */}
+        {/* Spans, not buttons: the row itself is a button and nesting one
+            inside another is invalid and swallows clicks. */}
+        <RowActions>
+          <RowActionButton
+            aria-label={session.pinned ? "Unpin" : "Pin"}
+            data-on={session.pinned ? "true" : undefined}
+            onClick={(event) => {
+              event.stopPropagation();
+              void togglePin(session);
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
+              event.stopPropagation();
+              void togglePin(session);
+            }}
+            role="button"
+            tabIndex={0}
+            title={session.pinned ? "Unpin this chat" : "Pin this chat"}
+          >
+            <PinGlyph aria-hidden="true" />
+          </RowActionButton>
+          {/* A running session's shell is doing work — turning it off is
+              only offered once it settles. */}
+          {(() => {
+            const shellOn = shellPrefs[session.id] === true;
+            const locked = shellOn && session.status === "running";
+            const toggle = (event) => {
+              event.stopPropagation();
+              if (locked) return;
+              onToggleShell?.(session.id);
+            };
+            return (
+              <RowActionButton
+                aria-disabled={locked ? "true" : undefined}
+                aria-label={shellOn ? "Turn shell off" : "Turn shell on"}
+                data-locked={locked ? "true" : undefined}
+                data-on={shellOn ? "true" : undefined}
+                onClick={toggle}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" && event.key !== " ") return;
+                  event.preventDefault();
+                  toggle(event);
+                }}
+                role="button"
+                tabIndex={0}
+                title={shellOn
+                  ? (locked
+                    ? "Shell is busy — turn it off once it settles"
+                    : "Turn this shell off")
+                  : "Keep this shell running"}
+              >
+                <TerminalGlyph aria-hidden="true" />
+              </RowActionButton>
+            );
+          })()}
+        </RowActions>
       </SessionRowButton>
     );
   };
@@ -402,6 +490,7 @@ const SessionsRailRoot = styled.div`
 
 /* Collapsed rail: the list stays as a brand-dot icon strip — group labels
    and row text fold away, the marks keep their activity badges. */
+
 /* Right-slot status indicators — one per row, shape-distinct so color is
    never the only signal: chip (words) / hollow ring / motion / dot / text. */
 const UnseenDot = styled.i`
@@ -588,6 +677,75 @@ const SessionRowButton = styled.button`
     gap: 0;
     padding: 0;
   }
+`;
+
+const PinGlyph = styled(PushPin)`
+  width: 12px;
+  height: 12px;
+`;
+
+const TerminalGlyph = styled(Terminal)`
+  width: 12px;
+  height: 12px;
+`;
+
+/* A running shell, stated quietly: no color, low opacity, and it steps aside
+   entirely while the row's actions are showing. */
+const ShellMark = styled.span`
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--forge-text-muted);
+  opacity: 0.45;
+
+  svg { width: 11px; height: 11px; }
+
+  ${SessionRowButton}:hover & { display: none; }
+  [data-collapsed="true"] & { display: none; }
+`;
+
+/* Hover actions occupy the same right slot as the time, so the row keeps its
+   width and nothing shifts under the pointer. */
+const RowActions = styled.span`
+  display: none;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+
+  ${SessionRowButton}:hover &,
+  ${SessionRowButton}:focus-within & {
+    display: inline-flex;
+  }
+
+  [data-collapsed="true"] & { display: none; }
+`;
+
+const RowActionButton = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 19px;
+  height: 19px;
+  border-radius: 5px;
+  color: var(--forge-text-muted);
+  cursor: pointer;
+
+  svg { width: 12px; height: 12px; }
+
+  &:hover {
+    color: var(--forge-text);
+    background: var(--forge-surface-hover);
+  }
+
+  /* On = the state is real and current, so it reads at full strength. */
+  &[data-on="true"] { color: var(--forge-accent-soft); }
+
+  &[data-locked="true"] {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  &[data-locked="true"]:hover { background: transparent; }
 `;
 
 const SessionRenameRow = styled.div`

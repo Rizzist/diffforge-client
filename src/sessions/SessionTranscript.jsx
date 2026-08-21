@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import styled from "styled-components";
+import NeedsInputCard from "./NeedsInputCard.jsx";
 
 /* Virtualized transcript for the session UI view, fed by the Rust
    projection store (haider_projection.rs):
@@ -360,8 +361,16 @@ function ToolCluster({ rows, sessionId }) {
 
 /* ---- transcript ------------------------------------------------------- */
 
-export default function SessionTranscript({ session, runStatus = "", onSyncingChange }) {
+export default function SessionTranscript({
+  session,
+  runStatus = "",
+  onSyncingChange,
+  onAnswered = null,
+}) {
   const sessionId = session?.id || "";
+  /* Harness-owned park (937): the roster row carries the whole card, so the
+     transcript renders daemon truth and never invents a prompt. */
+  const needsInput = session?.needs_input || null;
   const scrollerRef = useRef(null);
   const [totalRows, setTotalRows] = useState(0);
   const [liveTail, setLiveTail] = useState(null);
@@ -514,7 +523,10 @@ export default function SessionTranscript({ session, runStatus = "", onSyncingCh
     if (node) {
       node.scrollTop = node.scrollHeight;
     }
-  }, [windowState, liveTail, runStatus]);
+    /* needsInput belongs here: a park arriving grows the scroller, and
+       without it the card that just asked for a decision lands below the
+       fold on an already-bottomed transcript. */
+  }, [windowState, liveTail, runStatus, needsInput]);
 
   const measureRow = useCallback((key, element) => {
     if (element && !heightsRef.current.has(key)) {
@@ -535,11 +547,22 @@ export default function SessionTranscript({ session, runStatus = "", onSyncingCh
 
   if ((loadState === "error" || loadState === "empty") && !liveTail && !windowState.rows.length) {
     // A missing/empty projection is a normal state for young or unbound
-    // sessions — show a quiet empty chat, never a hard error wall.
+    // sessions — show a quiet empty chat, never a hard error wall. A park
+    // still renders here: it rides the ROSTER, not the projection, so a
+    // session with nothing projected can still be waiting on the user.
     return (
-      <TranscriptNotice data-quiet="true">
-        No messages here yet — send one below, or open the Shell view.
-      </TranscriptNotice>
+      <TranscriptScroller>
+        <TranscriptNotice data-quiet="true">
+          No messages here yet — send one below, or open the Shell view.
+        </TranscriptNotice>
+        {needsInput && (
+          <NeedsInputCard
+            card={needsInput}
+            onAnswered={onAnswered}
+            sessionId={sessionId}
+          />
+        )}
+      </TranscriptScroller>
     );
   }
 
@@ -629,6 +652,16 @@ export default function SessionTranscript({ session, runStatus = "", onSyncingCh
         </ShimmerRow>
       )}
       {bottomSpacer > 0 && <div aria-hidden="true" style={{ height: bottomSpacer }} />}
+      {/* A park outranks the stream: the answer is what unblocks it, so the
+          card sits at the TRUE tail — after the spacer that stands in for
+          unloaded rows, or it would float above transcript it precedes. */}
+      {needsInput && (
+        <NeedsInputCard
+          card={needsInput}
+          onAnswered={onAnswered}
+          sessionId={sessionId}
+        />
+      )}
     </TranscriptScroller>
   );
 }

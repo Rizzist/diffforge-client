@@ -23,6 +23,7 @@ struct SessionRow {
     last_activity_ms: Option<i64>,
     waiting_kind: Option<String>,
     waiting_menu_id: Option<String>,
+    needs_input: Value,
     pinned: bool,
     title_locked: bool,
 }
@@ -250,6 +251,7 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
                 last_activity_ms INTEGER,
                 waiting_kind TEXT,
                 waiting_menu_id TEXT,
+                needs_input_json TEXT,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 title_locked INTEGER NOT NULL DEFAULT 0
              );
@@ -268,6 +270,7 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
         ("last_activity_ms", "INTEGER"),
         ("waiting_kind", "TEXT"),
         ("waiting_menu_id", "TEXT"),
+        ("needs_input_json", "TEXT"),
     ];
     let columns = sessions_table_columns(connection)?;
     if migrations
@@ -328,13 +331,17 @@ fn sessions_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> 
         last_activity_ms: row.get(16)?,
         waiting_kind: row.get(17)?,
         waiting_menu_id: row.get(18)?,
-        pinned: row.get(19)?,
-        title_locked: row.get(20)?,
+        needs_input: row
+            .get::<_, Option<String>>(19)?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or(Value::Null),
+        pinned: row.get(20)?,
+        title_locked: row.get(21)?,
     })
 }
 
 const SESSIONS_SELECT_COLUMNS: &str =
-    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, state_raw, first_user_message, model, effort, speed_fast, seen_at_ms, last_activity_ms, waiting_kind, waiting_menu_id, pinned, title_locked";
+    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, state_raw, first_user_message, model, effort, speed_fast, seen_at_ms, last_activity_ms, waiting_kind, waiting_menu_id, needs_input_json, pinned, title_locked";
 
 fn sessions_row_by_id(connection: &rusqlite::Connection, id: &str) -> Result<SessionRow, String> {
     let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions WHERE id = ?1");
@@ -410,6 +417,7 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
         last_activity_ms: None,
         waiting_kind: None,
         waiting_menu_id: None,
+        needs_input: Value::Null,
         pinned: false,
         title_locked: false,
     };
@@ -711,6 +719,7 @@ mod sessions_tests {
             last_activity_ms: None,
             waiting_kind: None,
             waiting_menu_id: None,
+            needs_input: Value::Null,
             pinned: false,
             title_locked: false,
         }
@@ -840,6 +849,7 @@ mod sessions_tests {
             "last_activity_ms",
             "waiting_kind",
             "waiting_menu_id",
+            "needs_input_json",
         ] {
             assert_eq!(columns.iter().filter(|name| *name == column).count(), 1);
         }
@@ -852,6 +862,7 @@ mod sessions_tests {
         assert_eq!(row.last_activity_ms, None);
         assert_eq!(row.waiting_kind, None);
         assert_eq!(row.waiting_menu_id, None);
+        assert_eq!(row.needs_input, Value::Null);
         let row_json = serde_json::to_value(&row).unwrap();
         assert_eq!(row_json["effort"], Value::Null);
         assert_eq!(row_json["speed"], Value::Null);
@@ -859,6 +870,7 @@ mod sessions_tests {
         assert_eq!(row_json["last_activity_ms"], Value::Null);
         assert_eq!(row_json["waiting_kind"], Value::Null);
         assert_eq!(row_json["waiting_menu_id"], Value::Null);
+        assert_eq!(row_json["needs_input"], Value::Null);
         assert!(!row.pinned);
         assert!(!row.title_locked);
 
@@ -898,6 +910,7 @@ mod sessions_tests {
             last_activity_ms: None,
             waiting_kind: None,
             waiting_menu_id: None,
+            needs_input: Value::Null,
             latest_at_ms: Some(20),
         }])
         .unwrap());
@@ -994,6 +1007,7 @@ mod sessions_tests {
             last_activity_ms: None,
             waiting_kind: None,
             waiting_menu_id: None,
+            needs_input: Value::Null,
             latest_at_ms: Some(sessions_now_ms()),
         }
     }
@@ -1057,6 +1071,96 @@ mod sessions_tests {
         assert_eq!(reconciled.last_activity_ms, None);
         assert_eq!(reconciled.waiting_kind, None);
         assert_eq!(reconciled.waiting_menu_id, None);
+        drop(connection);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn haider_bridge_summary_needs_input_round_trips_and_clears_sql_null() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("needs-input-state");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let mut row = sessions_test_row("needs-input", Path::new(""), "pinned");
+        row.provider_session_id = "provider-needs-input".to_string();
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        let card = json!({
+            "kind": "recovery",
+            "title": "Effect outcome unknown",
+            "safe_body": [
+                "Dispatched effect: effect test",
+                "probe: no result committed"
+            ],
+            "menu_id": "effect-recovery-test",
+            "request_seq": 1843_u64,
+            "worker_generation": 122_u64,
+            "since_ms": 1_777_777_777_123_i64,
+            "options": [{
+                "key": "probe",
+                "label": "Probe",
+                "detail": "Re-check whether the effect completed."
+            }]
+        });
+        let mut tracker = HaiderBridgeReconcileTracker::default();
+        assert!(haider_bridge_reconcile_summary_values_tracked(
+            &mut tracker,
+            vec![json!({
+                "session_id": "provider-needs-input",
+                "head_seq": 17,
+                "state_raw": "waiting",
+                "needs_input": card.clone()
+            })],
+            false,
+            haider_bridge_reconcile_store,
+        )
+        .unwrap());
+
+        let connection = sessions_open_database().unwrap();
+        let stored_json = connection
+            .query_row(
+                "SELECT needs_input_json FROM sessions WHERE id = ?1",
+                ["needs-input"],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .expect("needs_input JSON text");
+        assert_eq!(serde_json::from_str::<Value>(&stored_json).unwrap(), card);
+        let reconciled = sessions_row_by_id(&connection, "needs-input").unwrap();
+        assert_eq!(reconciled.needs_input, card);
+        assert!(reconciled.needs_input.get("secret_answer").is_none());
+        drop(connection);
+
+        assert!(haider_bridge_reconcile_summary_values_tracked(
+            &mut tracker,
+            vec![json!({
+                "session_id": "provider-needs-input",
+                "head_seq": 17,
+                "state_raw": "waiting"
+            })],
+            false,
+            haider_bridge_reconcile_store,
+        )
+        .unwrap());
+
+        let connection = sessions_open_database().unwrap();
+        let stored_json = connection
+            .query_row(
+                "SELECT needs_input_json FROM sessions WHERE id = ?1",
+                ["needs-input"],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(stored_json, None);
+        let reconciled = sessions_row_by_id(&connection, "needs-input").unwrap();
+        assert_eq!(reconciled.needs_input, Value::Null);
+        assert_eq!(
+            serde_json::to_value(&reconciled).unwrap()["needs_input"],
+            Value::Null
+        );
         drop(connection);
 
         fs::remove_dir_all(directory).unwrap();

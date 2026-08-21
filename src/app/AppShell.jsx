@@ -18411,9 +18411,41 @@ export default function App() {
       : null
   ), [activeSession]);
   const activeSessionFileRoot = sessionWorkingDirectory(activeSession);
+  /* Warm shells: every session whose shell is currently MOUNTED. Opening a
+     shell warms it and it STAYS warm — switching back is then instant, with
+     no eviction guessing which one you meant to keep. The rail owns the off
+     switch (idle sessions only), so the cost is visible and controllable
+     rather than silently unbounded. Lives here because the rail toggles it
+     and the surface renders it. */
+  /* Per-session preference, not a cache: true = keep mounted, false = the
+     user turned it OFF (so it must not even pre-warm — otherwise "off" would
+     be a lie while the session is open), absent = default (pre-warms while
+     the session is open, mounts for real once its shell is used). */
+  const [shellPrefs, setShellPrefs] = useState({});
+  const markShellWarm = useCallback((sessionId) => {
+    if (!sessionId) return;
+    setShellPrefs((current) => (
+      current[sessionId] === true ? current : { ...current, [sessionId]: true }
+    ));
+  }, []);
+  const toggleShellWarm = useCallback((sessionId) => {
+    if (!sessionId) return;
+    setShellPrefs((current) => ({ ...current, [sessionId]: current[sessionId] !== true }));
+  }, []);
+
+  /* Concurrent refreshes (an event and an answer landing together) can
+     resolve out of order, and the LOSER would repaint older truth — most
+     visibly restoring a park card the user just answered. Last request
+     issued is the only one allowed to publish. */
+  const sessionsReadSeqRef = useRef(0);
   const refreshSessions = useCallback(async () => {
+    const seq = sessionsReadSeqRef.current + 1;
+    sessionsReadSeqRef.current = seq;
     try {
-      setSessions(await listSessions());
+      const rows = await listSessions();
+      if (sessionsReadSeqRef.current === seq) {
+        setSessions(rows);
+      }
     } catch {
       // Store not available yet (first boot before Rust lane) — rail stays empty.
     }
@@ -24576,6 +24608,8 @@ export default function App() {
                           onSelectMedia={openMediaSession}
                           onUpdateMedia={updateMediaSession}
                           onSelectSession={openSessionFromRail}
+                          onToggleShell={toggleShellWarm}
+                          shellPrefs={shellPrefs}
                           /* Collapsed hides the search box, so the filter
                              must not keep acting invisibly. */
                           searchQuery={workspaceRailCollapsed ? "" : railSearchQuery}
@@ -25015,7 +25049,10 @@ export default function App() {
                       onHeaderDragStart={handleTitleBarMouseDown}
                       onOpenSession={openSessionFromRail}
                       onResetToDraft={startNewSessionChat}
+                      onSessionsRefresh={refreshSessions}
+                      onShellWarm={markShellWarm}
                       onSyncingChange={setSessionHistorySyncing}
+                      shellPrefs={shellPrefs}
                       onToggleTheme={() => updateAppTheme(
                         activeAppTheme === APP_THEME_LIGHT ? APP_THEME_DARK : APP_THEME_LIGHT,
                       )}

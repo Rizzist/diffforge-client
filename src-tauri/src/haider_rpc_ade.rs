@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(unix)]
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Mutex as StdMutex};
 
 #[cfg(unix)]
 use tokio::{
@@ -46,6 +46,7 @@ const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
 const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
 const FEATURE_RESIDENT_TURN_SUBMIT_V1: &str = "resident_turn_submit_v1";
 const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
+const FEATURE_SESSION_NEEDS_INPUT_V1: &str = "session_needs_input_v1";
 const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
 const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
 const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
@@ -54,6 +55,13 @@ const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
 const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
 const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
+const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
+const HAIDER_NEEDS_INPUT_STALE: &str =
+    "haider_needs_input_stale: This park moved on; re-read the card.";
+const HAIDER_NEEDS_INPUT_ANSWER_UNCERTAIN: &str =
+    "haider_needs_input_answer_uncertain: Answer may have landed; retrying is safe.";
+#[cfg(unix)]
+const SESSION_ANSWER_MENU_REPLAY_LIMIT: usize = 64;
 const MAX_ACCOUNT_RESTAGE_RETRIES: usize = 3;
 /// `busy` is mailbox backpressure: retrying in the same microsecond spends
 /// the whole ladder before the daemon can drain. One short breath per rung.
@@ -649,6 +657,8 @@ enum ResponseBody {
         run_id: String,
         accepted_seq: u64,
     },
+    #[serde(rename = "menu.answer")]
+    MenuAnswer { resolution_seq: u64 },
     #[serde(rename = "account.list")]
     AccountList {
         #[serde(default)]
@@ -760,6 +770,19 @@ enum WireFrame {
         #[serde(default)]
         status: Option<SurfaceStatusWire>,
     },
+    MenuAnswer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        command_id: String,
+        session_id: String,
+        menu_id: String,
+        request_seq: u64,
+        worker_generation: u64,
+        option_key: String,
+        option_index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<MenuInputWire>,
+    },
     Ping {
         nonce: u64,
     },
@@ -769,6 +792,13 @@ enum WireFrame {
     ProtocolError(ProtocolError),
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MenuInputWire {
+    Text { text: String },
+    SecretVaultReference { vault_reference: String },
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1132,7 +1162,15 @@ struct Subscription {
 type RpcReply = oneshot::Sender<Option<Result<ResponseBody, String>>>;
 
 #[cfg(unix)]
-type PendingRpcRequest = (RpcReply, bool);
+#[derive(Debug, Clone, Copy)]
+enum RpcErrorStyle {
+    Detailed,
+    Public,
+    Code,
+}
+
+#[cfg(unix)]
+type PendingRpcRequest = (RpcReply, RpcErrorStyle);
 
 #[cfg(unix)]
 enum ActorCommand {
@@ -1144,6 +1182,16 @@ enum ActorCommand {
         capability: Capability,
         features: FeatureGate,
         public_errors: bool,
+        reply: RpcReply,
+    },
+    MenuAnswer {
+        command_id: String,
+        session_id: String,
+        menu_id: String,
+        request_seq: u64,
+        worker_generation: u64,
+        option_key: String,
+        option_index: u32,
         reply: RpcReply,
     },
     Attach {
@@ -1362,6 +1410,36 @@ async fn rpc_request_with_feature_gate(
             capability,
             features,
             public_errors,
+            reply,
+        })
+        .ok()?;
+    tokio::time::timeout(COMMAND_REPLY_TIMEOUT, answer)
+        .await
+        .ok()?
+        .ok()?
+}
+
+#[cfg(unix)]
+async fn rpc_menu_answer(
+    command_id: String,
+    session_id: String,
+    menu_id: String,
+    request_seq: u64,
+    worker_generation: u64,
+    option_key: String,
+    option_index: u32,
+) -> Option<Result<ResponseBody, String>> {
+    let (reply, answer) = oneshot::channel();
+    actor_handle()
+        .commands
+        .send(ActorCommand::MenuAnswer {
+            command_id,
+            session_id,
+            menu_id,
+            request_seq,
+            worker_generation,
+            option_key,
+            option_index,
             reply,
         })
         .ok()?;
@@ -2157,6 +2235,27 @@ async fn session_seen_request(body: RequestBody) -> Result<Option<ResponseBody>,
 }
 
 #[cfg(unix)]
+fn session_needs_input_features() -> BTreeSet<String> {
+    BTreeSet::from([FEATURE_SESSION_NEEDS_INPUT_V1.to_string()])
+}
+
+#[cfg(unix)]
+async fn session_needs_input_request(body: RequestBody) -> Result<Option<ResponseBody>, String> {
+    match rpc_request_with_feature_gate(
+        body,
+        Capability::Control,
+        FeatureGate::all(session_needs_input_features()),
+        true,
+    )
+    .await
+    {
+        Some(Ok(response)) => Ok(Some(response)),
+        Some(Err(error)) => Err(error),
+        None => Ok(None),
+    }
+}
+
+#[cfg(unix)]
 async fn config_session_summary(
     session_id: &str,
     capability: Capability,
@@ -2227,6 +2326,35 @@ async fn session_seen_session_summary(session_id: &str) -> Result<Option<Value>,
     loop {
         let Some(response) =
             session_seen_request(RequestBody::SessionList { cursor, limit: 256 }).await?
+        else {
+            return Ok(None);
+        };
+        let ResponseBody::SessionList {
+            sessions,
+            next_cursor,
+        } = response
+        else {
+            return Err("session.list response method mismatch".to_string());
+        };
+        if let Some(summary) = sessions
+            .into_iter()
+            .find(|summary| summary.get("session_id").and_then(Value::as_str) == Some(session_id))
+        {
+            return Ok(Some(summary));
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Err(format!("session `{session_id}` was not found"));
+        };
+        cursor = Some(next_cursor);
+    }
+}
+
+#[cfg(unix)]
+async fn session_needs_input_summary(session_id: &str) -> Result<Option<Value>, String> {
+    let mut cursor = None;
+    loop {
+        let Some(response) =
+            session_needs_input_request(RequestBody::SessionList { cursor, limit: 256 }).await?
         else {
             return Ok(None);
         };
@@ -2600,6 +2728,361 @@ fn session_seen_available(connection: &ConnectionSnapshot) -> bool {
 }
 
 #[cfg(unix)]
+fn session_needs_input_available(connection: &ConnectionSnapshot) -> bool {
+    connection.connected && connection.features.contains(FEATURE_SESSION_NEEDS_INPUT_V1)
+}
+
+fn session_answer_menu_option_index(
+    needs_input: &Value,
+    menu_id: &str,
+    request_seq: u64,
+    worker_generation: u64,
+    option_key: &str,
+) -> Result<u32, String> {
+    let stored_fence_matches = needs_input.get("menu_id").and_then(Value::as_str) == Some(menu_id)
+        && needs_input.get("request_seq").and_then(Value::as_u64) == Some(request_seq)
+        && needs_input.get("worker_generation").and_then(Value::as_u64) == Some(worker_generation);
+    if !stored_fence_matches {
+        return Err(HAIDER_NEEDS_INPUT_STALE.to_string());
+    }
+
+    needs_input
+        .get("options")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .position(|option| option.get("key").and_then(Value::as_str) == Some(option_key))
+        })
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or_else(|| HAIDER_NEEDS_INPUT_STALE.to_string())
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct SessionAnswerMenuReplay {
+    command_id: String,
+    provider_session_id: String,
+    option_index: u32,
+}
+
+#[cfg(unix)]
+static SESSION_ANSWER_MENU_REPLAYS: OnceLock<StdMutex<VecDeque<SessionAnswerMenuReplay>>> =
+    OnceLock::new();
+
+#[cfg(unix)]
+fn session_answer_menu_replays() -> &'static StdMutex<VecDeque<SessionAnswerMenuReplay>> {
+    SESSION_ANSWER_MENU_REPLAYS.get_or_init(|| StdMutex::new(VecDeque::new()))
+}
+
+#[cfg(unix)]
+fn session_answer_menu_replay_option_index(
+    command_id: &str,
+    provider_session_id: &str,
+) -> Option<u32> {
+    session_answer_menu_replays()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|replay| {
+            replay.command_id == command_id && replay.provider_session_id == provider_session_id
+        })
+        .map(|replay| replay.option_index)
+}
+
+#[cfg(unix)]
+fn session_answer_menu_remember_replay(
+    command_id: String,
+    provider_session_id: String,
+    option_index: u32,
+) {
+    let mut replays = session_answer_menu_replays()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    replays.retain(|replay| replay.command_id != command_id);
+    if replays.len() >= SESSION_ANSWER_MENU_REPLAY_LIMIT {
+        replays.pop_front();
+    }
+    replays.push_back(SessionAnswerMenuReplay {
+        command_id,
+        provider_session_id,
+        option_index,
+    });
+}
+
+#[cfg(unix)]
+fn session_answer_menu_forget_replay(command_id: &str) {
+    session_answer_menu_replays()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|replay| replay.command_id != command_id);
+}
+
+#[cfg(unix)]
+fn session_answer_menu_attempt_option_index(
+    command_id: &str,
+    provider_session_id: &str,
+    needs_input: &Value,
+    menu_id: &str,
+    request_seq: u64,
+    worker_generation: u64,
+    option_key: &str,
+) -> Result<u32, String> {
+    // Only an answer whose receipt was uncertain may bypass the current card.
+    // Its option index was validated before the original dispatch; retaining it
+    // lets the stable command id reach the daemon after the committed park clears.
+    if let Some(option_index) =
+        session_answer_menu_replay_option_index(command_id, provider_session_id)
+    {
+        return Ok(option_index);
+    }
+    session_answer_menu_option_index(
+        needs_input,
+        menu_id,
+        request_seq,
+        worker_generation,
+        option_key,
+    )
+}
+
+#[cfg(unix)]
+fn session_answer_menu_context(
+    local_session_id: &str,
+    menu_id: &str,
+    request_seq: u64,
+    worker_generation: u64,
+    option_key: &str,
+) -> Result<(String, u32, String), String> {
+    let connection = super::sessions_open_database()?;
+    let row = super::sessions_row_by_id(&connection, local_session_id.trim())?;
+    let provider_session_id = row.provider_session_id.trim();
+    if provider_session_id.is_empty() {
+        return Err("Haider session id is not bound yet.".to_string());
+    }
+    let command_id = session_answer_menu_command_id(
+        provider_session_id,
+        menu_id,
+        request_seq,
+        worker_generation,
+        option_key,
+    );
+    let option_index = session_answer_menu_attempt_option_index(
+        &command_id,
+        provider_session_id,
+        &row.needs_input,
+        menu_id,
+        request_seq,
+        worker_generation,
+        option_key,
+    )?;
+    Ok((provider_session_id.to_string(), option_index, command_id))
+}
+
+#[cfg(unix)]
+fn session_answer_menu_command_id(
+    provider_session_id: &str,
+    menu_id: &str,
+    request_seq: u64,
+    worker_generation: u64,
+    option_key: &str,
+) -> String {
+    fn append_text(material: &mut Vec<u8>, value: &str) {
+        material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        material.extend_from_slice(value.as_bytes());
+    }
+
+    let mut material = Vec::new();
+    material.extend_from_slice(b"diffforge-menu-answer-v1\n");
+    append_text(&mut material, provider_session_id);
+    append_text(&mut material, menu_id);
+    material.extend_from_slice(&request_seq.to_be_bytes());
+    material.extend_from_slice(&worker_generation.to_be_bytes());
+    append_text(&mut material, option_key);
+    format!("diffforge-menu-answer-{}", hex(&blake3_hash(&material)))
+}
+
+#[cfg(unix)]
+fn session_answer_menu_receipt(
+    response: Option<Result<ResponseBody, String>>,
+) -> Result<Value, String> {
+    let response = response.ok_or_else(|| HAIDER_NEEDS_INPUT_ANSWER_UNCERTAIN.to_string())??;
+    match response {
+        receipt @ ResponseBody::MenuAnswer { .. } => serde_json::to_value(receipt)
+            .map_err(|error| format!("Unable to encode menu.answer receipt: {error}")),
+        _ => Err("menu.answer response method mismatch".to_string()),
+    }
+}
+
+#[cfg(unix)]
+enum SessionAnswerMenuRpcError {
+    BeforeAnswer(String),
+    Answer(String),
+}
+
+#[cfg(unix)]
+fn session_answer_menu_update_replay(
+    command_id: &str,
+    provider_session_id: &str,
+    option_index: u32,
+    answer: &Result<Option<Value>, SessionAnswerMenuRpcError>,
+) {
+    match answer {
+        Ok(Some(_)) => session_answer_menu_forget_replay(command_id),
+        Err(SessionAnswerMenuRpcError::Answer(error))
+            if error == HAIDER_NEEDS_INPUT_ANSWER_UNCERTAIN =>
+        {
+            session_answer_menu_remember_replay(
+                command_id.to_string(),
+                provider_session_id.to_string(),
+                option_index,
+            );
+        }
+        Err(SessionAnswerMenuRpcError::Answer(error))
+            if matches!(error.as_str(), "already_resolved" | "stale_generation") =>
+        {
+            session_answer_menu_forget_replay(command_id);
+        }
+        Ok(None)
+        | Err(SessionAnswerMenuRpcError::BeforeAnswer(_))
+        | Err(SessionAnswerMenuRpcError::Answer(_)) => {}
+    }
+}
+
+#[cfg(unix)]
+async fn session_answer_menu_rpc_inner(
+    command_id: String,
+    session_id: String,
+    menu_id: String,
+    request_seq: u64,
+    worker_generation: u64,
+    option_key: String,
+    option_index: u32,
+) -> Result<Option<Value>, SessionAnswerMenuRpcError> {
+    let Some(summary) = session_needs_input_summary(&session_id)
+        .await
+        .map_err(SessionAnswerMenuRpcError::BeforeAnswer)?
+    else {
+        return Ok(None);
+    };
+    let head_seq = config_u64(summary.get("head_seq")).ok_or_else(|| {
+        SessionAnswerMenuRpcError::BeforeAnswer("session summary head_seq was missing".to_string())
+    })?;
+    let Some(response) = session_needs_input_request(RequestBody::SessionAttach {
+        session_id: session_id.clone(),
+        after_seq: head_seq,
+        mode: AttachMode::Control,
+        sealed_replay: false,
+    })
+    .await
+    .map_err(SessionAnswerMenuRpcError::BeforeAnswer)?
+    else {
+        return Ok(None);
+    };
+    let ResponseBody::SessionAttach {
+        attachment_id,
+        attach_state,
+    } = response
+    else {
+        return Err(SessionAnswerMenuRpcError::BeforeAnswer(
+            "session.attach response method mismatch".to_string(),
+        ));
+    };
+    if attach_state.session_id != session_id {
+        let _ = session_needs_input_request(RequestBody::SessionDetach { attachment_id }).await;
+        return Err(SessionAnswerMenuRpcError::BeforeAnswer(
+            "session.attach response session mismatch".to_string(),
+        ));
+    }
+
+    let answer = async {
+        let response = rpc_menu_answer(
+            command_id,
+            session_id,
+            menu_id,
+            request_seq,
+            worker_generation,
+            option_key,
+            option_index,
+        )
+        .await;
+        session_answer_menu_receipt(response)
+            .map(Some)
+            .map_err(SessionAnswerMenuRpcError::Answer)
+    }
+    .await;
+
+    let _ = session_needs_input_request(RequestBody::SessionDetach { attachment_id }).await;
+    answer
+}
+
+/// Resolves a daemon-owned needs-input card using the exact staleness fence
+/// supplied by the frontend. The option index is recovered from the locally
+/// stored card because the daemon validates the committed key/index pair.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_answer_menu(
+    session_id: String,
+    menu_id: String,
+    request_seq: u64,
+    worker_generation: u64,
+    option_key: String,
+) -> Result<Value, String> {
+    #[cfg(unix)]
+    {
+        if !session_needs_input_available(&actor_handle().connection.borrow()) {
+            return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
+        }
+        let context_session_id = session_id;
+        let context_menu_id = menu_id.clone();
+        let context_option_key = option_key.clone();
+        let (provider_session_id, option_index, command_id) =
+            tauri::async_runtime::spawn_blocking(move || {
+                session_answer_menu_context(
+                    &context_session_id,
+                    &context_menu_id,
+                    request_seq,
+                    worker_generation,
+                    &context_option_key,
+                )
+            })
+            .await
+            .map_err(|error| format!("Session menu answer worker failed: {error}"))??;
+        let answer = session_answer_menu_rpc_inner(
+            command_id.clone(),
+            provider_session_id.clone(),
+            menu_id,
+            request_seq,
+            worker_generation,
+            option_key,
+            option_index,
+        )
+        .await;
+        session_answer_menu_update_replay(&command_id, &provider_session_id, option_index, &answer);
+        return match answer {
+            Ok(Some(receipt)) => Ok(receipt),
+            Ok(None) => Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string()),
+            Err(SessionAnswerMenuRpcError::BeforeAnswer(error))
+                if error.starts_with("missing_feature:") =>
+            {
+                Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string())
+            }
+            Err(SessionAnswerMenuRpcError::BeforeAnswer(error))
+            | Err(SessionAnswerMenuRpcError::Answer(error)) => Err(error),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            session_id,
+            menu_id,
+            request_seq,
+            worker_generation,
+            option_key,
+        );
+        Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string())
+    }
+}
+
+#[cfg(unix)]
 async fn resident_turn_submit_rpc_inner(
     session_id: String,
     prompt: String,
@@ -2963,6 +3446,9 @@ fn apply_disconnected_command(
         ActorCommand::RpcRequest { reply, .. } => {
             let _ = reply.send(None);
         }
+        ActorCommand::MenuAnswer { reply, .. } => {
+            let _ = reply.send(None);
+        }
         ActorCommand::Attach {
             app,
             session_id,
@@ -3073,8 +3559,8 @@ async fn run_connected(
                 {
                     emit_surface(subscriptions, &connection, session_id, input, status);
                 }
-                if let Some((reply, public_errors)) = pending_requests.remove(&request_id) {
-                    let _ = reply.send(Some(response_result(body, public_errors)));
+                if let Some((reply, error_style)) = pending_requests.remove(&request_id) {
+                    let _ = reply.send(Some(response_result(body, error_style)));
                 }
             }
             WireFrame::SessionRosterDelta { summaries } => {
@@ -3175,7 +3661,54 @@ async fn apply_connected_command(
                 let _ = reply.send(None);
                 return false;
             }
-            pending_requests.insert(request_id, (reply, public_errors));
+            let error_style = if public_errors {
+                RpcErrorStyle::Public
+            } else {
+                RpcErrorStyle::Detailed
+            };
+            pending_requests.insert(request_id, (reply, error_style));
+            true
+        }
+        ActorCommand::MenuAnswer {
+            command_id,
+            session_id,
+            menu_id,
+            request_seq,
+            worker_generation,
+            option_key,
+            option_index,
+            reply,
+        } => {
+            if !connection.grants(Capability::Control) {
+                let _ = reply.send(Some(Err("capability_denied".to_string())));
+                return true;
+            }
+            if !connection.features.contains(FEATURE_SESSION_NEEDS_INPUT_V1) {
+                let _ = reply.send(Some(Err(format!(
+                    "missing_feature: daemon does not advertise {FEATURE_SESSION_NEEDS_INPUT_V1}"
+                ))));
+                return true;
+            }
+            let request_id = request_id(next_request);
+            let request = WireFrame::MenuAnswer {
+                request_id: Some(request_id.clone()),
+                command_id,
+                session_id,
+                menu_id,
+                request_seq,
+                worker_generation,
+                option_key,
+                option_index,
+                input: None,
+            };
+            if write_frame(stream, &request, connection.frame_limit, encoding)
+                .await
+                .is_err()
+            {
+                let _ = reply.send(None);
+                return false;
+            }
+            pending_requests.insert(request_id, (reply, RpcErrorStyle::Code));
             true
         }
         ActorCommand::Attach {
@@ -3319,9 +3852,10 @@ fn gated_surface_snapshot(
 }
 
 #[cfg(unix)]
-fn response_result(body: ResponseBody, public_errors: bool) -> Result<ResponseBody, String> {
+fn response_result(body: ResponseBody, error_style: RpcErrorStyle) -> Result<ResponseBody, String> {
     match body {
-        ResponseBody::Error { code, data, .. } if public_errors => {
+        ResponseBody::Error { code, .. } if matches!(error_style, RpcErrorStyle::Code) => Err(code),
+        ResponseBody::Error { code, data, .. } if matches!(error_style, RpcErrorStyle::Public) => {
             Err(public_rpc_error(code, data))
         }
         ResponseBody::Error {
@@ -4339,6 +4873,215 @@ mod tests {
     }
 
     #[test]
+    fn menu_answer_frame_matches_daemon_reference_json_bytes() {
+        let answer = WireFrame::MenuAnswer {
+            request_id: Some("request-menu-1".to_owned()),
+            command_id: "command-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            menu_id: "effect-recovery-8145a5758008720489a9af70".to_owned(),
+            request_seq: 1843,
+            worker_generation: 122,
+            option_key: "probe".to_owned(),
+            option_index: 0,
+            input: None,
+        };
+        let framed = encode_framed(&answer, DEFAULT_FRAME_LIMIT).expect("encode menu answer");
+        assert_eq!(
+            std::str::from_utf8(&framed[4..]).expect("menu answer JSON"),
+            r#"{"v":1,"kind":"menu_answer","request_id":"request-menu-1","command_id":"command-1","session_id":"session-1","menu_id":"effect-recovery-8145a5758008720489a9af70","request_seq":1843,"worker_generation":122,"option_key":"probe","option_index":0}"#
+        );
+        assert_eq!(
+            u32::from_be_bytes(framed[..4].try_into().expect("menu answer prefix")) as usize,
+            framed.len() - 4
+        );
+        assert_eq!(
+            decode_body(&framed[4..], DEFAULT_FRAME_LIMIT).expect("decode menu answer"),
+            answer
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn menu_answer_command_id_is_stable_for_one_logical_answer() {
+        let command_id =
+            session_answer_menu_command_id("session-1", "effect-recovery-1", 1843, 122, "probe");
+        assert_eq!(
+            command_id,
+            "diffforge-menu-answer-381f44d1fdce9b5283082c7364b5dbe20713b8213eb9fd0420497be2751c6269"
+        );
+        assert_eq!(
+            session_answer_menu_command_id("session-1", "effect-recovery-1", 1843, 122, "probe"),
+            command_id
+        );
+        assert!(command_id.starts_with("diffforge-menu-answer-"));
+
+        for different_answer in [
+            session_answer_menu_command_id("session-1", "effect-recovery-1", 1843, 122, "retry"),
+            session_answer_menu_command_id("session-1", "effect-recovery-2", 1843, 122, "probe"),
+            session_answer_menu_command_id("session-1", "effect-recovery-1", 1844, 122, "probe"),
+            session_answer_menu_command_id("session-1", "effect-recovery-1", 1843, 123, "probe"),
+            session_answer_menu_command_id("session-2", "effect-recovery-1", 1843, 122, "probe"),
+        ] {
+            assert_ne!(different_answer, command_id);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn menu_answer_missing_receipt_reports_safe_retry_uncertainty() {
+        assert_eq!(
+            session_answer_menu_receipt(None).unwrap_err(),
+            HAIDER_NEEDS_INPUT_ANSWER_UNCERTAIN
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_menu_answer_retry_reuses_the_validated_index_after_card_clear() {
+        let provider_session_id = "session-uncertain-replay";
+        let menu_id = "effect-recovery-uncertain-replay";
+        let command_id =
+            session_answer_menu_command_id(provider_session_id, menu_id, 1843, 122, "retry");
+        session_answer_menu_forget_replay(&command_id);
+        assert_eq!(
+            session_answer_menu_attempt_option_index(
+                &command_id,
+                provider_session_id,
+                &Value::Null,
+                menu_id,
+                1843,
+                122,
+                "retry",
+            )
+            .unwrap_err(),
+            HAIDER_NEEDS_INPUT_STALE
+        );
+
+        session_answer_menu_remember_replay(command_id.clone(), provider_session_id.to_string(), 2);
+        assert_eq!(
+            session_answer_menu_attempt_option_index(
+                &command_id,
+                provider_session_id,
+                &Value::Null,
+                menu_id,
+                1843,
+                122,
+                "retry",
+            )
+            .unwrap(),
+            2
+        );
+        session_answer_menu_forget_replay(&command_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_menu_answer_replay_survives_pre_answer_failures() {
+        let command_id = "diffforge-menu-answer-pre-answer-failure";
+        let provider_session_id = "session-pre-answer-failure";
+        session_answer_menu_remember_replay(
+            command_id.to_string(),
+            provider_session_id.to_string(),
+            3,
+        );
+
+        let pre_answer_failure = Err(SessionAnswerMenuRpcError::BeforeAnswer(
+            "draining".to_string(),
+        ));
+        session_answer_menu_update_replay(command_id, provider_session_id, 3, &pre_answer_failure);
+        assert_eq!(
+            session_answer_menu_replay_option_index(command_id, provider_session_id),
+            Some(3)
+        );
+
+        let pre_lookup_answer_error =
+            Err(SessionAnswerMenuRpcError::Answer("draining".to_string()));
+        session_answer_menu_update_replay(
+            command_id,
+            provider_session_id,
+            3,
+            &pre_lookup_answer_error,
+        );
+        assert_eq!(
+            session_answer_menu_replay_option_index(command_id, provider_session_id),
+            Some(3)
+        );
+
+        let conclusive_answer_error = Err(SessionAnswerMenuRpcError::Answer(
+            "already_resolved".to_string(),
+        ));
+        session_answer_menu_update_replay(
+            command_id,
+            provider_session_id,
+            3,
+            &conclusive_answer_error,
+        );
+        assert_eq!(
+            session_answer_menu_replay_option_index(command_id, provider_session_id),
+            None
+        );
+    }
+
+    #[test]
+    fn menu_answer_option_index_requires_the_callers_fence() {
+        let card = serde_json::json!({
+            "menu_id": "effect-recovery-1",
+            "request_seq": 1843,
+            "worker_generation": 122,
+            "options": [
+                {"key":"probe"},
+                {"key":"mark_done"},
+                {"key":"retry"},
+                {"key":"abandon"}
+            ]
+        });
+        assert_eq!(
+            session_answer_menu_option_index(&card, "effect-recovery-1", 1843, 122, "retry")
+                .unwrap(),
+            2
+        );
+
+        for stale_card in [
+            serde_json::json!({
+                "menu_id": "effect-recovery-2",
+                "request_seq": 1843,
+                "worker_generation": 122,
+                "options": [{"key":"retry"}]
+            }),
+            serde_json::json!({
+                "menu_id": "effect-recovery-1",
+                "request_seq": 1844,
+                "worker_generation": 122,
+                "options": [{"key":"retry"}]
+            }),
+            serde_json::json!({
+                "menu_id": "effect-recovery-1",
+                "request_seq": 1843,
+                "worker_generation": 123,
+                "options": [{"key":"retry"}]
+            }),
+            Value::Null,
+        ] {
+            assert_eq!(
+                session_answer_menu_option_index(
+                    &stale_card,
+                    "effect-recovery-1",
+                    1843,
+                    122,
+                    "retry"
+                )
+                .unwrap_err(),
+                HAIDER_NEEDS_INPUT_STALE
+            );
+        }
+        assert_eq!(
+            session_answer_menu_option_index(&card, "effect-recovery-1", 1843, 122, "missing")
+                .unwrap_err(),
+            HAIDER_NEEDS_INPUT_STALE
+        );
+    }
+
+    #[test]
     fn roster_watch_and_session_config_frames_match_reference_json_bytes() {
         let encoded = |frame: WireFrame| {
             let framed = encode_framed(&frame, DEFAULT_FRAME_LIMIT).expect("encode frame");
@@ -4586,6 +5329,26 @@ mod tests {
             .insert(FEATURE_SESSION_SEEN_V1.to_string());
         connection.connected = false;
         assert!(!session_seen_available(&connection));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn menu_answer_requires_a_live_feature_advertisement() {
+        let mut connection = ConnectionSnapshot {
+            connected: true,
+            features: BTreeSet::from([FEATURE_SESSION_NEEDS_INPUT_V1.to_string()]),
+            ..ConnectionSnapshot::default()
+        };
+        assert!(session_needs_input_available(&connection));
+
+        connection.features.clear();
+        assert!(!session_needs_input_available(&connection));
+
+        connection
+            .features
+            .insert(FEATURE_SESSION_NEEDS_INPUT_V1.to_string());
+        connection.connected = false;
+        assert!(!session_needs_input_available(&connection));
     }
 
     #[test]
