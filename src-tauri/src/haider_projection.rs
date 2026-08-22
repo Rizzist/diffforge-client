@@ -7,7 +7,7 @@ const HAIDER_PROJECTION_MAX_EXPORT_BYTES: u64 = 32 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_WINDOW_ROWS: i64 = 1_000;
 const HAIDER_PROJECTION_WATCH_LIMIT: usize = 6;
-const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 4;
+const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 5;
 const HAIDER_PROJECTION_PIPE_BATCH_LINES: usize = 256;
 const HAIDER_PROJECTION_PIPE_SAFETY_POLL: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_PIPE_STOP_POLL: Duration = Duration::from_millis(100);
@@ -61,8 +61,8 @@ struct HaiderProjectionFoldState {
     seen_sequences: HashSet<(i64, i64)>,
     pipe_eof_max_seq: Option<i64>,
     /* Enveloped watch/run items are canonical over compat records from those
-       same sources. Native pipes have a separate fold door because their
-       role-shaped rows are the canonical stream. */
+    same sources. Native pipes have a separate fold door because their
+    role-shaped rows are the canonical stream. */
     saw_item_stream: bool,
 }
 
@@ -210,11 +210,14 @@ impl Drop for HaiderProjectionForeground {
 struct HaiderProjectionPipeHeader {
     session_id: String,
     generation: i64,
+    segment_index: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct HaiderProjectionPipeCursor {
     session_id: String,
+    segment_name: String,
+    segment_index: i64,
     byte_offset: i64,
     last_seq: i64,
     last_ordinal: i64,
@@ -222,7 +225,7 @@ struct HaiderProjectionPipeCursor {
     covered_through_seq: i64,
     coverage_known: bool,
     /* Retained in the cursor schema for compatibility with v2 stores. Native
-       pipe folding no longer reads this cross-source bit. */
+    pipe folding no longer reads this cross-source bit. */
     saw_item_stream: bool,
 }
 
@@ -393,6 +396,8 @@ fn haider_projection_migrate_database(connection: &mut rusqlite::Connection) -> 
                 ON session_projection_rows(session_id, seq, ordinal);
              CREATE TABLE IF NOT EXISTS session_pipe_cursors (
                 session_id TEXT PRIMARY KEY,
+                segment_name TEXT NOT NULL DEFAULT '',
+                segment_index INTEGER NOT NULL DEFAULT 0,
                 byte_offset INTEGER NOT NULL,
                 last_seq INTEGER NOT NULL,
                 last_ordinal INTEGER NOT NULL,
@@ -808,16 +813,16 @@ fn haider_projection_item_class(item: &Value) -> (&'static str, &'static str) {
         }
         "incomplete_agent_message" => ("message", "assistant"),
         /* Reasoning renders as its own collapsed block, never as the answer —
-           DeepSeek-style open chains of thought otherwise read as the reply. */
+        DeepSeek-style open chains of thought otherwise read as the reply. */
         "reasoning" | "plan" => ("thinking", "assistant"),
         "refusal" => ("error", "assistant"),
         "tool_call" | "command_execution" | "file_change" | "child_spawn" | "child_result"
         | "context_compaction" | "extension" => ("tool", "tool"),
         /* The item vocabulary is OPEN and already wider than this list. An
-           unrecognised but NAMED kind renders in the tool cluster — the
-           neutral container — because dropping it means a future item type
-           silently disappears from the transcript instead of degrading. A
-           payload with no kind at all is not an item and is still skipped. */
+        unrecognised but NAMED kind renders in the tool cluster — the
+        neutral container — because dropping it means a future item type
+        silently disappears from the transcript instead of degrading. A
+        payload with no kind at all is not an item and is still skipped. */
         "" => ("", ""),
         _ => ("tool", "tool"),
     }
@@ -892,11 +897,11 @@ fn haider_projection_export_row(
         ),
         "usage" => ("usage", "meta", String::new()),
         /* The role vocabulary is OPEN — it already grew past user/assistant/
-           tool once. An unrecognised role keeps its own name rather than
-           borrowing "assistant", so its text is shown without the transcript
-           claiming the MODEL said it; dropping it would make a future role
-           disappear with nothing to notice. A row with no role at all is not
-           a row. */
+        tool once. An unrecognised role keeps its own name rather than
+        borrowing "assistant", so its text is shown without the transcript
+        claiming the MODEL said it; dropping it would make a future role
+        disappear with nothing to notice. A row with no role at all is not
+        a row. */
         "" => return None,
         other => (
             "message",
@@ -1123,9 +1128,9 @@ fn haider_projection_fold_value_locked(
 
     if payload_object.is_some_and(|object| object.contains_key("role")) {
         /* Once the enveloped item stream is live it is canonical: bare
-           role-shaped compat records would duplicate its content at fresh
-           seqs (and add empty turn-start markers). Cold export folds and
-           pre-item pipes never set the flag, so their rows all land. */
+        role-shaped compat records would duplicate its content at fresh
+        seqs (and add empty turn-start markers). Cold export folds and
+        pre-item pipes never set the flag, so their rows all land. */
         if !state.saw_item_stream {
             if let Some(row) = haider_projection_export_row(state, session_id, payload) {
                 step.rows.push(row);
@@ -1265,23 +1270,124 @@ fn haider_projection_fold_pipe_value_locked(
     value: &Value,
 ) -> HaiderProjectionFoldStep {
     let payload = haider_projection_payload(value);
+
+    /* v4 introduced rows discriminated by `kind` that carry NO role at all.
+    They have to be recognised before the role check below, which treats a
+    roleless row as not-a-row. */
+    if let Some(row) = haider_projection_pipe_kind_row(state, session_id, payload) {
+        let mut step = HaiderProjectionFoldStep::default();
+        step.rows.push(row);
+        return step;
+    }
+
     let compat_role = payload
         .as_object()
         .and_then(|object| object.get("role"))
         .and_then(Value::as_str)
         .is_some_and(|role| matches!(role, "user" | "assistant" | "tool" | "error"));
     if !compat_role {
-        return haider_projection_fold_value_locked(state, session_id, value);
+        let mut step = haider_projection_fold_value_locked(state, session_id, value);
+        let ordinal = haider_projection_pipe_projection_ordinal(payload, 0);
+        for row in &mut step.rows {
+            row.ordinal = ordinal;
+        }
+        return step;
     }
 
     /* 0.0.937 native pipes contain only bare compat rows. An item envelope
-       observed through run/watch/export must not suppress later pipe growth:
-       doing so advanced the byte cursor while silently dropping the row. */
+    observed through run/watch/export must not suppress later pipe growth:
+    doing so advanced the byte cursor while silently dropping the row.
+
+    This also carries v4's reasoning, and it is why compat rows must never be
+    dropped on this path: EVERY reasoning row the daemon writes is marked
+    compat: true, so the documented "safe to drop" reading of that flag costs
+    100% of the thinking. */
     let mut step = HaiderProjectionFoldStep::default();
-    if let Some(row) = haider_projection_export_row(state, session_id, payload) {
+    let reasoning = haider_projection_pipe_reasoning_row(state, session_id, payload);
+    let has_reasoning = reasoning.is_some();
+    let carried_only_reasoning = has_reasoning
+        && haider_projection_extract_text(payload)
+            .filter(|text| !text.trim().is_empty())
+            .is_none();
+    if let Some(row) = reasoning {
         step.rows.push(row);
     }
+    /* Reasoning rides the row where the thinking HAPPENED — before the tool
+    calls — not the answer row, and 57% of those rows carry no text. Emitting
+    the message row anyway would put an empty assistant bubble under every
+    thinking fold. */
+    if !carried_only_reasoning {
+        if let Some(mut row) = haider_projection_export_row(state, session_id, payload) {
+            row.ordinal =
+                haider_projection_pipe_projection_ordinal(payload, i64::from(has_reasoning));
+            step.rows.push(row);
+        }
+    }
     step
+}
+
+/* A v4 row named by `kind` rather than `role`. Kept open-vocabulary on purpose:
+an unfamiliar kind is passed to the generic fold rather than recognised here,
+so this function only claims the kinds it can actually render. */
+fn haider_projection_pipe_kind_row(
+    state: &mut HaiderProjectionFoldState,
+    session_id: &str,
+    payload: &Value,
+) -> Option<SessionProjectionRow> {
+    let object = payload.as_object()?;
+    let kind = haider_projection_text(object.get("kind"))?;
+    if kind != "compaction_boundary" {
+        return None;
+    }
+    Some(haider_projection_row(
+        session_id,
+        haider_projection_seq(state, payload, payload),
+        haider_projection_pipe_projection_ordinal(payload, 0),
+        String::new(),
+        "compaction_boundary",
+        "meta",
+        String::new(),
+        // run_id and branch_id ride in meta verbatim rather than being lifted
+        // into named fields; the daemon owns that vocabulary.
+        payload.clone(),
+        haider_projection_at_ms(payload, payload),
+    ))
+}
+
+/* v4 seals reasoning onto the row where it happened. Deliberately NOT folded
+into export_row: that function returns one row, and a single assistant row
+can now produce both a thinking fold and a reply. */
+fn haider_projection_pipe_reasoning_row(
+    state: &mut HaiderProjectionFoldState,
+    session_id: &str,
+    payload: &Value,
+) -> Option<SessionProjectionRow> {
+    let object = payload.as_object()?;
+    if object.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let reasoning = haider_projection_text(object.get("reasoning"))?;
+    Some(haider_projection_row(
+        session_id,
+        haider_projection_seq(state, payload, payload),
+        haider_projection_pipe_projection_ordinal(payload, 0),
+        haider_projection_branch_id(payload, payload),
+        "thinking",
+        "assistant",
+        reasoning,
+        payload.clone(),
+        haider_projection_at_ms(payload, payload),
+    ))
+}
+
+/* One wire row can project into a thinking row followed by assistant text.
+Reserve two adjacent projection ordinals per wire ordinal so both survive
+the `(session_id, seq, ordinal)` primary key without colliding with a later
+wire row at the same sequence. */
+fn haider_projection_pipe_projection_ordinal(payload: &Value, phase: i64) -> i64 {
+    haider_projection_ordinal(payload, payload)
+        .saturating_mul(2)
+        .saturating_add(phase.clamp(0, 1))
 }
 
 fn haider_projection_input_items(value: &Value) -> Vec<&Value> {
@@ -1354,10 +1460,13 @@ fn haider_projection_persist_batch(
             transaction
                 .prepare_cached(
                     "INSERT INTO session_pipe_cursors (
-                    session_id, byte_offset, last_seq, last_ordinal, generation,
-                    covered_through_seq, coverage_known, saw_item_stream
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    session_id, segment_name, segment_index, byte_offset,
+                    last_seq, last_ordinal, generation, covered_through_seq,
+                    coverage_known, saw_item_stream
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(session_id) DO UPDATE SET
+                    segment_name = excluded.segment_name,
+                    segment_index = excluded.segment_index,
                     byte_offset = excluded.byte_offset,
                     last_seq = CASE
                         WHEN (excluded.last_seq, excluded.last_ordinal) >=
@@ -1380,11 +1489,15 @@ fn haider_projection_persist_batch(
                         excluded.saw_item_stream
                     )
                  WHERE session_pipe_cursors.generation = excluded.generation
-                   AND session_pipe_cursors.byte_offset <= excluded.byte_offset",
+                   AND (session_pipe_cursors.segment_index < excluded.segment_index
+                        OR (session_pipe_cursors.segment_index = excluded.segment_index
+                            AND session_pipe_cursors.byte_offset <= excluded.byte_offset))",
                 )
                 .and_then(|mut statement| {
                     statement.execute(rusqlite::params![
                         cursor.session_id,
+                        cursor.segment_name,
+                        cursor.segment_index,
                         cursor.byte_offset,
                         cursor.last_seq,
                         cursor.last_ordinal,
@@ -1406,10 +1519,7 @@ fn haider_projection_persist_batch(
                             excluded.covered_through_seq)",
                 )
                 .and_then(|mut statement| {
-                    statement.execute(rusqlite::params![
-                        session_id,
-                        journal.covered_through_seq,
-                    ])
+                    statement.execute(rusqlite::params![session_id, journal.covered_through_seq,])
                 })
                 .map_err(|error| format!("Unable to persist session journal cursor: {error}"))?;
         }
@@ -1457,21 +1567,24 @@ fn haider_projection_load_pipe_cursor(
     haider_projection_with_database(|connection| {
         let result = connection
             .prepare_cached(
-                "SELECT session_id, byte_offset, last_seq, last_ordinal, generation,
-                        covered_through_seq, coverage_known, saw_item_stream
+                "SELECT session_id, segment_name, segment_index, byte_offset,
+                        last_seq, last_ordinal, generation, covered_through_seq,
+                        coverage_known, saw_item_stream
                  FROM session_pipe_cursors WHERE session_id = ?1",
             )
             .and_then(|mut statement| {
                 statement.query_row([session_id], |row| {
                     Ok(HaiderProjectionPipeCursor {
                         session_id: row.get(0)?,
-                        byte_offset: row.get(1)?,
-                        last_seq: row.get(2)?,
-                        last_ordinal: row.get(3)?,
-                        generation: row.get(4)?,
-                        covered_through_seq: row.get(5)?,
-                        coverage_known: row.get(6)?,
-                        saw_item_stream: row.get(7)?,
+                        segment_name: row.get(1)?,
+                        segment_index: row.get(2)?,
+                        byte_offset: row.get(3)?,
+                        last_seq: row.get(4)?,
+                        last_ordinal: row.get(5)?,
+                        generation: row.get(6)?,
+                        covered_through_seq: row.get(7)?,
+                        coverage_known: row.get(8)?,
+                        saw_item_stream: row.get(9)?,
                     })
                 })
             });
@@ -1560,13 +1673,16 @@ fn haider_projection_reset_pipe_session(
         transaction
             .prepare_cached(
                 "INSERT INTO session_pipe_cursors (
-                session_id, byte_offset, last_seq, last_ordinal, generation,
-                covered_through_seq, coverage_known, saw_item_stream
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                session_id, segment_name, segment_index, byte_offset,
+                last_seq, last_ordinal, generation, covered_through_seq,
+                coverage_known, saw_item_stream
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )
             .and_then(|mut statement| {
                 statement.execute(rusqlite::params![
                     cursor.session_id,
+                    cursor.segment_name,
+                    cursor.segment_index,
                     cursor.byte_offset,
                     cursor.last_seq,
                     cursor.last_ordinal,
@@ -1590,16 +1706,14 @@ fn haider_projection_reset_pipe_session(
 
 fn haider_projection_caught_up(
     head_seq: Option<i64>,
-    covered_through_seq: Option<i64>,
+    journal_covered_through_seq: Option<i64>,
     pipe_eof_max_seq: Option<i64>,
 ) -> bool {
     let Some(head_seq) = head_seq else {
         return true;
     };
-    if let Some(covered_through_seq) = covered_through_seq {
-        return covered_through_seq >= head_seq;
-    }
-    pipe_eof_max_seq.is_none_or(|max_seq| max_seq >= head_seq)
+    journal_covered_through_seq.is_some_and(|coverage| coverage >= head_seq)
+        || pipe_eof_max_seq.is_some_and(|max_seq| max_seq >= head_seq)
 }
 
 fn haider_projection_sync(
@@ -1611,8 +1725,8 @@ fn haider_projection_sync(
         .as_ref()
         .filter(|cursor| cursor.coverage_known)
         .map(|cursor| cursor.covered_through_seq);
-    let journal_coverage = haider_projection_load_journal_cursor(session_id)?
-        .map(|cursor| cursor.covered_through_seq);
+    let journal_coverage =
+        haider_projection_load_journal_cursor(session_id)?.map(|cursor| cursor.covered_through_seq);
     let covered_through_seq = match (journal_coverage, pipe_coverage) {
         (Some(left), Some(right)) => Some(left.max(right)),
         (Some(value), None) | (None, Some(value)) => Some(value),
@@ -1627,7 +1741,7 @@ fn haider_projection_sync(
     Ok(HaiderProjectionSync {
         covered_through_seq,
         head_seq,
-        caught_up: haider_projection_caught_up(head_seq, covered_through_seq, pipe_eof_max_seq),
+        caught_up: haider_projection_caught_up(head_seq, journal_coverage, pipe_eof_max_seq),
     })
 }
 
@@ -1729,8 +1843,8 @@ fn haider_projection_ingest_journal_page(
             poisoned.into_inner()
         }
     };
-    let prior_coverage = haider_projection_load_journal_cursor(session_id)?
-        .map(|cursor| cursor.covered_through_seq);
+    let prior_coverage =
+        haider_projection_load_journal_cursor(session_id)?.map(|cursor| cursor.covered_through_seq);
     let prior_head = haider_bridge_head_seq(provider_session_id);
     if reset {
         haider_projection_reset_journal_session(session_id)?;
@@ -1760,8 +1874,7 @@ fn haider_projection_ingest_journal_page(
     let journal = HaiderProjectionJournalCommit {
         covered_through_seq,
     };
-    let persisted =
-        haider_projection_persist_batch(session_id, &all_rows, None, Some(&journal))?;
+    let persisted = haider_projection_persist_batch(session_id, &all_rows, None, Some(&journal))?;
     let appended = persisted.rows.len();
     let start_total = (appended > 0).then(|| {
         persisted
@@ -1934,17 +2047,18 @@ async fn haider_projection_ingest_journal(
     provider_session_id: String,
 ) -> Result<HaiderProjectionJournalIngest, String> {
     let inspect_session_id = session_id.clone();
-    let (journal_cursor, pipe_cursor, pipe_active) = tauri::async_runtime::spawn_blocking(move || {
-        Ok::<_, String>((
-            haider_projection_load_journal_cursor(&inspect_session_id)?,
-            haider_projection_load_pipe_cursor(&inspect_session_id)?,
-            haider_projection_pipe_manager()
-                .lock()
-                .is_ok_and(|manager| manager.tails.contains_key(&inspect_session_id)),
-        ))
-    })
-    .await
-    .map_err(|error| format!("Session journal cursor worker failed: {error}"))??;
+    let (journal_cursor, pipe_cursor, pipe_active) =
+        tauri::async_runtime::spawn_blocking(move || {
+            Ok::<_, String>((
+                haider_projection_load_journal_cursor(&inspect_session_id)?,
+                haider_projection_load_pipe_cursor(&inspect_session_id)?,
+                haider_projection_pipe_manager()
+                    .lock()
+                    .is_ok_and(|manager| manager.tails.contains_key(&inspect_session_id)),
+            ))
+        })
+        .await
+        .map_err(|error| format!("Session journal cursor worker failed: {error}"))??;
     // Any pipe cursor beside journal coverage proves an offline fallback has
     // appended since the last canonical page. Rebuild from sequence one so
     // richer item metadata always wins when ADE comes back.
@@ -1962,12 +2076,8 @@ async fn haider_projection_ingest_journal(
     };
     let page_size = u64::try_from(HAIDER_PROJECTION_MAX_WINDOW_ROWS.max(1)).unwrap_or(1);
     let mut end_seq = start_seq.saturating_add(page_size.saturating_sub(1));
-    let Some(first) = haider_rpc_ade::session_read_rpc(
-        provider_session_id.clone(),
-        start_seq,
-        end_seq,
-    )
-    .await
+    let Some(first) =
+        haider_rpc_ade::session_read_rpc(provider_session_id.clone(), start_seq, end_seq).await
     else {
         return Ok(HaiderProjectionJournalIngest::Unavailable);
     };
@@ -2013,12 +2123,8 @@ async fn haider_projection_ingest_journal(
         end_seq = start_seq
             .saturating_add(page_size.saturating_sub(1))
             .min(target_head);
-        let Some(next) = haider_rpc_ade::session_read_rpc(
-            provider_session_id.clone(),
-            start_seq,
-            end_seq,
-        )
-        .await
+        let Some(next) =
+            haider_rpc_ade::session_read_rpc(provider_session_id.clone(), start_seq, end_seq).await
         else {
             // The committed prefix remains valid. The tail will retry from
             // its cursor and activate the pipe only if the connection stays
@@ -2067,13 +2173,9 @@ fn haider_projection_start_journal_tail(
         );
     }
     tauri::async_runtime::spawn(async move {
-        while !HAIDER_PROJECTION_STOPPING.load(Ordering::Acquire)
-            && !stop.load(Ordering::Acquire)
-        {
+        while !HAIDER_PROJECTION_STOPPING.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
             sleep(HAIDER_PROJECTION_PIPE_SAFETY_POLL).await;
-            if HAIDER_PROJECTION_STOPPING.load(Ordering::Acquire)
-                || stop.load(Ordering::Acquire)
-            {
+            if HAIDER_PROJECTION_STOPPING.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
                 break;
             }
             match haider_projection_ingest_journal(
@@ -2093,8 +2195,7 @@ fn haider_projection_start_journal_tail(
                     let fallback_app = app.clone();
                     let fallback_session_id = session_id.clone();
                     let _ = tauri::async_runtime::spawn_blocking(move || {
-                        let mut foreground =
-                            haider_projection_foreground(&fallback_session_id);
+                        let mut foreground = haider_projection_foreground(&fallback_session_id);
                         if haider_projection_attach_blocking(
                             fallback_app,
                             fallback_session_id,
@@ -2503,8 +2604,15 @@ fn haider_projection_parse_pipe_header(
     let version = haider_projection_json_i64(object.get("version"))
         .ok_or_else(|| "Haider pipe header version was missing.".to_string())?;
     // v2 = 0.0.932 baseline; v3 (0.0.934) adds args_preview/result_preview on
-    // tool rows — additive, and they ride into row meta untouched.
-    if !(2..=3).contains(&version) {
+    // tool rows — additive, and they ride into row meta untouched. v4 (0.0.939)
+    // adds sealed `reasoning` on assistant rows, a `compaction_boundary` row
+    // kind carrying no role, and a `segment_end` terminator.
+    //
+    // The v4 bump REBUILDS every sidecar on disk rather than leaving old files
+    // on the old format, so refusing a version here is not a graceful
+    // degradation — it takes the whole transcript offline for every session at
+    // once. That is what happened when 939 landed against a 2..=3 gate.
+    if !(2..=4).contains(&version) {
         return Err(format!("Unsupported Haider pipe version {version}."));
     }
     let session_id = object
@@ -2515,9 +2623,15 @@ fn haider_projection_parse_pipe_header(
     let generation = haider_projection_json_i64(object.get("generation"))
         .filter(|generation| *generation > 0)
         .ok_or_else(|| "Haider pipe header generation was invalid.".to_string())?;
+    let segment_index = match haider_projection_json_i64(object.get("segment")) {
+        Some(segment) if segment >= 0 => segment,
+        Some(_) => return Err("Haider pipe header segment was invalid.".to_string()),
+        None => 0,
+    };
     Ok(HaiderProjectionPipeHeader {
         session_id: session_id.to_string(),
         generation,
+        segment_index,
     })
 }
 
@@ -2564,8 +2678,9 @@ fn haider_projection_pipe_requires_refold(
 ) -> bool {
     cursor.is_none_or(|cursor| {
         cursor.generation != header.generation
-            || cursor.byte_offset < header_end
-            || cursor.byte_offset > file_len
+            || cursor.segment_index < header.segment_index
+            || (cursor.segment_index == header.segment_index
+                && (cursor.byte_offset < header_end || cursor.byte_offset > file_len))
     })
 }
 
@@ -2596,7 +2711,8 @@ fn haider_projection_pipe_row_identity(value: &Value) -> Result<Option<(i64, i64
         .get("role")
         .and_then(Value::as_str)
         .is_some_and(|role| matches!(role, "user" | "assistant" | "tool" | "error"));
-    if !projected_role && !haider_projection_pipe_usage_value(value) {
+    let projected_kind = object.get("kind").and_then(Value::as_str) == Some("compaction_boundary");
+    if !projected_role && !projected_kind && !haider_projection_pipe_usage_value(value) {
         return Ok(None);
     }
     let seq = haider_projection_json_i64(object.get("seq"))
@@ -2604,6 +2720,132 @@ fn haider_projection_pipe_row_identity(value: &Value) -> Result<Option<(i64, i64
     let ordinal = haider_projection_json_i64(object.get("ordinal"))
         .ok_or_else(|| "Haider pipe row ordinal was missing.".to_string())?;
     Ok(Some((seq, ordinal)))
+}
+
+fn haider_projection_pipe_segment_successor(value: &Value) -> Result<Option<&str>, String> {
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    if object.get("segment_end").and_then(Value::as_str) != Some("sealed") {
+        return Ok(None);
+    }
+    object
+        .get("successor")
+        .and_then(Value::as_str)
+        .map(Some)
+        .ok_or_else(|| "Haider pipe segment successor was missing.".to_string())
+}
+
+fn haider_projection_validate_pipe_successor(successor: &str) -> Result<&str, String> {
+    let path = Path::new(successor);
+    let mut components = path.components();
+    let plain_basename = !successor.is_empty()
+        && !successor.contains('/')
+        && !successor.contains('\\')
+        && !successor.contains("..")
+        && !path.is_absolute()
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none();
+    plain_basename
+        .then_some(successor)
+        .ok_or_else(|| "Haider pipe segment successor was not a plain basename.".to_string())
+}
+
+#[cfg(unix)]
+fn haider_projection_open_pipe_successor(
+    pipe_directory: &Path,
+    successor: &str,
+) -> Result<(fs::File, PathBuf), String> {
+    use std::{
+        ffi::CString,
+        os::unix::io::{AsRawFd as _, FromRawFd as _},
+    };
+
+    let successor = haider_projection_validate_pipe_successor(successor)?;
+    let directory = fs::File::open(pipe_directory)
+        .map_err(|error| format!("Unable to open Haider pipe directory: {error}"))?;
+    let name = CString::new(successor)
+        .map_err(|_| "Haider pipe segment successor was not a plain basename.".to_string())?;
+    // SAFETY: the directory descriptor and NUL-terminated basename remain
+    // valid for this call. `openat` binds lookup to the pipe directory while
+    // O_NOFOLLOW refuses a symlink at the hostile producer-controlled name.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "Unable to open Haider pipe segment successor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` was freshly returned by openat and ownership moves here.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file
+        .metadata()
+        .map_err(|error| format!("Unable to inspect Haider pipe segment successor: {error}"))?
+        .is_file()
+    {
+        return Err("Haider pipe segment successor was not a regular file.".to_string());
+    }
+    Ok((file, pipe_directory.join(successor)))
+}
+
+#[cfg(not(unix))]
+fn haider_projection_open_pipe_successor(
+    pipe_directory: &Path,
+    successor: &str,
+) -> Result<(fs::File, PathBuf), String> {
+    let successor = haider_projection_validate_pipe_successor(successor)?;
+    let path = pipe_directory.join(successor);
+    let file = fs::File::open(&path)
+        .map_err(|error| format!("Unable to open Haider pipe segment successor: {error}"))?;
+    if !file
+        .metadata()
+        .map_err(|error| format!("Unable to inspect Haider pipe segment successor: {error}"))?
+        .is_file()
+    {
+        return Err("Haider pipe segment successor was not a regular file.".to_string());
+    }
+    Ok((file, path))
+}
+
+fn haider_projection_prepare_pipe_file(
+    file: fs::File,
+    provider_session_id: &str,
+) -> Result<
+    (
+        std::io::BufReader<fs::File>,
+        HaiderProjectionPipeHeader,
+        i64,
+        i64,
+    ),
+    String,
+> {
+    let file_len = i64::try_from(
+        file.metadata()
+            .map_err(|error| format!("Unable to inspect Haider session pipe: {error}"))?
+            .len(),
+    )
+    .unwrap_or(i64::MAX);
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    let header_end = match haider_projection_read_pipe_line(&mut reader, &mut line)
+        .map_err(|error| format!("Unable to read Haider pipe header: {error}"))?
+    {
+        HaiderProjectionPipeLine::Complete {
+            consumed,
+            within_limit: true,
+        } => consumed,
+        _ => return Err("Haider pipe header was absent or incomplete.".to_string()),
+    };
+    let header_value: Value = serde_json::from_slice(&line)
+        .map_err(|error| format!("Unable to decode Haider pipe header: {error}"))?;
+    let header = haider_projection_parse_pipe_header(&header_value, provider_session_id)?;
+    Ok((reader, header, header_end, file_len))
 }
 
 fn haider_projection_ingest_pipe(
@@ -2659,43 +2901,31 @@ fn haider_projection_ingest_pipe_owned(
     if let Some(head_seq) = route.head_seq {
         haider_bridge_note_head_seq(provider_session_id, head_seq);
     }
-    let file = fs::File::open(&route.path)
+    let root_file = fs::File::open(&route.path)
         .map_err(|error| format!("Unable to open Haider session pipe: {error}"))?;
-    let file_len = i64::try_from(
-        file.metadata()
-            .map_err(|error| format!("Unable to inspect Haider session pipe: {error}"))?
-            .len(),
-    )
-    .unwrap_or(i64::MAX);
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = Vec::new();
-    let header_end = match haider_projection_read_pipe_line(&mut reader, &mut line)
-        .map_err(|error| format!("Unable to read Haider pipe header: {error}"))?
-    {
-        HaiderProjectionPipeLine::Complete {
-            consumed,
-            within_limit: true,
-        } => consumed,
-        _ => return Err("Haider pipe header was absent or incomplete.".to_string()),
-    };
-    let header_value: Value = serde_json::from_slice(&line)
-        .map_err(|error| format!("Unable to decode Haider pipe header: {error}"))?;
-    let header = haider_projection_parse_pipe_header(&header_value, provider_session_id)?;
+    let (mut reader, root_header, root_header_end, root_file_len) =
+        haider_projection_prepare_pipe_file(root_file, provider_session_id)?;
+    let pipe_directory = route
+        .path
+        .parent()
+        .ok_or_else(|| "Haider pipe path had no parent directory.".to_string())?;
     if should_cancel() {
         return Err("Haider projection prefold was cancelled.".to_string());
     }
 
     let existing = haider_projection_load_pipe_cursor(session_id)?;
-    let journal_coverage = haider_projection_load_journal_cursor(session_id)?
-        .map(|cursor| cursor.covered_through_seq);
+    let journal_coverage =
+        haider_projection_load_journal_cursor(session_id)?.map(|cursor| cursor.covered_through_seq);
     if existing
         .as_ref()
-        .is_some_and(|cursor| cursor.generation > header.generation)
+        .is_some_and(|cursor| cursor.generation > root_header.generation)
     {
         return Err("Haider pipe generation was stale.".to_string());
     }
     if existing.as_ref().is_some_and(|cursor| {
-        cursor.generation == header.generation && cursor.byte_offset > file_len
+        cursor.generation == root_header.generation
+            && cursor.segment_index == root_header.segment_index
+            && cursor.byte_offset > root_file_len
     }) {
         return Err("Haider pipe route was stale.".to_string());
     }
@@ -2706,9 +2936,9 @@ fn haider_projection_ingest_pipe_owned(
     let reset = !preserve_journal
         && haider_projection_pipe_requires_refold(
             existing.as_ref(),
-            &header,
-            header_end,
-            file_len,
+            &root_header,
+            root_header_end,
+            root_file_len,
         );
     if should_cancel() {
         return Err("Haider projection prefold was cancelled.".to_string());
@@ -2716,8 +2946,9 @@ fn haider_projection_ingest_pipe_owned(
     let mut cursor = if reset {
         let cursor = HaiderProjectionPipeCursor {
             session_id: session_id.to_string(),
-            byte_offset: header_end,
-            generation: header.generation,
+            segment_index: root_header.segment_index,
+            byte_offset: root_header_end,
+            generation: root_header.generation,
             ..HaiderProjectionPipeCursor::default()
         };
         haider_projection_reset_pipe_session(session_id, &cursor)?;
@@ -2727,19 +2958,49 @@ fn haider_projection_ingest_pipe_owned(
     } else {
         HaiderProjectionPipeCursor {
             session_id: session_id.to_string(),
-            byte_offset: header_end,
-            generation: header.generation,
+            segment_index: root_header.segment_index,
+            byte_offset: root_header_end,
+            generation: root_header.generation,
             covered_through_seq: journal_coverage.unwrap_or_default(),
             coverage_known: journal_coverage.is_some(),
             ..HaiderProjectionPipeCursor::default()
         }
     };
+    let mut header = root_header;
+    let mut current_file_len = root_file_len;
+    let mut visited_segments = HashSet::new();
+    if let Some(root_name) = route.path.file_name().and_then(|name| name.to_str()) {
+        visited_segments.insert(root_name.to_string());
+    }
+    if !cursor.segment_name.is_empty() {
+        let segment_name = haider_projection_validate_pipe_successor(&cursor.segment_name)?;
+        if !visited_segments.insert(segment_name.to_string()) {
+            return Err("Haider pipe segment successor cycle was detected.".to_string());
+        }
+        let (file, _) = haider_projection_open_pipe_successor(pipe_directory, segment_name)?;
+        let (segment_reader, segment_header, segment_header_end, segment_file_len) =
+            haider_projection_prepare_pipe_file(file, provider_session_id)?;
+        if segment_header.generation != header.generation
+            || segment_header.segment_index != cursor.segment_index
+            || cursor.byte_offset < segment_header_end
+            || cursor.byte_offset > segment_file_len
+        {
+            return Err("Haider pipe segment cursor was stale.".to_string());
+        }
+        reader = segment_reader;
+        header = segment_header;
+        current_file_len = segment_file_len;
+    }
+    if cursor.byte_offset > current_file_len {
+        return Err("Haider pipe route was stale.".to_string());
+    }
     reader
         .seek(SeekFrom::Start(cursor.byte_offset.max(0) as u64))
         .map_err(|error| format!("Unable to resume Haider session pipe: {error}"))?;
     haider_projection_initialize_state(session_id)?;
     let mut committed_state = haider_projection_state_snapshot(session_id)?;
 
+    let mut line = Vec::new();
     let mut rows = Vec::new();
     let mut line_count = 0usize;
     let mut appended = 0usize;
@@ -2749,7 +3010,7 @@ fn haider_projection_ingest_pipe_owned(
     let mut event_rows_overflow = false;
     let mut start_total = None;
     let mut advanced = false;
-    let mut consumed_to_eof = false;
+    let mut consumed_to_final_eof = false;
 
     loop {
         if should_cancel() {
@@ -2771,12 +3032,21 @@ fn haider_projection_ingest_pipe_owned(
             } => return Err("Haider pipe line exceeded the projection read cap.".to_string()),
             HaiderProjectionPipeLine::Torn => break,
             HaiderProjectionPipeLine::Eof => {
-                consumed_to_eof = true;
+                consumed_to_final_eof = true;
                 break;
             }
         };
+        // Any complete growth invalidates an earlier final-EOF proof until we
+        // reach EOF again. In particular, consuming a new segment terminator
+        // must clear the proof before successor validation/open can fail.
+        if let Ok(mut states) = haider_projection_states().lock() {
+            if let Some(state) = states.get_mut(session_id) {
+                state.pipe_eof_max_seq = None;
+            }
+        }
         let value: Value = serde_json::from_slice(&line)
             .map_err(|error| format!("Unable to decode Haider pipe line: {error}"))?;
+        let successor = haider_projection_pipe_segment_successor(&value)?;
         if let Some(coverage) =
             haider_projection_pipe_coverage(cursor.covered_through_seq, &value, header.generation)?
         {
@@ -2805,6 +3075,27 @@ fn haider_projection_ingest_pipe_owned(
         cursor.byte_offset = cursor.byte_offset.saturating_add(consumed);
         advanced = true;
         line_count = line_count.saturating_add(1);
+
+        if let Some(successor) = successor {
+            let successor = haider_projection_validate_pipe_successor(successor)?;
+            if !visited_segments.insert(successor.to_string()) {
+                return Err("Haider pipe segment successor cycle was detected.".to_string());
+            }
+            let (file, _) = haider_projection_open_pipe_successor(pipe_directory, successor)?;
+            let (next_reader, next_header, next_header_end, _) =
+                haider_projection_prepare_pipe_file(file, provider_session_id)?;
+            if next_header.generation != header.generation {
+                return Err("Haider pipe coverage generation changed between segments.".to_string());
+            }
+            if next_header.segment_index <= header.segment_index {
+                return Err("Haider pipe successor segment did not advance.".to_string());
+            }
+            cursor.segment_name = successor.to_string();
+            cursor.segment_index = next_header.segment_index;
+            cursor.byte_offset = next_header_end;
+            reader = next_reader;
+            header = next_header;
+        }
 
         if line_count >= HAIDER_PROJECTION_PIPE_BATCH_LINES {
             if should_cancel() {
@@ -2879,8 +3170,8 @@ fn haider_projection_ingest_pipe_owned(
     if let Ok(mut states) = haider_projection_states().lock() {
         if let Some(state) = states.get_mut(session_id) {
             state.total_rows = total_rows;
-            if consumed_to_eof {
-                state.pipe_eof_max_seq = Some(cursor.last_seq);
+            if consumed_to_final_eof {
+                state.pipe_eof_max_seq = Some(cursor.last_seq.max(cursor.covered_through_seq));
             }
             committed_state = state.clone();
         }
@@ -4228,11 +4519,11 @@ async fn session_projection_ensure(session_id: String) -> Result<i64, String> {
     .ok()
     .and_then(Result::ok);
     /* The PIPE is the hot path and stays that way: the daemon writes it for
-       this client specifically, it is a compact transcript projection, and
-       tailing it costs a seek and a few KB. The JOURNAL is richer but 2-4x
-       the bytes per event, so it earns its place on a COLD load — where it
-       replaces a `haider export` PROCESS SPAWN measured at a ~25ms floor —
-       and never on the incremental path a pipe already serves cheaply. */
+    this client specifically, it is a compact transcript projection, and
+    tailing it costs a seek and a few KB. The JOURNAL is richer but 2-4x
+    the bytes per event, so it earns its place on a COLD load — where it
+    replaces a `haider export` PROCESS SPAWN measured at a ~25ms floor —
+    and never on the incremental path a pipe already serves cheaply. */
     let already_projected = {
         let warm_session_id = session_id.clone();
         tauri::async_runtime::spawn_blocking(move || {
@@ -4268,12 +4559,8 @@ async fn session_projection_ensure(session_id: String) -> Result<i64, String> {
     }
     let result = if let Some((_, provider_session_id)) = provider {
         foreground.add(&provider_session_id);
-        match haider_projection_ingest_journal(
-            None,
-            session_id.clone(),
-            provider_session_id,
-        )
-        .await?
+        match haider_projection_ingest_journal(None, session_id.clone(), provider_session_id)
+            .await?
         {
             HaiderProjectionJournalIngest::Connected(frame) => Ok(frame.total_rows),
             HaiderProjectionJournalIngest::Unavailable => {
@@ -4282,10 +4569,7 @@ async fn session_projection_ensure(session_id: String) -> Result<i64, String> {
                     let _ensure_guard = haider_projection_ensure_lock().lock().map_err(|_| {
                         "Session projection ensure lock is unavailable.".to_string()
                     })?;
-                    haider_projection_ensure_blocking(
-                        &fallback_session_id,
-                        &mut foreground,
-                    )
+                    haider_projection_ensure_blocking(&fallback_session_id, &mut foreground)
                 })
                 .await
                 .map_err(|error| format!("Session projection ensure worker failed: {error}"))?
@@ -4411,10 +4695,8 @@ mod haider_projection_tests {
                     "DELETE FROM session_journal_cursors WHERE session_id = ?1",
                     [&self.session_id],
                 );
-                let _ = connection.execute(
-                    "DELETE FROM sessions WHERE id = ?1",
-                    [&self.session_id],
-                );
+                let _ =
+                    connection.execute("DELETE FROM sessions WHERE id = ?1", [&self.session_id]);
                 Ok(())
             });
             if let Ok(mut states) = haider_projection_states().lock() {
@@ -4781,12 +5063,7 @@ mod haider_projection_tests {
             generation: 1,
             ..HaiderProjectionPipeCursor::default()
         };
-        haider_projection_persist_batch(
-            &test_session.session_id,
-            &[],
-            Some(&old_generation),
-            None,
-        )
+        haider_projection_persist_batch(&test_session.session_id, &[], Some(&old_generation), None)
             .unwrap();
         assert_eq!(
             haider_projection_load_pipe_cursor(&test_session.session_id)
@@ -5193,14 +5470,14 @@ mod haider_projection_tests {
     }
 
     #[test]
-    fn haider_projection_unknown_coverage_is_honest() {
-        assert!(haider_projection_caught_up(Some(9), None, None));
+    fn haider_projection_final_unterminated_eof_is_required_for_pipe_head() {
+        assert!(!haider_projection_caught_up(Some(9), None, None));
         assert!(haider_projection_caught_up(Some(9), None, Some(9)));
         assert!(!haider_projection_caught_up(Some(9), None, Some(8)));
     }
 
     #[test]
-    fn haider_projection_known_coverage_reports_only_real_gaps() {
+    fn haider_projection_journal_coverage_can_independently_prove_head() {
         assert!(haider_projection_caught_up(Some(9), Some(9), None));
         assert!(!haider_projection_caught_up(Some(9), Some(8), None));
     }
@@ -5237,9 +5514,9 @@ mod haider_projection_tests {
     #[test]
     fn haider_projection_keeps_roles_it_has_never_seen() {
         /* The pipe's role set already grew beyond user/assistant/tool to
-           include error; assuming a closed set is how a future role vanishes.
-           An unknown role must render its text WITHOUT being attributed to
-           the model. */
+        include error; assuming a closed set is how a future role vanishes.
+        An unknown role must render its text WITHOUT being attributed to
+        the model. */
         let mut state = HaiderProjectionFoldState::default();
         let row = haider_projection_export_row(
             &mut state,
@@ -5265,9 +5542,9 @@ mod haider_projection_tests {
     #[test]
     fn haider_projection_keeps_item_kinds_it_has_never_seen() {
         /* The daemon's item vocabulary is open — `extension` items already
-           flow and were never in our list. An unrecognised kind must land
-           SOMEWHERE, because dropping it means a future item type vanishes
-           from the transcript with nothing to notice. */
+        flow and were never in our list. An unrecognised kind must land
+        SOMEWHERE, because dropping it means a future item type vanishes
+        from the transcript with nothing to notice. */
         let (kind, role) = haider_projection_item_class(&json!({"item": "quantum_widget"}));
         assert_eq!((kind, role), ("tool", "tool"));
 
@@ -5276,9 +5553,18 @@ mod haider_projection_tests {
         assert!(empty_kind.is_empty());
 
         // Known kinds keep their exact homes.
-        assert_eq!(haider_projection_item_class(&json!({"item": "reasoning"})).0, "thinking");
-        assert_eq!(haider_projection_item_class(&json!({"item": "agent_message"})).0, "message");
-        assert_eq!(haider_projection_item_class(&json!({"item": "extension"})).0, "tool");
+        assert_eq!(
+            haider_projection_item_class(&json!({"item": "reasoning"})).0,
+            "thinking"
+        );
+        assert_eq!(
+            haider_projection_item_class(&json!({"item": "agent_message"})).0,
+            "message"
+        );
+        assert_eq!(
+            haider_projection_item_class(&json!({"item": "extension"})).0,
+            "tool"
+        );
 
         let mut state = HaiderProjectionFoldState::default();
         let folded = haider_projection_fold_value_locked(
@@ -5310,8 +5596,7 @@ mod haider_projection_tests {
             "payload": {"type":"item", "event":"completed", "item_id":"item-9",
                 "item":{"item":"agent_message", "text":"Possibly the answer."}}
         });
-        let empty_marker =
-            json!({"role":"assistant", "text":"", "at_ms":1700000000162_i64, "seq":296, "ordinal":0});
+        let empty_marker = json!({"role":"assistant", "text":"", "at_ms":1700000000162_i64, "seq":296, "ordinal":0});
         let duplicate = json!({"role":"assistant", "text":"Possibly the answer.",
             "at_ms":1700000000296_i64, "seq":297, "ordinal":0});
         let mut state = HaiderProjectionFoldState::default();
@@ -5325,7 +5610,10 @@ mod haider_projection_tests {
         // item stream is live, compat records land nothing.
         assert_eq!(rows.len(), 2);
         assert_eq!((rows[0].seq, rows[0].role.as_str()), (4, "user"));
-        assert_eq!((rows[1].seq, rows[1].text.as_str()), (295, "Possibly the answer."));
+        assert_eq!(
+            (rows[1].seq, rows[1].text.as_str()),
+            (295, "Possibly the answer.")
+        );
         assert!(state.saw_item_stream);
     }
 
@@ -5401,9 +5689,7 @@ mod haider_projection_tests {
         let mut state = HaiderProjectionFoldState::default();
         let rows = values
             .iter()
-            .flat_map(|value| {
-                haider_projection_fold_value_locked(&mut state, "local", value).rows
-            })
+            .flat_map(|value| haider_projection_fold_value_locked(&mut state, "local", value).rows)
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, "thinking");
@@ -5561,9 +5847,204 @@ mod haider_projection_tests {
         assert_eq!(step.rows[0].text, "Provider is unavailable");
     }
 
+    /* The 57% case, measured on the live daemon: of 93 reasoning rows across 46
+    files, 53 carry NO text at all. A reader that skips empty-text rows loses
+    every one of them, and the daemon looks broken while being correct. */
     #[test]
-    fn haider_projection_parses_v2_v3_headers_and_rejects_future_version() {
-        for (version, generation) in [(2, 7), (3, 8)] {
+    fn v4_reasoning_survives_a_row_whose_text_is_empty() {
+        let mut state = HaiderProjectionFoldState::default();
+        let step = haider_projection_fold_pipe_value_locked(
+            &mut state,
+            "session-v4",
+            &json!({
+                "role": "assistant",
+                "text": "",
+                "reasoning": "weighing two options",
+                "at_ms": 10,
+                "seq": 15,
+                "ordinal": 0,
+                "compat": true
+            }),
+        );
+
+        assert_eq!(
+            step.rows.len(),
+            1,
+            "the thinking must survive an empty text"
+        );
+        assert_eq!(step.rows[0].kind, "thinking");
+        assert_eq!(step.rows[0].text, "weighing two options");
+        assert_eq!(step.rows[0].seq, 15);
+    }
+
+    /* The 100% case. EVERY reasoning row the daemon writes is compat: true, and
+    compat is documented as "safe to drop" — true for an item-canonical
+    client, false for a pipe-primary one, which is what we are. */
+    #[test]
+    fn a_compat_row_is_never_dropped_on_the_pipe_path() {
+        let mut state = HaiderProjectionFoldState::default();
+        let step = haider_projection_fold_pipe_value_locked(
+            &mut state,
+            "session-v4",
+            &json!({
+                "role": "assistant",
+                "text": "the answer",
+                "at_ms": 20,
+                "seq": 211,
+                "ordinal": 0,
+                "compat": true
+            }),
+        );
+
+        assert_eq!(step.rows.len(), 1);
+        assert_eq!(step.rows[0].text, "the answer");
+    }
+
+    /* Reasoning rides the row where thinking HAPPENED, before the tool calls —
+    not the answer row. Rendering it attached to the answer would find no
+    reasoning there at all, and would also put the fold below the reply it
+    produced instead of above it. */
+    #[test]
+    fn v4_reasoning_keeps_its_own_sequence_position_ahead_of_the_answer() {
+        let mut state = HaiderProjectionFoldState::default();
+        let thinking = haider_projection_fold_pipe_value_locked(
+            &mut state,
+            "session-v4",
+            &json!({"role":"assistant","text":"","reasoning":"first, plan",
+                    "at_ms":10,"seq":15,"ordinal":0,"compat":true}),
+        );
+        let answer = haider_projection_fold_pipe_value_locked(
+            &mut state,
+            "session-v4",
+            &json!({"role":"assistant","text":"the answer",
+                    "at_ms":30,"seq":211,"ordinal":0,"compat":true}),
+        );
+
+        assert_eq!(thinking.rows[0].kind, "thinking");
+        assert_eq!(answer.rows[0].kind, "message");
+        assert!(
+            thinking.rows[0].seq < answer.rows[0].seq,
+            "the thinking must sit ahead of the reply it produced"
+        );
+    }
+
+    /* Discriminated on `kind`. This row has no role at all, and the role path
+    treats a roleless row as not-a-row — so it has to be caught first. */
+    #[test]
+    fn a_compaction_boundary_is_recognised_without_any_role() {
+        let mut state = HaiderProjectionFoldState::default();
+        let value = json!({
+            "kind": "compaction_boundary",
+            "at_ms": 40,
+            "seq": 300,
+            "run_id": "run-77",
+            "branch_id": "branch-a",
+            "ordinal": 0
+        });
+        let step = haider_projection_fold_pipe_value_locked(&mut state, "session-v4", &value);
+
+        assert_eq!(step.rows.len(), 1);
+        assert_eq!(step.rows[0].kind, "compaction_boundary");
+        // The daemon owns this vocabulary; it rides in meta rather than being
+        // lifted into named fields we would then have to keep in step.
+        assert_eq!(step.rows[0].meta, value);
+        assert_eq!(step.rows[0].branch_id, "");
+        assert_eq!(
+            haider_projection_pipe_row_identity(&step.rows[0].meta).unwrap(),
+            Some((300, 0))
+        );
+    }
+
+    #[test]
+    fn v4_reasoning_and_text_have_distinct_ordered_projection_keys() {
+        let mut state = HaiderProjectionFoldState::default();
+        let step = haider_projection_fold_pipe_value_locked(
+            &mut state,
+            "session-v4",
+            &json!({
+                "role":"assistant",
+                "text":"the answer",
+                "reasoning":"thinking first",
+                "at_ms":50,
+                "seq":25,
+                "ordinal":3,
+                "compat":true
+            }),
+        );
+
+        assert_eq!(step.rows.len(), 2);
+        assert_eq!(step.rows[0].kind, "thinking");
+        assert_eq!(step.rows[1].kind, "message");
+        assert_eq!(step.rows[0].seq, step.rows[1].seq);
+        assert!(step.rows[0].ordinal < step.rows[1].ordinal);
+    }
+
+    #[test]
+    fn v4_reasoning_and_text_both_survive_projection_persistence() {
+        let test_session = haider_projection_test_session();
+        let root = std::env::temp_dir().join(format!(
+            "haider-reasoning-persist-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.pipe");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "pipe":"haider.session.jsonl",
+                    "version":4,
+                    "session_id":test_session.provider_session_id,
+                    "generation":1
+                }),
+                json!({
+                    "role":"assistant",
+                    "text":"the answer",
+                    "reasoning":"thinking first",
+                    "at_ms":50,
+                    "seq":25,
+                    "ordinal":3,
+                    "compat":true
+                })
+            ),
+        )
+        .unwrap();
+
+        let frame = haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &HaiderProjectionPipeRoute {
+                path: path.clone(),
+                head_seq: Some(25),
+            },
+        )
+        .unwrap();
+        assert_eq!(frame.appended, 2);
+        assert_eq!(
+            frame
+                .rows
+                .iter()
+                .map(|row| (row.kind.as_str(), row.ordinal, row.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("thinking", 6, "thinking first"),
+                ("message", 7, "the answer")
+            ]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn haider_projection_parses_v2_v3_v4_headers_and_rejects_future_version() {
+        // v4 moved from "future" to "current" when 0.0.939 shipped. The bump
+        // rebuilds every sidecar at once, so a gate that refuses the live
+        // version takes every session's transcript offline together — which is
+        // exactly what it did. Keep the rejection for genuinely unknown
+        // versions; it is the only thing standing between us and folding a
+        // format nobody has read.
+        for (version, generation) in [(2, 7), (3, 8), (4, 9)] {
             let header = haider_projection_parse_pipe_header(
                 &json!({
                     "pipe":"haider.session.jsonl",
@@ -5579,7 +6060,7 @@ mod haider_projection_tests {
         assert!(haider_projection_parse_pipe_header(
             &json!({
                 "pipe":"haider.session.jsonl",
-                "version":4,
+                "version":5,
                 "session_id":"session-test",
                 "generation":9
             }),
@@ -5638,6 +6119,7 @@ mod haider_projection_tests {
         let same = HaiderProjectionPipeHeader {
             session_id: "session-test".to_string(),
             generation: 4,
+            segment_index: 0,
         };
         let changed = HaiderProjectionPipeHeader {
             generation: 5,
@@ -5780,13 +6262,19 @@ mod haider_projection_tests {
                 .iter()
                 .map(|row| (row.seq, row.role.as_str(), row.text.as_str()))
                 .collect::<Vec<_>>(),
-            vec![(11, "user", "second turn"), (12, "assistant", "second answer")]
+            vec![
+                (11, "user", "second turn"),
+                (12, "assistant", "second answer")
+            ]
         );
         let cursor = haider_projection_load_pipe_cursor(&test_session.session_id)
             .unwrap()
             .unwrap();
         assert_eq!(cursor.last_seq, 12);
-        assert_eq!(cursor.byte_offset, fs::metadata(&path).unwrap().len() as i64);
+        assert_eq!(
+            cursor.byte_offset,
+            fs::metadata(&path).unwrap().len() as i64
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -5875,6 +6363,213 @@ mod haider_projection_tests {
         assert!(
             haider_projection_pipe_coverage(42, &json!({"coverage":44,"generation":4}), 3).is_err()
         );
+    }
+
+    #[test]
+    fn haider_projection_rejects_hostile_segment_successors() {
+        let root = std::env::temp_dir().join(format!(
+            "haider-successor-safety-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        for successor in ["../escape", "/etc/passwd", "a/b", ""] {
+            assert!(
+                haider_projection_validate_pipe_successor(successor).is_err(),
+                "{successor:?} unexpectedly passed basename validation"
+            );
+            let error = haider_projection_open_pipe_successor(&root, successor).unwrap_err();
+            assert!(
+                error.contains("plain basename"),
+                "{successor:?} failed for the wrong reason: {error}"
+            );
+        }
+        // The brief says any `..` and any path separator; cover Windows-style
+        // input even when this test runs on Unix.
+        for successor in ["a\\b", "a..b"] {
+            assert!(haider_projection_validate_pipe_successor(successor).is_err());
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn haider_projection_segment_successor_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "haider-successor-symlink-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let outside = root.with_extension("outside");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, root.join("next.pipe")).unwrap();
+
+        assert!(haider_projection_open_pipe_successor(&root, "next.pipe").is_err());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(outside).unwrap();
+    }
+
+    /* Prove at-head on an unterminated segment, THEN receive a seal whose
+       successor is not on disk. A daemon that seals before its successor is
+       durable makes this a race, not an exotic case.
+
+       What this pins is that the failure is LOUD: the ingest errors instead of
+       inheriting the earlier "caught up" and reporting a frozen transcript as
+       complete. Measured, not assumed — the error arm is the one that fires
+       ("Unable to open Haider pipe segment successor"). It does NOT reach the
+       stale-proof clearing at the top of the read loop, which sits behind this
+       error path; removing that line leaves every test green. It is kept as
+       defence for paths that return Ok, not because this test covers it. */
+    #[test]
+    fn a_seal_whose_successor_cannot_be_opened_never_reports_at_head() {
+        let test_session = haider_projection_test_session();
+        let root = std::env::temp_dir().join(format!(
+            "haider-segment-missing-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.pipe");
+        let header = json!({
+            "pipe":"haider.session.jsonl",
+            "version":4,
+            "session_id":test_session.provider_session_id,
+            "generation":1
+        });
+        let row = json!({
+            "role":"assistant","text":"answer","at_ms":1,"seq":9,"ordinal":0,"compat":true
+        });
+        fs::write(&path, format!("{header}\n{row}\n")).unwrap();
+        let route = HaiderProjectionPipeRoute {
+            path: path.clone(),
+            head_seq: Some(9),
+        };
+
+        // First ingest reaches EOF of an unterminated segment: at-head is real.
+        let first = haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &route,
+        )
+        .unwrap();
+        assert!(first.caught_up, "an unterminated EOF does prove head");
+
+        // Now the segment seals, naming a successor that is not on disk yet.
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(
+            format!(
+                "{}\n",
+                json!({
+                    "segment_end":"sealed",
+                    "coverage":9,
+                    "generation":1,
+                    "successor":"session.g1.s1.pipe"
+                })
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+
+        match haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &route,
+        ) {
+            // Loud failure is acceptable — it is visible and recoverable.
+            Err(_) => {}
+            Ok(sealed) => assert!(
+                !sealed.caught_up,
+                "a seal whose successor is missing must not inherit the earlier at-head proof"
+            ),
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn haider_projection_sealed_segment_coverage_equal_to_head_is_not_at_head() {
+        let test_session = haider_projection_test_session();
+        let root = std::env::temp_dir().join(format!(
+            "haider-segment-head-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.pipe");
+        let successor_name = "session.g1.s1.pipe";
+        let successor_path = root.join(successor_name);
+        let root_header = json!({
+            "pipe":"haider.session.jsonl",
+            "version":4,
+            "session_id":test_session.provider_session_id,
+            "generation":1
+        });
+        let successor_header = json!({
+            "pipe":"haider.session.jsonl",
+            "version":4,
+            "session_id":test_session.provider_session_id,
+            "generation":1,
+            "segment":1,
+            "starts_after":9
+        });
+        fs::write(
+            &path,
+            format!(
+                "{root_header}\n{}\n",
+                json!({
+                    "segment_end":"sealed",
+                    "coverage":9,
+                    "generation":1,
+                    "successor":successor_name
+                })
+            ),
+        )
+        .unwrap();
+        // A torn tail is deliberately not EOF of the final segment. It lets
+        // this regression isolate the sealed-root EOF trap even though the
+        // successor already exists and is followed securely.
+        fs::write(
+            &successor_path,
+            format!("{successor_header}\n{{\"coverage\":9"),
+        )
+        .unwrap();
+        let route = HaiderProjectionPipeRoute {
+            path: path.clone(),
+            head_seq: Some(9),
+        };
+
+        let sealed = haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &route,
+        )
+        .unwrap();
+        assert_eq!(sealed.covered_through_seq, Some(9));
+        assert!(!sealed.caught_up);
+        let cursor = haider_projection_load_pipe_cursor(&test_session.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.segment_name, successor_name);
+        assert_eq!(cursor.segment_index, 1);
+
+        let mut successor = fs::OpenOptions::new()
+            .append(true)
+            .open(&successor_path)
+            .unwrap();
+        successor.write_all(b",\"generation\":1}\n").unwrap();
+        successor.sync_all().unwrap();
+        let final_segment = haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &route,
+        )
+        .unwrap();
+        assert!(final_segment.caught_up);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
