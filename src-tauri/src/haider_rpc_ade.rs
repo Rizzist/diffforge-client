@@ -3020,10 +3020,11 @@ fn session_answer_menu_context(
         worker_generation,
         option_key,
     );
+    let needs_input = row.needs_input();
     let option_index = session_answer_menu_attempt_option_index(
         &command_id,
         provider_session_id,
-        &row.needs_input,
+        &needs_input,
         menu_id,
         request_seq,
         worker_generation,

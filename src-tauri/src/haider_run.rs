@@ -460,29 +460,17 @@ fn haider_run_kill_active(session_id: &str) {
     }
 }
 
-fn haider_run_state_raw(status: &str) -> &str {
-    if status == "running" {
-        "streaming"
-    } else {
-        status
-    }
-}
-
 fn haider_run_update_session(
     app: &AppHandle,
     session_id: &str,
-    status: Option<&str>,
     provider_session_id: Option<String>,
     first_user_message: Option<String>,
 ) -> Result<SessionRow, String> {
     let row = session_update_blocking(SessionUpdateArgs {
         id: session_id.to_string(),
         title: None,
-        status: status.map(str::to_string),
-        state_raw: status.map(haider_run_state_raw).map(str::to_string),
         provider_session_id,
         first_user_message,
-        touch: Some(true),
     })?;
     sessions_emit_changed(app);
     Ok(row)
@@ -598,7 +586,6 @@ fn haider_run_spawn(
                                             Some(haider_run_update_session(
                                                 &app,
                                                 &local_session_id,
-                                                Some("running"),
                                                 Some(accepted.session_id.clone()),
                                                 None,
                                             ))
@@ -628,7 +615,6 @@ fn haider_run_spawn(
                                 match haider_run_update_session(
                                     &app,
                                     &local_session_id,
-                                    Some("running"),
                                     Some(provider_id.clone()),
                                     None,
                                 ) {
@@ -675,20 +661,7 @@ fn haider_run_spawn(
             }
             child.wait().ok()
         });
-        if haider_run_is_current(&local_session_id, generation) {
-            let store_status = if HAIDER_RUN_STOPPING.load(Ordering::Acquire)
-                || status.is_some_and(|status| status.success())
-            {
-                "idle"
-            } else {
-                "error"
-            };
-            if let Err(error) =
-                haider_run_update_session(&app, &local_session_id, Some(store_status), None, None)
-            {
-                eprintln!("Unable to finalize Haider run session: {error}");
-            }
-        }
+        let _ = status;
         if let Some(sender) = binding_sender.take() {
             let _ = sender.send(Err(
                 "Haider run exited before its provider session id was available.".to_string(),
@@ -764,7 +737,7 @@ async fn session_start_with_prompt(
         }
         match binding_receiver.recv_timeout(HAIDER_RUN_BIND_TIMEOUT) {
             Ok(Ok(_bound_row)) => {
-                haider_run_update_session(&app, &created.id, Some("running"), None, Some(prompt))
+                haider_run_update_session(&app, &created.id, None, Some(prompt))
             }
             Ok(Err(error)) => {
                 haider_run_kill_active(&created.id);
@@ -848,12 +821,6 @@ async fn session_submit_prompt(
             if let Ok(head_seq) = i64::try_from(receipt.accepted_seq) {
                 haider_bridge_note_head_seq(&receipt.session_id, head_seq);
             }
-            let app = app.clone();
-            let local_session_id = submit.row.id.clone();
-            let _ = tauri::async_runtime::spawn_blocking(move || {
-                haider_run_update_session(&app, &local_session_id, Some("running"), None, None)
-            })
-            .await;
             return Ok(());
         }
     }
@@ -874,24 +841,20 @@ async fn session_submit_prompt(
             submit.config,
             Some(binding_sender),
         ) {
-            let _ = haider_run_update_session(&app, &submit.row.id, Some("error"), None, None);
             return Err(error);
         }
         match binding_receiver.recv_timeout(HAIDER_RUN_BIND_TIMEOUT) {
             Ok(Ok(_bound_row)) => Ok(()),
             Ok(Err(error)) => {
                 haider_run_kill_active(&submit.row.id);
-                let _ = haider_run_update_session(&app, &submit.row.id, Some("error"), None, None);
                 Err(error)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 haider_run_kill_active(&submit.row.id);
-                let _ = haider_run_update_session(&app, &submit.row.id, Some("error"), None, None);
                 Err("Timed out waiting for Haider to accept the session prompt.".to_string())
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 haider_run_kill_active(&submit.row.id);
-                let _ = haider_run_update_session(&app, &submit.row.id, Some("error"), None, None);
                 Err("Haider run ended before accepting the session prompt.".to_string())
             }
         }
@@ -900,23 +863,8 @@ async fn session_submit_prompt(
     .map_err(|error| format!("Session submit worker failed: {error}"))?
 }
 
-fn haider_run_store_seen_at_ms(session_id: String, seen_at_ms: i64) -> Result<(), String> {
-    let _write_guard = sessions_write_lock()
-        .lock()
-        .map_err(|_| "Sessions write lock is unavailable.".to_string())?;
-    let connection = sessions_open_database()?;
-    connection
-        .execute(
-            "UPDATE sessions SET seen_at_ms = CASE WHEN seen_at_ms IS NULL OR seen_at_ms < ?2 THEN ?2 ELSE seen_at_ms END WHERE id = ?1",
-            rusqlite::params![session_id, seen_at_ms],
-        )
-        .map_err(|error| format!("Unable to store session seen state: {error}"))?;
-    Ok(())
-}
-
 #[tauri::command(rename_all = "snake_case")]
-async fn session_mark_seen(app: AppHandle, session_id: String) -> Result<(), String> {
-    let local_session_id = session_id.clone();
+async fn session_mark_seen(_app: AppHandle, session_id: String) -> Result<(), String> {
     let provider_session_id =
         tauri::async_runtime::spawn_blocking(move || haider_run_provider_session_id(&session_id))
             .await
@@ -924,15 +872,7 @@ async fn session_mark_seen(app: AppHandle, session_id: String) -> Result<(), Str
     let Some(receipt) = haider_rpc_ade::session_seen_rpc(provider_session_id).await else {
         return Ok(());
     };
-    let receipt = receipt?;
-    let seen_at_ms = i64::try_from(receipt.seen_at_ms)
-        .map_err(|_| "Session seen receipt timestamp exceeded SQLite range.".to_string())?;
-    tauri::async_runtime::spawn_blocking(move || {
-        haider_run_store_seen_at_ms(local_session_id, seen_at_ms)
-    })
-    .await
-    .map_err(|error| format!("Session seen worker failed: {error}"))??;
-    sessions_emit_changed(&app);
+    receipt?;
     Ok(())
 }
 
@@ -1101,13 +1041,6 @@ mod haider_run_tests {
     fn haider_run_title_is_whitespace_compacted_and_bounded() {
         assert_eq!(haider_run_title("  hello\n  world  "), "hello world");
         assert_eq!(haider_run_title(&"x".repeat(80)).chars().count(), 48);
-    }
-
-    #[test]
-    fn haider_run_records_raw_lifecycle_state() {
-        assert_eq!(haider_run_state_raw("running"), "streaming");
-        assert_eq!(haider_run_state_raw("idle"), "idle");
-        assert_eq!(haider_run_state_raw("error"), "error");
     }
 
     #[test]

@@ -1,43 +1,241 @@
 const SESSIONS_HOME_ENV: &str = "RUST_DIFFFORGE_SESSIONS_HOME";
 const SESSIONS_CHANGED_EVENT: &str = "sessions-changed";
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 struct SessionRow {
     id: String,
-    title: String,
     slug: String,
     dir: String,
     kind: String,
-    provider: String,
     provider_session_id: String,
-    run_id: Option<String>,
-    worker_generation: Option<i64>,
     created_at_ms: i64,
-    latest_at_ms: i64,
-    status: String,
-    state_raw: String,
+    // ADE derives this locally for rail search and the pre-auto-title fallback;
+    // it is deliberately not presented as harness truth.
     first_user_message: String,
-    model: String,
-    effort: Option<String>,
-    #[serde(rename = "speed", serialize_with = "sessions_serialize_speed")]
-    speed_fast: Option<i64>,
-    seen_at_ms: Option<i64>,
-    last_activity_ms: Option<i64>,
-    waiting_kind: Option<String>,
-    waiting_menu_id: Option<String>,
-    needs_input: Value,
+    harness: Value,
     pinned: bool,
-    title_locked: bool,
+    // The column named title_locked owns the locked title itself. Keeping the
+    // override outside harness_json lets every bridge write remain verbatim;
+    // the frontend still receives title_locked as a boolean.
+    title_override: Option<String>,
 }
 
-fn sessions_serialize_speed<S>(speed_fast: &Option<i64>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    if speed_fast == &Some(1) {
-        serializer.serialize_some("fast")
+fn sessions_harness_object(row: &SessionRow) -> Option<&serde_json::Map<String, Value>> {
+    row.harness.as_object()
+}
+
+fn sessions_harness_value<'a>(row: &'a SessionRow, key: &str) -> Option<&'a Value> {
+    sessions_harness_object(row).and_then(|object| object.get(key))
+}
+
+fn sessions_harness_text(row: &SessionRow, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = sessions_harness_value(row, key)?;
+        match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }
+    })
+}
+
+fn sessions_run_state_text(run_state: Option<&Value>) -> String {
+    let Some(run_state) = run_state else {
+        return String::new();
+    };
+    if let Some(text) = run_state.as_str() {
+        return text.to_string();
+    }
+    let Some(object) = run_state.as_object() else {
+        return String::new();
+    };
+    let state = ["status", "state", "kind", "type", "name"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .unwrap_or_default();
+    match (state, object.get("tool").and_then(Value::as_str)) {
+        ("", _) => String::new(),
+        (state, Some(tool)) if !tool.trim().is_empty() => format!("{state}: {tool}"),
+        (state, _) => state.to_string(),
+    }
+}
+
+// This is the one intentional harness derivation: the UI groups the daemon's
+// detailed run_state vocabulary into four coarse rail buckets.
+fn sessions_status_from_run_state(run_state: Option<&Value>) -> &'static str {
+    let normalized = sessions_run_state_text(run_state)
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' ', '.'], "_");
+    if ["error", "errored", "failed", "failure", "fatal"]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+    {
+        "error"
+    } else if [
+        "waiting",
+        "input_required",
+        "permission_required",
+        "needs_input",
+        "awaiting_input",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        "waiting"
+    } else if [
+        "active",
+        "running",
+        "streaming",
+        "tool",
+        "thinking",
+        "queued",
+        "compacting",
+        "verifying",
+        "concluding",
+        "cancelling",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        "running"
     } else {
-        serializer.serialize_none()
+        "idle"
+    }
+}
+
+impl SessionRow {
+    fn title(&self) -> String {
+        self.title_override
+            .clone()
+            .or_else(|| sessions_harness_text(self, &["title"]))
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| "New session".to_string())
+    }
+
+    fn latest_at_ms(&self) -> i64 {
+        ["latest_at_ms", "updated_at_ms"]
+            .iter()
+            .find_map(|key| sessions_harness_value(self, key).and_then(Value::as_i64))
+            .unwrap_or(self.created_at_ms)
+    }
+
+    fn needs_input(&self) -> Value {
+        sessions_harness_value(self, "needs_input")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    fn serialized_value(&self) -> Value {
+        let mut object = sessions_harness_object(self).cloned().unwrap_or_default();
+        let run_state = object.get("run_state");
+        let state_raw = if run_state.is_some() {
+            sessions_run_state_text(run_state)
+        } else {
+            sessions_harness_text(self, &["state_raw"]).unwrap_or_default()
+        };
+        let status = sessions_status_from_run_state(run_state).to_string();
+        let model = sessions_harness_text(self, &["model", "last_model"])
+            .or_else(|| {
+                ["model", "last_model"]
+                    .iter()
+                    .find_map(|key| sessions_harness_value(self, key))
+                    .and_then(Value::as_object)
+                    .and_then(|model| {
+                        ["model", "id", "name"]
+                            .iter()
+                            .find_map(|key| model.get(*key).and_then(Value::as_str))
+                    })
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let provider = sessions_harness_text(self, &["provider", "last_provider"])
+            .or_else(|| {
+                ["model", "last_model"]
+                    .iter()
+                    .find_map(|key| sessions_harness_value(self, key))
+                    .and_then(Value::as_object)
+                    .and_then(|model| model.get("provider"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "haider".to_string());
+        let speed = object.get("speed").cloned().unwrap_or_else(|| {
+            if object.get("fast").and_then(Value::as_bool) == Some(true) {
+                Value::String("fast".to_string())
+            } else {
+                Value::Null
+            }
+        });
+        let waiting_why = object.get("waiting_why").and_then(Value::as_object);
+        let waiting_kind = object
+            .get("waiting_kind")
+            .cloned()
+            .or_else(|| waiting_why.and_then(|why| why.get("kind")).cloned())
+            .unwrap_or(Value::Null);
+        let waiting_menu_id = object
+            .get("waiting_menu_id")
+            .cloned()
+            .or_else(|| {
+                waiting_why
+                    .and_then(|why| why.get("pending_menu_id"))
+                    .cloned()
+            })
+            .unwrap_or(Value::Null);
+
+        // Stable frontend aliases are projected at read time. The source
+        // object remains the base, so additive daemon fields pass through.
+        object.insert("title".to_string(), Value::String(self.title()));
+        object.insert("provider".to_string(), Value::String(provider));
+        object.insert("model".to_string(), Value::String(model));
+        object.insert("status".to_string(), Value::String(status));
+        object.insert("state_raw".to_string(), Value::String(state_raw));
+        object.insert("latest_at_ms".to_string(), json!(self.latest_at_ms()));
+        object.entry("effort".to_string()).or_insert(Value::Null);
+        object.insert("speed".to_string(), speed);
+        for key in [
+            "seen_at_ms",
+            "last_activity_ms",
+            "run_id",
+            "worker_generation",
+        ] {
+            object.entry(key.to_string()).or_insert(Value::Null);
+        }
+        object.insert("waiting_kind".to_string(), waiting_kind);
+        object.insert("waiting_menu_id".to_string(), waiting_menu_id);
+        object
+            .entry("needs_input".to_string())
+            .or_insert(Value::Null);
+
+        // ADE-owned fields win name collisions with the opaque harness object.
+        object.insert("id".to_string(), Value::String(self.id.clone()));
+        object.insert("slug".to_string(), Value::String(self.slug.clone()));
+        object.insert("dir".to_string(), Value::String(self.dir.clone()));
+        object.insert("kind".to_string(), Value::String(self.kind.clone()));
+        object.insert(
+            "provider_session_id".to_string(),
+            Value::String(self.provider_session_id.clone()),
+        );
+        object.insert("created_at_ms".to_string(), json!(self.created_at_ms));
+        object.insert(
+            "first_user_message".to_string(),
+            Value::String(self.first_user_message.clone()),
+        );
+        object.insert("pinned".to_string(), Value::Bool(self.pinned));
+        object.insert(
+            "title_locked".to_string(),
+            Value::Bool(self.title_override.is_some()),
+        );
+        Value::Object(object)
+    }
+}
+
+impl Serialize for SessionRow {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.serialized_value().serialize(serializer)
     }
 }
 
@@ -51,11 +249,8 @@ struct SessionCreateArgs {
 struct SessionUpdateArgs {
     id: String,
     title: Option<String>,
-    status: Option<String>,
-    state_raw: Option<String>,
     provider_session_id: Option<String>,
     first_user_message: Option<String>,
-    touch: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,35 +430,63 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
                 slug TEXT NOT NULL,
                 dir TEXT NOT NULL,
                 kind TEXT NOT NULL CHECK (kind IN ('generated', 'pinned')),
-                provider TEXT NOT NULL DEFAULT 'haider',
                 provider_session_id TEXT NOT NULL DEFAULT '',
-                run_id TEXT,
-                worker_generation INTEGER,
                 created_at_ms INTEGER NOT NULL,
-                latest_at_ms INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'idle',
-                state_raw TEXT NOT NULL DEFAULT '',
-                first_user_message TEXT NOT NULL DEFAULT '',
-                model TEXT NOT NULL DEFAULT '',
-                effort TEXT,
-                speed_fast INTEGER,
-                seen_at_ms INTEGER,
-                last_activity_ms INTEGER,
-                waiting_kind TEXT,
-                waiting_menu_id TEXT,
-                needs_input_json TEXT,
                 pinned INTEGER NOT NULL DEFAULT 0,
-                title_locked INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE INDEX IF NOT EXISTS idx_sessions_latest_at_ms
-                ON sessions(latest_at_ms DESC);",
+                title_locked TEXT,
+                harness_json TEXT NOT NULL DEFAULT '{}',
+                first_user_message TEXT NOT NULL DEFAULT ''
+             );",
         )
         .map_err(|error| format!("Unable to initialize sessions SQLite store: {error}"))?;
-    let migrations = [
+
+    let columns = sessions_table_columns(connection)?;
+    let retired_columns = [
+        "title",
+        "provider",
+        "model",
+        "status",
+        "state_raw",
+        "latest_at_ms",
+        "effort",
+        "speed_fast",
+        "seen_at_ms",
+        "last_activity_ms",
+        "waiting_kind",
+        "waiting_menu_id",
+        "run_id",
+        "worker_generation",
+        "needs_input_json",
+    ];
+    if columns.contains("harness_json")
+        && retired_columns
+            .iter()
+            .all(|column| !columns.contains(*column))
+    {
+        return Ok(());
+    }
+
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("Unable to begin sessions SQLite migration: {error}"))?;
+    let mut columns = sessions_table_columns(&transaction)?;
+    if !columns.contains("harness_json") {
+        transaction
+            .execute(
+                "ALTER TABLE sessions ADD COLUMN harness_json TEXT NOT NULL DEFAULT '{}'",
+                [],
+            )
+            .map_err(|error| format!("Unable to add sessions harness payload: {error}"))?;
+        columns.insert("harness_json".to_string());
+    }
+
+    // Older additive schemas may predate some of the mirror columns. Add
+    // neutral defaults only long enough to make the one-time reconstruction
+    // uniform; the replacement table below removes the entire mirror.
+    let legacy_additions = [
         ("model", "TEXT NOT NULL DEFAULT ''"),
         ("pinned", "INTEGER NOT NULL DEFAULT 0"),
         ("title_locked", "INTEGER NOT NULL DEFAULT 0"),
@@ -278,18 +501,7 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
         ("run_id", "TEXT"),
         ("worker_generation", "INTEGER"),
     ];
-    let columns = sessions_table_columns(connection)?;
-    if migrations
-        .iter()
-        .all(|(column, _)| columns.contains(*column))
-    {
-        return Ok(());
-    }
-    let transaction = connection
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|error| format!("Unable to begin sessions SQLite migration: {error}"))?;
-    let columns = sessions_table_columns(&transaction)?;
-    for (column, definition) in migrations {
+    for (column, definition) in legacy_additions {
         if !columns.contains(column) {
             transaction
                 .execute(
@@ -297,8 +509,113 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
                     [],
                 )
                 .map_err(|error| format!("Unable to migrate sessions SQLite schema: {error}"))?;
+            columns.insert(column.to_string());
         }
     }
+
+    let reconstructed = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, title, provider, model, status, state_raw,
+                        latest_at_ms, effort, speed_fast, seen_at_ms,
+                        last_activity_ms, waiting_kind, waiting_menu_id,
+                        run_id, worker_generation, needs_input_json
+                 FROM sessions",
+            )
+            .map_err(|error| format!("Unable to prepare sessions payload migration: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                let state_raw = row.get::<_, String>(5)?;
+                let status = row.get::<_, String>(4)?;
+                let needs_input = row
+                    .get::<_, Option<String>>(15)?
+                    .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
+                    .unwrap_or(Value::Null);
+                let mut harness = serde_json::Map::new();
+                harness.insert("title".to_string(), json!(row.get::<_, String>(1)?));
+                harness.insert("provider".to_string(), json!(row.get::<_, String>(2)?));
+                harness.insert("model".to_string(), json!(row.get::<_, String>(3)?));
+                harness.insert(
+                    "run_state".to_string(),
+                    json!(if state_raw.trim().is_empty() {
+                        status
+                    } else {
+                        state_raw
+                    }),
+                );
+                harness.insert("latest_at_ms".to_string(), json!(row.get::<_, i64>(6)?));
+                harness.insert(
+                    "effort".to_string(),
+                    json!(row.get::<_, Option<String>>(7)?),
+                );
+                harness.insert(
+                    "fast".to_string(),
+                    row.get::<_, Option<i64>>(8)?
+                        .map(|fast| Value::Bool(fast != 0))
+                        .unwrap_or(Value::Null),
+                );
+                for (key, index) in [
+                    ("seen_at_ms", 9),
+                    ("last_activity_ms", 10),
+                    ("worker_generation", 14),
+                ] {
+                    harness.insert(key.to_string(), json!(row.get::<_, Option<i64>>(index)?));
+                }
+                for (key, index) in [
+                    ("waiting_kind", 11),
+                    ("waiting_menu_id", 12),
+                    ("run_id", 13),
+                ] {
+                    harness.insert(key.to_string(), json!(row.get::<_, Option<String>>(index)?));
+                }
+                harness.insert("needs_input".to_string(), needs_input);
+                Ok((row.get::<_, String>(0)?, Value::Object(harness)))
+            })
+            .map_err(|error| format!("Unable to read sessions payload migration: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to decode sessions payload migration: {error}"))?;
+        rows
+    };
+    for (id, harness) in reconstructed {
+        let harness_json = serde_json::to_string(&harness)
+            .map_err(|error| format!("Unable to encode migrated harness payload: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE sessions SET harness_json = ?2 WHERE id = ?1",
+                rusqlite::params![id, harness_json],
+            )
+            .map_err(|error| format!("Unable to store migrated harness payload: {error}"))?;
+    }
+
+    transaction
+        .execute_batch(
+            "DROP INDEX IF EXISTS idx_sessions_latest_at_ms;
+             DROP TABLE IF EXISTS sessions_harness_migration;
+             CREATE TABLE sessions_harness_migration (
+                id TEXT PRIMARY KEY,
+                slug TEXT NOT NULL,
+                dir TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('generated', 'pinned')),
+                provider_session_id TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                title_locked TEXT,
+                harness_json TEXT NOT NULL DEFAULT '{}',
+                first_user_message TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO sessions_harness_migration (
+                id, slug, dir, kind, provider_session_id, created_at_ms,
+                pinned, title_locked, harness_json, first_user_message
+             )
+             SELECT id, slug, dir, kind, provider_session_id, created_at_ms,
+                    pinned,
+                    CASE WHEN title_locked != 0 THEN title ELSE NULL END,
+                    harness_json, first_user_message
+             FROM sessions;
+             DROP TABLE sessions;
+             ALTER TABLE sessions_harness_migration RENAME TO sessions;",
+        )
+        .map_err(|error| format!("Unable to replace sessions mirror schema: {error}"))?;
     transaction
         .commit()
         .map_err(|error| format!("Unable to commit sessions SQLite migration: {error}"))?;
@@ -319,37 +636,23 @@ fn sessions_open_database() -> Result<rusqlite::Connection, String> {
 fn sessions_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
         id: row.get(0)?,
-        title: row.get(1)?,
-        slug: row.get(2)?,
-        dir: row.get(3)?,
-        kind: row.get(4)?,
-        provider: row.get(5)?,
-        provider_session_id: row.get(6)?,
-        run_id: row.get(7)?,
-        worker_generation: row.get(8)?,
-        created_at_ms: row.get(9)?,
-        latest_at_ms: row.get(10)?,
-        status: row.get(11)?,
-        state_raw: row.get(12)?,
-        first_user_message: row.get(13)?,
-        model: row.get(14)?,
-        effort: row.get(15)?,
-        speed_fast: row.get(16)?,
-        seen_at_ms: row.get(17)?,
-        last_activity_ms: row.get(18)?,
-        waiting_kind: row.get(19)?,
-        waiting_menu_id: row.get(20)?,
-        needs_input: row
-            .get::<_, Option<String>>(21)?
+        slug: row.get(1)?,
+        dir: row.get(2)?,
+        kind: row.get(3)?,
+        provider_session_id: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        pinned: row.get(6)?,
+        title_override: row.get(7)?,
+        harness: row
+            .get::<_, Option<String>>(8)?
             .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or(Value::Null),
-        pinned: row.get(22)?,
-        title_locked: row.get(23)?,
+            .unwrap_or_else(|| json!({})),
+        first_user_message: row.get(9)?,
     })
 }
 
 const SESSIONS_SELECT_COLUMNS: &str =
-    "id, title, slug, dir, kind, provider, provider_session_id, run_id, worker_generation, created_at_ms, latest_at_ms, status, state_raw, first_user_message, model, effort, speed_fast, seen_at_ms, last_activity_ms, waiting_kind, waiting_menu_id, needs_input_json, pinned, title_locked";
+    "id, slug, dir, kind, provider_session_id, created_at_ms, pinned, title_locked, harness_json, first_user_message";
 
 fn sessions_row_by_id(connection: &rusqlite::Connection, id: &str) -> Result<SessionRow, String> {
     let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions WHERE id = ?1");
@@ -362,17 +665,21 @@ fn sessions_row_by_id(connection: &rusqlite::Connection, id: &str) -> Result<Ses
 
 fn sessions_list_blocking() -> Result<Vec<SessionRow>, String> {
     let connection = sessions_open_database()?;
-    let query = format!(
-        "SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions ORDER BY latest_at_ms DESC, id DESC"
-    );
+    let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions");
     let mut statement = connection
         .prepare(&query)
         .map_err(|error| format!("Unable to prepare sessions list: {error}"))?;
-    let rows = statement
+    let mut rows = statement
         .query_map([], sessions_sqlite_row)
         .map_err(|error| format!("Unable to list sessions: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to decode session row: {error}"))?;
+    rows.sort_by(|left, right| {
+        right
+            .latest_at_ms()
+            .cmp(&left.latest_at_ms())
+            .then_with(|| right.id.cmp(&left.id))
+    });
     Ok(rows)
 }
 
@@ -407,54 +714,43 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
     let now_ms = sessions_now_ms();
     let row = SessionRow {
         id: sessions_new_id(now_ms),
-        title,
         slug,
         dir: directory.to_string_lossy().to_string(),
         kind: kind.to_string(),
-        provider: "haider".to_string(),
         provider_session_id: String::new(),
-        run_id: None,
-        worker_generation: None,
         created_at_ms: now_ms,
-        latest_at_ms: now_ms,
-        status: "idle".to_string(),
-        state_raw: String::new(),
         first_user_message: String::new(),
-        model: String::new(),
-        effort: None,
-        speed_fast: None,
-        seen_at_ms: None,
-        last_activity_ms: None,
-        waiting_kind: None,
-        waiting_menu_id: None,
-        needs_input: Value::Null,
+        // A local draft has no daemon summary yet. Reconcile replaces this
+        // bootstrap object wholesale as soon as the provider session binds.
+        harness: json!({
+            "title": title,
+            "provider": "haider",
+            "run_state": "idle",
+            "updated_at_ms": now_ms,
+        }),
         pinned: false,
-        title_locked: false,
+        title_override: None,
     };
+    let harness_json = serde_json::to_string(&row.harness)
+        .map_err(|error| format!("Unable to encode new session harness payload: {error}"))?;
     let connection = sessions_open_database()?;
     connection
         .execute(
             "INSERT INTO sessions (
-                id, title, slug, dir, kind, provider, provider_session_id,
-                created_at_ms, latest_at_ms, status, state_raw, first_user_message,
-                model, pinned, title_locked
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                id, slug, dir, kind, provider_session_id, created_at_ms,
+                pinned, title_locked, harness_json, first_user_message
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 row.id,
-                row.title,
                 row.slug,
                 row.dir,
                 row.kind,
-                row.provider,
                 row.provider_session_id,
                 row.created_at_ms,
-                row.latest_at_ms,
-                row.status,
-                row.state_raw,
-                row.first_user_message,
-                row.model,
                 row.pinned,
-                row.title_locked,
+                row.title_override,
+                harness_json,
+                row.first_user_message,
             ],
         )
         .map_err(|error| format!("Unable to store session: {error}"))?;
@@ -468,23 +764,22 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
     let connection = sessions_open_database()?;
     let mut row = sessions_row_by_id(&connection, args.id.trim())?;
 
-    if !row.title_locked {
+    if row.title_override.is_none() {
         if let Some(title) = args.title {
-            row.title = title;
+            if !row.harness.is_object() {
+                row.harness = json!({});
+            }
+            if let Some(object) = row.harness.as_object_mut() {
+                object.insert("title".to_string(), Value::String(title));
+            }
         }
-    }
-    if let Some(status) = args.status {
-        row.status = status;
-    }
-    if let Some(state_raw) = args.state_raw {
-        row.state_raw = state_raw;
     }
     if let Some(provider_session_id) = args.provider_session_id {
         row.provider_session_id = provider_session_id;
     }
     if let Some(first_user_message) = args.first_user_message {
         let should_reslug = row.kind == "generated"
-            && !row.title_locked
+            && row.title_override.is_none()
             && row.first_user_message.trim().is_empty()
             && !first_user_message.trim().is_empty();
         if should_reslug {
@@ -503,34 +798,23 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
         }
         row.first_user_message = first_user_message;
     }
-    if args.touch.unwrap_or(false) {
-        row.latest_at_ms = sessions_now_ms();
-    }
+    let harness_json = serde_json::to_string(&row.harness)
+        .map_err(|error| format!("Unable to encode session harness payload: {error}"))?;
 
     connection
         .execute(
             "UPDATE sessions SET
-                title = ?2, slug = ?3, dir = ?4, kind = ?5, provider = ?6,
-                provider_session_id = ?7, created_at_ms = ?8, latest_at_ms = ?9,
-                status = ?10, state_raw = ?11, first_user_message = ?12,
-                model = ?13, pinned = ?14, title_locked = ?15
+                slug = ?2, dir = ?3, kind = ?4, provider_session_id = ?5,
+                first_user_message = ?6, harness_json = ?7
              WHERE id = ?1",
             rusqlite::params![
                 row.id,
-                row.title,
                 row.slug,
                 row.dir,
                 row.kind,
-                row.provider,
                 row.provider_session_id,
-                row.created_at_ms,
-                row.latest_at_ms,
-                row.status,
-                row.state_raw,
                 row.first_user_message,
-                row.model,
-                row.pinned,
-                row.title_locked,
+                harness_json,
             ],
         )
         .map_err(|error| format!("Unable to update session: {error}"))?;
@@ -548,7 +832,7 @@ fn session_rename_blocking(session_id: String, title: String) -> Result<SessionR
     let row = sessions_row_by_id(&connection, session_id.trim())?;
     connection
         .execute(
-            "UPDATE sessions SET title = ?2, title_locked = 1 WHERE id = ?1",
+            "UPDATE sessions SET title_locked = ?2 WHERE id = ?1",
             rusqlite::params![row.id, title],
         )
         .map_err(|error| format!("Unable to rename session: {error}"))?;
@@ -711,58 +995,42 @@ mod sessions_tests {
     fn sessions_test_row(id: &str, dir: &Path, kind: &str) -> SessionRow {
         SessionRow {
             id: id.to_string(),
-            title: "Original title".to_string(),
             slug: "original-title".to_string(),
             dir: dir.to_string_lossy().to_string(),
             kind: kind.to_string(),
-            provider: "haider".to_string(),
             provider_session_id: format!("provider-{id}"),
-            run_id: None,
-            worker_generation: None,
             created_at_ms: 10,
-            latest_at_ms: 10,
-            status: "idle".to_string(),
-            state_raw: "idle".to_string(),
             first_user_message: String::new(),
-            model: String::new(),
-            effort: None,
-            speed_fast: None,
-            seen_at_ms: None,
-            last_activity_ms: None,
-            waiting_kind: None,
-            waiting_menu_id: None,
-            needs_input: Value::Null,
+            harness: json!({
+                "session_id": format!("provider-{id}"),
+                "title": "Original title",
+                "run_state": "idle",
+                "updated_at_ms": 10,
+            }),
             pinned: false,
-            title_locked: false,
+            title_override: None,
         }
     }
 
     fn sessions_test_insert_row(connection: &rusqlite::Connection, row: &SessionRow) {
+        let harness_json = serde_json::to_string(&row.harness).unwrap();
         connection
             .execute(
                 "INSERT INTO sessions (
-                    id, title, slug, dir, kind, provider, provider_session_id,
-                    run_id, worker_generation, created_at_ms, latest_at_ms,
-                    status, state_raw, first_user_message, model, pinned, title_locked
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    id, slug, dir, kind, provider_session_id, created_at_ms,
+                    pinned, title_locked, harness_json, first_user_message
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     row.id,
-                    row.title,
                     row.slug,
                     row.dir,
                     row.kind,
-                    row.provider,
                     row.provider_session_id,
-                    row.run_id,
-                    row.worker_generation,
                     row.created_at_ms,
-                    row.latest_at_ms,
-                    row.status,
-                    row.state_raw,
-                    row.first_user_message,
-                    row.model,
                     row.pinned,
-                    row.title_locked,
+                    row.title_override,
+                    harness_json,
+                    row.first_user_message,
                 ],
             )
             .unwrap();
@@ -852,36 +1120,32 @@ mod sessions_tests {
                 .unwrap();
             columns
         };
-        for column in [
-            "model",
-            "pinned",
-            "title_locked",
-            "state_raw",
-            "effort",
-            "speed_fast",
-            "seen_at_ms",
-            "last_activity_ms",
-            "waiting_kind",
-            "waiting_menu_id",
-            "needs_input_json",
-            "run_id",
-            "worker_generation",
-        ] {
-            assert_eq!(columns.iter().filter(|name| *name == column).count(), 1);
-        }
+        assert_eq!(
+            columns.into_iter().collect::<HashSet<_>>(),
+            [
+                "id",
+                "slug",
+                "dir",
+                "kind",
+                "provider_session_id",
+                "created_at_ms",
+                "pinned",
+                "title_locked",
+                "harness_json",
+                "first_user_message",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>()
+        );
         let row = sessions_row_by_id(&connection, "old-row").unwrap();
-        assert_eq!(row.model, "");
-        assert_eq!(row.state_raw, "");
-        assert_eq!(row.effort, None);
-        assert_eq!(row.speed_fast, None);
-        assert_eq!(row.seen_at_ms, None);
-        assert_eq!(row.last_activity_ms, None);
-        assert_eq!(row.waiting_kind, None);
-        assert_eq!(row.waiting_menu_id, None);
-        assert_eq!(row.needs_input, Value::Null);
-        assert_eq!(row.run_id, None);
-        assert_eq!(row.worker_generation, None);
+        assert_eq!(row.harness["title"], "Old row");
+        assert_eq!(row.harness["latest_at_ms"], 2);
+        assert_eq!(row.harness["run_state"], "idle");
         let row_json = serde_json::to_value(&row).unwrap();
+        assert_eq!(row_json["title"], "Old row");
+        assert_eq!(row_json["latest_at_ms"], 2);
+        assert_eq!(row_json["status"], "idle");
         assert_eq!(row_json["effort"], Value::Null);
         assert_eq!(row_json["speed"], Value::Null);
         assert_eq!(row_json["seen_at_ms"], Value::Null);
@@ -892,7 +1156,67 @@ mod sessions_tests {
         assert_eq!(row_json["run_id"], Value::Null);
         assert_eq!(row_json["worker_generation"], Value::Null);
         assert!(!row.pinned);
-        assert!(!row.title_locked);
+        assert!(row.title_override.is_none());
+
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    // title_locked changed meaning in this migration: it was a boolean beside a
+    // `title` column, and it now holds the locked title itself. A row that was
+    // renamed by hand before the upgrade is the only place that rename exists,
+    // so the rebuild has to carry it across rather than reconstruct it.
+    #[test]
+    fn sessions_migration_preserves_a_locked_legacy_title() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("migration-locked");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sessions.sqlite");
+        let mut connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    dir TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('generated', 'pinned')),
+                    provider TEXT NOT NULL DEFAULT 'haider',
+                    provider_session_id TEXT NOT NULL DEFAULT '',
+                    created_at_ms INTEGER NOT NULL,
+                    latest_at_ms INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    first_user_message TEXT NOT NULL DEFAULT '',
+                    title_locked INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO sessions (
+                    id, title, slug, dir, kind, provider_session_id,
+                    created_at_ms, latest_at_ms, title_locked
+                 ) VALUES
+                    ('locked', 'Hand written', 'locked', '', 'pinned', 'p-locked', 1, 2, 1),
+                    ('auto', 'Model written', 'auto', '', 'pinned', 'p-auto', 1, 2, 0);",
+            )
+            .unwrap();
+
+        sessions_initialize_database(&mut connection).unwrap();
+
+        let locked = sessions_row_by_id(&connection, "locked").unwrap();
+        assert_eq!(locked.title_override.as_deref(), Some("Hand written"));
+        assert_eq!(locked.title(), "Hand written");
+        assert_eq!(
+            serde_json::to_value(&locked).unwrap()["title_locked"],
+            Value::Bool(true)
+        );
+
+        // An auto-titled row must NOT come back locked, or the daemon could
+        // never retitle it again.
+        let auto = sessions_row_by_id(&connection, "auto").unwrap();
+        assert!(auto.title_override.is_none());
+        assert_eq!(auto.title(), "Model written");
+        assert_eq!(
+            serde_json::to_value(&auto).unwrap()["title_locked"],
+            Value::Bool(false)
+        );
 
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
@@ -912,38 +1236,34 @@ mod sessions_tests {
         assert!(session_rename_blocking("rename".to_string(), "  \n".to_string()).is_err());
         let renamed =
             session_rename_blocking("rename".to_string(), "User title".to_string()).unwrap();
-        assert_eq!(renamed.title, "User title");
+        assert_eq!(renamed.title(), "User title");
         assert_eq!(renamed.slug, "original-title");
         assert_eq!(renamed.dir, "");
-        assert!(renamed.title_locked);
+        assert!(renamed.title_override.is_some());
 
         assert!(haider_bridge_reconcile(&[HaiderBridgeSession {
             id: "provider-rename".to_string(),
-            title: Some("Daemon title".to_string()),
-            model: Some("daemon-model".to_string()),
-            provider: Some("openai".to_string()),
-            cwd: None,
-            state_raw: Some("running".to_string()),
-            effort: None,
-            fast: None,
-            seen_at_ms: None,
-            last_activity_ms: None,
-            waiting_kind: None,
-            waiting_menu_id: None,
-            run_id: None,
-            worker_generation: None,
-            needs_input: Value::Null,
-            latest_at_ms: Some(20),
+            harness: json!({
+                "session_id": "provider-rename",
+                "title": "Daemon title",
+                "model": "daemon-model",
+                "provider": "openai",
+                "run_state": "running",
+                "updated_at_ms": 20,
+            }),
         }])
         .unwrap());
         let connection = sessions_open_database().unwrap();
         let reconciled = sessions_row_by_id(&connection, "rename").unwrap();
-        assert_eq!(reconciled.title, "User title");
-        assert!(reconciled.title_locked);
-        assert_eq!(reconciled.model, "daemon-model");
-        assert_eq!(reconciled.status, "running");
-        assert_eq!(reconciled.state_raw, "running");
-        assert_eq!(reconciled.latest_at_ms, 20);
+        assert_eq!(reconciled.title(), "User title");
+        assert!(reconciled.title_override.is_some());
+        assert_eq!(reconciled.harness["title"], "Daemon title");
+        let serialized = reconciled.serialized_value();
+        assert_eq!(serialized["title"], "User title");
+        assert_eq!(serialized["model"], "daemon-model");
+        assert_eq!(serialized["status"], "running");
+        assert_eq!(serialized["state_raw"], "running");
+        assert_eq!(serialized["latest_at_ms"], 20);
         drop(connection);
 
         fs::remove_dir_all(directory).unwrap();
@@ -994,14 +1314,11 @@ mod sessions_tests {
         let updated = session_update_blocking(SessionUpdateArgs {
             id: "locked-reslug".to_string(),
             title: Some("Automatic title".to_string()),
-            status: None,
-            state_raw: None,
             provider_session_id: None,
             first_user_message: Some("Automatic title".to_string()),
-            touch: None,
         })
         .unwrap();
-        assert_eq!(updated.title, "User title");
+        assert_eq!(updated.title(), "User title");
         assert_eq!(updated.slug, "original-title");
         assert_eq!(updated.dir, session_directory.to_string_lossy());
         assert_eq!(updated.first_user_message, "Automatic title");
@@ -1018,21 +1335,14 @@ mod sessions_tests {
     fn haider_bridge_test_roster(id: &str) -> HaiderBridgeSession {
         HaiderBridgeSession {
             id: id.to_string(),
-            title: Some("Daemon session".to_string()),
-            model: Some("model".to_string()),
-            provider: Some("openai".to_string()),
-            cwd: None,
-            state_raw: Some("idle".to_string()),
-            effort: None,
-            fast: None,
-            seen_at_ms: None,
-            last_activity_ms: None,
-            waiting_kind: None,
-            waiting_menu_id: None,
-            run_id: None,
-            worker_generation: None,
-            needs_input: Value::Null,
-            latest_at_ms: Some(sessions_now_ms()),
+            harness: json!({
+                "session_id": id,
+                "title": "Daemon session",
+                "model": "model",
+                "provider": "openai",
+                "run_state": "idle",
+                "updated_at_ms": sessions_now_ms(),
+            }),
         }
     }
 
@@ -1058,49 +1368,75 @@ mod sessions_tests {
     }
 
     #[test]
-    fn haider_bridge_reconcile_round_trips_and_clears_attention_state() {
+    fn haider_bridge_store_serialize_round_trip_preserves_full_and_unknown_harness_payload() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let directory = sessions_test_directory("attention-state");
+        let directory = sessions_test_directory("opaque-harness");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
         let connection = sessions_open_database().unwrap();
-        let mut row = sessions_test_row("attention", Path::new(""), "pinned");
-        row.run_id = Some("run-live".to_string());
-        row.worker_generation = Some(97);
+        let mut row = sessions_test_row("opaque", Path::new("/ade-owned-dir"), "pinned");
+        row.pinned = true;
+        row.first_user_message = "ADE search text".to_string();
         sessions_test_insert_row(&connection, &row);
         drop(connection);
 
-        let mut roster = haider_bridge_test_roster("provider-attention");
-        roster.seen_at_ms = Some(20);
-        roster.last_activity_ms = Some(30);
-        roster.waiting_kind = Some("permission".to_string());
-        roster.waiting_menu_id = Some("menu-936".to_string());
-        assert!(haider_bridge_reconcile(&[roster.clone()]).unwrap());
+        let needs_input = json!({"kind": "permission", "future_card_field": [1, 2, 3]});
+        let summary = json!({
+            "session_id": "provider-opaque",
+            "title": "Opaque daemon title",
+            "last_model": "gpt-future",
+            "provider": "openai",
+            "run_state": {"status": "running_tool", "tool": "cargo"},
+            "updated_at_ms": 1_777_777_777_123_i64,
+            "effort": "xhigh",
+            "fast": true,
+            "seen_at_ms": 20,
+            "last_activity_ms": 30,
+            "waiting_why": {"kind": "permission", "pending_menu_id": "menu-936"},
+            "run_id": "run-live",
+            "worker_generation": 97,
+            "needs_input": needs_input,
+            "turn_count": 8,
+            "footprint_tokens": 42_001,
+            "agent_metrics": {"tool_calls": 17},
+            "agent_type": "direct",
+            "account_alias": "work",
+            "parent_session_id": null,
+            "workspace_cwd": "/daemon/workspace",
+            "daemon_field_added_after_ade_had_shipped": {"nested": [true, "intact"]}
+        });
+        assert!(haider_bridge_reconcile(&[HaiderBridgeSession {
+            id: "provider-opaque".to_string(),
+            harness: summary.clone(),
+        }])
+        .unwrap());
 
         let connection = sessions_open_database().unwrap();
-        let reconciled = sessions_row_by_id(&connection, "attention").unwrap();
-        assert_eq!(reconciled.seen_at_ms, Some(20));
-        assert_eq!(reconciled.last_activity_ms, Some(30));
-        assert_eq!(reconciled.waiting_kind.as_deref(), Some("permission"));
-        assert_eq!(reconciled.waiting_menu_id.as_deref(), Some("menu-936"));
-        assert_eq!(reconciled.run_id.as_deref(), Some("run-live"));
-        assert_eq!(reconciled.worker_generation, Some(97));
-        drop(connection);
-
-        roster.seen_at_ms = None;
-        roster.last_activity_ms = None;
-        roster.waiting_kind = None;
-        roster.waiting_menu_id = None;
-        assert!(haider_bridge_reconcile(&[roster]).unwrap());
-
-        let connection = sessions_open_database().unwrap();
-        let reconciled = sessions_row_by_id(&connection, "attention").unwrap();
-        assert_eq!(reconciled.seen_at_ms, None);
-        assert_eq!(reconciled.last_activity_ms, None);
-        assert_eq!(reconciled.waiting_kind, None);
-        assert_eq!(reconciled.waiting_menu_id, None);
-        assert_eq!(reconciled.run_id.as_deref(), Some("run-live"));
-        assert_eq!(reconciled.worker_generation, Some(97));
+        let reconciled = sessions_row_by_id(&connection, "opaque").unwrap();
+        assert_eq!(reconciled.harness, summary);
+        let serialized = serde_json::to_value(&reconciled).unwrap();
+        assert_eq!(serialized["title"], "Opaque daemon title");
+        assert_eq!(serialized["model"], "gpt-future");
+        assert_eq!(serialized["status"], "running");
+        assert_eq!(serialized["state_raw"], "running_tool: cargo");
+        assert_eq!(serialized["latest_at_ms"], 1_777_777_777_123_i64);
+        assert_eq!(serialized["speed"], "fast");
+        assert_eq!(serialized["waiting_kind"], "permission");
+        assert_eq!(serialized["waiting_menu_id"], "menu-936");
+        assert_eq!(serialized["needs_input"], needs_input);
+        assert_eq!(serialized["turn_count"], 8);
+        assert_eq!(serialized["footprint_tokens"], 42_001);
+        assert_eq!(
+            serialized["daemon_field_added_after_ade_had_shipped"],
+            json!({"nested": [true, "intact"]})
+        );
+        // Reconcile mentioned none of these ADE-owned values.
+        assert_eq!(reconciled.slug, "original-title");
+        assert_eq!(reconciled.dir, "/ade-owned-dir");
+        assert_eq!(reconciled.kind, "pinned");
+        assert_eq!(reconciled.created_at_ms, 10);
+        assert!(reconciled.pinned);
+        assert_eq!(reconciled.first_user_message, "ADE search text");
         drop(connection);
 
         fs::remove_dir_all(directory).unwrap();
@@ -1141,7 +1477,7 @@ mod sessions_tests {
             vec![json!({
                 "session_id": "provider-needs-input",
                 "head_seq": 17,
-                "state_raw": "waiting",
+                "run_state": "waiting",
                 "needs_input": card.clone()
             })],
             false,
@@ -1152,16 +1488,18 @@ mod sessions_tests {
         let connection = sessions_open_database().unwrap();
         let stored_json = connection
             .query_row(
-                "SELECT needs_input_json FROM sessions WHERE id = ?1",
+                "SELECT harness_json FROM sessions WHERE id = ?1",
                 ["needs-input"],
-                |row| row.get::<_, Option<String>>(0),
+                |row| row.get::<_, String>(0),
             )
-            .unwrap()
-            .expect("needs_input JSON text");
-        assert_eq!(serde_json::from_str::<Value>(&stored_json).unwrap(), card);
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored_json).unwrap()["needs_input"],
+            card
+        );
         let reconciled = sessions_row_by_id(&connection, "needs-input").unwrap();
-        assert_eq!(reconciled.needs_input, card);
-        assert!(reconciled.needs_input.get("secret_answer").is_none());
+        assert_eq!(reconciled.needs_input(), card);
+        assert!(reconciled.needs_input().get("secret_answer").is_none());
         drop(connection);
 
         assert!(haider_bridge_reconcile_summary_values_tracked(
@@ -1169,7 +1507,7 @@ mod sessions_tests {
             vec![json!({
                 "session_id": "provider-needs-input",
                 "head_seq": 17,
-                "state_raw": "waiting"
+                "run_state": "waiting"
             })],
             false,
             haider_bridge_reconcile_store,
@@ -1179,14 +1517,14 @@ mod sessions_tests {
         let connection = sessions_open_database().unwrap();
         let stored_json = connection
             .query_row(
-                "SELECT needs_input_json FROM sessions WHERE id = ?1",
+                "SELECT harness_json FROM sessions WHERE id = ?1",
                 ["needs-input"],
-                |row| row.get::<_, Option<String>>(0),
+                |row| row.get::<_, String>(0),
             )
             .unwrap();
-        assert_eq!(stored_json, None);
+        assert!(serde_json::from_str::<Value>(&stored_json).unwrap()["needs_input"].is_null());
         let reconciled = sessions_row_by_id(&connection, "needs-input").unwrap();
-        assert_eq!(reconciled.needs_input, Value::Null);
+        assert_eq!(reconciled.needs_input(), Value::Null);
         assert_eq!(
             serde_json::to_value(&reconciled).unwrap()["needs_input"],
             Value::Null

@@ -86,8 +86,6 @@ impl Default for HaiderProjectionFoldState {
 #[derive(Debug, Default)]
 struct HaiderProjectionFoldStep {
     rows: Vec<SessionProjectionRow>,
-    status: Option<String>,
-    state_raw: Option<String>,
     tail_changed: bool,
 }
 
@@ -129,7 +127,6 @@ struct HaiderProjectionEvent {
 struct HaiderProjectionPersistedRows {
     rows: Vec<SessionProjectionRow>,
     total_rows: i64,
-    session_changed: bool,
 }
 
 struct HaiderProjectionWatch {
@@ -235,16 +232,9 @@ struct HaiderProjectionJournalCursor {
     covered_through_seq: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct HaiderProjectionRunCoordinates {
-    run_id: Option<String>,
-    worker_generation: Option<i64>,
-}
-
 #[derive(Clone, Debug)]
 struct HaiderProjectionJournalCommit {
     covered_through_seq: i64,
-    coordinates: Option<HaiderProjectionRunCoordinates>,
 }
 
 enum HaiderProjectionJournalIngest {
@@ -1202,7 +1192,6 @@ fn haider_projection_fold_value_locked(
                 payload.clone(),
                 haider_projection_at_ms(value, payload),
             ));
-            step.status = Some("error".to_string());
         }
         "effect" => {
             let effect_id = payload_object
@@ -1255,13 +1244,6 @@ fn haider_projection_fold_value_locked(
                     payload.clone(),
                     haider_projection_at_ms(value, payload),
                 ));
-            }
-            if matches!(payload_type.as_str(), "run_state" | "session_state") {
-                let state_raw = payload_object
-                    .and_then(|object| object.get("state"))
-                    .and_then(haider_bridge_state_raw);
-                step.status = Some(haider_bridge_store_status(state_raw.as_deref()).to_string());
-                step.state_raw = state_raw;
             }
         }
         _ => {
@@ -1414,7 +1396,6 @@ fn haider_projection_persist_batch(
                 })
                 .map_err(|error| format!("Unable to persist session pipe cursor: {error}"))?;
         }
-        let mut session_changed = false;
         if let Some(journal) = journal {
             transaction
                 .prepare_cached(
@@ -1431,25 +1412,6 @@ fn haider_projection_persist_batch(
                     ])
                 })
                 .map_err(|error| format!("Unable to persist session journal cursor: {error}"))?;
-            if let Some(coordinates) = journal.coordinates.as_ref() {
-                session_changed = transaction
-                    .prepare_cached(
-                        "UPDATE sessions SET run_id = ?2, worker_generation = ?3
-                         WHERE id = ?1
-                           AND (run_id IS NOT ?2 OR worker_generation IS NOT ?3)",
-                    )
-                    .and_then(|mut statement| {
-                        statement.execute(rusqlite::params![
-                            session_id,
-                            coordinates.run_id,
-                            coordinates.worker_generation,
-                        ])
-                    })
-                    .map_err(|error| {
-                        format!("Unable to persist Haider run coordinates: {error}")
-                    })?
-                    > 0;
-            }
         }
         transaction
             .commit()
@@ -1476,7 +1438,6 @@ fn haider_projection_persist_batch(
         Ok(HaiderProjectionPersistedRows {
             rows: persisted_rows,
             total_rows: state.total_rows,
-            session_changed,
         })
     })
 }
@@ -1670,36 +1631,8 @@ fn haider_projection_sync(
     })
 }
 
-fn haider_projection_apply_status(
-    app: Option<&AppHandle>,
-    session_id: &str,
-    status: Option<String>,
-    state_raw: Option<String>,
-) {
-    if status.is_none() && state_raw.is_none() {
-        return;
-    }
-    let result = session_update_blocking(SessionUpdateArgs {
-        id: session_id.to_string(),
-        title: None,
-        status,
-        state_raw,
-        provider_session_id: None,
-        first_user_message: None,
-        // Recency is DAEMON-owned (reconcile mirrors updated_at). Touching
-        // here made merely OPENING a session jump to the top of Recent —
-        // status/state writes must never move the clock.
-        touch: None,
-    });
-    if result.is_ok() {
-        if let Some(app) = app {
-            sessions_emit_changed(app);
-        }
-    }
-}
-
 fn haider_projection_ingest_value(
-    app: Option<&AppHandle>,
+    _app: Option<&AppHandle>,
     session_id: &str,
     value: &Value,
 ) -> Result<HaiderProjectionFrame, String> {
@@ -1717,8 +1650,6 @@ fn haider_projection_ingest_value(
     };
     haider_projection_initialize_state(session_id)?;
     let mut all_rows = Vec::new();
-    let mut status = None;
-    let mut state_raw = None;
     let mut tail_changed = false;
     {
         let mut states = haider_projection_states()
@@ -1730,8 +1661,6 @@ fn haider_projection_ingest_value(
         for item in haider_projection_input_items(value) {
             let step = haider_projection_fold_value_locked(state, session_id, item);
             all_rows.extend(step.rows);
-            status = step.status.or(status);
-            state_raw = step.state_raw.or(state_raw);
             tail_changed |= step.tail_changed;
         }
     }
@@ -1754,7 +1683,6 @@ fn haider_projection_ingest_value(
     let live_tail = state.tail.as_ref().map(|tail| tail.row.clone());
     let total_rows = state.total_rows;
     drop(states);
-    haider_projection_apply_status(app, session_id, status, state_raw);
     let provider_session_id = haider_projection_resolve_provider_session(session_id)
         .ok()
         .map(|(_, provider_session_id)| provider_session_id);
@@ -1785,30 +1713,8 @@ fn haider_projection_ingest_value(
     })
 }
 
-fn haider_projection_envelope_coordinates(
-    envelopes: &[Value],
-) -> Option<HaiderProjectionRunCoordinates> {
-    let envelope = envelopes.iter().max_by_key(|envelope| {
-        envelope
-            .as_object()
-            .and_then(|object| haider_projection_json_i64(object.get("seq")))
-            .unwrap_or_default()
-    })?;
-    let object = envelope.as_object()?;
-    Some(HaiderProjectionRunCoordinates {
-        // Missing/null is positive idle truth, never an empty run id.
-        run_id: object
-            .get("run_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|run_id| !run_id.is_empty())
-            .map(str::to_string),
-        worker_generation: haider_projection_json_i64(object.get("worker_generation")),
-    })
-}
-
 fn haider_projection_ingest_journal_page(
-    app: Option<&AppHandle>,
+    _app: Option<&AppHandle>,
     session_id: &str,
     provider_session_id: &str,
     mut result: haider_rpc_ade::SessionReadResult,
@@ -1836,10 +1742,7 @@ fn haider_projection_ingest_journal_page(
             .and_then(|object| haider_projection_json_i64(object.get("seq")))
             .unwrap_or_default()
     });
-    let coordinates = haider_projection_envelope_coordinates(&result.envelopes);
     let mut all_rows = Vec::new();
-    let mut status = None;
-    let mut state_raw = None;
     let mut tail_changed = reset;
     {
         let mut states = haider_projection_states()
@@ -1851,14 +1754,11 @@ fn haider_projection_ingest_journal_page(
         for envelope in &result.envelopes {
             let step = haider_projection_fold_value_locked(state, session_id, envelope);
             all_rows.extend(step.rows);
-            status = step.status.or(status);
-            state_raw = step.state_raw.or(state_raw);
             tail_changed |= step.tail_changed;
         }
     }
     let journal = HaiderProjectionJournalCommit {
         covered_through_seq,
-        coordinates,
     };
     let persisted =
         haider_projection_persist_batch(session_id, &all_rows, None, Some(&journal))?;
@@ -1878,12 +1778,6 @@ fn haider_projection_ingest_journal_page(
     let live_tail = state.tail.as_ref().map(|tail| tail.row.clone());
     let total_rows = state.total_rows;
     drop(states);
-    haider_projection_apply_status(app, session_id, status, state_raw);
-    if persisted.session_changed {
-        if let Some(app) = app {
-            sessions_emit_changed(app);
-        }
-    }
     let head_seq = result.head_seq.min(i64::MAX as u64) as i64;
     haider_bridge_note_head_seq(provider_session_id, head_seq);
     let sync = haider_projection_sync(session_id, Some(provider_session_id))?;
@@ -3196,7 +3090,7 @@ fn haider_projection_local_session_for_provider(provider_session_id: &str) -> Op
         match connection
             .prepare_cached(
                 "SELECT id FROM sessions
-                 WHERE provider = 'haider' AND provider_session_id = ?1 LIMIT 1",
+                 WHERE provider_session_id = ?1 LIMIT 1",
             )
             .and_then(|mut statement| {
                 statement.query_row([provider_session_id], |row| row.get::<_, String>(0))
@@ -5193,52 +5087,6 @@ mod haider_projection_tests {
     }
 
     #[test]
-    fn haider_projection_journal_coordinates_round_trip_and_terminal_clears_run() {
-        let test_session = haider_projection_test_session();
-        haider_projection_with_database(|connection| {
-            connection
-                .execute(
-                    "INSERT INTO sessions (
-                        id, title, slug, dir, kind, provider, provider_session_id,
-                        created_at_ms, latest_at_ms
-                     ) VALUES (?1, 'Run coordinates', '', '', 'pinned', 'haider', ?2, 1, 1)",
-                    rusqlite::params![
-                        test_session.session_id,
-                        test_session.provider_session_id,
-                    ],
-                )
-                .map(|_| ())
-                .map_err(|error| format!("test session insert failed: {error}"))
-        })
-        .unwrap();
-        for (covered, run_id, generation) in [
-            (7, Some("run-live".to_string()), Some(97)),
-            (8, None, Some(97)),
-        ] {
-            let journal = HaiderProjectionJournalCommit {
-                covered_through_seq: covered,
-                coordinates: Some(HaiderProjectionRunCoordinates {
-                    run_id,
-                    worker_generation: generation,
-                }),
-            };
-            haider_projection_persist_batch(
-                &test_session.session_id,
-                &[],
-                None,
-                Some(&journal),
-            )
-            .unwrap();
-            let row = haider_projection_with_database(|connection| {
-                sessions_row_by_id(connection, &test_session.session_id)
-            })
-            .unwrap();
-            assert_eq!(row.worker_generation, Some(97));
-            assert_eq!(row.run_id, journal.coordinates.unwrap().run_id);
-        }
-    }
-
-    #[test]
     fn haider_projection_keyset_window_matches_offset_golden() {
         let test_session = haider_projection_test_session();
         let rows = [
@@ -5612,11 +5460,8 @@ mod haider_projection_tests {
                 "status":"running_tool", "tool":"cargo"
             }}}),
         );
-        assert_eq!(object_state.status.as_deref(), Some("running"));
-        assert_eq!(
-            object_state.state_raw.as_deref(),
-            Some("running_tool: cargo")
-        );
+        assert!(object_state.rows.is_empty());
+        assert_eq!(state.metadata["run_state"]["state"]["tool"], "cargo");
     }
 
     #[test]
@@ -5700,7 +5545,7 @@ mod haider_projection_tests {
     }
 
     #[test]
-    fn haider_projection_run_failure_is_visible_and_marks_error() {
+    fn haider_projection_run_failure_is_visible() {
         let mut state = HaiderProjectionFoldState::default();
         let event = json!({
             "seq": 9,
@@ -5714,7 +5559,6 @@ mod haider_projection_tests {
         assert_eq!(step.rows.len(), 1);
         assert_eq!(step.rows[0].kind, "error");
         assert_eq!(step.rows[0].text, "Provider is unavailable");
-        assert_eq!(step.status.as_deref(), Some("error"));
     }
 
     #[test]

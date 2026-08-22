@@ -9,56 +9,20 @@ const HAIDER_LIBRARY_CACHE_TTL: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HaiderBridgeSession {
     id: String,
-    title: Option<String>,
-    model: Option<String>,
-    provider: Option<String>,
-    cwd: Option<PathBuf>,
-    state_raw: Option<String>,
-    effort: Option<String>,
-    fast: Option<bool>,
-    seen_at_ms: Option<i64>,
-    last_activity_ms: Option<i64>,
-    waiting_kind: Option<String>,
-    waiting_menu_id: Option<String>,
-    run_id: Option<String>,
-    worker_generation: Option<i64>,
-    needs_input: Value,
-    latest_at_ms: Option<i64>,
+    harness: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HaiderBridgeReconcileStamp {
     head_seq: Option<i64>,
-    state_raw: Option<String>,
-    title: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
-    fast: Option<bool>,
-    seen_at_ms: Option<i64>,
-    last_activity_ms: Option<i64>,
-    waiting_kind: Option<String>,
-    waiting_menu_id: Option<String>,
-    run_id: Option<String>,
-    worker_generation: Option<i64>,
-    needs_input: Value,
+    harness: Value,
 }
 
 impl HaiderBridgeReconcileStamp {
     fn new(session: &HaiderBridgeSession, head_seq: Option<i64>) -> Self {
         Self {
             head_seq,
-            state_raw: session.state_raw.clone(),
-            title: session.title.clone(),
-            model: session.model.clone(),
-            effort: session.effort.clone(),
-            fast: session.fast,
-            seen_at_ms: session.seen_at_ms,
-            last_activity_ms: session.last_activity_ms,
-            run_id: session.run_id.clone(),
-            worker_generation: session.worker_generation,
-            waiting_kind: session.waiting_kind.clone(),
-            waiting_menu_id: session.waiting_menu_id.clone(),
-            needs_input: session.needs_input.clone(),
+            harness: session.harness.clone(),
         }
     }
 }
@@ -170,10 +134,6 @@ fn haider_bridge_text(value: &Value) -> Option<String> {
     }
 }
 
-fn haider_bridge_bool(value: &Value) -> Option<bool> {
-    value.as_bool()
-}
-
 fn haider_bridge_object_value<'a>(
     object: &'a serde_json::Map<String, Value>,
     keys: &[&str],
@@ -187,58 +147,6 @@ fn haider_bridge_object_value<'a>(
                 .and_then(|nested| keys.iter().find_map(|key| nested.get(*key)))
         })
     })
-}
-
-fn haider_bridge_state_raw(value: &Value) -> Option<String> {
-    if let Some(text) = haider_bridge_text(value) {
-        return Some(text);
-    }
-    let object = value.as_object()?;
-    let mut state = None;
-    for key in ["status", "state", "kind", "type", "name"] {
-        if let Some(text) = object.get(key).and_then(haider_bridge_text) {
-            state = Some(text);
-            break;
-        }
-    }
-    if let (Some(state), Some(tool)) = (
-        state.as_deref(),
-        object.get("tool").and_then(haider_bridge_text),
-    ) {
-        return Some(format!("{state}: {tool}"));
-    }
-    state.or_else(|| {
-        (object.len() == 1)
-            .then(|| object.keys().next().cloned())
-            .flatten()
-    })
-}
-
-fn haider_bridge_timestamp(value: &Value) -> Option<i64> {
-    let raw = match value {
-        Value::Number(number) => number.as_i64().or_else(|| {
-            number
-                .as_f64()
-                .filter(|value| value.is_finite())
-                .map(|value| value as i64)
-        }),
-        Value::String(text) => text.trim().parse::<i64>().ok(),
-        _ => None,
-    }?;
-    Some(if raw.abs() < 100_000_000_000 {
-        raw.saturating_mul(1_000)
-    } else {
-        raw
-    })
-}
-
-fn haider_bridge_milliseconds(value: &Value) -> Option<i64> {
-    let raw = match value {
-        Value::Number(number) => number.as_u64(),
-        Value::String(text) => text.trim().parse::<u64>().ok(),
-        _ => None,
-    }?;
-    i64::try_from(raw).ok()
 }
 
 fn haider_bridge_sequence(value: &Value) -> Option<i64> {
@@ -269,202 +177,9 @@ fn haider_bridge_parse_session(
     if id.trim().is_empty() {
         return None;
     }
-
-    let title = haider_bridge_object_value(
-        object,
-        &["title", "name"],
-        &["metadata", "session", "summary"],
-    )
-    .and_then(haider_bridge_text);
-    let model_value = haider_bridge_object_value(
-        object,
-        &["model", "last_model"],
-        &["summary", "metadata", "session"],
-    );
-    let model = model_value.and_then(haider_bridge_text).or_else(|| {
-        model_value.and_then(Value::as_object).and_then(|model| {
-            ["model", "id", "name"]
-                .iter()
-                .find_map(|key| model.get(*key).and_then(haider_bridge_text))
-        })
-    });
-    let provider = haider_bridge_object_value(
-        object,
-        &["provider", "model_provider", "last_provider"],
-        &["summary", "metadata", "session"],
-    )
-    .and_then(haider_bridge_text)
-    .or_else(|| {
-        model_value
-            .and_then(Value::as_object)
-            .and_then(|model| model.get("provider"))
-            .and_then(haider_bridge_text)
-    });
-    let cwd = haider_bridge_object_value(
-        object,
-        &[
-            "workspace_cwd",
-            "cwd",
-            "dir",
-            "directory",
-            "working_directory",
-            "workingDirectory",
-            "workspace_root",
-            "workspaceRoot",
-        ],
-        &["summary", "workspace", "metadata", "session"],
-    )
-    .and_then(haider_bridge_text)
-    .map(PathBuf::from);
-    let run_state = haider_bridge_object_value(
-        object,
-        &["run_state", "runState"],
-        &["runtime", "summary", "session"],
-    );
-    let state_raw = run_state
-        .or_else(|| {
-            haider_bridge_object_value(
-                object,
-                &[
-                    "state_raw",
-                    "stateRaw",
-                    "state",
-                    "status",
-                    "session_state",
-                    "sessionState",
-                ],
-                &["runtime", "summary", "session"],
-            )
-        })
-        .and_then(haider_bridge_state_raw);
-    let effort = haider_bridge_object_value(
-        object,
-        &["effort"],
-        &["runtime", "summary", "metadata", "session"],
-    )
-    .and_then(haider_bridge_text);
-    let fast = haider_bridge_object_value(
-        object,
-        &["fast"],
-        &["runtime", "summary", "metadata", "session"],
-    )
-    .and_then(haider_bridge_bool);
-    let seen_at_ms = haider_bridge_object_value(
-        object,
-        &["seen_at_ms", "seenAtMs"],
-        &["runtime", "summary", "metadata", "session"],
-    )
-    .and_then(haider_bridge_milliseconds);
-    let last_activity_ms = haider_bridge_object_value(
-        object,
-        &["last_activity_ms", "lastActivityMs"],
-        &["runtime", "summary", "metadata", "session"],
-    )
-    .and_then(haider_bridge_milliseconds);
-    let waiting_why = haider_bridge_object_value(
-        object,
-        &["waiting_why", "waitingWhy"],
-        &["runtime", "summary", "metadata", "session"],
-    )
-    .and_then(Value::as_object);
-    let waiting_kind = waiting_why
-        .and_then(|waiting_why| waiting_why.get("kind"))
-        .and_then(haider_bridge_text);
-    let waiting_menu_id = waiting_why
-        .and_then(|waiting_why| {
-            waiting_why
-                .get("pending_menu_id")
-                .or_else(|| waiting_why.get("pendingMenuId"))
-        })
-        .and_then(haider_bridge_text);
-    /* 938 cancel coordinates. They are ONE observation and are read off the
-       SAME summary object: the daemon's selector can rank a parked run above
-       a newer running one, so an id paired with a state from a different poll
-       could name a different run than the one being rendered. Absent run_id
-       means no active run — never an error, and never a stop button. */
-    let run_id = haider_bridge_object_value(
-        object,
-        &["run_id", "runId"],
-        &["runtime", "summary", "metadata", "session"],
-    )
-    .and_then(haider_bridge_text);
-    let worker_generation = haider_bridge_object_value(
-        object,
-        &["worker_generation", "workerGeneration"],
-        &["runtime", "summary", "metadata", "session"],
-    )
-    .and_then(Value::as_i64);
-    let needs_input = haider_bridge_object_value(
-        object,
-        &["needs_input", "needsInput"],
-        &["runtime", "summary", "metadata", "session"],
-    )
-    .cloned()
-    .unwrap_or(Value::Null);
-
-    let timestamp_keys = [
-        "updated_at_ms",
-        "latest_at_ms",
-        "last_activity_at_ms",
-        "last_event_at_ms",
-        "activity_at_ms",
-        "terminal_at_ms",
-        "updated_at",
-        "latest_at",
-        "last_activity_at",
-    ];
-    let latest_at_ms = [None, Some("summary"), Some("activity"), Some("runtime")]
-        .into_iter()
-        .filter_map(|wrapper| {
-            let candidate = match wrapper {
-                Some(wrapper) => object.get(wrapper)?.as_object()?,
-                None => object,
-            };
-            timestamp_keys
-                .iter()
-                .filter_map(|key| candidate.get(*key).and_then(haider_bridge_timestamp))
-                .max()
-        })
-        .max();
-    let has_lineage = haider_bridge_object_value(
-        object,
-        &["kind", "parent_session_id", "parentSessionId"],
-        &["summary", "metadata", "session"],
-    )
-    .is_some();
-    let has_session_shape = title.is_some()
-        || model.is_some()
-        || provider.is_some()
-        || cwd.is_some()
-        || state_raw.is_some()
-        || effort.is_some()
-        || fast.is_some()
-        || seen_at_ms.is_some()
-        || last_activity_ms.is_some()
-        || waiting_kind.is_some()
-        || waiting_menu_id.is_some()
-        || !needs_input.is_null()
-        || latest_at_ms.is_some()
-        || has_lineage
-        || object.contains_key("head_seq")
-        || object.contains_key("summary");
-    has_session_shape.then_some(HaiderBridgeSession {
+    Some(HaiderBridgeSession {
         id,
-        title,
-        model,
-        provider,
-        cwd,
-        state_raw,
-        effort,
-        fast,
-        seen_at_ms,
-        last_activity_ms,
-        waiting_kind,
-        waiting_menu_id,
-        run_id,
-        worker_generation,
-        needs_input,
-        latest_at_ms,
+        harness: value.clone(),
     })
 }
 
@@ -606,56 +321,23 @@ fn haider_bridge_parse_session_list(value: &Value) -> Vec<HaiderBridgeSession> {
     sessions
 }
 
-fn haider_bridge_store_status(state: Option<&str>) -> &'static str {
-    let normalized = state
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', ' ', '.'], "_");
-    if ["error", "errored", "failed", "failure", "fatal"]
-        .iter()
-        .any(|needle| normalized.contains(needle))
-    {
-        "error"
-    } else if [
-        "waiting",
-        "input_required",
-        "permission_required",
-        "needs_input",
-        "awaiting_input",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-    {
-        "waiting"
-    } else if [
-        "active",
-        "running",
-        "streaming",
-        "tool",
-        "thinking",
-        "queued",
-        "compacting",
-        "verifying",
-        "concluding",
-        "cancelling",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-    {
-        "running"
-    } else {
-        "idle"
-    }
-}
-
 fn haider_bridge_canonical_path(path: &Path) -> Option<PathBuf> {
     path.canonicalize().ok()
 }
 
+fn haider_bridge_session_cwd(session: &HaiderBridgeSession) -> Option<PathBuf> {
+    let object = session.harness.as_object()?;
+    haider_bridge_object_value(
+        object,
+        &["workspace_cwd", "cwd"],
+        &["summary", "workspace", "metadata", "session"],
+    )
+    .and_then(haider_bridge_text)
+    .map(PathBuf::from)
+}
+
 fn haider_bridge_session_matches_dir(session: &HaiderBridgeSession, row: &SessionRow) -> bool {
-    let Some(cwd) = session
-        .cwd
+    let Some(cwd) = haider_bridge_session_cwd(session)
         .as_deref()
         .and_then(haider_bridge_canonical_path)
     else {
@@ -679,7 +361,7 @@ fn haider_bridge_reconcile_store(
         .lock()
         .map_err(|_| "Sessions write lock is unavailable.".to_string())?;
     let mut connection = sessions_open_database()?;
-    let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions WHERE provider = 'haider'");
+    let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions");
     let rows = {
         let mut statement = connection
             .prepare(&query)
@@ -744,133 +426,22 @@ fn haider_bridge_reconcile_store(
             continue;
         };
 
-        let mut row_changed = false;
+        let mut row_changed = row.harness != session.harness;
         if row.provider_session_id.trim().is_empty() {
             row.provider_session_id = session.id.clone();
-            row_changed = true;
-        }
-        if !row.title_locked
-            && (row.first_user_message.trim().is_empty() || row.title == "New session")
-            && session
-                .title
-                .as_ref()
-                .is_some_and(|title| !title.is_empty())
-            && session.title.as_deref() != Some(row.title.as_str())
-        {
-            row.title = session.title.clone().unwrap_or_default();
-            row_changed = true;
-        }
-        if let Some(model) = session
-            .model
-            .clone()
-            .or_else(|| roster.is_some().then(String::new))
-        {
-            if row.model != model {
-                row.model = model;
-                row_changed = true;
-            }
-        }
-        if let Some(state_raw) = session
-            .state_raw
-            .clone()
-            .or_else(|| roster.is_some().then(String::new))
-        {
-            let status = haider_bridge_store_status(Some(&state_raw));
-            if row.status != status {
-                row.status = status.to_string();
-                row_changed = true;
-            }
-            if row.state_raw != state_raw {
-                row.state_raw = state_raw;
-                row_changed = true;
-            }
-        }
-        if let Some(effort) = session.effort.clone() {
-            if row.effort.as_deref() != Some(effort.as_str()) {
-                row.effort = Some(effort);
-                row_changed = true;
-            }
-        }
-        if let Some(fast) = session.fast {
-            let fast = i64::from(fast);
-            if row.speed_fast != Some(fast) {
-                row.speed_fast = Some(fast);
-                row_changed = true;
-            }
-        }
-        if row.seen_at_ms != session.seen_at_ms {
-            row.seen_at_ms = session.seen_at_ms;
-            row_changed = true;
-        }
-        if row.last_activity_ms != session.last_activity_ms {
-            row.last_activity_ms = session.last_activity_ms;
-            row_changed = true;
-        }
-        /* Run coordinates are only written by a source that CARRIES them.
-           worker_generation is non-optional on the RPC wire, so its absence
-           means the source is lossy — the CLI projection drops both — and
-           letting that source write would clear a live run's id moments
-           after the watch set it. When the rich source does write, absence
-           of run_id is real and clears the pair, so a stop button can never
-           fire at a run that already finished. */
-        if session.worker_generation.is_some() || row.worker_generation.is_none() {
-        if row.run_id != session.run_id {
-            row.run_id = session.run_id.clone();
-            row_changed = true;
-        }
-        if row.worker_generation != session.worker_generation {
-            row.worker_generation = session.worker_generation;
-            row_changed = true;
-        }
-        }
-        if row.waiting_kind != session.waiting_kind {
-            row.waiting_kind = session.waiting_kind.clone();
-            row_changed = true;
-        }
-        if row.waiting_menu_id != session.waiting_menu_id {
-            row.waiting_menu_id = session.waiting_menu_id.clone();
-            row_changed = true;
-        }
-        if row.needs_input != session.needs_input {
-            row.needs_input = session.needs_input.clone();
-            row_changed = true;
-        }
-        if session
-            .latest_at_ms
-            .is_some_and(|latest_at_ms| latest_at_ms > row.latest_at_ms)
-        {
-            row.latest_at_ms = session.latest_at_ms.unwrap_or(row.latest_at_ms);
             row_changed = true;
         }
         if !row_changed {
             continue;
         }
-        let needs_input_json = (!row.needs_input.is_null())
-            .then(|| serde_json::to_string(&row.needs_input))
-            .transpose()
-            .map_err(|error| format!("Unable to encode Haider needs_input state: {error}"))?;
+        row.harness = session.harness.clone();
+        let harness_json = serde_json::to_string(&row.harness)
+            .map_err(|error| format!("Unable to encode Haider session summary: {error}"))?;
 
         transaction
             .execute(
-                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5, state_raw = ?6, model = ?7, effort = ?8, speed_fast = ?9, seen_at_ms = ?10, last_activity_ms = ?11, waiting_kind = ?12, waiting_menu_id = ?13, needs_input_json = ?14, run_id = ?15, worker_generation = ?16 WHERE id = ?1",
-                rusqlite::params![
-                    row.id,
-                    row.title,
-                    row.provider_session_id,
-                    row.latest_at_ms,
-                    row.status,
-                    row.state_raw,
-                    row.model,
-                    row.effort,
-                    row.speed_fast,
-                    row.seen_at_ms,
-                    row.last_activity_ms,
-                    row.waiting_kind,
-                    row.waiting_menu_id,
-                    needs_input_json,
-                    row.run_id,
-                    row.worker_generation,
-                ],
+                "UPDATE sessions SET provider_session_id = ?2, harness_json = ?3 WHERE id = ?1",
+                rusqlite::params![row.id, row.provider_session_id, harness_json,],
             )
             .map_err(|error| format!("Unable to reconcile Haider session: {error}"))?;
         changed = true;
@@ -889,43 +460,15 @@ fn haider_bridge_reconcile_store(
             continue;
         }
         let now_ms = sessions_now_ms();
-        let latest = session.latest_at_ms.unwrap_or(now_ms);
-        let title = session
-            .title
-            .clone()
-            .filter(|title| !title.trim().is_empty())
-            .unwrap_or_else(|| "Haider session".to_string());
-        let state_raw = session.state_raw.clone().unwrap_or_default();
-        let status = haider_bridge_store_status(Some(&state_raw));
-        let needs_input_json = (!session.needs_input.is_null())
-            .then(|| serde_json::to_string(&session.needs_input))
-            .transpose()
-            .map_err(|error| format!("Unable to encode Haider needs_input state: {error}"))?;
+        let harness_json = serde_json::to_string(&session.harness)
+            .map_err(|error| format!("Unable to encode imported Haider summary: {error}"))?;
         transaction
             .execute(
                 "INSERT INTO sessions (
-                    id, title, slug, dir, kind, provider, provider_session_id,
-                    created_at_ms, latest_at_ms, status, state_raw,
-                    first_user_message, model, effort, speed_fast, seen_at_ms,
-                    last_activity_ms, waiting_kind, waiting_menu_id, needs_input_json
-                 ) VALUES (?1, ?2, '', '', 'pinned', 'haider', ?3, ?4, ?5, ?6, ?7, '', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                rusqlite::params![
-                    sessions_new_id(now_ms),
-                    title,
-                    session.id,
-                    latest,
-                    latest,
-                    status,
-                    state_raw,
-                    session.model.clone().unwrap_or_default(),
-                    session.effort.clone(),
-                    session.fast.map(i64::from),
-                    session.seen_at_ms,
-                    session.last_activity_ms,
-                    session.waiting_kind.clone(),
-                    session.waiting_menu_id.clone(),
-                    needs_input_json,
-                ],
+                    id, slug, dir, kind, provider_session_id, created_at_ms,
+                    pinned, title_locked, harness_json, first_user_message
+                 ) VALUES (?1, '', '', 'pinned', ?2, ?3, 0, NULL, ?4, '')",
+                rusqlite::params![sessions_new_id(now_ms), session.id, now_ms, harness_json,],
             )
             .map_err(|error| format!("Unable to import Haider session: {error}"))?;
         changed = true;
@@ -974,7 +517,6 @@ fn haider_bridge_reconcile_tracked(
             || snapshot
                 .keys()
                 .any(|session_id| !tracker.sessions.contains_key(session_id)));
-    let observed_at_ms = sessions_now_ms();
     let candidates = if tracker.initialized {
         sessions
             .iter()
@@ -982,23 +524,7 @@ fn haider_bridge_reconcile_tracked(
                 (snapshot.contains_key(&session.id)
                     && (!head_sequences.contains_key(&session.id)
                         || snapshot.get(&session.id) != tracker.sessions.get(&session.id)))
-                .then(|| {
-                    let mut session = session.clone();
-                    let head_advanced = snapshot
-                        .get(&session.id)
-                        .and_then(|stamp| stamp.head_seq)
-                        .zip(
-                            tracker
-                                .sessions
-                                .get(&session.id)
-                                .and_then(|stamp| stamp.head_seq),
-                        )
-                        .is_some_and(|(incoming, previous)| incoming > previous);
-                    if !complete && head_advanced && session.latest_at_ms.is_none() {
-                        session.latest_at_ms = Some(observed_at_ms);
-                    }
-                    session
-                })
+                .then(|| session.clone())
             })
             .collect::<Vec<_>>()
     } else {
@@ -1177,9 +703,22 @@ fn haider_library_observed_models(value: &Value) -> Vec<HaiderLibraryModel> {
     let mut models = haider_bridge_parse_session_list(value)
         .into_iter()
         .filter_map(|session| {
+            let summary = session.harness.as_object()?;
+            let model_value = summary.get("model").or_else(|| summary.get("last_model"))?;
             Some(HaiderLibraryModel {
-                model: session.model?.trim().to_string(),
-                provider: session.provider.unwrap_or_default().trim().to_string(),
+                model: model_value
+                    .as_str()
+                    .or_else(|| model_value.get("model").and_then(Value::as_str))?
+                    .trim()
+                    .to_string(),
+                provider: summary
+                    .get("provider")
+                    .or_else(|| summary.get("last_provider"))
+                    .or_else(|| model_value.get("provider"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
                 available: true,
                 auth_state: None,
             })
@@ -1375,12 +914,11 @@ mod haider_bridge_tests {
     #[test]
     fn haider_bridge_maps_run_states_defensively() {
         assert_eq!(
-            haider_bridge_state_raw(&json!({
+            sessions_run_state_text(Some(&json!({
                 "status": "running_tool",
                 "tool": "cargo"
-            }))
-            .as_deref(),
-            Some("running_tool: cargo")
+            }))),
+            "running_tool: cargo"
         );
         for state in [
             "active_run",
@@ -1389,18 +927,24 @@ mod haider_bridge_tests {
             "running_tool",
             "tool-call",
         ] {
-            assert_eq!(haider_bridge_store_status(Some(state)), "running");
+            assert_eq!(
+                sessions_status_from_run_state(Some(&json!(state))),
+                "running"
+            );
         }
         for state in ["waiting", "input_required", "permission-required"] {
-            assert_eq!(haider_bridge_store_status(Some(state)), "waiting");
+            assert_eq!(
+                sessions_status_from_run_state(Some(&json!(state))),
+                "waiting"
+            );
         }
         for state in ["errored", "run_failed", "fatal"] {
-            assert_eq!(haider_bridge_store_status(Some(state)), "error");
+            assert_eq!(sessions_status_from_run_state(Some(&json!(state))), "error");
         }
         for state in ["idle", "paused", "closed", "future_unknown_state"] {
-            assert_eq!(haider_bridge_store_status(Some(state)), "idle");
+            assert_eq!(sessions_status_from_run_state(Some(&json!(state))), "idle");
         }
-        assert_eq!(haider_bridge_store_status(None), "idle");
+        assert_eq!(sessions_status_from_run_state(None), "idle");
     }
 
     #[test]
@@ -1423,31 +967,15 @@ mod haider_bridge_tests {
                 "unknown_future_field": { "safe": true }
             }]
         });
-        assert_eq!(
-            haider_bridge_parse_session_list(&sample),
-            vec![HaiderBridgeSession {
-                id: "sess_01JTEST".to_string(),
-                title: Some("Review the parser".to_string()),
-                model: Some("test-model".to_string()),
-                provider: None,
-                cwd: Some(PathBuf::from("/tmp/diffforge-project/work")),
-                state_raw: Some("running_tool: cargo".to_string()),
-                effort: None,
-                fast: None,
-                seen_at_ms: None,
-                last_activity_ms: None,
-                waiting_kind: None,
-                waiting_menu_id: None,
-                run_id: None,
-                worker_generation: None,
-                needs_input: Value::Null,
-                latest_at_ms: Some(1_777_777_777_123),
-            }]
-        );
+        let parsed = haider_bridge_parse_session_list(&sample);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "sess_01JTEST");
+        assert_eq!(parsed[0].harness, sample["sessions"][0]);
+        assert_eq!(parsed[0].harness["unknown_future_field"]["safe"], true);
     }
 
     #[test]
-    fn haider_bridge_extracts_roster_scalars_without_storing_account_alias() {
+    fn haider_bridge_does_not_extract_roster_scalars() {
         let with_scalars = json!({
             "session_id": "session-935",
             "run_state": "running",
@@ -1463,25 +991,7 @@ mod haider_bridge_tests {
             "account_alias": null
         });
         let parsed = haider_bridge_parse_session(&with_scalars, None).unwrap();
-        assert_eq!(parsed.state_raw.as_deref(), Some("running"));
-        assert_eq!(parsed.effort.as_deref(), Some("xhigh"));
-        assert_eq!(parsed.fast, Some(true));
-        assert_eq!(parsed.seen_at_ms, Some(1_234));
-        assert_eq!(parsed.last_activity_ms, Some(2_345));
-        assert_eq!(parsed.waiting_kind.as_deref(), Some("permission"));
-        assert_eq!(parsed.waiting_menu_id.as_deref(), Some("menu-935"));
-
-        let without_scalars = haider_bridge_parse_session(
-            &json!({"session_id":"session-934", "state_raw":"idle"}),
-            None,
-        )
-        .unwrap();
-        assert_eq!(without_scalars.effort, None);
-        assert_eq!(without_scalars.fast, None);
-        assert_eq!(without_scalars.seen_at_ms, None);
-        assert_eq!(without_scalars.last_activity_ms, None);
-        assert_eq!(without_scalars.waiting_kind, None);
-        assert_eq!(without_scalars.waiting_menu_id, None);
+        assert_eq!(parsed.harness, with_scalars);
     }
 
     #[test]
@@ -1511,55 +1021,25 @@ mod haider_bridge_tests {
         )
         .unwrap();
 
-        assert_eq!(parsed.needs_input, needs_input);
-        assert_eq!(parsed.needs_input["kind"], "future_daemon_prompt");
+        assert_eq!(parsed.harness["needs_input"], needs_input);
+        assert_eq!(
+            parsed.harness["needs_input"]["kind"],
+            "future_daemon_prompt"
+        );
     }
 
     #[test]
-    fn haider_bridge_reconcile_stamp_tracks_effort_and_fast_changes() {
+    fn haider_bridge_reconcile_stamp_tracks_the_entire_payload() {
         let session = HaiderBridgeSession {
             id: "session-stamp".to_string(),
-            title: None,
-            model: None,
-            provider: None,
-            cwd: None,
-            state_raw: None,
-            effort: Some("medium".to_string()),
-            fast: Some(false),
-            seen_at_ms: None,
-            last_activity_ms: None,
-            waiting_kind: None,
-            waiting_menu_id: None,
-            run_id: None,
-            worker_generation: None,
-            needs_input: Value::Null,
-            latest_at_ms: None,
+            harness: json!({"session_id": "session-stamp", "effort": "medium"}),
         };
         let baseline = HaiderBridgeReconcileStamp::new(&session, Some(4));
-        let mut effort_changed = session.clone();
-        effort_changed.effort = Some("high".to_string());
+        let mut unknown_changed = session;
+        unknown_changed.harness["field_the_bridge_does_not_know"] = json!({"value": 50});
         assert_ne!(
             baseline,
-            HaiderBridgeReconcileStamp::new(&effort_changed, Some(4))
-        );
-        let mut fast_changed = session;
-        fast_changed.fast = Some(true);
-        assert_ne!(
-            baseline,
-            HaiderBridgeReconcileStamp::new(&fast_changed, Some(4))
-        );
-
-        let mut needs_input_changed = fast_changed.clone();
-        needs_input_changed.needs_input = json!({"kind":"future_kind"});
-        assert_ne!(
-            baseline,
-            HaiderBridgeReconcileStamp::new(&needs_input_changed, Some(4))
-        );
-        let mut attention_changed = fast_changed;
-        attention_changed.seen_at_ms = Some(50);
-        assert_ne!(
-            baseline,
-            HaiderBridgeReconcileStamp::new(&attention_changed, Some(4))
+            HaiderBridgeReconcileStamp::new(&unknown_changed, Some(4))
         );
     }
 
@@ -1652,10 +1132,10 @@ mod haider_bridge_tests {
         let parsed = haider_bridge_parse_session_list(&sample);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "session-from-map-key");
-        assert_eq!(parsed[0].title.as_deref(), Some("Nested session"));
-        assert_eq!(parsed[0].model.as_deref(), Some("current-model"));
-        assert_eq!(parsed[0].state_raw.as_deref(), Some("input-required"));
-        assert_eq!(parsed[0].latest_at_ms, Some(1_776_582_489_000));
+        assert_eq!(
+            parsed[0].harness,
+            sample["result"]["sessions"]["session-from-map-key"]
+        );
         let mut heads = HashMap::new();
         haider_bridge_collect_head_sequences(&sample, None, &mut heads);
         assert_eq!(heads.get("session-from-map-key"), Some(&12));
@@ -1665,21 +1145,14 @@ mod haider_bridge_tests {
     fn haider_bridge_unchanged_head_skips_store_reconcile() {
         let session = HaiderBridgeSession {
             id: "session-test".to_string(),
-            title: Some("Test".to_string()),
-            model: Some("model".to_string()),
-            provider: Some("openai".to_string()),
-            cwd: None,
-            state_raw: Some("idle".to_string()),
-            effort: None,
-            fast: None,
-            seen_at_ms: None,
-            last_activity_ms: None,
-            waiting_kind: None,
-            waiting_menu_id: None,
-            run_id: None,
-            worker_generation: None,
-            needs_input: Value::Null,
-            latest_at_ms: Some(100),
+            harness: json!({
+                "session_id": "session-test",
+                "title": "Test",
+                "model": "model",
+                "provider": "openai",
+                "run_state": "idle",
+                "updated_at_ms": 100,
+            }),
         };
         let mut tracker = HaiderBridgeReconcileTracker::default();
         let mut heads = HashMap::from([(session.id.clone(), 7)]);
@@ -1720,7 +1193,7 @@ mod haider_bridge_tests {
         assert_eq!(writes.get(), 2);
 
         let mut raw_changed = session.clone();
-        raw_changed.state_raw = Some("running_tool: cargo".to_string());
+        raw_changed.harness["run_state"] = json!({"status": "running_tool", "tool": "cargo"});
         haider_bridge_reconcile_tracked(
             &mut tracker,
             std::slice::from_ref(&raw_changed),
@@ -1792,7 +1265,7 @@ mod haider_bridge_tests {
                     push_calls.borrow_mut().push(
                         candidates
                             .iter()
-                            .map(|session| (session.id.clone(), session.latest_at_ms))
+                            .map(|session| session.id.clone())
                             .collect::<Vec<_>>(),
                     );
                     Ok(false)
@@ -1813,7 +1286,7 @@ mod haider_bridge_tests {
                 push_calls.borrow_mut().push(
                     candidates
                         .iter()
-                        .map(|session| (session.id.clone(), session.latest_at_ms))
+                        .map(|session| session.id.clone())
                         .collect::<Vec<_>>(),
                 );
                 Ok(false)
@@ -1830,9 +1303,8 @@ mod haider_bridge_tests {
         );
         let push_calls = push_calls.borrow();
         assert_eq!(push_calls.len(), 2);
-        assert_eq!(push_calls[0][0].0, "session-shared");
-        assert!(push_calls[0][0].1.is_none());
-        assert!(push_calls[1][0].1.is_some());
+        assert_eq!(push_calls[0], vec!["session-shared".to_string()]);
+        assert_eq!(push_calls[1], vec!["session-shared".to_string()]);
         assert_eq!(push_tracker.sessions["session-shared"].head_seq, Some(5));
     }
 

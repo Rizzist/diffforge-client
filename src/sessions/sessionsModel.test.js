@@ -9,12 +9,16 @@ import {
 } from "./sessionPaneOwnership.js";
 import { normalizeSessionRow } from "./sessionsModel.js";
 
-/* normalizeSessionRow builds a FRESH row object, so any harness field it does
-   not name is silently discarded — no error, nothing to notice. That defect
-   shipped invisibly once: 935's roster scalars, 936's attention state and
-   937's park card were all arriving correctly from the daemon and being
+/* normalizeSessionRow USED TO build a FRESH row object, so any harness field
+   it did not name was silently discarded — no error, nothing to notice. That
+   defect shipped invisibly once: 935's roster scalars, 936's attention state
+   and 937's park card were all arriving correctly from the daemon and being
    dropped one layer above the bridge, so features that were green in Rust and
    correct in their components simply never appeared.
+
+   It now spreads the incoming row, so the whole class is gone rather than
+   patched — see the unknown-field test at the bottom of this file, which is
+   the one that fails if anyone rebuilds the mirror.
 
    Decoding a field is not the same as KEEPING it. These assertions exist to
    fail when a field stops surviving the trip to the surfaces that render it —
@@ -81,9 +85,14 @@ test("normalizeSessionRow passes the park card through verbatim", () => {
   assert.equal(row.needs_input.options[0].key, "probe");
 });
 
-test("absent harness fields normalize to null, never to a fabricated default", () => {
+test("absent harness fields stay absent, never a fabricated default", () => {
   // A daemon that omits these said nothing about them — which is NOT the same
   // as zero, "" or false, and a surface must be able to tell those apart.
+  // Which nullish spelling arrives is deliberately not asserted: the normalizer
+  // no longer enumerates these fields, and pinning null here would mean listing
+  // all nine again — the exact mirror this refactor deleted. Rust's serializer
+  // does emit an explicit null for each; what matters at this boundary is only
+  // that nothing invents a value the daemon never sent.
   const row = normalizeSessionRow({
     id: "local-1",
     title: "Bare row",
@@ -91,15 +100,22 @@ test("absent harness fields normalize to null, never to a fabricated default", (
     latest_at_ms: 1,
   });
 
-  assert.equal(row.effort, null);
-  assert.equal(row.speed, null);
-  assert.equal(row.seen_at_ms, null);
-  assert.equal(row.last_activity_ms, null);
-  assert.equal(row.waiting_kind, null);
-  assert.equal(row.waiting_menu_id, null);
-  assert.equal(row.run_id, null);
-  assert.equal(row.worker_generation, null);
-  assert.equal(row.needs_input, null);
+  for (const field of [
+    "effort",
+    "speed",
+    "seen_at_ms",
+    "last_activity_ms",
+    "waiting_kind",
+    "waiting_menu_id",
+    "run_id",
+    "worker_generation",
+    "needs_input",
+  ]) {
+    assert.ok(
+      row[field] === null || row[field] === undefined,
+      `${field} was fabricated as ${JSON.stringify(row[field])}`,
+    );
+  }
 });
 
 test("session pane rehome swaps identities instead of aliasing one pane", () => {
@@ -163,4 +179,18 @@ test("an in-TUI session hop keeps the live Shell visible", () => {
   });
 
   assert.equal(modes["session-b"], "terminal");
+});
+
+/* The regression that proves the mirror is gone rather than merely up to date.
+   This field is not mentioned anywhere in the ADE — it stands in for whatever
+   the daemon adds next. If someone reintroduces field-by-field copying, every
+   other test in this file still passes and only this one fails. */
+test("normalizeSessionRow carries a field the ADE has never heard of", () => {
+  const row = normalizeSessionRow({
+    id: "unknown-field",
+    daemon_field_added_after_ade_had_shipped: { nested: ["shape", 7] },
+  });
+  assert.deepEqual(row.daemon_field_added_after_ade_had_shipped, {
+    nested: ["shape", 7],
+  });
 });

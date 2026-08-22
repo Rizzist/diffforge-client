@@ -759,6 +759,19 @@ export default function SessionSurface({
     }
     submitBusyRef.current = true;
     setDraftError("");
+    /* A command is an instruction to the harness, not a message to a model.
+       Sending one as the opening prompt created a session whose entire
+       content was the word "/model" and asked an agent to interpret it —
+       burning a session on a request that was never a question. Commands
+       are not answerable from a new chat yet (the harness has no door for
+       them), so say that rather than doing something surprising. */
+    if (/^\/\S/.test(prompt.trim())) {
+      setDraftError(
+        `${prompt.trim().split(/\s+/)[0]} is a harness command — open a chat first, or use the controls below the composer.`,
+      );
+      submitBusyRef.current = false;
+      return false;
+    }
     /* Same generation guard as bound submits: the draft's clear applies only
        if the user hasn't typed again while materialization ran. */
     const gen = editGenRef.current.draft || 0;
