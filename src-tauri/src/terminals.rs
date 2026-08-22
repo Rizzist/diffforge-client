@@ -3098,6 +3098,10 @@ fn terminal_project_runtime(
         "thinking" | "starting" | "waiting" => "busy",
         "uir" | "paused" => "needs_input",
         "error" => "error",
+        // An interrupted terminal is settled, but it is NOT ready: without this
+        // arm it fell through to "ready" below and the rail invited input into
+        // a shell that had just been cancelled.
+        "interrupted" | "cancelled" | "canceled" => "interrupted",
         "closing" => "closing",
         "closed" | "offline" => "closed",
         _ => "ready",
@@ -3126,7 +3130,9 @@ fn terminal_project_runtime(
         "prompting_user"
     } else if canonical_state == "error" {
         "error"
-    } else if matches!(canonical_state.as_str(), "thinking" | "waiting") {
+    } else if matches!(canonical_state.as_str(), "thinking" | "waiting" | "starting") {
+        // "starting" is work in progress, not finished work. Omitting it here
+        // reported a booting terminal as complete.
         "running"
     } else {
         "complete"
