@@ -99,8 +99,33 @@ fn sessions_status_from_run_state(run_state: Option<&Value>) -> &'static str {
     .any(|needle| normalized.contains(needle))
     {
         "running"
-    } else {
+    } else if normalized.is_empty()
+        || [
+            "idle",
+            "ready",
+            "paused",
+            "done",
+            "complete",
+            "completed",
+            "finished",
+            "stopped",
+            "interrupted",
+            "cancelled",
+            "canceled",
+            "closed",
+            "offline",
+        ]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+    {
         "idle"
+    } else {
+        // A state this list has never seen is the daemon naming something it is
+        // DOING — it does not invent vocabulary for sitting still. Bucketing it
+        // as idle would tell the user a working session is quiet, which is the
+        // failure that hides work. Over-reporting activity is visible and
+        // dismissable; under-reporting it is not. Degrade toward being seen.
+        "running"
     }
 }
 
@@ -1166,6 +1191,33 @@ mod sessions_tests {
     // `title` column, and it now holds the locked title itself. A row that was
     // renamed by hand before the upgrade is the only place that rename exists,
     // so the rebuild has to carry it across rather than reconstruct it.
+    // A fallback that asserts a REAL STATE is the dangerous kind. Bucketing an
+    // unrecognised run_state as idle would report a working session as quiet,
+    // which is the direction that hides work from the person watching.
+    #[test]
+    fn an_unrecognised_run_state_is_never_reported_as_idle() {
+        let invented = json!({"status": "summarising_for_handoff"});
+        assert_eq!(sessions_status_from_run_state(Some(&invented)), "running");
+
+        // Saying nothing still means idle — absent is not the same as unknown.
+        assert_eq!(sessions_status_from_run_state(None), "idle");
+        assert_eq!(sessions_status_from_run_state(Some(&json!(""))), "idle");
+
+        // And a state the daemon names that genuinely IS quiet stays idle.
+        for quiet in ["idle", "done", "completed", "interrupted", "offline"] {
+            assert_eq!(
+                sessions_status_from_run_state(Some(&json!(quiet))),
+                "idle",
+                "{quiet} should bucket as idle"
+            );
+        }
+
+        // The listed vocabularies keep their meaning.
+        assert_eq!(sessions_status_from_run_state(Some(&json!("failed"))), "error");
+        assert_eq!(sessions_status_from_run_state(Some(&json!("waiting"))), "waiting");
+        assert_eq!(sessions_status_from_run_state(Some(&json!("thinking"))), "running");
+    }
+
     #[test]
     fn sessions_migration_preserves_a_locked_legacy_title() {
         let _lock = ENV_LOCK.lock().unwrap();

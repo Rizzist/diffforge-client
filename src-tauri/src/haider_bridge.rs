@@ -941,10 +941,23 @@ mod haider_bridge_tests {
         for state in ["errored", "run_failed", "fatal"] {
             assert_eq!(sessions_status_from_run_state(Some(&json!(state))), "error");
         }
-        for state in ["idle", "paused", "closed", "future_unknown_state"] {
+        for state in ["idle", "paused", "closed"] {
             assert_eq!(sessions_status_from_run_state(Some(&json!(state))), "idle");
         }
         assert_eq!(sessions_status_from_run_state(None), "idle");
+
+        // This expectation was REVERSED deliberately. It used to assert that an
+        // unrecognised state buckets as idle, which reads as defensive and is
+        // the opposite: the daemon does not invent vocabulary for sitting still,
+        // so a name we have never seen almost certainly describes work in
+        // progress. Calling it idle tells the person watching that a busy
+        // session is quiet — the one direction they cannot recover from, since
+        // there is nothing on screen to prompt a second look. Over-reporting
+        // activity is visible and self-correcting.
+        assert_eq!(
+            sessions_status_from_run_state(Some(&json!("future_unknown_state"))),
+            "running"
+        );
     }
 
     #[test]
