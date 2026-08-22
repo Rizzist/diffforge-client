@@ -188,8 +188,40 @@ function dayLabel(atMs) {
    cluster; day dividers slot in where the calendar date changes. Cluster
    keys pin to the FIRST row's identity — append-only rows keep them stable
    so React state (expansion) survives live growth. */
+/* Journal items that record the daemon's own bookkeeping rather than work
+   the agent did. They arrive as items like everything else, but a reader
+   learns nothing from "the graph committed a node" — they are noise between
+   the user and the answer. */
+const INTERNAL_ITEM_NAMES = new Set([
+  "node_committed",
+  "model_selected",
+  "extension",
+  "context_compaction",
+  "session_state",
+  "run_state",
+]);
+
+function isInternalToolRow(row) {
+  const meta = row?.meta && typeof row.meta === "object" ? row.meta : {};
+  const name = String(meta.item || meta.type || meta.name || "").trim();
+  if (INTERNAL_ITEM_NAMES.has(name)) return true;
+  // Live-fold text leads with the name when meta is thin.
+  const lead = String(row?.text || "").split("·")[0].trim();
+  return INTERNAL_ITEM_NAMES.has(lead);
+}
+
 function buildBlocks(rows) {
   const blocks = [];
+  /* Reasoning is committed when it SEALS, which is after the answer it
+     produced — but it happened before. Hold it and emit it above the reply
+     so the transcript reads in the order the work actually occurred. */
+  let pendingThinking = [];
+  const flushThinking = () => {
+    for (const thinking of pendingThinking) {
+      blocks.push({ type: "row", key: `${thinking.seq}:${thinking.ordinal || 0}`, row: thinking });
+    }
+    pendingThinking = [];
+  };
   let lastDay = "";
   let lastAssistantText = null;
   for (let row of rows) {
@@ -202,6 +234,7 @@ function buildBlocks(rows) {
       row = { ...row, kind: "tool", role: "tool" };
     }
     if (row.kind === "thinking" && !String(row.text || "").trim()) continue;
+    if (row.kind === "tool" && isInternalToolRow(row)) continue;
     /* Daemon compat records leave empty assistant turn-markers and duplicate
        final answers in older projections: an empty message row renders as a
        blank spacer that also splits tool clusters, and an adjacent identical
@@ -229,6 +262,13 @@ function buildBlocks(rows) {
         lastDay = day;
       }
     }
+    if (row.kind === "thinking") {
+      pendingThinking.push(row);
+      continue;
+    }
+    if (row.kind === "message" && row.role === "assistant") {
+      flushThinking();
+    }
     if (row.kind === "tool") {
       const last = blocks[blocks.length - 1];
       if (last && last.type === "tools") {
@@ -240,6 +280,7 @@ function buildBlocks(rows) {
       blocks.push({ type: "row", key: `${row.seq}:${row.ordinal || 0}`, row });
     }
   }
+  flushThinking();
   return blocks;
 }
 
