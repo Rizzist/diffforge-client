@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 
+import { formatBasisPoints, measuredCacheRereadBasisPoints } from "./cacheMetric.js";
+
 /* Trajectory view: a canvas strip of the session's event stream (Input /
    Model / Tools lanes + a tokens bar lane), metrics header, and a synced
    detail list. Fed by session_projection_trajectory — lean points only,
@@ -107,6 +109,8 @@ function usageDeltas(usagePoints) {
 
 export default function SessionTrajectory({ session }) {
   const sessionId = session?.id || "";
+  // Absent and zero are different facts; see cacheMetric.js.
+  const measuredCacheReread = measuredCacheRereadBasisPoints(session);
   const [points, setPoints] = useState([]);
   const [loadState, setLoadState] = useState("loading");
   const [selectedKey, setSelectedKey] = useState(null);
@@ -568,11 +572,18 @@ export default function SessionTrajectory({ session }) {
             <span>{formatTokens(derived.tokenTotal)}</span>
           </Metric>
         )}
-        {derived.cachePct != null && (
-          <Metric title="Approximate share of input tokens served from the provider prompt cache. Estimated by the ADE from provider-shaped usage totals — the denominator is inferred, not reported. The harness measures this properly; once it publishes the figure this estimate goes away.">
+        {measuredCacheReread != null ? (
+          <Metric title="Share of re-readable context actually served from the provider prompt cache, as measured by the harness. Not an estimate.">
             <em>Cache</em>
-            <span>~{derived.cachePct}%</span>
+            <span>{formatBasisPoints(measuredCacheReread)}</span>
           </Metric>
+        ) : (
+          derived.cachePct != null && (
+            <Metric title="Approximate share of input tokens served from the provider prompt cache. Estimated by the ADE from provider-shaped usage totals — the denominator is inferred, not reported. Shown only because the harness has not measured this session yet.">
+              <em>Cache</em>
+              <span>~{derived.cachePct}%</span>
+            </Metric>
+          )
         )}
         <Legend>
           <i data-color="input" /> Input
