@@ -1398,6 +1398,233 @@ mod sessions_tests {
         }
     }
 
+    fn haider_bridge_test_rpc_summary(id: &str, head_seq: i64) -> Value {
+        json!({
+            "session_id": id,
+            "head_seq": head_seq,
+            "title": "RPC session",
+            "last_model": "gpt-5.6-sol",
+            "run_state": "idle",
+            "footprint_tokens": 42_001,
+            "footprint_truth": "exact",
+            "agent_metrics": {
+                "usage": {
+                    "cache_reread_hit_basis_points": 8125,
+                    "cache_hit_basis_points": 8750
+                }
+            },
+            "workspace_cwd": "/daemon/workspace"
+        })
+    }
+
+    fn haider_bridge_test_cli_summary(id: &str, title: &str) -> Value {
+        json!({
+            "active_branch": "main",
+            "branches": ["main"],
+            "footprint": {"tokens": 40_000, "truth": "exact"},
+            "id": id,
+            "last_activity_ms": 30,
+            "model": "gpt-5.6-sol",
+            "provider": "openai-oauth",
+            "run_id": "run-cli",
+            "run_state": "idle",
+            "seen_at_ms": 31,
+            "session_id": id,
+            "subagent_count": 0,
+            "title": title,
+            "updated_at": 32,
+            "worker_generation": 4
+        })
+    }
+
+    #[test]
+    fn haider_bridge_cli_payload_cannot_downgrade_stored_rpc_payload() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("rpc-precedence");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let mut row = sessions_test_row("rpc-precedence", Path::new(""), "pinned");
+        row.harness = haider_bridge_test_rpc_summary(&row.provider_session_id, 17);
+        let rich = row.harness.clone();
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        let cli = HaiderBridgeSession {
+            id: row.provider_session_id.clone(),
+            harness: haider_bridge_test_cli_summary(&row.provider_session_id, "CLI downgrade"),
+        };
+        assert!(!haider_bridge_reconcile_store_with_policy(
+            HaiderBridgeReconcilePolicy::cli(false),
+            None,
+            &[cli],
+        )
+        .unwrap());
+
+        let connection = sessions_open_database().unwrap();
+        let stored = sessions_row_by_id(&connection, &row.id).unwrap();
+        assert_eq!(stored.harness, rich);
+        assert_eq!(
+            stored.harness["agent_metrics"]["usage"]["cache_reread_hit_basis_points"],
+            8125
+        );
+        assert!(stored.harness.get("footprint").is_none());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn haider_bridge_live_cli_sync_preserves_idle_rpc_payload() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("live-cli-cycle");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let row = sessions_test_row("live-cli-cycle", Path::new(""), "pinned");
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        *haider_bridge_reconcile_trackers().lock().unwrap() =
+            HaiderBridgeReconcileTrackers::default();
+        let rpc_summary = haider_bridge_test_rpc_summary(&row.provider_session_id, 21);
+        assert!(haider_bridge_reconcile_summary_values(
+            vec![rpc_summary.clone()],
+            false,
+            HaiderBridgeReconcilePolicy::rpc(),
+        )
+        .unwrap());
+
+        assert!(!haider_bridge_reconcile_summary_values(
+            vec![json!({
+                "sessions": [haider_bridge_test_cli_summary(
+                    &row.provider_session_id,
+                    "CLI cycle"
+                )]
+            })],
+            true,
+            HaiderBridgeReconcilePolicy::cli(true),
+        )
+        .unwrap());
+
+        let connection = sessions_open_database().unwrap();
+        let stored = sessions_row_by_id(&connection, &row.id).unwrap();
+        assert_eq!(stored.harness, rpc_summary);
+        assert!(stored.harness.get("agent_metrics").is_some());
+        assert!(stored.harness.get("footprint").is_none());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn haider_bridge_cli_fallback_reconciles_without_rpc() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("cli-fallback");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let row = sessions_test_row("cli-fallback", Path::new(""), "pinned");
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        let cli_summary = haider_bridge_test_cli_summary(&row.provider_session_id, "CLI fallback");
+        let imported_summary =
+            haider_bridge_test_cli_summary("provider-daemon-created", "Daemon-created session");
+        let roster = vec![
+            HaiderBridgeSession {
+                id: row.provider_session_id.clone(),
+                harness: cli_summary.clone(),
+            },
+            HaiderBridgeSession {
+                id: "provider-daemon-created".to_string(),
+                harness: imported_summary.clone(),
+            },
+        ];
+        let summary = json!({
+            "sessions": roster
+                .iter()
+                .map(|session| session.harness.clone())
+                .collect::<Vec<_>>()
+        });
+        *haider_bridge_reconcile_trackers().lock().unwrap() =
+            HaiderBridgeReconcileTrackers::default();
+        assert!(haider_bridge_reconcile_summary_values(
+            vec![summary.clone()],
+            true,
+            HaiderBridgeReconcilePolicy::cli(false),
+        )
+        .unwrap());
+
+        let connection = sessions_open_database().unwrap();
+        assert_eq!(
+            sessions_row_by_id(&connection, &row.id).unwrap().harness,
+            cli_summary
+        );
+        let imported_json = connection
+            .query_row(
+                "SELECT harness_json FROM sessions WHERE provider_session_id = ?1",
+                ["provider-daemon-created"],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&imported_json).unwrap(),
+            imported_summary
+        );
+        drop(connection);
+
+        // An unchanged complete fallback roster is still maintenance
+        // evidence. A ghost introduced after the first cycle must be pruned.
+        let connection = sessions_open_database().unwrap();
+        let ghost = sessions_test_row("fallback-ghost", Path::new(""), "pinned");
+        sessions_test_insert_row(&connection, &ghost);
+        drop(connection);
+        assert!(haider_bridge_reconcile_summary_values(
+            vec![summary],
+            true,
+            HaiderBridgeReconcilePolicy::cli(false),
+        )
+        .unwrap());
+        let connection = sessions_open_database().unwrap();
+        assert!(sessions_row_by_id(&connection, &ghost.id).is_err());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn haider_bridge_live_cli_sync_still_prunes_ghosts() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("live-cli-prune");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let mut kept = sessions_test_row("live-kept", Path::new(""), "pinned");
+        kept.harness = haider_bridge_test_rpc_summary(&kept.provider_session_id, 33);
+        let ghost = sessions_test_row("live-ghost", Path::new(""), "pinned");
+        sessions_test_insert_row(&connection, &kept);
+        sessions_test_insert_row(&connection, &ghost);
+        drop(connection);
+
+        assert!(haider_bridge_reconcile_summary_values(
+            vec![json!({
+                "sessions": [haider_bridge_test_cli_summary(
+                    &kept.provider_session_id,
+                    "CLI roster"
+                )]
+            })],
+            true,
+            HaiderBridgeReconcilePolicy::cli(true),
+        )
+        .unwrap());
+
+        let connection = sessions_open_database().unwrap();
+        assert!(sessions_row_by_id(&connection, &ghost.id).is_err());
+        let stored = sessions_row_by_id(&connection, &kept.id).unwrap();
+        assert!(stored.harness.get("agent_metrics").is_some());
+        assert!(stored.harness.get("footprint").is_none());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn haider_bridge_empty_roster_does_not_prune() {
         let _lock = ENV_LOCK.lock().unwrap();

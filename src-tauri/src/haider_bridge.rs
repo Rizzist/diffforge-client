@@ -12,6 +12,63 @@ struct HaiderBridgeSession {
     harness: Value,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HaiderBridgeSummarySource {
+    Rpc,
+    Cli,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HaiderBridgeReconcilePolicy {
+    source: HaiderBridgeSummarySource,
+    rpc_live: bool,
+}
+
+impl HaiderBridgeReconcilePolicy {
+    const fn rpc() -> Self {
+        Self {
+            source: HaiderBridgeSummarySource::Rpc,
+            rpc_live: true,
+        }
+    }
+
+    const fn cli(rpc_live: bool) -> Self {
+        Self {
+            source: HaiderBridgeSummarySource::Cli,
+            rpc_live,
+        }
+    }
+
+    fn preserves_stored_harness(self, harness: &Value) -> bool {
+        // Source precedence is enforced at the transaction boundary. The
+        // shape check keeps a rich row authoritative across disconnect and
+        // across CLI work admitted before the roster watch became healthy.
+        self.source == HaiderBridgeSummarySource::Cli
+            && (self.rpc_live || haider_bridge_harness_is_rpc_shape(harness))
+    }
+
+    fn imports_payloads(self) -> bool {
+        self.source == HaiderBridgeSummarySource::Rpc || !self.rpc_live
+    }
+}
+
+fn haider_bridge_harness_is_rpc_shape(harness: &Value) -> bool {
+    let Some(object) = harness.as_object() else {
+        return false;
+    };
+    [
+        "agent_metrics",
+        "footprint_tokens",
+        "footprint_truth",
+        "last_model",
+        "turn_count",
+        "head_seq",
+        "workspace_cwd",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HaiderBridgeReconcileStamp {
     head_seq: Option<i64>,
@@ -31,6 +88,24 @@ impl HaiderBridgeReconcileStamp {
 struct HaiderBridgeReconcileTracker {
     initialized: bool,
     sessions: HashMap<String, HaiderBridgeReconcileStamp>,
+}
+
+#[derive(Default)]
+struct HaiderBridgeReconcileTrackers {
+    rpc: HaiderBridgeReconcileTracker,
+    cli: HaiderBridgeReconcileTracker,
+}
+
+impl HaiderBridgeReconcileTrackers {
+    fn source_mut(
+        &mut self,
+        source: HaiderBridgeSummarySource,
+    ) -> &mut HaiderBridgeReconcileTracker {
+        match source {
+            HaiderBridgeSummarySource::Rpc => &mut self.rpc,
+            HaiderBridgeSummarySource::Cli => &mut self.cli,
+        }
+    }
 }
 
 static HAIDER_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
@@ -60,9 +135,9 @@ fn haider_bridge_head_seq(session_id: &str) -> Option<i64> {
         .and_then(|heads| heads.get(session_id).copied())
 }
 
-fn haider_bridge_reconcile_tracker() -> &'static StdMutex<HaiderBridgeReconcileTracker> {
-    static TRACKER: OnceLock<StdMutex<HaiderBridgeReconcileTracker>> = OnceLock::new();
-    TRACKER.get_or_init(|| StdMutex::new(HaiderBridgeReconcileTracker::default()))
+fn haider_bridge_reconcile_trackers() -> &'static StdMutex<HaiderBridgeReconcileTrackers> {
+    static TRACKERS: OnceLock<StdMutex<HaiderBridgeReconcileTrackers>> = OnceLock::new();
+    TRACKERS.get_or_init(|| StdMutex::new(HaiderBridgeReconcileTrackers::default()))
 }
 
 fn haider_library_cache() -> &'static StdMutex<Option<(Instant, Value)>> {
@@ -73,6 +148,46 @@ fn haider_library_cache() -> &'static StdMutex<Option<(Instant, Value)>> {
 fn haider_bridge_sync_lock() -> &'static StdMutex<()> {
     static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+enum HaiderBridgeRpcReconcileJob {
+    Delta {
+        app: AppHandle,
+        summaries: Vec<Value>,
+    },
+    Snapshot {
+        app: AppHandle,
+        reply: Option<oneshot::Sender<bool>>,
+    },
+}
+
+fn haider_bridge_rpc_reconcile_queue() -> &'static mpsc::UnboundedSender<HaiderBridgeRpcReconcileJob> {
+    static QUEUE: OnceLock<mpsc::UnboundedSender<HaiderBridgeRpcReconcileJob>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        tauri::async_runtime::spawn(async move {
+            while let Some(job) = receiver.recv().await {
+                match job {
+                    HaiderBridgeRpcReconcileJob::Delta { app, summaries } => {
+                        haider_bridge_apply_summary_values(
+                            &app,
+                            summaries,
+                            false,
+                            HaiderBridgeReconcilePolicy::rpc(),
+                        )
+                        .await;
+                    }
+                    HaiderBridgeRpcReconcileJob::Snapshot { app, reply } => {
+                        let live = haider_bridge_reconcile_rpc_snapshot_queued(&app).await;
+                        if let Some(reply) = reply {
+                            let _ = reply.send(live);
+                        }
+                    }
+                }
+            }
+        });
+        sender
+    })
 }
 
 fn haider_bridge_json_args(args: &[&str]) -> Option<Value> {
@@ -348,7 +463,8 @@ fn haider_bridge_session_matches_dir(session: &HaiderBridgeSession, row: &Sessio
         || haider_bridge_canonical_path(&directory.join("work")).is_some_and(|path| path == cwd)
 }
 
-fn haider_bridge_reconcile_store(
+fn haider_bridge_reconcile_store_with_policy(
+    policy: HaiderBridgeReconcilePolicy,
     roster: Option<&[HaiderBridgeSession]>,
     sessions: &[HaiderBridgeSession],
 ) -> Result<bool, String> {
@@ -426,7 +542,9 @@ fn haider_bridge_reconcile_store(
             continue;
         };
 
-        let mut row_changed = row.harness != session.harness;
+        let replace_harness =
+            row.harness != session.harness && !policy.preserves_stored_harness(&row.harness);
+        let mut row_changed = replace_harness;
         if row.provider_session_id.trim().is_empty() {
             row.provider_session_id = session.id.clone();
             row_changed = true;
@@ -434,7 +552,9 @@ fn haider_bridge_reconcile_store(
         if !row_changed {
             continue;
         }
-        row.harness = session.harness.clone();
+        if replace_harness {
+            row.harness = session.harness.clone();
+        }
         let harness_json = serde_json::to_string(&row.harness)
             .map_err(|error| format!("Unable to encode Haider session summary: {error}"))?;
 
@@ -456,6 +576,9 @@ fn haider_bridge_reconcile_store(
         .map(|row| row.provider_session_id.as_str())
         .collect();
     for session in roster.unwrap_or(sessions) {
+        if !policy.imports_payloads() {
+            continue;
+        }
         if session.id.trim().is_empty() || bound.contains(session.id.as_str()) {
             continue;
         }
@@ -479,6 +602,14 @@ fn haider_bridge_reconcile_store(
     Ok(changed)
 }
 
+#[cfg(test)]
+fn haider_bridge_reconcile_store(
+    roster: Option<&[HaiderBridgeSession]>,
+    sessions: &[HaiderBridgeSession],
+) -> Result<bool, String> {
+    haider_bridge_reconcile_store_with_policy(HaiderBridgeReconcilePolicy::rpc(), roster, sessions)
+}
+
 fn haider_bridge_reconcile_tracked(
     tracker: &mut HaiderBridgeReconcileTracker,
     sessions: &[HaiderBridgeSession],
@@ -498,18 +629,22 @@ fn haider_bridge_reconcile_tracked(
             )
         })
         .collect::<HashMap<_, _>>();
-    if !complete && tracker.initialized {
-        snapshot.retain(|session_id, incoming| {
-            !incoming
+    if tracker.initialized {
+        for (session_id, incoming) in &mut snapshot {
+            let Some(previous) = tracker.sessions.get(session_id) else {
+                continue;
+            };
+            if incoming
                 .head_seq
-                .zip(
-                    tracker
-                        .sessions
-                        .get(session_id)
-                        .and_then(|previous| previous.head_seq),
-                )
+                .zip(previous.head_seq)
                 .is_some_and(|(incoming, previous)| incoming < previous)
-        });
+            {
+                // A paginated complete seed can overlap a newer pushed delta.
+                // Preserve the newer stamp so the stale page is neither a
+                // store candidate nor a regression in the source tracker.
+                *incoming = previous.clone();
+            }
+        }
     }
     let roster_changed = complete
         && tracker.initialized
@@ -530,7 +665,7 @@ fn haider_bridge_reconcile_tracked(
     } else {
         sessions.to_vec()
     };
-    if candidates.is_empty() && !roster_changed {
+    if candidates.is_empty() && !roster_changed && !complete {
         tracker.initialized = true;
         if complete {
             tracker.sessions = snapshot;
@@ -600,38 +735,118 @@ fn haider_bridge_reconcile_summary_values_prefold(
 fn haider_bridge_reconcile_summary_values(
     summaries: Vec<Value>,
     complete: bool,
+    policy: HaiderBridgeReconcilePolicy,
 ) -> Result<bool, String> {
-    let mut tracker = haider_bridge_reconcile_tracker()
+    if policy == HaiderBridgeReconcilePolicy::cli(true) && complete {
+        // A live CLI roster is absence evidence only. Do not feed its poor
+        // stamps into either source tracker or enqueue projection work from
+        // payloads that are forbidden to reach harness_json.
+        let sessions = haider_bridge_parse_session_list(&Value::Array(summaries));
+        return haider_bridge_reconcile_store_with_policy(policy, Some(&sessions), &[]);
+    }
+    let mut trackers = haider_bridge_reconcile_trackers()
         .lock()
         .map_err(|_| "Haider reconciliation tracker is unavailable.".to_string())?;
+    let tracker = trackers.source_mut(policy.source);
     haider_bridge_reconcile_summary_values_prefold(
-        &mut tracker,
+        tracker,
         summaries,
         complete,
-        haider_bridge_reconcile_store,
+        |roster, sessions| haider_bridge_reconcile_store_with_policy(policy, roster, sessions),
         haider_projection_prefold_enqueue_provider_sessions,
     )
 }
 
+async fn haider_bridge_apply_summary_values(
+    app: &AppHandle,
+    summaries: Vec<Value>,
+    complete: bool,
+    policy: HaiderBridgeReconcilePolicy,
+) {
+    let changed = tauri::async_runtime::spawn_blocking(move || {
+        let _sync_guard = haider_bridge_sync_lock()
+            .lock()
+            .map_err(|_| "Haider bridge sync lock is unavailable.".to_string())?;
+        haider_bridge_reconcile_summary_values(summaries, complete, policy)
+    })
+    .await;
+    match changed {
+        Ok(Ok(true)) => sessions_emit_changed(app),
+        Ok(Ok(false)) => {}
+        Ok(Err(error)) => eprintln!("Haider session reconciliation failed: {error}"),
+        Err(error) => eprintln!("Haider session reconciliation worker failed: {error}"),
+    }
+}
+
 fn haider_bridge_reconcile_from_summaries(app: AppHandle, summaries: Vec<Value>) {
-    tauri::async_runtime::spawn(async move {
-        let changed = tauri::async_runtime::spawn_blocking(move || {
-            let _sync_guard = haider_bridge_sync_lock()
-                .lock()
-                .map_err(|_| "Haider bridge sync lock is unavailable.".to_string())?;
-            haider_bridge_reconcile_summary_values(summaries, false)
-        })
-        .await;
-        match changed {
-            Ok(Ok(true)) => sessions_emit_changed(&app),
-            Ok(Ok(false)) => {}
-            Ok(Err(error)) => eprintln!("Haider session reconciliation failed: {error}"),
-            Err(error) => eprintln!("Haider session reconciliation worker failed: {error}"),
-        }
+    let _ = haider_bridge_rpc_reconcile_queue()
+        .send(HaiderBridgeRpcReconcileJob::Delta { app, summaries });
+}
+
+fn haider_bridge_seed_from_rpc(app: AppHandle) {
+    // All RPC persistence uses this FIFO. The actor enqueues the triggering
+    // delta first, this seed second, and later deltas after it. Thus a snapshot
+    // fetch+apply cannot commit after a delta that arrived later on the wire.
+    let _ = haider_bridge_rpc_reconcile_queue().send(HaiderBridgeRpcReconcileJob::Snapshot {
+        app,
+        reply: None,
     });
 }
 
+fn haider_bridge_rpc_snapshot_permits_cli_fallback(
+    snapshot: &Option<Result<Vec<Value>, String>>,
+) -> bool {
+    snapshot.is_none()
+}
+
+async fn haider_bridge_reconcile_rpc_snapshot_queued(app: &AppHandle) -> bool {
+    let snapshot = haider_rpc_ade::session_roster_snapshot_rpc().await;
+    if haider_bridge_rpc_snapshot_permits_cli_fallback(&snapshot) {
+        return false;
+    }
+    let Some(result) = snapshot else {
+        unreachable!("offline RPC snapshots return before result decoding");
+    };
+    let summaries = match result {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            eprintln!("Haider RPC roster seed failed: {error}");
+            // A connected RPC route remains authoritative even when this
+            // snapshot failed. Do not reinterpret a live protocol error as
+            // permission for the poor CLI source to overwrite the store.
+            return true;
+        }
+    };
+    haider_bridge_apply_summary_values(
+        app,
+        summaries,
+        true,
+        HaiderBridgeReconcilePolicy::rpc(),
+    )
+    .await;
+    true
+}
+
+async fn haider_bridge_reconcile_rpc_snapshot(app: &AppHandle) -> bool {
+    let (reply, answer) = oneshot::channel();
+    if haider_bridge_rpc_reconcile_queue()
+        .send(HaiderBridgeRpcReconcileJob::Snapshot {
+            app: app.clone(),
+            reply: Some(reply),
+        })
+        .is_err()
+    {
+        return true;
+    }
+    // A dead reconcile worker must fail closed: it is not evidence that RPC
+    // is offline, so it cannot authorize the poor CLI payload source.
+    answer.await.unwrap_or(true)
+}
+
 async fn haider_bridge_sync_once(app: &AppHandle) {
+    if haider_bridge_reconcile_rpc_snapshot(app).await {
+        return;
+    }
     let changed = tauri::async_runtime::spawn_blocking(|| {
         let _sync_guard = haider_bridge_sync_lock()
             .lock()
@@ -639,7 +854,11 @@ async fn haider_bridge_sync_once(app: &AppHandle) {
         let Some(value) = haider_bridge_json_command("sessions") else {
             return Ok(false);
         };
-        haider_bridge_reconcile_summary_values(vec![value], true)
+        haider_bridge_reconcile_summary_values(
+            vec![value],
+            true,
+            HaiderBridgeReconcilePolicy::cli(haider_rpc_ade::roster_watch_healthy()),
+        )
     })
     .await;
     match changed {
@@ -667,8 +886,8 @@ fn haider_bridge_start(app: AppHandle) {
         return;
     }
     HAIDER_BRIDGE_STOPPING.store(false, Ordering::Release);
-    if let Ok(mut tracker) = haider_bridge_reconcile_tracker().lock() {
-        *tracker = HaiderBridgeReconcileTracker::default();
+    if let Ok(mut trackers) = haider_bridge_reconcile_trackers().lock() {
+        *trackers = HaiderBridgeReconcileTrackers::default();
     }
     haider_rpc_ade::roster_watch_start(app.clone());
 
@@ -1069,6 +1288,17 @@ mod haider_bridge_tests {
     }
 
     #[test]
+    fn haider_bridge_cli_fallback_requires_an_offline_rpc_route() {
+        let unavailable: Option<Result<Vec<Value>, String>> = None;
+        let live_error = Some(Err("protocol rejected the snapshot".to_string()));
+        let live_success = Some(Ok(Vec::new()));
+
+        assert!(haider_bridge_rpc_snapshot_permits_cli_fallback(&unavailable));
+        assert!(!haider_bridge_rpc_snapshot_permits_cli_fallback(&live_error));
+        assert!(!haider_bridge_rpc_snapshot_permits_cli_fallback(&live_success));
+    }
+
+    #[test]
     fn haider_bridge_subagent_sessions_never_reach_the_rail() {
         let sample = json!({
             "sessions": [
@@ -1155,7 +1385,7 @@ mod haider_bridge_tests {
     }
 
     #[test]
-    fn haider_bridge_unchanged_head_skips_store_reconcile() {
+    fn haider_bridge_unchanged_delta_head_skips_store_reconcile() {
         let session = HaiderBridgeSession {
             id: "session-test".to_string(),
             harness: json!({
@@ -1179,7 +1409,7 @@ mod haider_bridge_tests {
             &mut tracker,
             std::slice::from_ref(&session),
             &heads,
-            true,
+            false,
             &mut reconcile,
         )
         .unwrap());
@@ -1188,7 +1418,7 @@ mod haider_bridge_tests {
             &mut tracker,
             std::slice::from_ref(&session),
             &heads,
-            true,
+            false,
             &mut reconcile,
         )
         .unwrap());
@@ -1199,7 +1429,7 @@ mod haider_bridge_tests {
             &mut tracker,
             std::slice::from_ref(&session),
             &heads,
-            true,
+            false,
             &mut reconcile,
         )
         .unwrap();
@@ -1211,7 +1441,7 @@ mod haider_bridge_tests {
             &mut tracker,
             std::slice::from_ref(&raw_changed),
             &heads,
-            true,
+            false,
             &mut reconcile,
         )
         .unwrap();
@@ -1223,12 +1453,89 @@ mod haider_bridge_tests {
                 &mut tracker,
                 std::slice::from_ref(&raw_changed),
                 &heads,
-                true,
+                false,
                 &mut reconcile,
             )
             .unwrap();
         }
         assert_eq!(writes.get(), 5);
+    }
+
+    #[test]
+    fn haider_bridge_complete_roster_reconciles_unchanged_for_maintenance() {
+        let session = HaiderBridgeSession {
+            id: "session-maintenance".to_string(),
+            harness: json!({"session_id": "session-maintenance", "head_seq": 7}),
+        };
+        let heads = HashMap::from([(session.id.clone(), 7)]);
+        let mut tracker = HaiderBridgeReconcileTracker::default();
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        for _ in 0..2 {
+            haider_bridge_reconcile_tracked(
+                &mut tracker,
+                std::slice::from_ref(&session),
+                &heads,
+                true,
+                |roster, candidates| {
+                    calls
+                        .borrow_mut()
+                        .push((roster.map(<[HaiderBridgeSession]>::len), candidates.len()));
+                    Ok(false)
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(*calls.borrow(), vec![(Some(1), 1), (Some(1), 0)]);
+    }
+
+    #[test]
+    fn haider_bridge_complete_rpc_snapshot_cannot_regress_a_newer_delta() {
+        let newer = HaiderBridgeSession {
+            id: "session-stale-seed".to_string(),
+            harness: json!({
+                "session_id": "session-stale-seed",
+                "head_seq": 9,
+                "title": "newer delta"
+            }),
+        };
+        let stale = HaiderBridgeSession {
+            id: newer.id.clone(),
+            harness: json!({
+                "session_id": "session-stale-seed",
+                "head_seq": 8,
+                "title": "stale seed page"
+            }),
+        };
+        let mut tracker = HaiderBridgeReconcileTracker::default();
+
+        haider_bridge_reconcile_tracked(
+            &mut tracker,
+            std::slice::from_ref(&newer),
+            &HashMap::from([(newer.id.clone(), 9)]),
+            false,
+            |_, candidates| {
+                assert_eq!(candidates, std::slice::from_ref(&newer));
+                Ok(false)
+            },
+        )
+        .unwrap();
+        haider_bridge_reconcile_tracked(
+            &mut tracker,
+            std::slice::from_ref(&stale),
+            &HashMap::from([(stale.id.clone(), 8)]),
+            true,
+            |roster, candidates| {
+                assert!(roster.is_some());
+                assert!(candidates.is_empty());
+                Ok(false)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tracker.sessions[&newer.id].head_seq, Some(9));
+        assert_eq!(tracker.sessions[&newer.id].harness["title"], "newer delta");
     }
 
     #[test]
@@ -1311,6 +1618,7 @@ mod haider_bridge_tests {
             full_calls.borrow().as_slice(),
             &[
                 vec!["session-shared".to_string()],
+                Vec::new(),
                 vec!["session-shared".to_string()]
             ]
         );

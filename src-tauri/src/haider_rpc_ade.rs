@@ -1461,6 +1461,48 @@ pub(crate) fn roster_watch_healthy() -> bool {
     false
 }
 
+/// Fetches the daemon's rich roster to completion. `None` means there is no
+/// live RPC route, so the bridge may use its CLI fallback.
+pub(crate) async fn session_roster_snapshot_rpc() -> Option<Result<Vec<Value>, String>> {
+    #[cfg(unix)]
+    {
+        let mut cursor = None;
+        let mut seen_cursors = BTreeSet::new();
+        let mut summaries = Vec::new();
+        loop {
+            let response = rpc_request(
+                RequestBody::SessionList {
+                    cursor: cursor.clone(),
+                    limit: 256,
+                },
+                Capability::View,
+                BTreeSet::new(),
+            )
+            .await?;
+            let (sessions, next_cursor) = match response {
+                Ok(ResponseBody::SessionList {
+                    sessions,
+                    next_cursor,
+                }) => (sessions, next_cursor),
+                Ok(_) => {
+                    return Some(Err("session.list response method mismatch".to_string()));
+                }
+                Err(error) => return Some(Err(error)),
+            };
+            summaries.extend(sessions);
+            let Some(next_cursor) = next_cursor else {
+                return Some(Ok(summaries));
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Some(Err("session.list returned a repeated cursor".to_string()));
+            }
+            cursor = Some(next_cursor);
+        }
+    }
+    #[cfg(not(unix))]
+    None
+}
+
 #[cfg(unix)]
 async fn rpc_request(
     body: RequestBody,
@@ -3952,9 +3994,12 @@ async fn run_connected(
                 }
             }
             WireFrame::SessionRosterDelta { summaries } => {
-                ROSTER_WATCH_ACTIVE.store(true, Ordering::Release);
+                let first_delta = !ROSTER_WATCH_ACTIVE.swap(true, Ordering::AcqRel);
                 if let Some(app) = roster_app.as_ref() {
                     super::haider_bridge_reconcile_from_summaries(app.clone(), summaries);
+                    if first_delta {
+                        super::haider_bridge_seed_from_rpc(app.clone());
+                    }
                 }
             }
             WireFrame::SessionSurfaceDelta {
