@@ -7,7 +7,7 @@ const HAIDER_PROJECTION_MAX_EXPORT_BYTES: u64 = 32 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_WINDOW_ROWS: i64 = 1_000;
 const HAIDER_PROJECTION_WATCH_LIMIT: usize = 6;
-const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 3;
+const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 4;
 const HAIDER_PROJECTION_PIPE_BATCH_LINES: usize = 256;
 const HAIDER_PROJECTION_PIPE_SAFETY_POLL: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_PIPE_STOP_POLL: Duration = Duration::from_millis(100);
@@ -129,6 +129,7 @@ struct HaiderProjectionEvent {
 struct HaiderProjectionPersistedRows {
     rows: Vec<SessionProjectionRow>,
     total_rows: i64,
+    session_changed: bool,
 }
 
 struct HaiderProjectionWatch {
@@ -143,6 +144,11 @@ struct HaiderProjectionPipeTail {
     generation: u64,
 }
 
+struct HaiderProjectionJournalTail {
+    stop: Arc<AtomicBool>,
+    generation: u64,
+}
+
 #[derive(Default)]
 struct HaiderProjectionWatchManager {
     watches: HashMap<String, HaiderProjectionWatch>,
@@ -152,6 +158,11 @@ struct HaiderProjectionWatchManager {
 #[derive(Default)]
 struct HaiderProjectionPipeManager {
     tails: HashMap<String, HaiderProjectionPipeTail>,
+}
+
+#[derive(Default)]
+struct HaiderProjectionJournalManager {
+    tails: HashMap<String, HaiderProjectionJournalTail>,
 }
 
 #[derive(Default)]
@@ -218,6 +229,29 @@ struct HaiderProjectionPipeCursor {
     saw_item_stream: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HaiderProjectionJournalCursor {
+    session_id: String,
+    covered_through_seq: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HaiderProjectionRunCoordinates {
+    run_id: Option<String>,
+    worker_generation: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct HaiderProjectionJournalCommit {
+    covered_through_seq: i64,
+    coordinates: Option<HaiderProjectionRunCoordinates>,
+}
+
+enum HaiderProjectionJournalIngest {
+    Connected(HaiderProjectionFrame),
+    Unavailable,
+}
+
 #[derive(Clone, Debug)]
 struct HaiderProjectionPipeRoute {
     path: PathBuf,
@@ -253,6 +287,11 @@ fn haider_projection_watch_manager() -> &'static StdMutex<HaiderProjectionWatchM
 fn haider_projection_pipe_manager() -> &'static StdMutex<HaiderProjectionPipeManager> {
     static MANAGER: OnceLock<StdMutex<HaiderProjectionPipeManager>> = OnceLock::new();
     MANAGER.get_or_init(|| StdMutex::new(HaiderProjectionPipeManager::default()))
+}
+
+fn haider_projection_journal_manager() -> &'static StdMutex<HaiderProjectionJournalManager> {
+    static MANAGER: OnceLock<StdMutex<HaiderProjectionJournalManager>> = OnceLock::new();
+    MANAGER.get_or_init(|| StdMutex::new(HaiderProjectionJournalManager::default()))
 }
 
 fn haider_projection_ingest_locks() -> &'static StdMutex<HashMap<String, Arc<StdMutex<()>>>> {
@@ -332,6 +371,7 @@ fn haider_projection_migrate_database(connection: &mut rusqlite::Connection) -> 
             .execute_batch(
                 "DROP TABLE IF EXISTS session_projection_rows;
                  DROP TABLE IF EXISTS session_pipe_cursors;
+                 DROP TABLE IF EXISTS session_journal_cursors;
                  DELETE FROM session_projection_schema;",
             )
             .map_err(|error| format!("Unable to migrate session projection store: {error}"))?;
@@ -370,6 +410,10 @@ fn haider_projection_migrate_database(connection: &mut rusqlite::Connection) -> 
                 covered_through_seq INTEGER NOT NULL,
                 coverage_known INTEGER NOT NULL DEFAULT 0,
                 saw_item_stream INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS session_journal_cursors (
+                session_id TEXT PRIMARY KEY,
+                covered_through_seq INTEGER NOT NULL
              );",
         )
         .map_err(|error| format!("Unable to initialize session projection store: {error}"))?;
@@ -1023,6 +1067,16 @@ fn haider_projection_fold_value_locked(
     value: &Value,
 ) -> HaiderProjectionFoldStep {
     let mut step = HaiderProjectionFoldStep::default();
+    // The daemon owns display-safety policy. An explicit false is a redaction
+    // decision for this envelope; no payload shape may override it locally.
+    if value
+        .get("render")
+        .and_then(|render| render.get("ui"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return step;
+    }
     if value
         .as_object()
         .is_some_and(|object| object.contains_key("payload"))
@@ -1255,8 +1309,9 @@ fn haider_projection_persist_batch(
     session_id: &str,
     rows: &[SessionProjectionRow],
     cursor: Option<&HaiderProjectionPipeCursor>,
+    journal: Option<&HaiderProjectionJournalCommit>,
 ) -> Result<HaiderProjectionPersistedRows, String> {
-    if rows.is_empty() && cursor.is_none() {
+    if rows.is_empty() && cursor.is_none() && journal.is_none() {
         return Ok(HaiderProjectionPersistedRows::default());
     }
     let _write_guard = sessions_write_lock()
@@ -1348,6 +1403,43 @@ fn haider_projection_persist_batch(
                 })
                 .map_err(|error| format!("Unable to persist session pipe cursor: {error}"))?;
         }
+        let mut session_changed = false;
+        if let Some(journal) = journal {
+            transaction
+                .prepare_cached(
+                    "INSERT INTO session_journal_cursors (session_id, covered_through_seq)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(session_id) DO UPDATE SET covered_through_seq =
+                        MAX(session_journal_cursors.covered_through_seq,
+                            excluded.covered_through_seq)",
+                )
+                .and_then(|mut statement| {
+                    statement.execute(rusqlite::params![
+                        session_id,
+                        journal.covered_through_seq,
+                    ])
+                })
+                .map_err(|error| format!("Unable to persist session journal cursor: {error}"))?;
+            if let Some(coordinates) = journal.coordinates.as_ref() {
+                session_changed = transaction
+                    .prepare_cached(
+                        "UPDATE sessions SET run_id = ?2, worker_generation = ?3
+                         WHERE id = ?1
+                           AND (run_id IS NOT ?2 OR worker_generation IS NOT ?3)",
+                    )
+                    .and_then(|mut statement| {
+                        statement.execute(rusqlite::params![
+                            session_id,
+                            coordinates.run_id,
+                            coordinates.worker_generation,
+                        ])
+                    })
+                    .map_err(|error| {
+                        format!("Unable to persist Haider run coordinates: {error}")
+                    })?
+                    > 0;
+            }
+        }
         transaction
             .commit()
             .map_err(|error| format!("Unable to commit session projection rows: {error}"))?;
@@ -1373,6 +1465,7 @@ fn haider_projection_persist_batch(
         Ok(HaiderProjectionPersistedRows {
             rows: persisted_rows,
             total_rows: state.total_rows,
+            session_changed,
         })
     })
 }
@@ -1383,7 +1476,7 @@ fn haider_projection_persist_rows(
     if rows.is_empty() {
         return Ok(HaiderProjectionPersistedRows::default());
     }
-    haider_projection_persist_batch(&rows[0].session_id, rows, None)
+    haider_projection_persist_batch(&rows[0].session_id, rows, None, None)
 }
 
 fn haider_projection_load_pipe_cursor(
@@ -1415,6 +1508,61 @@ fn haider_projection_load_pipe_cursor(
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(format!("Unable to read session pipe cursor: {error}")),
         }
+    })
+}
+
+fn haider_projection_load_journal_cursor(
+    session_id: &str,
+) -> Result<Option<HaiderProjectionJournalCursor>, String> {
+    haider_projection_with_database(|connection| {
+        let result = connection
+            .prepare_cached(
+                "SELECT session_id, covered_through_seq
+                 FROM session_journal_cursors WHERE session_id = ?1",
+            )
+            .and_then(|mut statement| {
+                statement.query_row([session_id], |row| {
+                    Ok(HaiderProjectionJournalCursor {
+                        session_id: row.get(0)?,
+                        covered_through_seq: row.get(1)?,
+                    })
+                })
+            });
+        match result {
+            Ok(cursor) => Ok(Some(cursor)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(format!("Unable to read session journal cursor: {error}")),
+        }
+    })
+}
+
+fn haider_projection_reset_journal_session(session_id: &str) -> Result<(), String> {
+    let _write_guard = sessions_write_lock()
+        .lock()
+        .map_err(|_| "Sessions write lock is unavailable.".to_string())?;
+    haider_projection_with_database(|connection| {
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("Unable to begin session journal refold: {error}"))?;
+        for table in [
+            "session_projection_rows",
+            "session_pipe_cursors",
+            "session_journal_cursors",
+        ] {
+            transaction
+                .execute(
+                    &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                    [session_id],
+                )
+                .map_err(|error| format!("Unable to reset session journal projection: {error}"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("Unable to commit session journal refold: {error}"))?;
+        if let Ok(mut states) = haider_projection_states().lock() {
+            states.remove(session_id);
+        }
+        Ok(())
     })
 }
 
@@ -1486,11 +1634,18 @@ fn haider_projection_sync(
     session_id: &str,
     provider_session_id: Option<&str>,
 ) -> Result<HaiderProjectionSync, String> {
-    let cursor = haider_projection_load_pipe_cursor(session_id)?;
-    let covered_through_seq = cursor
+    let pipe_cursor = haider_projection_load_pipe_cursor(session_id)?;
+    let pipe_coverage = pipe_cursor
         .as_ref()
         .filter(|cursor| cursor.coverage_known)
         .map(|cursor| cursor.covered_through_seq);
+    let journal_coverage = haider_projection_load_journal_cursor(session_id)?
+        .map(|cursor| cursor.covered_through_seq);
+    let covered_through_seq = match (journal_coverage, pipe_coverage) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
     let head_seq = provider_session_id.and_then(haider_bridge_head_seq);
     let pipe_eof_max_seq = haider_projection_states().lock().ok().and_then(|states| {
         states
@@ -1619,6 +1774,131 @@ fn haider_projection_ingest_value(
     })
 }
 
+fn haider_projection_envelope_coordinates(
+    envelopes: &[Value],
+) -> Option<HaiderProjectionRunCoordinates> {
+    let envelope = envelopes.iter().max_by_key(|envelope| {
+        envelope
+            .as_object()
+            .and_then(|object| haider_projection_json_i64(object.get("seq")))
+            .unwrap_or_default()
+    })?;
+    let object = envelope.as_object()?;
+    Some(HaiderProjectionRunCoordinates {
+        // Missing/null is positive idle truth, never an empty run id.
+        run_id: object
+            .get("run_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|run_id| !run_id.is_empty())
+            .map(str::to_string),
+        worker_generation: haider_projection_json_i64(object.get("worker_generation")),
+    })
+}
+
+fn haider_projection_ingest_journal_page(
+    app: Option<&AppHandle>,
+    session_id: &str,
+    provider_session_id: &str,
+    mut result: haider_rpc_ade::SessionReadResult,
+    covered_through_seq: i64,
+    reset: bool,
+) -> Result<HaiderProjectionFrame, String> {
+    let ingest_lock = haider_projection_ingest_lock(session_id)?;
+    let _ingest_guard = match ingest_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            ingest_lock.clear_poison();
+            poisoned.into_inner()
+        }
+    };
+    let prior_coverage = haider_projection_load_journal_cursor(session_id)?
+        .map(|cursor| cursor.covered_through_seq);
+    let prior_head = haider_bridge_head_seq(provider_session_id);
+    if reset {
+        haider_projection_reset_journal_session(session_id)?;
+    }
+    haider_projection_initialize_state(session_id)?;
+    result.envelopes.sort_by_key(|envelope| {
+        envelope
+            .as_object()
+            .and_then(|object| haider_projection_json_i64(object.get("seq")))
+            .unwrap_or_default()
+    });
+    let coordinates = haider_projection_envelope_coordinates(&result.envelopes);
+    let mut all_rows = Vec::new();
+    let mut status = None;
+    let mut state_raw = None;
+    let mut tail_changed = reset;
+    {
+        let mut states = haider_projection_states()
+            .lock()
+            .map_err(|_| "Session projection state is unavailable.".to_string())?;
+        let state = states
+            .get_mut(session_id)
+            .ok_or_else(|| "Session projection state was not initialized.".to_string())?;
+        for envelope in &result.envelopes {
+            let step = haider_projection_fold_value_locked(state, session_id, envelope);
+            all_rows.extend(step.rows);
+            status = step.status.or(status);
+            state_raw = step.state_raw.or(state_raw);
+            tail_changed |= step.tail_changed;
+        }
+    }
+    let journal = HaiderProjectionJournalCommit {
+        covered_through_seq,
+        coordinates,
+    };
+    let persisted =
+        haider_projection_persist_batch(session_id, &all_rows, None, Some(&journal))?;
+    let appended = persisted.rows.len();
+    let start_total = (appended > 0).then(|| {
+        persisted
+            .total_rows
+            .saturating_sub(i64::try_from(appended).unwrap_or(i64::MAX))
+    });
+    let mut states = haider_projection_states()
+        .lock()
+        .map_err(|_| "Session projection state is unavailable.".to_string())?;
+    let state = states
+        .get_mut(session_id)
+        .ok_or_else(|| "Session projection state was not initialized.".to_string())?;
+    state.total_rows = persisted.total_rows;
+    let live_tail = state.tail.as_ref().map(|tail| tail.row.clone());
+    let total_rows = state.total_rows;
+    drop(states);
+    haider_projection_apply_status(app, session_id, status, state_raw);
+    if persisted.session_changed {
+        if let Some(app) = app {
+            sessions_emit_changed(app);
+        }
+    }
+    let head_seq = result.head_seq.min(i64::MAX as u64) as i64;
+    haider_bridge_note_head_seq(provider_session_id, head_seq);
+    let sync = haider_projection_sync(session_id, Some(provider_session_id))?;
+    let from_seq = (appended > 0)
+        .then(|| persisted.rows.iter().map(|row| row.seq).min())
+        .flatten();
+    Ok(HaiderProjectionFrame {
+        session_id: session_id.to_string(),
+        from_seq,
+        appended,
+        total_rows,
+        live_tail,
+        tail_changed,
+        covered_through_seq: sync.covered_through_seq,
+        head_seq: sync.head_seq,
+        pipe_max_seq: None,
+        caught_up: sync.caught_up,
+        sync_changed: reset
+            || prior_coverage.is_none_or(|coverage| covered_through_seq > coverage)
+            || prior_head.is_none_or(|head| head_seq > head),
+        rows: persisted.rows,
+        start_total,
+        rows_overflow: appended > HAIDER_PROJECTION_EVENT_ROWS_LIMIT,
+    })
+}
+
 fn haider_projection_frame_sender(
     app: &AppHandle,
 ) -> tokio::sync::mpsc::UnboundedSender<HaiderProjectionFrame> {
@@ -1727,6 +2007,207 @@ fn haider_projection_ingest_and_emit(app: &AppHandle, session_id: &str, value: &
         Ok(_) => {}
         Err(error) => eprintln!("Haider projection fold failed: {error}"),
     }
+}
+
+fn haider_projection_stop_pipe_tail(session_id: &str) -> Result<bool, String> {
+    let tail = haider_projection_pipe_manager()
+        .lock()
+        .map_err(|_| "Haider projection pipe manager is unavailable.".to_string())?
+        .tails
+        .remove(session_id);
+    if let Some(tail) = tail {
+        tail.stop.store(true, Ordering::Release);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+async fn haider_projection_ingest_journal(
+    app: Option<AppHandle>,
+    session_id: String,
+    provider_session_id: String,
+) -> Result<HaiderProjectionJournalIngest, String> {
+    let inspect_session_id = session_id.clone();
+    let (journal_cursor, pipe_cursor, pipe_active) = tauri::async_runtime::spawn_blocking(move || {
+        Ok::<_, String>((
+            haider_projection_load_journal_cursor(&inspect_session_id)?,
+            haider_projection_load_pipe_cursor(&inspect_session_id)?,
+            haider_projection_pipe_manager()
+                .lock()
+                .is_ok_and(|manager| manager.tails.contains_key(&inspect_session_id)),
+        ))
+    })
+    .await
+    .map_err(|error| format!("Session journal cursor worker failed: {error}"))??;
+    // Any pipe cursor beside journal coverage proves an offline fallback has
+    // appended since the last canonical page. Rebuild from sequence one so
+    // richer item metadata always wins when ADE comes back.
+    let rebuild = journal_cursor.is_none() || pipe_cursor.is_some() || pipe_active;
+    let mut start_seq = if rebuild {
+        1
+    } else {
+        u64::try_from(
+            journal_cursor
+                .as_ref()
+                .map_or(0, |cursor| cursor.covered_through_seq)
+                .saturating_add(1),
+        )
+        .unwrap_or(u64::MAX)
+    };
+    let page_size = u64::try_from(HAIDER_PROJECTION_MAX_WINDOW_ROWS.max(1)).unwrap_or(1);
+    let mut end_seq = start_seq.saturating_add(page_size.saturating_sub(1));
+    let Some(first) = haider_rpc_ade::session_read_rpc(
+        provider_session_id.clone(),
+        start_seq,
+        end_seq,
+    )
+    .await
+    else {
+        return Ok(HaiderProjectionJournalIngest::Unavailable);
+    };
+    let mut response = first?;
+    let target_head = response.head_seq;
+    let _ = haider_projection_stop_pipe_tail(&session_id)?;
+    haider_projection_stop_session_watch(&session_id)?;
+
+    let mut aggregate = None::<HaiderProjectionFrame>;
+    let mut reset = rebuild;
+    loop {
+        if response.session_id != provider_session_id {
+            return Err("session.read response session id did not match".to_string());
+        }
+        if response.range.start_seq != start_seq || response.range.end_seq != end_seq {
+            return Err("session.read response range did not match".to_string());
+        }
+        let covered = end_seq.min(target_head).min(i64::MAX as u64) as i64;
+        let page_app = app.clone();
+        let page_session_id = session_id.clone();
+        let page_provider_session_id = provider_session_id.clone();
+        let page = tauri::async_runtime::spawn_blocking(move || {
+            haider_projection_ingest_journal_page(
+                page_app.as_ref(),
+                &page_session_id,
+                &page_provider_session_id,
+                response,
+                covered,
+                reset,
+            )
+        })
+        .await
+        .map_err(|error| format!("Session journal fold worker failed: {error}"))??;
+        match aggregate.as_mut() {
+            Some(aggregate) => haider_projection_merge_frame(aggregate, page),
+            None => aggregate = Some(page),
+        }
+        reset = false;
+        if end_seq >= target_head {
+            break;
+        }
+        start_seq = end_seq.saturating_add(1);
+        end_seq = start_seq
+            .saturating_add(page_size.saturating_sub(1))
+            .min(target_head);
+        let Some(next) = haider_rpc_ade::session_read_rpc(
+            provider_session_id.clone(),
+            start_seq,
+            end_seq,
+        )
+        .await
+        else {
+            // The committed prefix remains valid. The tail will retry from
+            // its cursor and activate the pipe only if the connection stays
+            // unavailable.
+            break;
+        };
+        response = next?;
+    }
+    Ok(HaiderProjectionJournalIngest::Connected(
+        aggregate.expect("session.read always folds its first response"),
+    ))
+}
+
+fn haider_projection_journal_finished(session_id: &str, generation: u64) {
+    if let Ok(mut manager) = haider_projection_journal_manager().lock() {
+        if manager
+            .tails
+            .get(session_id)
+            .is_some_and(|tail| tail.generation == generation)
+        {
+            manager.tails.remove(session_id);
+        }
+    }
+}
+
+fn haider_projection_start_journal_tail(
+    app: AppHandle,
+    session_id: String,
+    provider_session_id: String,
+) -> Result<(), String> {
+    let generation = HAIDER_PROJECTION_WATCH_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let mut manager = haider_projection_journal_manager()
+            .lock()
+            .map_err(|_| "Haider projection journal manager is unavailable.".to_string())?;
+        if manager.tails.contains_key(&session_id) {
+            return Ok(());
+        }
+        manager.tails.insert(
+            session_id.clone(),
+            HaiderProjectionJournalTail {
+                stop: stop.clone(),
+                generation,
+            },
+        );
+    }
+    tauri::async_runtime::spawn(async move {
+        while !HAIDER_PROJECTION_STOPPING.load(Ordering::Acquire)
+            && !stop.load(Ordering::Acquire)
+        {
+            sleep(HAIDER_PROJECTION_PIPE_SAFETY_POLL).await;
+            if HAIDER_PROJECTION_STOPPING.load(Ordering::Acquire)
+                || stop.load(Ordering::Acquire)
+            {
+                break;
+            }
+            match haider_projection_ingest_journal(
+                Some(app.clone()),
+                session_id.clone(),
+                provider_session_id.clone(),
+            )
+            .await
+            {
+                Ok(HaiderProjectionJournalIngest::Connected(frame))
+                    if frame.appended > 0 || frame.tail_changed || frame.sync_changed =>
+                {
+                    let _ = haider_projection_frame_sender(&app).send(frame);
+                }
+                Ok(HaiderProjectionJournalIngest::Connected(_)) => {}
+                Ok(HaiderProjectionJournalIngest::Unavailable) => {
+                    let fallback_app = app.clone();
+                    let fallback_session_id = session_id.clone();
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        let mut foreground =
+                            haider_projection_foreground(&fallback_session_id);
+                        if haider_projection_attach_blocking(
+                            fallback_app,
+                            fallback_session_id,
+                            &mut foreground,
+                        )
+                        .is_ok()
+                        {
+                            foreground.mark_attached();
+                        }
+                    })
+                    .await;
+                }
+                Err(error) => eprintln!("Haider projection journal tail failed: {error}"),
+            }
+        }
+        haider_projection_journal_finished(&session_id, generation);
+    });
+    Ok(())
 }
 
 fn haider_projection_read_capped_line(
@@ -2300,6 +2781,8 @@ fn haider_projection_ingest_pipe_owned(
     }
 
     let existing = haider_projection_load_pipe_cursor(session_id)?;
+    let journal_coverage = haider_projection_load_journal_cursor(session_id)?
+        .map(|cursor| cursor.covered_through_seq);
     if existing
         .as_ref()
         .is_some_and(|cursor| cursor.generation > header.generation)
@@ -2311,8 +2794,17 @@ fn haider_projection_ingest_pipe_owned(
     }) {
         return Err("Haider pipe route was stale.".to_string());
     }
-    let reset =
-        haider_projection_pipe_requires_refold(existing.as_ref(), &header, header_end, file_len);
+    // A pipe opened only because the ADE connection disappeared is an
+    // incremental fallback over the already-folded journal. Do not erase the
+    // richer canonical rows merely because no byte cursor exists yet.
+    let preserve_journal = existing.is_none() && journal_coverage.is_some();
+    let reset = !preserve_journal
+        && haider_projection_pipe_requires_refold(
+            existing.as_ref(),
+            &header,
+            header_end,
+            file_len,
+        );
     if should_cancel() {
         return Err("Haider projection prefold was cancelled.".to_string());
     }
@@ -2325,8 +2817,17 @@ fn haider_projection_ingest_pipe_owned(
         };
         haider_projection_reset_pipe_session(session_id, &cursor)?;
         cursor
+    } else if let Some(existing) = existing {
+        existing
     } else {
-        existing.unwrap_or_default()
+        HaiderProjectionPipeCursor {
+            session_id: session_id.to_string(),
+            byte_offset: header_end,
+            generation: header.generation,
+            covered_through_seq: journal_coverage.unwrap_or_default(),
+            coverage_known: journal_coverage.is_some(),
+            ..HaiderProjectionPipeCursor::default()
+        }
     };
     reader
         .seek(SeekFrom::Start(cursor.byte_offset.max(0) as u64))
@@ -2379,16 +2880,18 @@ fn haider_projection_ingest_pipe_owned(
         } else if let Some((seq, ordinal)) = haider_projection_pipe_row_identity(&value)? {
             // Observed v2: text rows carry role/text/at_ms/seq/ordinal;
             // tool rows use name/summary; branch_id is present only off-main.
-            let step = {
-                let mut states = haider_projection_states()
-                    .lock()
-                    .map_err(|_| "Session projection state is unavailable.".to_string())?;
-                let state = states
-                    .get_mut(session_id)
-                    .ok_or_else(|| "Session projection state was not initialized.".to_string())?;
-                haider_projection_fold_pipe_value_locked(state, session_id, &value)
-            };
-            rows.extend(step.rows);
+            if journal_coverage.is_none_or(|coverage| seq > coverage) {
+                let step = {
+                    let mut states = haider_projection_states()
+                        .lock()
+                        .map_err(|_| "Session projection state is unavailable.".to_string())?;
+                    let state = states.get_mut(session_id).ok_or_else(|| {
+                        "Session projection state was not initialized.".to_string()
+                    })?;
+                    haider_projection_fold_pipe_value_locked(state, session_id, &value)
+                };
+                rows.extend(step.rows);
+            }
             if (seq, ordinal) > (cursor.last_seq, cursor.last_ordinal) {
                 cursor.last_seq = seq;
                 cursor.last_ordinal = ordinal;
@@ -2406,7 +2909,8 @@ fn haider_projection_ingest_pipe_owned(
                 ));
             }
             let batch_from = rows.iter().map(|row| row.seq).min();
-            let persisted = haider_projection_persist_batch(session_id, &rows, Some(&cursor))?;
+            let persisted =
+                haider_projection_persist_batch(session_id, &rows, Some(&cursor), None)?;
             let batch_appended = persisted.rows.len();
             if batch_appended > 0 {
                 start_total.get_or_insert_with(|| {
@@ -2443,7 +2947,7 @@ fn haider_projection_ingest_pipe_owned(
     }
     if advanced && (line_count > 0 || !rows.is_empty()) {
         let batch_from = rows.iter().map(|row| row.seq).min();
-        let persisted = haider_projection_persist_batch(session_id, &rows, Some(&cursor))?;
+        let persisted = haider_projection_persist_batch(session_id, &rows, Some(&cursor), None)?;
         let batch_appended = persisted.rows.len();
         if batch_appended > 0 {
             start_total.get_or_insert_with(|| {
@@ -3571,6 +4075,11 @@ fn haider_projection_attach_blocking(
 
 fn haider_projection_stop() {
     HAIDER_PROJECTION_STOPPING.store(true, Ordering::Release);
+    if let Ok(mut manager) = haider_projection_journal_manager().lock() {
+        for (_, tail) in manager.tails.drain() {
+            tail.stop.store(true, Ordering::Release);
+        }
+    }
     if let Ok(mut manager) = haider_projection_pipe_manager().lock() {
         for (_, tail) in manager.tails.drain() {
             tail.stop.store(true, Ordering::Release);
@@ -3803,41 +4312,144 @@ async fn session_projection_ensure(session_id: String) -> Result<i64, String> {
     let timed_at = Instant::now();
     #[cfg(debug_assertions)]
     let timed_session = session_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let session_id = session_id.trim().to_string();
-        let mut foreground = haider_projection_foreground(&session_id);
-        let _ensure_guard = haider_projection_ensure_lock()
-            .lock()
-            .map_err(|_| "Session projection ensure lock is unavailable.".to_string())?;
-        haider_projection_ensure_blocking(&session_id, &mut foreground)
+    let session_id = session_id.trim().to_string();
+    let mut foreground = haider_projection_foreground(&session_id);
+    let resolve_session_id = session_id.clone();
+    let provider = tauri::async_runtime::spawn_blocking(move || {
+        haider_projection_resolve_provider_session(&resolve_session_id)
     })
     .await
-    .map_err(|error| format!("Session projection ensure worker failed: {error}"))
-    .map(|result| {
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[ade-timing] ensure {}ms session={timed_session}",
-            timed_at.elapsed().as_millis()
-        );
-        result
-    })?
+    .map_err(|error| format!("Session projection resolve worker failed: {error}"))
+    .ok()
+    .and_then(Result::ok);
+    /* The PIPE is the hot path and stays that way: the daemon writes it for
+       this client specifically, it is a compact transcript projection, and
+       tailing it costs a seek and a few KB. The JOURNAL is richer but 2-4x
+       the bytes per event, so it earns its place on a COLD load — where it
+       replaces a `haider export` PROCESS SPAWN measured at a ~25ms floor —
+       and never on the incremental path a pipe already serves cheaply. */
+    let already_projected = {
+        let warm_session_id = session_id.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            haider_projection_state_total_rows(&warm_session_id).unwrap_or(0) > 0
+        })
+        .await
+        .unwrap_or(false)
+    };
+    if already_projected {
+        if let Some((_, provider_session_id)) = provider.clone() {
+            let pipe_session_id = session_id.clone();
+            let warmed = tauri::async_runtime::spawn_blocking(move || {
+                haider_projection_ingest_resolved_pipe(&pipe_session_id, &provider_session_id)
+                    .is_ok()
+            })
+            .await
+            .unwrap_or(false);
+            if warmed {
+                let total_session_id = session_id.clone();
+                let total = tauri::async_runtime::spawn_blocking(move || {
+                    haider_projection_state_total_rows(&total_session_id)
+                })
+                .await
+                .map_err(|error| format!("Session projection total worker failed: {error}"))?;
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[ade-timing] ensure {}ms session={timed_session} (pipe)",
+                    timed_at.elapsed().as_millis()
+                );
+                return total;
+            }
+        }
+    }
+    let result = if let Some((_, provider_session_id)) = provider {
+        foreground.add(&provider_session_id);
+        match haider_projection_ingest_journal(
+            None,
+            session_id.clone(),
+            provider_session_id,
+        )
+        .await?
+        {
+            HaiderProjectionJournalIngest::Connected(frame) => Ok(frame.total_rows),
+            HaiderProjectionJournalIngest::Unavailable => {
+                let fallback_session_id = session_id.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _ensure_guard = haider_projection_ensure_lock().lock().map_err(|_| {
+                        "Session projection ensure lock is unavailable.".to_string()
+                    })?;
+                    haider_projection_ensure_blocking(
+                        &fallback_session_id,
+                        &mut foreground,
+                    )
+                })
+                .await
+                .map_err(|error| format!("Session projection ensure worker failed: {error}"))?
+            }
+        }
+    } else {
+        let fallback_session_id = session_id.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ensure_guard = haider_projection_ensure_lock()
+                .lock()
+                .map_err(|_| "Session projection ensure lock is unavailable.".to_string())?;
+            haider_projection_ensure_blocking(&fallback_session_id, &mut foreground)
+        })
+        .await
+        .map_err(|error| format!("Session projection ensure worker failed: {error}"))?
+    };
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[ade-timing] ensure {}ms session={timed_session}",
+        timed_at.elapsed().as_millis()
+    );
+    result
 }
 
 #[tauri::command(rename_all = "snake_case")]
 async fn session_projection_attach(app: AppHandle, session_id: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let session_id = session_id.trim().to_string();
-        let mut foreground = haider_projection_foreground(&session_id);
-        match haider_projection_attach_blocking(app, session_id, &mut foreground) {
-            Ok(()) => {
-                foreground.mark_attached();
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+    let session_id = session_id.trim().to_string();
+    let mut foreground = haider_projection_foreground(&session_id);
+    let resolve_session_id = session_id.clone();
+    let (_, provider_session_id) = tauri::async_runtime::spawn_blocking(move || {
+        haider_projection_resolve_provider_session(&resolve_session_id)
     })
     .await
-    .map_err(|error| format!("Session projection attach worker failed: {error}"))?
+    .map_err(|error| format!("Session projection resolve worker failed: {error}"))??;
+    foreground.add(&provider_session_id);
+    HAIDER_PROJECTION_STOPPING.store(false, Ordering::Release);
+    match haider_projection_ingest_journal(
+        Some(app.clone()),
+        session_id.clone(),
+        provider_session_id.clone(),
+    )
+    .await?
+    {
+        HaiderProjectionJournalIngest::Connected(frame) => {
+            if frame.appended > 0 || frame.tail_changed || frame.sync_changed {
+                let _ = haider_projection_frame_sender(&app).send(frame);
+            }
+        }
+        HaiderProjectionJournalIngest::Unavailable => {
+            let fallback_app = app.clone();
+            let fallback_session_id = session_id.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                haider_projection_attach_blocking(
+                    fallback_app,
+                    fallback_session_id,
+                    &mut foreground,
+                )?;
+                foreground.mark_attached();
+                Ok::<_, String>(())
+            })
+            .await
+            .map_err(|error| format!("Session projection attach worker failed: {error}"))??;
+            haider_projection_start_journal_tail(app, session_id, provider_session_id)?;
+            return Ok(());
+        }
+    }
+    haider_projection_start_journal_tail(app, session_id, provider_session_id)?;
+    foreground.mark_attached();
+    Ok(())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -3846,6 +4458,14 @@ async fn session_projection_detach(session_id: String) -> Result<(), String> {
     let mut detached = vec![session_id.clone()];
     if let Ok((_, provider_session_id)) = haider_projection_resolve_provider_session(&session_id) {
         detached.push(provider_session_id);
+    }
+    if let Some(tail) = haider_projection_journal_manager()
+        .lock()
+        .map_err(|_| "Haider projection journal manager is unavailable.".to_string())?
+        .tails
+        .remove(&session_id)
+    {
+        tail.stop.store(true, Ordering::Release);
     }
     if let Some(tail) = haider_projection_pipe_manager()
         .lock()
@@ -3880,6 +4500,14 @@ mod haider_projection_tests {
                 );
                 let _ = connection.execute(
                     "DELETE FROM session_pipe_cursors WHERE session_id = ?1",
+                    [&self.session_id],
+                );
+                let _ = connection.execute(
+                    "DELETE FROM session_journal_cursors WHERE session_id = ?1",
+                    [&self.session_id],
+                );
+                let _ = connection.execute(
+                    "DELETE FROM sessions WHERE id = ?1",
                     [&self.session_id],
                 );
                 Ok(())
@@ -4181,7 +4809,7 @@ mod haider_projection_tests {
             generation: 1,
             ..HaiderProjectionPipeCursor::default()
         };
-        haider_projection_persist_batch(&test_session.session_id, &[], Some(&stale)).unwrap();
+        haider_projection_persist_batch(&test_session.session_id, &[], Some(&stale), None).unwrap();
         assert_eq!(
             haider_projection_load_pipe_cursor(&test_session.session_id)
                 .unwrap()
@@ -4248,7 +4876,12 @@ mod haider_projection_tests {
             generation: 1,
             ..HaiderProjectionPipeCursor::default()
         };
-        haider_projection_persist_batch(&test_session.session_id, &[], Some(&old_generation))
+        haider_projection_persist_batch(
+            &test_session.session_id,
+            &[],
+            Some(&old_generation),
+            None,
+        )
             .unwrap();
         assert_eq!(
             haider_projection_load_pipe_cursor(&test_session.session_id)
@@ -4541,10 +5174,57 @@ mod haider_projection_tests {
             generation: 1,
             ..HaiderProjectionPipeCursor::default()
         };
-        let total = haider_projection_persist_batch(&test_session.session_id, &[], Some(&cursor))
-            .unwrap()
-            .total_rows;
+        let total =
+            haider_projection_persist_batch(&test_session.session_id, &[], Some(&cursor), None)
+                .unwrap()
+                .total_rows;
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn haider_projection_journal_coordinates_round_trip_and_terminal_clears_run() {
+        let test_session = haider_projection_test_session();
+        haider_projection_with_database(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO sessions (
+                        id, title, slug, dir, kind, provider, provider_session_id,
+                        created_at_ms, latest_at_ms
+                     ) VALUES (?1, 'Run coordinates', '', '', 'pinned', 'haider', ?2, 1, 1)",
+                    rusqlite::params![
+                        test_session.session_id,
+                        test_session.provider_session_id,
+                    ],
+                )
+                .map(|_| ())
+                .map_err(|error| format!("test session insert failed: {error}"))
+        })
+        .unwrap();
+        for (covered, run_id, generation) in [
+            (7, Some("run-live".to_string()), Some(97)),
+            (8, None, Some(97)),
+        ] {
+            let journal = HaiderProjectionJournalCommit {
+                covered_through_seq: covered,
+                coordinates: Some(HaiderProjectionRunCoordinates {
+                    run_id,
+                    worker_generation: generation,
+                }),
+            };
+            haider_projection_persist_batch(
+                &test_session.session_id,
+                &[],
+                None,
+                Some(&journal),
+            )
+            .unwrap();
+            let row = haider_projection_with_database(|connection| {
+                sessions_row_by_id(connection, &test_session.session_id)
+            })
+            .unwrap();
+            assert_eq!(row.worker_generation, Some(97));
+            assert_eq!(row.run_id, journal.coordinates.unwrap().run_id);
+        }
     }
 
     #[test]
@@ -4712,6 +5392,21 @@ mod haider_projection_tests {
         assert_eq!(haider_projection_item_class(&json!({"item": "reasoning"})).0, "thinking");
         assert_eq!(haider_projection_item_class(&json!({"item": "agent_message"})).0, "message");
         assert_eq!(haider_projection_item_class(&json!({"item": "extension"})).0, "tool");
+
+        let mut state = HaiderProjectionFoldState::default();
+        let folded = haider_projection_fold_value_locked(
+            &mut state,
+            "local-session",
+            &json!({
+                "seq": 12,
+                "render": {"ui": true, "durable": true, "prompt": "verbatim"},
+                "payload": {"type":"item", "event":"completed", "item_id":"future-1",
+                    "item":{"item":"quantum_widget", "summary":"future item landed"}}
+            }),
+        );
+        assert_eq!(folded.rows.len(), 1);
+        assert_eq!(folded.rows[0].kind, "tool");
+        assert_eq!(folded.rows[0].text, "quantum_widget · future item landed");
     }
 
     #[test]
@@ -4786,6 +5481,65 @@ mod haider_projection_tests {
         assert_eq!(sealed.rows[0].seq, 42);
         assert_eq!(sealed.rows[0].text, "Hello world");
         assert!(state.tail.is_none());
+    }
+
+    #[test]
+    fn haider_projection_reasoning_lifecycle_seals_one_accumulated_thinking_row() {
+        let values = [
+            json!({
+                "seq": 50,
+                "render": {"ui": true, "durable": true, "prompt": "verbatim"},
+                "payload": {"type":"item", "event":"started", "item_id":"reasoning-1",
+                    "item":{"item":"reasoning", "summary":""}}
+            }),
+            json!({
+                "seq": 51,
+                "render": {"ui": true, "durable": true, "prompt": "verbatim"},
+                "payload": {"type":"item", "event":"delta", "item_id":"reasoning-1",
+                    "delta":{"delta":"reasoning", "text":"The user is asking "}}
+            }),
+            json!({
+                "seq": 52,
+                "render": {"ui": true, "durable": true, "prompt": "verbatim"},
+                "payload": {"type":"item", "event":"delta", "item_id":"reasoning-1",
+                    "delta":{"delta":"reasoning", "text":"me to inspect the journal."}}
+            }),
+            json!({
+                "seq": 53,
+                "render": {"ui": true, "durable": true, "prompt": "verbatim"},
+                "payload": {"type":"item", "event":"completed", "item_id":"reasoning-1",
+                    "item":{"item":"reasoning", "summary":""}}
+            }),
+        ];
+        let mut state = HaiderProjectionFoldState::default();
+        let rows = values
+            .iter()
+            .flat_map(|value| {
+                haider_projection_fold_value_locked(&mut state, "local", value).rows
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "thinking");
+        assert_eq!(
+            rows[0].text,
+            "The user is asking me to inspect the journal."
+        );
+        assert!(state.tail.is_none());
+    }
+
+    #[test]
+    fn haider_projection_honors_daemon_ui_redaction() {
+        let mut state = HaiderProjectionFoldState::default();
+        let hidden = json!({
+            "seq": 60,
+            "render": {"ui": false, "durable": true, "prompt": "verbatim"},
+            "payload": {"type":"item", "event":"completed", "item_id":"hidden-1",
+                "item":{"item":"agent_message", "text":"must stay hidden"}}
+        });
+        let folded = haider_projection_fold_value_locked(&mut state, "local", &hidden);
+        assert!(folded.rows.is_empty());
+        assert!(state.tail.is_none());
+        assert!(!state.saw_item_stream);
     }
 
     #[test]

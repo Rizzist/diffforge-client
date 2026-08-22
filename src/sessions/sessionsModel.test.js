@@ -44,6 +44,9 @@ const DAEMON_ROW = {
   last_activity_ms: 1787319179764,
   waiting_kind: "permission",
   waiting_menu_id: "menu-77",
+  // committed run coordinates
+  run_id: "run-ee1a29d3",
+  worker_generation: 97,
   // 937 park card
   needs_input: {
     kind: "recovery",
@@ -65,6 +68,8 @@ test("normalizeSessionRow keeps every harness field the UI renders", () => {
   assert.equal(row.last_activity_ms, 1787319179764);
   assert.equal(row.waiting_kind, "permission");
   assert.equal(row.waiting_menu_id, "menu-77");
+  assert.equal(row.run_id, "run-ee1a29d3");
+  assert.equal(row.worker_generation, 97);
 });
 
 test("normalizeSessionRow passes the park card through verbatim", () => {
@@ -92,6 +97,8 @@ test("absent harness fields normalize to null, never to a fabricated default", (
   assert.equal(row.last_activity_ms, null);
   assert.equal(row.waiting_kind, null);
   assert.equal(row.waiting_menu_id, null);
+  assert.equal(row.run_id, null);
+  assert.equal(row.worker_generation, null);
   assert.equal(row.needs_input, null);
 });
 

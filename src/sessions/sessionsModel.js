@@ -42,6 +42,8 @@ export function normalizeSessionRow(row) {
     last_activity_ms: row.last_activity_ms ?? null,
     waiting_kind: row.waiting_kind ?? null,
     waiting_menu_id: row.waiting_menu_id ?? null,
+    run_id: row.run_id ?? null,
+    worker_generation: row.worker_generation ?? null,
     /* The needs_input card is rendered verbatim (kinds and fields can grow),
        so it is never reshaped here. */
     needs_input: row.needs_input ?? null,

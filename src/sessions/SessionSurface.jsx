@@ -792,6 +792,32 @@ export default function SessionSurface({
     }
   }, [composerPrefs, onDraftMaterialized, setComposerPastesFor, setComposerText]);
 
+  /* A stop button exists only when the harness has named the run to stop.
+     run_id and worker_generation are ONE observation and ride verbatim: the
+     generation fences a resurrected worker and the run id fences the specific
+     run, so a cancel that raced a turn boundary cannot kill the next turn.
+     Absent run_id means no active run — never a guess, never a stop button. */
+  const cancelTurnFor = useCallback((session) => {
+    if (session?.status !== "running") return null;
+    const runId = session?.run_id;
+    const generation = session?.worker_generation;
+    if (typeof runId !== "string" || !runId) return null;
+    if (typeof generation !== "number" || !Number.isFinite(generation)) return null;
+    return async () => {
+      try {
+        await invoke("session_cancel_turn", {
+          session_id: session.id,
+          run_id: runId,
+          worker_generation: generation,
+        });
+      } catch {
+        /* already_terminal and a lost receipt are both benign here: the
+           command id is derived, so the roster's next state is the truth. */
+      }
+      onSessionsRefresh?.();
+    };
+  }, [onSessionsRefresh]);
+
   const submitIntoSession = useCallback(async (session, prompt, attachments) => {
     /* Clearing is SURFACE-owned and generation-guarded: a completion that
        lands after the user edited again (or switched away and back) clears
@@ -1306,6 +1332,7 @@ export default function SessionSurface({
                       onChipMenuOpen={() => refreshConfig(session.id)}
                       attachments={composerAttachments[session.id] || []}
                       holdNotice={submitHold[session.id] || ""}
+                      onCancelTurn={cancelTurnFor(session)}
                       mirrorAttachments={mirrorAttachments[session.id] || []}
                       onAttachmentsChange={(next) => handleAttachmentsChange(session, next)}
                       onMirrorType={(text) => publishMirror(session, text)}

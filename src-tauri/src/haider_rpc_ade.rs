@@ -107,6 +107,29 @@ pub(crate) struct SessionSeen {
     pub worker_generation: u64,
 }
 
+/// Inclusive committed-journal coordinates used by `session.read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionReadRange {
+    pub start_seq: u64,
+    pub end_seq: u64,
+}
+
+/// Forward-compatible `session.read` result. Envelopes intentionally remain
+/// raw JSON so a newer daemon can add payload and item kinds without making
+/// the ADE projection reject the entire page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SessionReadResult {
+    pub session_id: String,
+    pub range: SessionReadRange,
+    pub head_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_context_footprint: Option<Value>,
+    #[serde(default)]
+    pub envelopes: Vec<Value>,
+}
+
 #[derive(Clone, Serialize)]
 pub struct AccountListResult {
     pub descriptors: Vec<Value>,
@@ -447,6 +470,11 @@ enum RequestBody {
     },
     #[serde(rename = "session.list_watch")]
     SessionListWatch {},
+    #[serde(rename = "session.read")]
+    SessionRead {
+        session_id: String,
+        range: SessionReadRange,
+    },
     #[serde(rename = "provider.list")]
     ProviderList {},
     #[serde(rename = "session.observe")]
@@ -622,6 +650,8 @@ enum ResponseBody {
     },
     #[serde(rename = "session.list_watch")]
     SessionListWatch { accepted: bool },
+    #[serde(rename = "session.read")]
+    SessionRead { result: SessionReadResult },
     #[serde(rename = "provider.list")]
     ProviderList {
         #[serde(default)]
@@ -1462,6 +1492,42 @@ async fn rpc_request_with_feature_gate(
         .await
         .ok()?
         .ok()?
+}
+
+/// Reads one bounded inclusive range from the daemon's committed journal.
+/// `None` means there is no live ADE connection, which is the caller's signal
+/// to use its pipe fallback. A connected daemon rejection remains an error so
+/// protocol and authorization failures are never disguised as offline state.
+pub(crate) async fn session_read_rpc(
+    session_id: String,
+    start_seq: u64,
+    end_seq: u64,
+) -> Option<Result<SessionReadResult, String>> {
+    #[cfg(unix)]
+    {
+        let response = rpc_request(
+            RequestBody::SessionRead {
+                session_id,
+                range: SessionReadRange {
+                    start_seq,
+                    end_seq,
+                },
+            },
+            Capability::View,
+            BTreeSet::new(),
+        )
+        .await?;
+        return Some(match response {
+            Ok(ResponseBody::SessionRead { result }) => Ok(result),
+            Ok(_) => Err("session.read response method mismatch".to_string()),
+            Err(error) => Err(error),
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, start_seq, end_seq);
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -4884,6 +4950,40 @@ mod tests {
             std::str::from_utf8(&framed[4..]).expect("attached publish JSON"),
             r#"{"v":1,"kind":"request","request_id":"req-publish-attachments","body":{"method":"session.surface_publish","session_id":"session-1","input":{"text":"full composer text","attachments":[{"mime":"image/png","bytes":2,"artifact":"blake3:paste-image"}],"revision":9}}}"#
         );
+    }
+
+    #[test]
+    fn session_read_frames_match_the_inclusive_raw_envelope_contract() {
+        let request = WireFrame::Request {
+            request_id: "req-session-read".to_owned(),
+            body: RequestBody::SessionRead {
+                session_id: "session-1".to_owned(),
+                range: SessionReadRange {
+                    start_seq: 1,
+                    end_seq: 500,
+                },
+            },
+        };
+        let framed = encode_framed(&request, DEFAULT_FRAME_LIMIT).expect("encode session.read");
+        assert_eq!(
+            std::str::from_utf8(&framed[4..]).expect("session.read JSON"),
+            r#"{"v":1,"kind":"request","request_id":"req-session-read","body":{"method":"session.read","session_id":"session-1","range":{"start_seq":1,"end_seq":500}}}"#
+        );
+
+        let response = br#"{"v":1,"kind":"response","request_id":"req-session-read","body":{"method":"session.read","result":{"session_id":"session-1","range":{"start_seq":1,"end_seq":500},"head_seq":724,"metadata":{"model":"gpt-5"},"latest_context_footprint":{"used_tokens":12},"envelopes":[{"schema_version":1,"event_id":"worker-event-1","seq":724,"session_id":"session-1","run_id":"run-1","worker_generation":97,"committed_at_ms":1787155782065,"render":{"ui":true,"durable":true,"prompt":"verbatim"},"payload":{"type":"item","event":"completed","item":{"item":"reasoning","summary":"thinking"}}}]}}}"#;
+        let WireFrame::Response {
+            body: ResponseBody::SessionRead { result },
+            ..
+        } = decode_body(response, DEFAULT_FRAME_LIMIT).expect("decode session.read")
+        else {
+            panic!("expected session.read response");
+        };
+        assert_eq!(result.session_id, "session-1");
+        assert_eq!(result.range.start_seq, 1);
+        assert_eq!(result.range.end_seq, 500);
+        assert_eq!(result.head_seq, 724);
+        assert_eq!(result.envelopes[0]["run_id"], "run-1");
+        assert_eq!(result.envelopes[0]["worker_generation"], 97);
     }
 
     #[cfg(unix)]

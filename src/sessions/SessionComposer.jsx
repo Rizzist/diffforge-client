@@ -64,6 +64,9 @@ export default function SessionComposer({
      stays put and un-editable rather than being cleared or lost — editing it
      mid-flight would send something the user never finished writing. */
   holdNotice = "",
+  /* Present only while a turn is running AND the harness has told us which
+     run it is. Absent means no stop button — never a guess. */
+  onCancelTurn = null,
 }) {
   /* The draft text is SURFACE-owned (value/onValueChange): the composer
      unmounts on every view/session switch, so component-local text would be
@@ -136,6 +139,16 @@ export default function SessionComposer({
      in `attachments`, or a paste-then-instant-Enter submits without its
      image and ghosts it onto the next prompt. */
   const [pendingStages, setPendingStages] = useState(0);
+  const [cancelling, setCancelling] = useState(false);
+  const cancelTurn = useCallback(async () => {
+    if (cancelling) return;
+    setCancelling(true);
+    try {
+      await onCancelTurn?.();
+    } finally {
+      setCancelling(false);
+    }
+  }, [cancelling, onCancelTurn]);
   const submit = useCallback(async () => {
     const prompt = compositeText(pastedBlocks, value).trim();
     if (!prompt || busy || disabled || pendingStages > 0) {
@@ -476,6 +489,23 @@ export default function SessionComposer({
           >
             <KeyboardVoice aria-hidden="true" />
           </ComposerRoundButton>
+          {/* While a turn is streaming the send button becomes a stop: the
+              useful action mid-turn is to end it, and hiding that behind the
+              TUI made the chat the weaker surface. Only offered when the
+              harness told us WHICH run to stop — cancelling by guess could
+              kill the next turn instead. */}
+          {onCancelTurn ? (
+            <ComposerRoundButton
+              aria-label="Stop"
+              data-variant="stop"
+              disabled={cancelling}
+              onClick={() => void cancelTurn()}
+              title="Stop this turn"
+              type="button"
+            >
+              {cancelling ? "…" : <StopGlyph aria-hidden="true" />}
+            </ComposerRoundButton>
+          ) : (
           <ComposerRoundButton
             aria-label="Send"
             data-variant="send"
@@ -485,6 +515,7 @@ export default function SessionComposer({
           >
             {busy ? "…" : <Send aria-hidden="true" />}
           </ComposerRoundButton>
+          )}
         </ComposerField>
       </ComposerBarWrap>
     </ComposerRoot>
@@ -640,6 +671,15 @@ const ChipMenuEmpty = styled.div`
 
 const ComposerBarWrap = styled.div`
   position: relative;
+`;
+
+/* A square inside the round button — the universal "stop", and shape-distinct
+   from the send arrow so the control never reads ambiguously mid-turn. */
+const StopGlyph = styled.i`
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: currentColor;
 `;
 
 const HoldNotice = styled.p`

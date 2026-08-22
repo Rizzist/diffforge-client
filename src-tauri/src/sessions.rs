@@ -10,6 +10,8 @@ struct SessionRow {
     kind: String,
     provider: String,
     provider_session_id: String,
+    run_id: Option<String>,
+    worker_generation: Option<i64>,
     created_at_ms: i64,
     latest_at_ms: i64,
     status: String,
@@ -239,6 +241,8 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
                 kind TEXT NOT NULL CHECK (kind IN ('generated', 'pinned')),
                 provider TEXT NOT NULL DEFAULT 'haider',
                 provider_session_id TEXT NOT NULL DEFAULT '',
+                run_id TEXT,
+                worker_generation INTEGER,
                 created_at_ms INTEGER NOT NULL,
                 latest_at_ms INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'idle',
@@ -271,6 +275,8 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
         ("waiting_kind", "TEXT"),
         ("waiting_menu_id", "TEXT"),
         ("needs_input_json", "TEXT"),
+        ("run_id", "TEXT"),
+        ("worker_generation", "INTEGER"),
     ];
     let columns = sessions_table_columns(connection)?;
     if migrations
@@ -319,29 +325,31 @@ fn sessions_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> 
         kind: row.get(4)?,
         provider: row.get(5)?,
         provider_session_id: row.get(6)?,
-        created_at_ms: row.get(7)?,
-        latest_at_ms: row.get(8)?,
-        status: row.get(9)?,
-        state_raw: row.get(10)?,
-        first_user_message: row.get(11)?,
-        model: row.get(12)?,
-        effort: row.get(13)?,
-        speed_fast: row.get(14)?,
-        seen_at_ms: row.get(15)?,
-        last_activity_ms: row.get(16)?,
-        waiting_kind: row.get(17)?,
-        waiting_menu_id: row.get(18)?,
+        run_id: row.get(7)?,
+        worker_generation: row.get(8)?,
+        created_at_ms: row.get(9)?,
+        latest_at_ms: row.get(10)?,
+        status: row.get(11)?,
+        state_raw: row.get(12)?,
+        first_user_message: row.get(13)?,
+        model: row.get(14)?,
+        effort: row.get(15)?,
+        speed_fast: row.get(16)?,
+        seen_at_ms: row.get(17)?,
+        last_activity_ms: row.get(18)?,
+        waiting_kind: row.get(19)?,
+        waiting_menu_id: row.get(20)?,
         needs_input: row
-            .get::<_, Option<String>>(19)?
+            .get::<_, Option<String>>(21)?
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or(Value::Null),
-        pinned: row.get(20)?,
-        title_locked: row.get(21)?,
+        pinned: row.get(22)?,
+        title_locked: row.get(23)?,
     })
 }
 
 const SESSIONS_SELECT_COLUMNS: &str =
-    "id, title, slug, dir, kind, provider, provider_session_id, created_at_ms, latest_at_ms, status, state_raw, first_user_message, model, effort, speed_fast, seen_at_ms, last_activity_ms, waiting_kind, waiting_menu_id, needs_input_json, pinned, title_locked";
+    "id, title, slug, dir, kind, provider, provider_session_id, run_id, worker_generation, created_at_ms, latest_at_ms, status, state_raw, first_user_message, model, effort, speed_fast, seen_at_ms, last_activity_ms, waiting_kind, waiting_menu_id, needs_input_json, pinned, title_locked";
 
 fn sessions_row_by_id(connection: &rusqlite::Connection, id: &str) -> Result<SessionRow, String> {
     let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions WHERE id = ?1");
@@ -405,6 +413,8 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
         kind: kind.to_string(),
         provider: "haider".to_string(),
         provider_session_id: String::new(),
+        run_id: None,
+        worker_generation: None,
         created_at_ms: now_ms,
         latest_at_ms: now_ms,
         status: "idle".to_string(),
@@ -707,6 +717,8 @@ mod sessions_tests {
             kind: kind.to_string(),
             provider: "haider".to_string(),
             provider_session_id: format!("provider-{id}"),
+            run_id: None,
+            worker_generation: None,
             created_at_ms: 10,
             latest_at_ms: 10,
             status: "idle".to_string(),
@@ -730,9 +742,9 @@ mod sessions_tests {
             .execute(
                 "INSERT INTO sessions (
                     id, title, slug, dir, kind, provider, provider_session_id,
-                    created_at_ms, latest_at_ms, status, state_raw,
-                    first_user_message, model, pinned, title_locked
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    run_id, worker_generation, created_at_ms, latest_at_ms,
+                    status, state_raw, first_user_message, model, pinned, title_locked
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     row.id,
                     row.title,
@@ -741,6 +753,8 @@ mod sessions_tests {
                     row.kind,
                     row.provider,
                     row.provider_session_id,
+                    row.run_id,
+                    row.worker_generation,
                     row.created_at_ms,
                     row.latest_at_ms,
                     row.status,
@@ -850,6 +864,8 @@ mod sessions_tests {
             "waiting_kind",
             "waiting_menu_id",
             "needs_input_json",
+            "run_id",
+            "worker_generation",
         ] {
             assert_eq!(columns.iter().filter(|name| *name == column).count(), 1);
         }
@@ -863,6 +879,8 @@ mod sessions_tests {
         assert_eq!(row.waiting_kind, None);
         assert_eq!(row.waiting_menu_id, None);
         assert_eq!(row.needs_input, Value::Null);
+        assert_eq!(row.run_id, None);
+        assert_eq!(row.worker_generation, None);
         let row_json = serde_json::to_value(&row).unwrap();
         assert_eq!(row_json["effort"], Value::Null);
         assert_eq!(row_json["speed"], Value::Null);
@@ -871,6 +889,8 @@ mod sessions_tests {
         assert_eq!(row_json["waiting_kind"], Value::Null);
         assert_eq!(row_json["waiting_menu_id"], Value::Null);
         assert_eq!(row_json["needs_input"], Value::Null);
+        assert_eq!(row_json["run_id"], Value::Null);
+        assert_eq!(row_json["worker_generation"], Value::Null);
         assert!(!row.pinned);
         assert!(!row.title_locked);
 
@@ -1040,7 +1060,9 @@ mod sessions_tests {
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
         let connection = sessions_open_database().unwrap();
-        let row = sessions_test_row("attention", Path::new(""), "pinned");
+        let mut row = sessions_test_row("attention", Path::new(""), "pinned");
+        row.run_id = Some("run-live".to_string());
+        row.worker_generation = Some(97);
         sessions_test_insert_row(&connection, &row);
         drop(connection);
 
@@ -1057,6 +1079,8 @@ mod sessions_tests {
         assert_eq!(reconciled.last_activity_ms, Some(30));
         assert_eq!(reconciled.waiting_kind.as_deref(), Some("permission"));
         assert_eq!(reconciled.waiting_menu_id.as_deref(), Some("menu-936"));
+        assert_eq!(reconciled.run_id.as_deref(), Some("run-live"));
+        assert_eq!(reconciled.worker_generation, Some(97));
         drop(connection);
 
         roster.seen_at_ms = None;
@@ -1071,6 +1095,8 @@ mod sessions_tests {
         assert_eq!(reconciled.last_activity_ms, None);
         assert_eq!(reconciled.waiting_kind, None);
         assert_eq!(reconciled.waiting_menu_id, None);
+        assert_eq!(reconciled.run_id.as_deref(), Some("run-live"));
+        assert_eq!(reconciled.worker_generation, Some(97));
         drop(connection);
 
         fs::remove_dir_all(directory).unwrap();
