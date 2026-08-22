@@ -852,7 +852,7 @@ fn haider_bridge_reconcile_store(
 
         transaction
             .execute(
-                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5, state_raw = ?6, model = ?7, effort = ?8, speed_fast = ?9, seen_at_ms = ?10, last_activity_ms = ?11, waiting_kind = ?12, waiting_menu_id = ?13, needs_input_json = ?14 WHERE id = ?1",
+                "UPDATE sessions SET title = ?2, provider_session_id = ?3, latest_at_ms = ?4, status = ?5, state_raw = ?6, model = ?7, effort = ?8, speed_fast = ?9, seen_at_ms = ?10, last_activity_ms = ?11, waiting_kind = ?12, waiting_menu_id = ?13, needs_input_json = ?14, run_id = ?15, worker_generation = ?16 WHERE id = ?1",
                 rusqlite::params![
                     row.id,
                     row.title,
@@ -868,6 +868,8 @@ fn haider_bridge_reconcile_store(
                     row.waiting_kind,
                     row.waiting_menu_id,
                     needs_input_json,
+                    row.run_id,
+                    row.worker_generation,
                 ],
             )
             .map_err(|error| format!("Unable to reconcile Haider session: {error}"))?;
