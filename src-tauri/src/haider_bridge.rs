@@ -20,6 +20,8 @@ struct HaiderBridgeSession {
     last_activity_ms: Option<i64>,
     waiting_kind: Option<String>,
     waiting_menu_id: Option<String>,
+    run_id: Option<String>,
+    worker_generation: Option<i64>,
     needs_input: Value,
     latest_at_ms: Option<i64>,
 }
@@ -36,6 +38,8 @@ struct HaiderBridgeReconcileStamp {
     last_activity_ms: Option<i64>,
     waiting_kind: Option<String>,
     waiting_menu_id: Option<String>,
+    run_id: Option<String>,
+    worker_generation: Option<i64>,
     needs_input: Value,
 }
 
@@ -50,6 +54,8 @@ impl HaiderBridgeReconcileStamp {
             fast: session.fast,
             seen_at_ms: session.seen_at_ms,
             last_activity_ms: session.last_activity_ms,
+            run_id: session.run_id.clone(),
+            worker_generation: session.worker_generation,
             waiting_kind: session.waiting_kind.clone(),
             waiting_menu_id: session.waiting_menu_id.clone(),
             needs_input: session.needs_input.clone(),
@@ -371,6 +377,23 @@ fn haider_bridge_parse_session(
                 .or_else(|| waiting_why.get("pendingMenuId"))
         })
         .and_then(haider_bridge_text);
+    /* 938 cancel coordinates. They are ONE observation and are read off the
+       SAME summary object: the daemon's selector can rank a parked run above
+       a newer running one, so an id paired with a state from a different poll
+       could name a different run than the one being rendered. Absent run_id
+       means no active run — never an error, and never a stop button. */
+    let run_id = haider_bridge_object_value(
+        object,
+        &["run_id", "runId"],
+        &["runtime", "summary", "metadata", "session"],
+    )
+    .and_then(haider_bridge_text);
+    let worker_generation = haider_bridge_object_value(
+        object,
+        &["worker_generation", "workerGeneration"],
+        &["runtime", "summary", "metadata", "session"],
+    )
+    .and_then(Value::as_i64);
     let needs_input = haider_bridge_object_value(
         object,
         &["needs_input", "needsInput"],
@@ -438,6 +461,8 @@ fn haider_bridge_parse_session(
         last_activity_ms,
         waiting_kind,
         waiting_menu_id,
+        run_id,
+        worker_generation,
         needs_input,
         latest_at_ms,
     })
@@ -780,6 +805,23 @@ fn haider_bridge_reconcile_store(
         if row.last_activity_ms != session.last_activity_ms {
             row.last_activity_ms = session.last_activity_ms;
             row_changed = true;
+        }
+        /* Run coordinates are only written by a source that CARRIES them.
+           worker_generation is non-optional on the RPC wire, so its absence
+           means the source is lossy — the CLI projection drops both — and
+           letting that source write would clear a live run's id moments
+           after the watch set it. When the rich source does write, absence
+           of run_id is real and clears the pair, so a stop button can never
+           fire at a run that already finished. */
+        if session.worker_generation.is_some() || row.worker_generation.is_none() {
+        if row.run_id != session.run_id {
+            row.run_id = session.run_id.clone();
+            row_changed = true;
+        }
+        if row.worker_generation != session.worker_generation {
+            row.worker_generation = session.worker_generation;
+            row_changed = true;
+        }
         }
         if row.waiting_kind != session.waiting_kind {
             row.waiting_kind = session.waiting_kind.clone();
@@ -1394,6 +1436,8 @@ mod haider_bridge_tests {
                 last_activity_ms: None,
                 waiting_kind: None,
                 waiting_menu_id: None,
+                run_id: None,
+                worker_generation: None,
                 needs_input: Value::Null,
                 latest_at_ms: Some(1_777_777_777_123),
             }]
@@ -1484,6 +1528,8 @@ mod haider_bridge_tests {
             last_activity_ms: None,
             waiting_kind: None,
             waiting_menu_id: None,
+            run_id: None,
+            worker_generation: None,
             needs_input: Value::Null,
             latest_at_ms: None,
         };
@@ -1628,6 +1674,8 @@ mod haider_bridge_tests {
             last_activity_ms: None,
             waiting_kind: None,
             waiting_menu_id: None,
+            run_id: None,
+            worker_generation: None,
             needs_input: Value::Null,
             latest_at_ms: Some(100),
         };

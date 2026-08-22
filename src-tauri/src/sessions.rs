@@ -930,6 +930,8 @@ mod sessions_tests {
             last_activity_ms: None,
             waiting_kind: None,
             waiting_menu_id: None,
+            run_id: None,
+            worker_generation: None,
             needs_input: Value::Null,
             latest_at_ms: Some(20),
         }])
@@ -1027,6 +1029,8 @@ mod sessions_tests {
             last_activity_ms: None,
             waiting_kind: None,
             waiting_menu_id: None,
+            run_id: None,
+            worker_generation: None,
             needs_input: Value::Null,
             latest_at_ms: Some(sessions_now_ms()),
         }
