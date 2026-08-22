@@ -15,6 +15,25 @@ export function effectiveSessionPaneId(paneOverrides, sessionId) {
   return paneOverrides?.[sessionId] || sessionPaneId(sessionId);
 }
 
+export function rehomeSessionViewMode(
+  viewModes,
+  { hostSessionId, targetSessionId },
+) {
+  const current = viewModes || {};
+  if (!hostSessionId || !targetSessionId || hostSessionId === targetSessionId) {
+    return current;
+  }
+
+  /* Only a visible Shell follows the pane. A hidden/warm terminal behind
+     Chat does not make the materialization Shell-originated. Writing "ui"
+     explicitly also prevents an old target preference from winning. */
+  const targetMode = current[hostSessionId] === "terminal" ? "terminal" : "ui";
+  if (current[targetSessionId] === targetMode) {
+    return current;
+  }
+  return { ...current, [targetSessionId]: targetMode };
+}
+
 export function rehomeSessionPane(
   paneOverrides,
   { paneId, hostSessionId, targetSessionId },

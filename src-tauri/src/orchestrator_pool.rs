@@ -564,17 +564,12 @@ async fn orchestrator_pool_submit_prompt(
         pane_id: entry.pane_id.clone(),
         instance_id: Some(entry.instance_id),
         data: input,
-        app_fork_enabled: Some(false),
         prompt_event_id: Some(prompt_id.clone()),
         prompt_event_revision: None,
         prompt_event_source: Some("orchestrator_pool".to_string()),
         prompt_event_submitted_at: Some(cloud_mcp_now_ms().to_string()),
         prompt_event_text: Some(prepared.text.clone()),
-        todo_id: None,
-        todo_dispatch_id: None,
-        todo_command_id: Some(cloud_mcp_remote_command_id(event)),
         todo_action: None,
-        todo_resume_requested: None,
         thread_id: Some(entry.thread_id.clone()),
     };
     let ack = enqueue_terminal_input_event_with_ack(app, payload);

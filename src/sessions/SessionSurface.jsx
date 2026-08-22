@@ -20,7 +20,10 @@ import {
 } from "../app/appStyles.js";
 import { PlanFlame } from "../app/PlanFlame.jsx";
 import SessionComposer from "./SessionComposer.jsx";
-import { rehomeSessionPane } from "./sessionPaneOwnership.js";
+import {
+  rehomeSessionPane,
+  rehomeSessionViewMode,
+} from "./sessionPaneOwnership.js";
 import SessionTerminal from "./SessionTerminal.jsx";
 import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
@@ -256,6 +259,10 @@ export default function SessionSurface({
   const [paneOverrides, setPaneOverrides] = useState({});
   const paneOverridesRef = useRef(paneOverrides);
   paneOverridesRef.current = paneOverrides;
+  /* A new TUI-created session can announce before the roster refresh that
+     makes its provider id resolvable. Keep the latest announcement per pane
+     and finish the same rehome when that row arrives. */
+  const pendingTuiAttachmentsRef = useRef(new Map());
   const [surfaceStatus, setSurfaceStatus] = useState({});
 
   /* Config fetches are LATEST-WINS per session: a slow menu-open GET must
@@ -483,18 +490,11 @@ export default function SessionSurface({
     return () => window.clearTimeout(timer);
   }, [activeSessionId, sessions]);
 
-  /* tui_attach_announce_v1: the TUI told us which session its PTY now
-     serves — auto-select it and re-home the live pane under it. */
-  const handleTuiAttached = useCallback(({ paneId, providerSessionId, hostSessionId }) => {
-    if (!providerSessionId) {
-      return; // back at the launcher — the pane keeps its host session
-    }
-    const target = sessions.find(
-      (row) => row.provider_session_id === providerSessionId,
-    );
-    if (!target || target.id === hostSessionId) {
-      return;
-    }
+  const rehomeAttachedTui = useCallback(({
+    paneId,
+    hostSessionId,
+  }, target) => {
+    if (!target || target.id === hostSessionId) return;
     const currentPanes = paneOverridesRef.current;
     const nextPanes = rehomeSessionPane(currentPanes, {
       paneId,
@@ -513,11 +513,45 @@ export default function SessionSurface({
     setShellTouched((current) => (
       current[target.id] ? current : { ...current, [target.id]: true }
     ));
-    if ((viewModes[hostSessionId] || "ui") === "terminal") {
-      setViewModes((current) => ({ ...current, [target.id]: "terminal" }));
-    }
+    setViewModes((current) => rehomeSessionViewMode(current, {
+      hostSessionId,
+      targetSessionId: target.id,
+    }));
     onOpenSession?.(target);
-  }, [sessions, onOpenSession, viewModes]);
+  }, [onOpenSession]);
+
+  /* tui_attach_announce_v1: the TUI told us which session its PTY now
+     serves — auto-select it and re-home the live pane under it. */
+  const handleTuiAttached = useCallback((announcement) => {
+    const { paneId, providerSessionId } = announcement;
+    if (!providerSessionId) {
+      pendingTuiAttachmentsRef.current.delete(paneId);
+      return; // back at the launcher — the pane keeps its host session
+    }
+    const target = sessions.find(
+      (row) => row.provider_session_id === providerSessionId,
+    );
+    if (!target) {
+      pendingTuiAttachmentsRef.current.set(paneId, announcement);
+      onSessionsRefresh?.();
+      return;
+    }
+    pendingTuiAttachmentsRef.current.delete(paneId);
+    rehomeAttachedTui(announcement, target);
+  }, [onSessionsRefresh, rehomeAttachedTui, sessions]);
+
+  /* The OSC and roster lanes are independent. Resolve announcements that
+     arrived first as soon as their freshly-created session is imported. */
+  useEffect(() => {
+    for (const [paneId, announcement] of pendingTuiAttachmentsRef.current) {
+      const target = sessions.find(
+        (row) => row.provider_session_id === announcement.providerSessionId,
+      );
+      if (!target) continue;
+      pendingTuiAttachmentsRef.current.delete(paneId);
+      rehomeAttachedTui(announcement, target);
+    }
+  }, [rehomeAttachedTui, sessions]);
 
   /* ONE model chip: provider, model, and the provider's bound account are a
      single coherent choice (a deepseek model can never ride an openai
@@ -741,6 +775,10 @@ export default function SessionSurface({
           setComposerText("draft", "");
           setComposerPastesFor("draft", []);
         }
+        setViewModes((current) => rehomeSessionViewMode(current, {
+          hostSessionId: "draft",
+          targetSessionId: row.id,
+        }));
         onDraftMaterialized(row);
         return true;
       }
@@ -1152,7 +1190,12 @@ export default function SessionSurface({
             </ChatHostLayer>
             {(draftMode === "terminal" || shellTouched.draft) && (
               <TerminalHostLayer data-visible={draftMode === "terminal" ? "true" : "false"}>
-                <SessionTerminal active={draftMode === "terminal"} session={draftSession} />
+                <SessionTerminal
+                  active={draftMode === "terminal"}
+                  onTuiAttached={handleTuiAttached}
+                  paneIdOverride={paneOverrides.draft}
+                  session={draftSession}
+                />
               </TerminalHostLayer>
             )}
           </PaneContent>

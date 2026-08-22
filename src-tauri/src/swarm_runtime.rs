@@ -1370,17 +1370,12 @@ async fn swarm_enqueue_prompt(
         pane_id: member.pane_id.clone(),
         instance_id: Some(member.instance_id),
         data: format!("{prompt}{TERMINAL_ENTER_SEQUENCE}"),
-        app_fork_enabled: Some(false),
         prompt_event_id: Some(swarm_prompt_event_id(run_id, &member.member_id, phase)),
         prompt_event_revision: None,
         prompt_event_source: Some(format!("swarm_{phase}")),
         prompt_event_submitted_at: Some(swarm_now_ms().to_string()),
         prompt_event_text: Some(prompt),
-        todo_id: None,
-        todo_dispatch_id: None,
-        todo_command_id: None,
         todo_action: None,
-        todo_resume_requested: None,
         thread_id: Some(format!("swarm:{run_id}:{}", member.member_id)),
     };
     let ack = enqueue_terminal_input_event_with_ack(app, payload);

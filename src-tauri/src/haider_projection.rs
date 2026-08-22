@@ -779,7 +779,13 @@ fn haider_projection_item_class(item: &Value) -> (&'static str, &'static str) {
         "refusal" => ("error", "assistant"),
         "tool_call" | "command_execution" | "file_change" | "child_spawn" | "child_result"
         | "context_compaction" | "extension" => ("tool", "tool"),
-        _ => ("", ""),
+        /* The item vocabulary is OPEN and already wider than this list. An
+           unrecognised but NAMED kind renders in the tool cluster — the
+           neutral container — because dropping it means a future item type
+           silently disappears from the transcript instead of degrading. A
+           payload with no kind at all is not an item and is still skipped. */
+        "" => ("", ""),
+        _ => ("tool", "tool"),
     }
 }
 
@@ -4687,6 +4693,25 @@ mod haider_projection_tests {
         assert_eq!((rows[1].seq, rows[1].role.as_str()), (19, "assistant"));
         assert_eq!((rows[2].seq, rows[2].kind.as_str()), (20, "tool"));
         assert_eq!(rows[2].text, "read src/parser.rs");
+    }
+
+    #[test]
+    fn haider_projection_keeps_item_kinds_it_has_never_seen() {
+        /* The daemon's item vocabulary is open — `extension` items already
+           flow and were never in our list. An unrecognised kind must land
+           SOMEWHERE, because dropping it means a future item type vanishes
+           from the transcript with nothing to notice. */
+        let (kind, role) = haider_projection_item_class(&json!({"item": "quantum_widget"}));
+        assert_eq!((kind, role), ("tool", "tool"));
+
+        // A payload carrying no kind at all is genuinely not an item.
+        let (empty_kind, _) = haider_projection_item_class(&json!({"text": "hi"}));
+        assert!(empty_kind.is_empty());
+
+        // Known kinds keep their exact homes.
+        assert_eq!(haider_projection_item_class(&json!({"item": "reasoning"})).0, "thinking");
+        assert_eq!(haider_projection_item_class(&json!({"item": "agent_message"})).0, "message");
+        assert_eq!(haider_projection_item_class(&json!({"item": "extension"})).0, "tool");
     }
 
     #[test]

@@ -237,11 +237,9 @@ const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-ref
 const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
 const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
 const TERMINAL_FORK_REQUESTED_EVENT: &str = "forge-terminal-fork-requested";
-const TERMINAL_PROMPT_SUBMITTED_EVENT: &str = "forge-terminal-prompt-submitted";
 const TERMINAL_ACTIVITY_HOOK_EVENT: &str = "forge-terminal-activity-hook";
 const AGENT_CHAT_SESSION_SYNC_STATUS_CHANGED_EVENT: &str = "agent-chat-session-sync-status-changed";
 const TERMINAL_ARCHITECTURE_ACTIVITY_EVENT: &str = "diffforge:terminal-architecture-activity";
-const TERMINAL_OUTPUT_STATE_EVENT: &str = "forge-terminal-output-state";
 const MAIN_WINDOW_CURSOR_EVENT: &str = "forge-main-window-cursor";
 const MAIN_WINDOW_CURSOR_POLL_MS: u64 = 50;
 const MAIN_WINDOW_CURSOR_BACKOFF_POLL_MS: u64 = 150;
@@ -1264,7 +1262,6 @@ struct TerminalInstance {
     adoptable_output: Option<Arc<StdMutex<TerminalAdoptableOutputSlot>>>,
     working_directory: Arc<PathBuf>,
     agent_started: Arc<Mutex<bool>>,
-    input_gate: Arc<Mutex<TerminalInputGate>>,
     input_queue: Arc<Mutex<()>>,
     active_task: Arc<Mutex<Option<TerminalActiveTask>>>,
     // Admission is the close/write/runtime-publication linearization point.
@@ -1401,26 +1398,6 @@ impl TerminalHeadlessOutputBuffer {
         }
         state.extend_from_slice(&screen.state_formatted());
         state
-    }
-
-    /// The bottom `count` rows of the CURRENT VT screen as plain text, with
-    /// trailing blank rows trimmed. Unlike the raw `tail` (an append-only
-    /// byte journal), this reflects what a viewer actually sees right now:
-    /// content that was overwritten in place or scrolled away by later
-    /// output — a TUI footer after the CLI exited to its wrapper shell —
-    /// is NOT here, so liveness detectors keyed on visible markers cannot be
-    /// satisfied by stale bytes.
-    fn vt_screen_bottom_rows(&self, count: usize) -> Vec<String> {
-        let screen = self.vt.screen();
-        let (_, cols) = screen.size();
-        let mut rows: Vec<String> = screen.rows(0, cols).collect();
-        while rows.last().is_some_and(|row| row.trim().is_empty()) {
-            rows.pop();
-        }
-        if rows.len() > count {
-            rows.drain(..rows.len() - count);
-        }
-        rows
     }
 
     fn snapshot(&self, pane_id: &str, instance_id: u64) -> TerminalHeadlessOutputSnapshot {
@@ -1648,19 +1625,6 @@ struct TerminalParkedWaitingOn {
     resource_key: Option<String>,
 }
 
-#[derive(Clone, Default)]
-struct TerminalInputGate {
-    current_line: String,
-    current_line_user_touched: bool,
-    ansi_escape_active: bool,
-    ansi_csi_active: bool,
-    ansi_csi_buffer: String,
-    ansi_osc_active: bool,
-    ansi_osc_escape_pending: bool,
-    ansi_ss3_active: bool,
-    cursor_position: usize,
-}
-
 /// Daemon-only diagnostic tap wrapped around an agent pane's PTY writer:
 /// hex-dumps every byte that enters the agent's stdin into journald. Added
 /// for the BYOC claude exit-1 investigation — the launch envelope was fully
@@ -1762,7 +1726,6 @@ impl TerminalInstance {
                 adoptable_output: None,
                 working_directory: Arc::new(working_directory),
                 agent_started: Arc::new(Mutex::new(agent_started)),
-                input_gate: Arc::new(Mutex::new(TerminalInputGate::default())),
                 input_queue: Arc::new(Mutex::new(())),
                 active_task: Arc::new(Mutex::new(None)),
                 operation_admission: Arc::new(StdMutex::new(
@@ -2356,17 +2319,12 @@ struct TerminalInputEventPayload {
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
-    app_fork_enabled: Option<bool>,
     prompt_event_id: Option<String>,
     prompt_event_revision: Option<u64>,
     prompt_event_source: Option<String>,
     prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
-    todo_id: Option<String>,
-    todo_dispatch_id: Option<String>,
-    todo_command_id: Option<String>,
     todo_action: Option<String>,
-    todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
 }
 
@@ -2387,35 +2345,6 @@ struct TerminalInputErrorPayload {
     pane_id: String,
     instance_id: Option<u64>,
     message: String,
-}
-
-#[derive(Serialize, Clone)]
-struct TerminalPromptSubmittedPayload {
-    pane_id: String,
-    instance_id: u64,
-    workspace_id: String,
-    workspace_name: String,
-    terminal_index: Option<u16>,
-    thread_id: String,
-    agent_id: String,
-    agent_kind: String,
-    prompt_event_id: Option<String>,
-    prompt_event_revision: Option<u64>,
-    prompt_event_source: Option<String>,
-    prompt_event_submitted_at: Option<String>,
-    todo_id: Option<String>,
-    todo_dispatch_id: Option<String>,
-    todo_command_id: Option<String>,
-    todo_action: Option<String>,
-    todo_resume_requested: bool,
-    /// When a direct prompt was captured as a Rust todo, the item id every
-    /// other surface (webview item, journal, receipts, cloud row) must reuse.
-    direct_todo_item_id: Option<String>,
-    expected_prompt: Option<String>,
-    observed_prompt: Option<String>,
-    prompt_match: bool,
-    prompt_source: String,
-    prompt: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -2589,16 +2518,6 @@ struct TerminalArchitectureActivityPayload {
     graph_title: String,
     source: String,
     observed_at_ms: u64,
-}
-
-#[derive(Serialize, Clone)]
-struct TerminalOutputStatePayload {
-    pane_id: String,
-    instance_id: u64,
-    looks_active: bool,
-    looks_ready: bool,
-    status_truth: String,
-    output_preview: String,
 }
 
 #[derive(Serialize)]
@@ -6343,6 +6262,7 @@ fn run_app(daemon: bool) {
             haider_rpc_ade::surface_detach,
             haider_rpc_ade::surface_publish_input,
             haider_rpc_ade::session_answer_menu,
+            haider_rpc_ade::session_cancel_turn,
             haider_rpc_ade::computer_permission_open_settings,
             haider_rpc_ade::account_list,
             haider_rpc_ade::account_add_api_key,
@@ -6354,6 +6274,7 @@ fn run_app(daemon: bool) {
             haider_rpc_ade::account_device_candidates,
             haider_rpc_ade::account_import_device,
             haider_rpc_ade::account_set_active,
+            haider_rpc_ade::account_set_label,
             haider_rpc_ade::account_remove,
             haider_rpc_ade::account_set_default_model,
             haider_usage_snapshot,
@@ -6775,7 +6696,6 @@ fn run_app(daemon: bool) {
             windows_terminal_set_diagnostic_logging,
             windows_terminal_diagnostic_log,
             terminal_provider_turn_completed,
-            terminal_delete_selection,
             terminal_cancel_parked_task,
             terminal_interrupt_agent,
             resize_terminal,

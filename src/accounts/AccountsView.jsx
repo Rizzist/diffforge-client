@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { Add } from "@styled-icons/material-rounded/Add";
 import { Close } from "@styled-icons/material-rounded/Close";
+import { Edit } from "@styled-icons/material-rounded/Edit";
 
 /* Harness-owned account management (936 account_* doors). The daemon's vault
    is the single credential authority for every surface — this view LISTS,
@@ -12,6 +13,9 @@ import { Close } from "@styled-icons/material-rounded/Close";
    watch door lands (937 delta). */
 
 const LIST_POLL_MS = 5000;
+/* Matches the daemon's bound; it truncates rather than rejecting, so holding
+   the same limit here means the user learns at the keystroke. */
+const LABEL_MAX = 64;
 const OAUTH_POLL_MS = 1500;
 
 /* OAuth-capable providers by daemon registration (contract §4); API-key
@@ -293,6 +297,8 @@ export default function AccountsView({ active = false }) {
   const [oauthForm, setOauthForm] = useState({ provider: OAUTH_PROVIDERS[0], alias: "" });
   const [oauthFlow, setOauthFlow] = useState(null); // {provider, alias, flow_id, attempt_id, url, user_code, phase, detail}
   const [confirmRemove, setConfirmRemove] = useState("");
+  const [renamingAlias, setRenamingAlias] = useState("");
+  const [labelDraft, setLabelDraft] = useState("");
   const [confirmEpoch, setConfirmEpoch] = useState("");
   const [candidates, setCandidates] = useState(null); // {discovery_disabled, candidates}
   const [library, setLibrary] = useState(null);
@@ -408,6 +414,19 @@ export default function AccountsView({ active = false }) {
       }
     }
   }, [run]);
+
+  /* The daemon truncates an over-long label rather than refusing it, so the
+     bound is enforced at the keystroke AND the returned descriptor is treated
+     as the truth — a silently shortened name should be visible immediately,
+     not discovered later. */
+  const commitLabel = useCallback(async (alias) => {
+    const next = labelDraft.trim().slice(0, LABEL_MAX);
+    setRenamingAlias("");
+    await run(`label:${alias}`, () => invoke("account_set_label", {
+      alias,
+      label: next || null,
+    }));
+  }, [labelDraft, run]);
 
   const removeAccount = useCallback((alias) => {
     setConfirmRemove("");
@@ -569,14 +588,57 @@ export default function AccountsView({ active = false }) {
               const status = statusOf(descriptor);
               return (
                 <AccountRow key={descriptor.alias}>
+                  {renamingAlias === descriptor.alias ? (
+                    <RenameForm
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void commitLabel(descriptor.alias);
+                      }}
+                    >
+                      <input
+                        aria-label={`Label for ${descriptor.alias}`}
+                        autoFocus
+                        maxLength={LABEL_MAX}
+                        onChange={(event) => setLabelDraft(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Escape") setRenamingAlias("");
+                        }}
+                        placeholder={descriptor.identity || descriptor.alias}
+                        value={labelDraft}
+                      />
+                      <ConfirmButton type="submit">Save</ConfirmButton>
+                      {/* Empty clears — the erase gesture and an explicit
+                          clear are the same intent, daemon-side too. */}
+                      <GhostButton onClick={() => setRenamingAlias("")} type="button">
+                        Cancel
+                      </GhostButton>
+                    </RenameForm>
+                  ) : (
                   <AccountIdentity>
-                    <strong>{descriptor.identity || descriptor.alias}</strong>
+                    {/* An operator-chosen label outranks a provider identity:
+                        it is the only one of the three the user authored. */}
+                    <strong>{descriptor.label || descriptor.identity || descriptor.alias}</strong>
                     <span>
+                      {descriptor.label ? `${descriptor.identity || descriptor.alias} · ` : ""}
                       {descriptor.alias}
                       {" · "}
                       {descriptor.auth_method === "oauth" ? "OAuth" : "API key"}
                     </span>
                   </AccountIdentity>
+                  )}
+                  {renamingAlias !== descriptor.alias && (
+                    <RowIconButton
+                      aria-label={`Rename ${descriptor.alias}`}
+                      onClick={() => {
+                        setRenamingAlias(descriptor.alias);
+                        setLabelDraft(descriptor.label || "");
+                      }}
+                      title="Give this account a name of your own"
+                      type="button"
+                    >
+                      <Edit aria-hidden="true" />
+                    </RowIconButton>
+                  )}
                   <StatusBadge data-state={status}>
                     {STATUS_LABELS[status] || status}
                   </StatusBadge>
@@ -906,6 +968,25 @@ const ProviderName = styled.h2`
   font-weight: 700;
   letter-spacing: 0.07em;
   text-transform: uppercase;
+`;
+
+const RenameForm = styled.form`
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+
+  input {
+    flex: 1;
+    min-width: 0;
+    padding: 4px 9px;
+    border: 1px solid var(--forge-border-strong);
+    border-radius: 8px;
+    background: var(--forge-surface-control);
+    color: var(--forge-text);
+    font-size: 12.5px;
+  }
 `;
 
 const ProviderHeadRow = styled.div`

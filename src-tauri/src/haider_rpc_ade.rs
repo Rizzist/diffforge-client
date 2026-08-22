@@ -161,6 +161,12 @@ pub struct AccountDeviceCandidatesResult {
 }
 
 #[derive(Clone, Serialize)]
+pub struct AccountSetLabelResult {
+    pub descriptor: Value,
+    pub revision: u64,
+}
+
+#[derive(Clone, Serialize)]
 pub struct AccountSetActiveResult {
     pub descriptor: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -570,6 +576,22 @@ enum RequestBody {
         #[serde(default, skip_serializing_if = "is_false")]
         confirm_new_epoch: bool,
     },
+    /// Cooperative cancellation of a running turn. The daemon journals the
+    /// intent BEFORE waking the worker, so the turn is recorded as cancelled
+    /// rather than appearing as a truncated answer.
+    #[serde(rename = "turn.cancel")]
+    TurnCancel {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        run_id: String,
+    },
+    #[serde(rename = "account.set_label")]
+    AccountSetLabel {
+        alias: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     #[serde(rename = "account.remove")]
     AccountRemove {
         command_id: String,
@@ -719,6 +741,18 @@ enum ResponseBody {
     },
     #[serde(rename = "account.import_device")]
     AccountImportDevice { descriptor: Value, revision: u64 },
+    #[serde(rename = "turn.cancel")]
+    TurnCancel {
+        session_id: String,
+        run_id: String,
+        /// accepted | already_terminal, and the daemon marks it non-exhaustive
+        /// — never match this exhaustively.
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_seq: Option<u64>,
+    },
+    #[serde(rename = "account.set_label")]
+    AccountSetLabel { descriptor: Value, revision: u64 },
     #[serde(rename = "account.set_active")]
     AccountSetActive {
         descriptor: Value,
@@ -1921,6 +1955,49 @@ pub async fn account_import_device(candidate: String) -> Result<AccountImportRes
     }
 }
 
+/// Sets or clears an operator-chosen display label for an account. Plain
+/// management class: Control, no UDS, and deliberately NO command_id — a
+/// label is idempotent by value, so a receipt would be ceremony without
+/// safety and a retry is naturally safe.
+///
+/// The daemon TRUNCATES an over-long label rather than rejecting it, so the
+/// returned descriptor is the truth and callers reconcile from it.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_set_label(
+    alias: String,
+    label: Option<String>,
+) -> Result<AccountSetLabelResult, String> {
+    #[cfg(unix)]
+    {
+        /* Empty-after-trim clears, matching the daemon: the UI's "erase the
+           label" gesture and an explicit clear are the same intent. */
+        let label = label
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let response = account_request(
+            RequestBody::AccountSetLabel { alias, label },
+            Capability::Control,
+            account_feature_gate(&[FEATURE_ACCOUNT_MANAGEMENT_V1]),
+        )
+        .await?;
+        return match response {
+            ResponseBody::AccountSetLabel {
+                descriptor,
+                revision,
+            } => Ok(AccountSetLabelResult {
+                descriptor,
+                revision,
+            }),
+            _ => Err("account.set_label response method mismatch".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (alias, label);
+        Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
+    }
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn account_set_active(
     alias: String,
@@ -2912,6 +2989,27 @@ fn session_answer_menu_command_id(
     format!("diffforge-menu-answer-{}", hex(&blake3_hash(&material)))
 }
 
+/// Derived, not minted: a retry after a lost reply must replay the SAME
+/// cancel rather than issue a second one against whatever is running by then.
+#[cfg(unix)]
+fn session_cancel_turn_command_id(
+    provider_session_id: &str,
+    run_id: &str,
+    worker_generation: u64,
+) -> String {
+    fn append_text(material: &mut Vec<u8>, value: &str) {
+        material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        material.extend_from_slice(value.as_bytes());
+    }
+
+    let mut material = Vec::new();
+    material.extend_from_slice(b"diffforge-turn-cancel-v1\n");
+    append_text(&mut material, provider_session_id);
+    append_text(&mut material, run_id);
+    material.extend_from_slice(&worker_generation.to_be_bytes());
+    format!("diffforge-turn-cancel-{}", hex(&blake3_hash(&material)))
+}
+
 #[cfg(unix)]
 fn session_answer_menu_receipt(
     response: Option<Result<ResponseBody, String>>,
@@ -3024,6 +3122,112 @@ async fn session_answer_menu_rpc_inner(
 
     let _ = session_needs_input_request(RequestBody::SessionDetach { attachment_id }).await;
     answer
+}
+
+/// Cancels a running turn. `run_id` and `worker_generation` are ONE
+/// observation and ride verbatim off the row being rendered: the generation
+/// fences a resurrected worker and the run id fences the specific run, so a
+/// cancel that raced a turn boundary cannot kill the next turn.
+///
+/// Borrows a control attachment for the call, like menu.answer. Capability
+/// and attachment rejections happen before any receipt is claimed, so the
+/// derived command id stays safely retryable.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_cancel_turn(
+    session_id: String,
+    run_id: String,
+    worker_generation: u64,
+) -> Result<Value, String> {
+    #[cfg(unix)]
+    {
+        if !session_needs_input_available(&actor_handle().connection.borrow()) {
+            return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
+        }
+        if run_id.trim().is_empty() {
+            return Err("turn.cancel requires the run id of the turn to stop".to_string());
+        }
+        let context_session_id = session_id.clone();
+        let provider_session_id = tauri::async_runtime::spawn_blocking(move || {
+            let connection = super::sessions_open_database()?;
+            let row = super::sessions_row_by_id(&connection, context_session_id.trim())?;
+            let provider_session_id = row.provider_session_id.trim();
+            if provider_session_id.is_empty() {
+                return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
+            }
+            Ok::<String, String>(provider_session_id.to_string())
+        })
+        .await
+        .map_err(|error| format!("Turn cancel worker failed: {error}"))??;
+        return session_cancel_turn_rpc(provider_session_id, run_id, worker_generation).await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, run_id, worker_generation);
+        Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string())
+    }
+}
+
+#[cfg(unix)]
+async fn session_cancel_turn_rpc(
+    session_id: String,
+    run_id: String,
+    worker_generation: u64,
+) -> Result<Value, String> {
+    let Some(summary) = session_needs_input_summary(&session_id).await? else {
+        return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
+    };
+    let head_seq = config_u64(summary.get("head_seq"))
+        .ok_or_else(|| "session summary head_seq was missing".to_string())?;
+    let Some(response) = session_needs_input_request(RequestBody::SessionAttach {
+        session_id: session_id.clone(),
+        after_seq: head_seq,
+        mode: AttachMode::Control,
+        sealed_replay: false,
+    })
+    .await?
+    else {
+        return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
+    };
+    let ResponseBody::SessionAttach {
+        attachment_id,
+        attach_state,
+    } = response
+    else {
+        return Err("session.attach response method mismatch".to_string());
+    };
+    if attach_state.session_id != session_id {
+        let _ = session_needs_input_request(RequestBody::SessionDetach { attachment_id }).await;
+        return Err("session.attach response session mismatch".to_string());
+    }
+
+    let cancelled = async {
+        let command_id = session_cancel_turn_command_id(&session_id, &run_id, worker_generation);
+        match session_needs_input_request(RequestBody::TurnCancel {
+            command_id,
+            session_id,
+            worker_generation,
+            run_id,
+        })
+        .await?
+        {
+            Some(ResponseBody::TurnCancel {
+                status,
+                terminal_seq,
+                run_id,
+                ..
+            }) => Ok(serde_json::json!({
+                "status": status,
+                "run_id": run_id,
+                "terminal_seq": terminal_seq,
+            })),
+            Some(_) => Err("turn.cancel response method mismatch".to_string()),
+            None => Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string()),
+        }
+    }
+    .await;
+
+    let _ = session_needs_input_request(RequestBody::SessionDetach { attachment_id }).await;
+    cancelled
 }
 
 /// Opens the System Settings pane for an OS-permission park. macOS requires a

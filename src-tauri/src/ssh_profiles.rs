@@ -749,11 +749,6 @@ async fn terminal_ssh_connect(
         None,
         None,
         None,
-        None,
-        None,
-        None,
-        Some(false),
-        None,
         false,
         false,
     )

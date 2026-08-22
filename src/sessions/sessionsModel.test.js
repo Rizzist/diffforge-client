@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   effectiveSessionPaneId,
   rehomeSessionPane,
+  rehomeSessionViewMode,
   sessionPaneId,
 } from "./sessionPaneOwnership.js";
 import { normalizeSessionRow } from "./sessionsModel.js";
@@ -129,4 +130,30 @@ test("chained pane rehomes stay bijective and reject stale announcements", () =>
     hostSessionId: "session-b",
     targetSessionId: "session-a",
   }), second);
+});
+
+test("draft materialization lands on the surface that started the session", () => {
+  const chat = rehomeSessionViewMode({ "session-new": "terminal" }, {
+    hostSessionId: "draft",
+    targetSessionId: "session-new",
+  });
+  const shell = rehomeSessionViewMode({ draft: "terminal" }, {
+    hostSessionId: "draft",
+    targetSessionId: "session-new",
+  });
+
+  assert.equal(chat["session-new"], "ui");
+  assert.equal(shell["session-new"], "terminal");
+});
+
+test("an in-TUI session hop keeps the live Shell visible", () => {
+  const modes = rehomeSessionViewMode({
+    "session-a": "terminal",
+    "session-b": "ui",
+  }, {
+    hostSessionId: "session-a",
+    targetSessionId: "session-b",
+  });
+
+  assert.equal(modes["session-b"], "terminal");
 });

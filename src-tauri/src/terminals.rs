@@ -7,24 +7,14 @@ fn terminal_now_ms() -> u64 {
 
 const TERMINAL_STARTING_IDLE_BUFFER_MS: u64 = 5_000;
 const TERMINAL_ACTIVITY_IDLE_QUIESCE_MS: u64 = 1_750;
-const TERMINAL_PROMPT_READY_BUSY_DEBOUNCE_MS: u64 = 750;
-const TERMINAL_STARTING_WATCHDOG_MS: u64 = 30_000;
-const TERMINAL_MCP_STARTUP_DEGRADED_MS: u64 = 30_000;
-const TERMINAL_WATCHDOG_OUTPUT_QUIET_MS: u64 = 2_500;
-const TERMINAL_HOT_STALE_WATCHDOG_MS: u64 = 10 * 60_000;
 /// A WAITING session (turn parked on live background shells/subagents) that
 /// sees no hook or output activity for this long is force-released to idle so
 /// a silently-dead background task can never hold receipts hostage forever.
 const TERMINAL_WAITING_RELEASE_WATCHDOG_MS: u64 = 30 * 60_000;
-/// Interrupted/error are SETTLED states — the CLI is back at its prompt.
-/// After this much quiet they decay to idle so the pane doesn't wear a stale
-/// attention badge forever.
-const TERMINAL_SETTLED_DECAY_WATCHDOG_MS: u64 = 30_000;
 /// A UserPromptSubmit can be emitted for local TUI menu/slash-command actions
 /// that never start a provider turn. If no todo or provider evidence follows,
 /// release the prompt-submit latch quickly.
 const TERMINAL_PROMPT_SUBMIT_THINKING_DECAY_WATCHDOG_MS: u64 = 4_000;
-const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
 const TERMINAL_CONTROL_AUTOMATION_GUARD_TTL_MS: u64 = 60_000;
 const TERMINAL_CONTROL_PROMPT_ANSWER_GUARD_TTL_MS: u64 = 10_000;
 const TERMINAL_CONTROL_AUTOMATION_WAIT_POLL_MS: u64 = 25;
@@ -282,102 +272,6 @@ fn terminal_codex_hook_trust_discovery_clear_generation(
     }
 }
 
-fn terminal_output_latest_working_indicator_index(text: &str) -> Option<usize> {
-    let lower = text.to_ascii_lowercase();
-    ["Working (", "Working("]
-        .into_iter()
-        .flat_map(|needle| text.match_indices(needle).map(|(index, _)| index))
-        .filter(|index| {
-            *index == 0
-                || text[..*index]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
-        })
-        .filter_map(|index| {
-            lower[index..]
-                .find("esc to interrupt")
-                .filter(|suffix_index| *suffix_index <= 160)
-                .map(|_| index)
-        })
-        .max()
-}
-
-fn terminal_output_latest_mcp_startup_indicator_index(text: &str) -> Option<usize> {
-    let lower = text.to_ascii_lowercase();
-    let startup = ["booting mcp server", "starting mcp server"]
-        .into_iter()
-        .filter_map(|needle| lower.rfind(needle))
-        .max();
-    let failed = (lower.contains("mcp client for") && lower.contains("failed to start"))
-        .then(|| lower.rfind("mcp client for"))
-        .flatten();
-    startup.max(failed)
-}
-
-fn terminal_output_latest_readiness_blocker_index(text: &str) -> Option<usize> {
-    terminal_output_latest_working_indicator_index(text)
-        .max(terminal_output_latest_mcp_startup_indicator_index(text))
-}
-
-fn terminal_output_latest_prompt_marker_index(text: &str) -> Option<usize> {
-    let lower = text.to_ascii_lowercase();
-    let mut latest = ["›", "❯", "❱"]
-        .into_iter()
-        .filter_map(|needle| text.rfind(needle))
-        .max();
-
-    if (lower.contains("opencode") || lower.contains("build ")) && lower.contains("ctrl+p commands")
-    {
-        latest = latest.max(lower.rfind("ctrl+p commands"));
-    }
-
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let line_without_newline = line.trim_end_matches(|ch| ch == '\r' || ch == '\n');
-        let trimmed_start = line_without_newline.trim_start();
-        if trimmed_start == ">" || trimmed_start.starts_with("> ") {
-            latest = latest.max(Some(
-                offset + (line_without_newline.len() - trimmed_start.len()),
-            ));
-        }
-        offset += line.len();
-    }
-
-    latest
-}
-
-fn terminal_output_prompt_marker_after_working_indicator(text: &str) -> bool {
-    let Some(prompt_index) = terminal_output_latest_prompt_marker_index(text) else {
-        return false;
-    };
-    terminal_output_latest_readiness_blocker_index(text)
-        .map(|working_index| prompt_index > working_index)
-        .unwrap_or(true)
-}
-
-fn terminal_output_current_mcp_startup_marker(text: &str) -> bool {
-    let current_in_text = |value: &str| {
-        let Some(startup_index) = terminal_output_latest_mcp_startup_indicator_index(value) else {
-            return false;
-        };
-        terminal_output_latest_prompt_marker_index(value)
-            .max(terminal_output_latest_working_indicator_index(value))
-            .map(|newer_activity_index| startup_index > newer_activity_index)
-            .unwrap_or(true)
-    };
-    let cleaned = terminal_activity_strip_terminal_sequences(text);
-    current_in_text(&cleaned)
-}
-
-fn terminal_output_current_prompt_marker(text: &str) -> bool {
-    let cleaned = cloud_mcp_clean_terminal_state_text(text);
-    if cleaned.is_empty() {
-        return false;
-    }
-    terminal_output_prompt_marker_after_working_indicator(text)
-        || terminal_output_prompt_marker_after_working_indicator(&cleaned)
-}
 
 #[derive(Clone, Debug)]
 struct TerminalControlOperation {
@@ -2110,56 +2004,6 @@ fn terminal_runtime_snapshot_is_busy_turn(runtime: &TerminalRuntimeSnapshot) -> 
         )
 }
 
-fn terminal_prompt_ready_recovery_allowed(
-    metadata: &TerminalInstanceMetadata,
-    runtime: &TerminalRuntimeSnapshot,
-) -> bool {
-    // Startup is the one PTY recovery every hook-managed provider (Claude
-    // included) is allowed: this path only runs once a prompt marker is
-    // already on screen and a Claude terminal sitting at its composer prompt
-    // during startup is genuinely idle/ready. Without it a missed SessionStart
-    // hook strands the cloud/web row on "starting" forever, since Claude's
-    // busy-turn PTY recovery stays disabled below.
-    if terminal_runtime_snapshot_is_starting(runtime) {
-        return true;
-    }
-
-    // An interrupt is authoritative immediately, but it is not itself proof
-    // that the provider has returned to its composer. Likewise, an MCP
-    // startup timeout remains recoverable. In both states, a later prompt
-    // marker is the explicit provider boundary that may restore input-ready.
-    if terminal_runtime_snapshot_is_interrupted(runtime)
-        || terminal_runtime_snapshot_is_recoverable_startup_error(runtime)
-    {
-        return terminal_activity_provider_allows_pty_lifecycle_recovery(metadata);
-    }
-
-    // Claude Code exposes deterministic SessionStart/UserPromptSubmit/Stop
-    // hooks and keeps its composer prompt on screen while a turn is still
-    // reasoning, so a visible prompt glyph mid-turn is not proof input is
-    // ready. Outside startup, let provider hooks own Claude's lifecycle.
-    if !terminal_activity_provider_allows_pty_lifecycle_recovery(metadata) {
-        return false;
-    }
-
-    // Provider Stop/session-idle hooks remain the primary completion signal,
-    // but running terminals can predate the latest hook install or miss one
-    // hook write. A prompt marker after the busy debounce is a recovery signal
-    // for hook-managed providers that do not emit reliable turn-end hooks.
-    // Codex and Claude have full lifecycle-hook coverage, and prompt-ready
-    // recovery can race ahead of their real Stop hook while output is active.
-    if terminal_metadata_is_codex(metadata) {
-        return false;
-    }
-
-    terminal_runtime_snapshot_is_busy_turn(runtime)
-}
-
-fn terminal_activity_provider_allows_pty_lifecycle_recovery(
-    metadata: &TerminalInstanceMetadata,
-) -> bool {
-    !terminal_metadata_is_claude(metadata)
-}
 
 fn terminal_runtime_startup_idle_fingerprint(runtime: &TerminalRuntimeSnapshot) -> Value {
     json!({
@@ -2266,174 +2110,6 @@ fn terminal_projection_state_is_finished(value: &str) -> bool {
         terminal_projection_text(value, "").as_str(),
         "cancelled" | "canceled" | "complete" | "completed" | "done" | "interrupted"
     )
-}
-
-fn terminal_projection_state_is_compacting(value: &str) -> bool {
-    matches!(
-        terminal_projection_text(value, "").as_str(),
-        "compacting" | "compaction"
-    )
-}
-
-fn terminal_projection_readiness(status: &str) -> &'static str {
-    let status = terminal_projection_text(status, "idle");
-    if matches!(status.as_str(), "cancelled" | "canceled" | "interrupted") {
-        "interrupted"
-    } else if terminal_projection_state_is_busy(&status) {
-        "busy"
-    } else if terminal_projection_state_is_paused(&status) {
-        "needs_input"
-    } else if terminal_projection_state_is_error(&status) {
-        "error"
-    } else if status == "closing" {
-        "closing"
-    } else if terminal_projection_state_is_closed(&status) {
-        "closed"
-    } else {
-        "ready"
-    }
-}
-
-fn terminal_projection_turn_status(activity_status: &str, status: &str) -> &'static str {
-    let activity =
-        terminal_projection_text(activity_status, &terminal_projection_text(status, "idle"));
-    if matches!(activity.as_str(), "cancelled" | "canceled" | "interrupted") {
-        "interrupted"
-    } else if terminal_projection_state_is_compacting(&activity) {
-        "running"
-    } else if terminal_projection_state_is_busy(&activity) {
-        "running"
-    } else if terminal_projection_state_is_error(&activity) {
-        "failed"
-    } else if terminal_projection_state_is_paused(&activity) {
-        "pending"
-    } else if terminal_projection_state_is_closed(&activity) {
-        "interrupted"
-    } else {
-        "completed"
-    }
-}
-
-fn terminal_projection_execution_phase(
-    event_type: &str,
-    command_phase: &str,
-    activity_status: &str,
-    status: &str,
-    readiness: &str,
-    turn_status: &str,
-    terminal_lifecycle: &str,
-) -> &'static str {
-    let event_type = terminal_projection_text(event_type, "");
-    let command_phase = terminal_projection_text(command_phase, "");
-    let activity = terminal_projection_text(activity_status, "");
-    let status = terminal_projection_text(status, "");
-    let readiness = terminal_projection_text(readiness, "");
-    let turn = terminal_projection_text(turn_status, "");
-    let lifecycle = terminal_projection_text(terminal_lifecycle, "");
-
-    if matches!(activity.as_str(), "starting" | "prewarmed")
-        || matches!(status.as_str(), "starting" | "prewarmed")
-        || command_phase == "starting"
-    {
-        return "starting";
-    }
-    if lifecycle == "offline" || activity == "offline" || status == "offline" {
-        return "offline";
-    }
-    if lifecycle == "exited" || activity == "exited" || status == "exited" {
-        return "exited";
-    }
-    if ["closed", "closing", "terminated"].contains(&lifecycle.as_str())
-        || ["closed", "closing", "terminated"].contains(&status.as_str())
-    {
-        return if lifecycle == "closing" || status == "closing" {
-            "closing"
-        } else {
-            "closed"
-        };
-    }
-    if matches!(
-        event_type.as_str(),
-        "provider_turn_compacting" | "context_compaction_started"
-    ) || terminal_projection_state_is_compacting(&command_phase)
-        || terminal_projection_state_is_compacting(&activity)
-        || terminal_projection_state_is_compacting(&turn)
-    {
-        return "compacting";
-    }
-    if event_type == "provider_turn_interrupted" || turn == "interrupted" {
-        return "interrupted";
-    }
-    if matches!(turn.as_str(), "cancelled" | "canceled")
-        || matches!(command_phase.as_str(), "cancelled" | "canceled")
-    {
-        return "cancelled";
-    }
-    if matches!(
-        event_type.as_str(),
-        "provider_turn_error" | "pending_prompt_error"
-    ) || matches!(turn.as_str(), "failed" | "error")
-        || terminal_projection_state_is_error(&activity)
-        || readiness == "error"
-        || status == "error"
-    {
-        return "failed";
-    }
-    if terminal_projection_state_is_paused(&activity)
-        || matches!(readiness.as_str(), "needs_input" | "paused")
-    {
-        return "needs_input";
-    }
-    if command_phase == "queued" {
-        return "queued";
-    }
-    if matches!(
-        command_phase.as_str(),
-        "submitted" | "input_written" | "accepted" | "running"
-    ) || matches!(
-        event_type.as_str(),
-        "message_submitted" | "provider_turn_started" | "agent_output" | "pending_prompt_sent"
-    ) || terminal_projection_state_is_busy(&activity)
-        || matches!(
-            turn.as_str(),
-            "queued" | "submitted" | "pending" | "running" | "thinking" | "reasoning" | "working"
-        )
-        || (readiness == "busy" && !terminal_projection_state_is_finished(&turn))
-    {
-        return "running";
-    }
-    if event_type == "provider_turn_completed"
-        || matches!(command_phase.as_str(), "completed" | "complete" | "done")
-        || terminal_projection_state_is_finished(&turn)
-        || terminal_projection_state_is_idle(&activity)
-        || matches!(readiness.as_str(), "ready" | "input_ready")
-    {
-        return "idle";
-    }
-
-    "idle"
-}
-
-fn terminal_projection_rail_state(execution_phase: &str, fallback: &str) -> String {
-    match terminal_projection_text(execution_phase, "").as_str() {
-        "starting" | "prewarmed" => "starting".to_string(),
-        "offline" | "closed" | "closing" | "exited" => {
-            terminal_projection_text(execution_phase, "closed")
-        }
-        "failed" => "error".to_string(),
-        "needs_input" | "paused" | "parked" | "resume_ready" => "paused".to_string(),
-        "compacting" | "compaction" => "compacting".to_string(),
-        "queued" | "submitted" | "input_written" | "accepted" | "running" | "cancelling" => {
-            "thinking".to_string()
-        }
-        "cancelled" | "canceled" | "interrupted" => "interrupted".to_string(),
-        "completed" | "complete" | "done" | "idle" => "idle".to_string(),
-        _ => terminal_projection_text(fallback, "idle"),
-    }
-}
-
-fn terminal_projection_label(value: &str) -> String {
-    terminal_projection_text(value, "unknown").replace(['_', '-'], " ")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3651,8 +3327,6 @@ fn terminal_record_workspace_agent_session_history(
 }
 
 const TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS: [u64; 6] = [100, 250, 500, 1_000, 2_000, 4_000];
-const TERMINAL_PROMPT_SESSION_DISCOVERY_DELAYS_MS: [u64; 8] =
-    [50, 150, 300, 600, 1_200, 2_500, 5_000, 10_000];
 
 fn terminal_runtime_has_provider_session(instance: &TerminalInstance) -> bool {
     terminal_runtime_snapshot(instance)
@@ -3807,145 +3481,6 @@ fn spawn_terminal_codex_session_discovery(
                 }),
             );
             break;
-        }
-    });
-}
-
-fn spawn_terminal_non_codex_session_discovery_for_prompt(
-    app: AppHandle,
-    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
-    pane_id: String,
-    instance_id: u64,
-    prompt: String,
-    source: impl Into<String>,
-) {
-    let source = source.into();
-    let prompt = prompt.trim().to_string();
-    if prompt.is_empty() {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        for (attempt, &delay_ms) in TERMINAL_PROMPT_SESSION_DISCOVERY_DELAYS_MS
-            .iter()
-            .enumerate()
-        {
-            sleep(Duration::from_millis(delay_ms)).await;
-
-            let Some(instance) =
-                terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
-            else {
-                return;
-            };
-            if terminal_runtime_has_provider_session(&instance) {
-                return;
-            }
-            let agent_id = terminal_normalize_agent_kind(Some(&instance.metadata.agent_kind))
-                .or_else(|| terminal_normalize_agent_kind(Some(&instance.metadata.agent_id)))
-                .unwrap_or_default();
-            if !matches!(agent_id.as_str(), "claude" | "opencode") {
-                return;
-            }
-
-            let cwd = instance.working_directory.to_string_lossy().to_string();
-            let prompt_for_discovery = prompt.clone();
-            let agent_for_discovery = agent_id.clone();
-            let launch_account_binding = instance.launch_account_binding.clone();
-            let discovered = tauri::async_runtime::spawn_blocking(move || {
-                match (agent_for_discovery.as_str(), launch_account_binding.as_ref()) {
-                    (
-                        "claude",
-                        Some(TerminalProviderLaunchAccountBinding::Claude {
-                            home: Some(home),
-                            ..
-                        }),
-                    ) => discover_claude_session_by_prompt_in_home(
-                        &prompt_for_discovery,
-                        &cwd,
-                        CODEX_TRANSCRIPT_DEFAULT_LIMIT,
-                        home,
-                    ),
-                    (
-                        "opencode",
-                        Some(TerminalProviderLaunchAccountBinding::OpenCode {
-                            db_path: Some(db_path),
-                            ..
-                        }),
-                    ) => discover_opencode_session_by_prompt_in_db(
-                        &prompt_for_discovery,
-                        &cwd,
-                        CODEX_TRANSCRIPT_DEFAULT_LIMIT,
-                        db_path,
-                    ),
-                    _ => Err(
-                        "The terminal has no frozen provider session store for discovery."
-                            .to_string(),
-                    ),
-                }
-            })
-            .await
-            .ok()
-            .and_then(Result::ok);
-
-            let Some(discovered) = discovered else {
-                if attempt + 1 == TERMINAL_PROMPT_SESSION_DISCOVERY_DELAYS_MS.len() {
-                    log_terminal_status_event(
-                        "backend.terminal_provider_session.prompt_discovery_exhausted",
-                        json!({
-                            "agent_id": agent_id,
-                            "attempt_count": attempt + 1,
-                            "instance_id": instance_id,
-                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                            "source": source.clone(),
-                        }),
-                    );
-                }
-                continue;
-            };
-            let Some(provider_session_id) =
-                terminal_clean_provider_session_id(Some(&discovered.session_id))
-            else {
-                continue;
-            };
-            let Some(current_instance) =
-                terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
-            else {
-                return;
-            };
-            if terminal_runtime_has_provider_session(&current_instance) {
-                return;
-            }
-
-            terminal_runtime_apply_provider_session_id(
-                &current_instance,
-                &provider_session_id,
-                "prompt-transcript-discovery",
-            );
-            terminal_record_workspace_provider_session_binding_with_transcript_path(
-                Some(app.clone()),
-                &current_instance,
-                provider_session_id.clone(),
-                "prompt-transcript-discovery",
-                Some(discovered.rollout_path.as_str()),
-            );
-            if let Some(coordination) = current_instance.coordination.clone() {
-                terminal_record_coordination_provider_session_id(
-                    coordination,
-                    provider_session_id,
-                    "prompt-transcript-discovery",
-                );
-            }
-            log_terminal_status_event(
-                "backend.terminal_provider_session.prompt_discovered",
-                json!({
-                    "agent_id": agent_id,
-                    "attempt": attempt + 1,
-                    "instance_id": instance_id,
-                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    "provider_session_id_present": true,
-                    "source": source.clone(),
-                }),
-            );
-            return;
         }
     });
 }
@@ -4766,11 +4301,6 @@ async fn write_to_active_terminal_audio_input_target(
         None,
         None,
         None,
-        None,
-        None,
-        None,
-        None,
-        None,
         true,
         true,
     )
@@ -5169,7 +4699,6 @@ fn cleanup_terminal_instance_with_context(
         adoptable_output,
         working_directory,
         agent_started,
-        input_gate,
         input_queue,
         active_task,
         operation_admission: _,
@@ -5269,7 +4798,6 @@ fn cleanup_terminal_instance_with_context(
         drop(size);
         drop(working_directory);
         drop(agent_started);
-        drop(input_gate);
         drop(input_queue);
         drop(active_task);
         drop(metadata);
@@ -5398,7 +4926,6 @@ fn cleanup_terminal_instance_with_context(
     drop(size);
     drop(working_directory);
     drop(agent_started);
-    drop(input_gate);
     drop(input_queue);
     drop(active_task);
     drop(metadata);
@@ -7030,171 +6557,23 @@ fn spawn_terminal_reader(
     output_channel: Channel<InvokeResponseBody>,
     adoptable_output: Option<Arc<StdMutex<TerminalAdoptableOutputSlot>>>,
     prefer_output_transport: bool,
-    cloud_output_observer_enabled: bool,
-    rust_readiness_observer_enabled: bool,
-    harness_owned_pane: bool,
     mut reader: Box<dyn Read + Send>,
 ) {
-    async fn observe_terminal_prompt_ready(
-        app: AppHandle,
-        terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
-        cloud_mcp_state: CloudMcpState,
-        headless_output: Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
-        pane_id: String,
-        instance_id: u64,
-    ) {
-        if terminal_codex_hook_trust_discovery_blocks_idle(&pane_id, instance_id) {
-            return;
-        }
-        if !terminal_headless_tail_has_prompt_marker(&headless_output) {
-            return;
-        }
-        let mut instance = match terminal_activity_hook_current_instance(
-            &terminals,
-            &pane_id,
-            instance_id,
-        )
-        .await
-        {
-            Some(instance) => instance,
-            None => return,
-        };
-        if !cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_id)
-            && !cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_kind)
-        {
-            return;
-        }
-        let structured_prompt_open = app
-            .state::<TerminalState>()
-            .terminal_structured_interactions
-            .lock()
-            .ok()
-            .is_some_and(|interactions| {
-                interactions.values().any(|interaction| {
-                    interaction.pane_id == pane_id && interaction.instance_id == instance_id
-                })
-            });
-        if structured_prompt_open {
-            return;
-        }
-        let mut runtime = terminal_runtime_snapshot(&instance);
-        if runtime.input_ready {
-            return;
-        }
-        let startup_ready = terminal_runtime_snapshot_is_starting(&runtime);
-        if !terminal_prompt_ready_recovery_allowed(&instance.metadata, &runtime) {
-            return;
-        }
-        if !startup_ready {
-            let busy_age_ms = terminal_now_ms().saturating_sub(runtime.updated_at_ms);
-            if busy_age_ms < TERMINAL_PROMPT_READY_BUSY_DEBOUNCE_MS {
-                sleep(Duration::from_millis(
-                    TERMINAL_PROMPT_READY_BUSY_DEBOUNCE_MS.saturating_sub(busy_age_ms),
-                ))
-                .await;
-                instance = match terminal_activity_hook_current_instance(
-                    &terminals,
-                    &pane_id,
-                    instance_id,
-                )
-                .await
-                {
-                    Some(instance) => instance,
-                    None => return,
-                };
-                runtime = terminal_runtime_snapshot(&instance);
-                if runtime.input_ready
-                    || !terminal_prompt_ready_recovery_allowed(&instance.metadata, &runtime)
-                {
-                    return;
-                }
-                if !terminal_headless_tail_has_prompt_marker(&headless_output) {
-                    return;
-                }
-            }
-        }
-
-        let interrupted_ready = terminal_runtime_snapshot_is_interrupted(&runtime);
-        let startup_error_ready = terminal_runtime_snapshot_is_recoverable_startup_error(&runtime);
-        let (recovery_source, hook_event_name) = if interrupted_ready {
-            (
-                "backend-interrupt-prompt-ready",
-                "PromptReadyAfterInterrupt",
-            )
-        } else if startup_error_ready {
-            (
-                "backend-startup-error-prompt-ready",
-                "PromptReadyAfterStartupError",
-            )
-        } else if terminal_runtime_snapshot_is_starting(&runtime) {
-            ("backend-startup-prompt-ready", "Stop")
-        } else {
-            ("backend-output-prompt-ready", "Stop")
-        };
-        let mut event = json!({
-            "hook_event_name": hook_event_name,
-            "provider": instance.metadata.agent_kind.clone(),
-            "source": recovery_source,
-            "timestamp": cloud_mcp_rfc3339_now(),
-            "turn_generation": runtime.turn_generation,
-        });
-        if let Some(object) = event.as_object_mut() {
-            if let Some(provider_session_id) = runtime
-                .provider_session_id
-                .as_deref()
-                .or(runtime.native_session_id.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                object.insert("session_id".to_string(), json!(provider_session_id));
-                object.insert(
-                    "provider_session_id".to_string(),
-                    json!(provider_session_id),
-                );
-                object.insert("native_session_id".to_string(), json!(provider_session_id));
-            }
-            if let Some(turn_id) = runtime
-                .turn_id
-                .as_deref()
-                .or(runtime.provider_turn_id.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                object.insert("turn_id".to_string(), json!(turn_id));
-            }
-        }
-
-        process_terminal_activity_hook_event(
-            &app,
-            &terminals,
-            &cloud_mcp_state,
-            &pane_id,
-            instance_id,
-            &instance,
-            &event,
-            recovery_source,
-        )
-        .await;
-    }
 
     fn send_terminal_output_frame(
-        app: &AppHandle,
         chunk: Vec<u8>,
         pane_id: &str,
         instance_id: u64,
-        cloud_mcp_state: &CloudMcpState,
         output_channel: &Channel<InvokeResponseBody>,
         adoptable_output: Option<&Arc<StdMutex<TerminalAdoptableOutputSlot>>>,
         output_subscribers: &Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
         prefer_output_transport: bool,
-        cloud_output_observer_enabled: bool,
-    ) -> (bool, f64, f64) {
+    ) -> (bool, f64) {
         if chunk.is_empty() {
-            return (true, 0.0, 0.0);
+            return (true, 0.0);
         }
 
         let send_started_at = Instant::now();
-        let observer_chunk = cloud_output_observer_enabled.then(|| chunk.clone());
         let transport_sent =
             send_terminal_output_transport_frame(output_subscribers, pane_id, instance_id, &chunk);
         let channel_sent = if let Some(adoptable_output) = adoptable_output {
@@ -7208,35 +6587,10 @@ fn spawn_terminal_reader(
             output_channel.send(InvokeResponseBody::Raw(chunk)).is_ok()
         };
         let sent = adoptable_output.is_some() || transport_sent || channel_sent;
-        // Native rendering is the latency-critical consumer. Provider/output
-        // observers are scheduled only after the frame has reached xterm.
-        let observe_started_at = Instant::now();
-        if let Some(observer_chunk) = observer_chunk {
-            let observer_app = app.clone();
-            let observer_state = cloud_mcp_state.clone();
-            let observer_pane_id = pane_id.to_string();
-            tauri::async_runtime::spawn(async move {
-                cloud_mcp_observe_terminal_output(
-                    observer_app,
-                    observer_state,
-                    &observer_pane_id,
-                    instance_id,
-                    &observer_chunk,
-                )
-                .await;
-            });
-        }
-        let observe_schedule_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
-        (
-            sent,
-            terminal_diagnostic_elapsed_ms(send_started_at),
-            observe_schedule_ms,
-        )
+        (sent, terminal_diagnostic_elapsed_ms(send_started_at))
     }
 
     let reader_pane_id = pane_id.clone();
-    let prompt_ready_observer_in_flight = Arc::new(AtomicBool::new(false));
-
     log_terminal_crash_forensics_event(
         "backend.terminal_reader.spawn",
         json!({
@@ -7262,9 +6616,6 @@ fn spawn_terminal_reader(
         let output_pane_id = reader_pane_id.clone();
         let output_workspace_id = workspace_id.clone();
         let output_subscribers = Arc::clone(&output_subscribers);
-        let output_prompt_ready_observer_in_flight =
-            Arc::clone(&prompt_ready_observer_in_flight);
-        let output_readiness_terminals = Arc::clone(&terminals);
         let output_sender_handle = thread::spawn(move || {
             let mut pending = Vec::with_capacity(TERMINAL_OUTPUT_COALESCE_MAX_BYTES);
             let mut pending_started_at: Option<Instant> = None;
@@ -7277,9 +6628,6 @@ fn spawn_terminal_reader(
             let mut stats_slow_sends: u64 = 0;
             let mut stats_total_send_ms = 0.0f64;
             let mut stats_max_send_ms = 0.0f64;
-            let mut stats_slow_observer_schedules: u64 = 0;
-            let mut stats_total_observer_schedule_ms = 0.0f64;
-            let mut stats_max_observer_schedule_ms = 0.0f64;
             let mut cloud_output_seq: u64 = 0;
             let mut forensics_started_at = Instant::now();
             let mut forensics_frames: u64 = 0;
@@ -7357,17 +6705,14 @@ fn spawn_terminal_reader(
                 pending_started_at = None;
                 pending_source_chunks = 0;
                 cloud_output_seq = cloud_output_seq.saturating_add(1);
-                let (sent, send_ms, observer_schedule_ms) = send_terminal_output_frame(
-                    &output_app,
+                let (sent, send_ms) = send_terminal_output_frame(
                     frame.clone(),
                     &output_pane_id,
                     instance_id,
-                    &output_cloud_mcp_state,
                     &output_channel,
                     adoptable_output.as_ref(),
                     &output_subscribers,
                     prefer_output_transport,
-                    cloud_output_observer_enabled,
                 );
                 // The local renderer always receives the PTY bytes first. The
                 // cloud journal is ordered immediately afterwards, so slow
@@ -7382,36 +6727,6 @@ fn spawn_terminal_reader(
                     cloud_output_seq,
                     &frame,
                 );
-                // Prompt readiness is evaluated only after this frame has
-                // advanced the headless journal. Checking in the PTY reader
-                // before publication misses a prompt marker delivered in the
-                // final chunk when no later output arrives.
-                if rust_readiness_observer_enabled
-                    && terminal_headless_tail_has_prompt_marker(&output_headless_output)
-                    && output_prompt_ready_observer_in_flight
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                {
-                    let readiness_app = output_app.clone();
-                    let readiness_terminals = Arc::clone(&output_readiness_terminals);
-                    let readiness_cloud_state = output_cloud_mcp_state.clone();
-                    let readiness_headless_output = Arc::clone(&output_headless_output);
-                    let readiness_pane_id = output_pane_id.clone();
-                    let readiness_observer_in_flight =
-                        Arc::clone(&output_prompt_ready_observer_in_flight);
-                    tauri::async_runtime::spawn(async move {
-                        observe_terminal_prompt_ready(
-                            readiness_app,
-                            readiness_terminals,
-                            readiness_cloud_state,
-                            readiness_headless_output,
-                            readiness_pane_id,
-                            instance_id,
-                        )
-                        .await;
-                        readiness_observer_in_flight.store(false, Ordering::Release);
-                    });
-                }
                 let coalesced_ms = terminal_diagnostic_elapsed_ms(frame_started_at);
                 forensics_frames += 1;
                 forensics_source_chunks += source_chunks;
@@ -7431,7 +6746,6 @@ fn spawn_terminal_reader(
                             "frames": forensics_frames,
                             "instance_id": instance_id,
                             "last_coalesced_ms": coalesced_ms,
-                            "last_observer_schedule_ms": observer_schedule_ms,
                             "last_send_ms": send_ms,
                             "pane_id": clean_terminal_diagnostic_log_text(&output_pane_id),
                             "source_chunks": forensics_source_chunks,
@@ -7451,9 +6765,6 @@ fn spawn_terminal_reader(
                     stats_bytes += frame_bytes as u64;
                     stats_total_send_ms += send_ms;
                     stats_max_send_ms = stats_max_send_ms.max(send_ms);
-                    stats_total_observer_schedule_ms += observer_schedule_ms;
-                    stats_max_observer_schedule_ms =
-                        stats_max_observer_schedule_ms.max(observer_schedule_ms);
                     if send_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
                         stats_slow_sends += 1;
                         log_terminal_diagnostic_event(
@@ -7468,21 +6779,6 @@ fn spawn_terminal_reader(
                             }),
                         );
                     }
-                    if observer_schedule_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
-                        stats_slow_observer_schedules += 1;
-                        log_terminal_diagnostic_event(
-                            &output_app,
-                            "backend.output_observer_schedule.slow",
-                            json!({
-                                "bytes": frame_bytes,
-                                "elapsed_ms": observer_schedule_ms,
-                                "instance_id": instance_id,
-                                "pane_id": clean_terminal_diagnostic_log_text(&output_pane_id),
-                                "source_chunks": source_chunks,
-                            }),
-                        );
-                    }
-
                     if stats_started_at.elapsed() >= Duration::from_secs(1) {
                         log_terminal_diagnostic_event(
                             &output_app,
@@ -7492,13 +6788,10 @@ fn spawn_terminal_reader(
                                 "elapsed_ms": terminal_diagnostic_elapsed_ms(stats_started_at),
                                 "frames": stats_frames,
                                 "instance_id": instance_id,
-                                "max_observer_schedule_ms": stats_max_observer_schedule_ms,
                                 "max_send_ms": stats_max_send_ms,
                                 "pane_id": clean_terminal_diagnostic_log_text(&output_pane_id),
-                                "slow_observer_schedules": stats_slow_observer_schedules,
                                 "slow_sends": stats_slow_sends,
                                 "source_chunks": stats_source_chunks,
-                                "total_observer_schedule_ms": stats_total_observer_schedule_ms,
                                 "total_send_ms": stats_total_send_ms,
                             }),
                         );
@@ -7509,9 +6802,6 @@ fn spawn_terminal_reader(
                         stats_slow_sends = 0;
                         stats_total_send_ms = 0.0;
                         stats_max_send_ms = 0.0;
-                        stats_slow_observer_schedules = 0;
-                        stats_total_observer_schedule_ms = 0.0;
-                        stats_max_observer_schedule_ms = 0.0;
                     }
                 }
 
@@ -7559,8 +6849,6 @@ fn spawn_terminal_reader(
         let mut forensics_bytes: u64 = 0;
         let mut forensics_total_chunks: u64 = 0;
         let mut forensics_total_bytes: u64 = 0;
-        let mut auth_failure_scan_tail = String::new();
-        let mut auth_failure_last_marked_at: Option<Instant> = None;
         let exit_reason = loop {
             if output_channel_closed.load(Ordering::SeqCst) {
                 break "output_channel_closed";
@@ -7581,66 +6869,6 @@ fn spawn_terminal_reader(
                 }
                 Ok(bytes_read) => {
                     let chunk = &buffer[..bytes_read];
-                    let auth_failure_debounce_elapsed = auth_failure_last_marked_at
-                        .map(|marked_at| marked_at.elapsed() >= Duration::from_secs(30))
-                        .unwrap_or(true);
-                    /* Never read a harness pane's output to infer credential
-                       state: the daemon publishes it as CredentialStatus on
-                       account.list, and a prose match here can only invent a
-                       failure that did not happen. */
-                    if !harness_owned_pane && auth_failure_debounce_elapsed {
-                        if let Some(auth_error) = agent_accounts_observe_terminal_auth_output(
-                            &app,
-                            &reader_pane_id,
-                            &mut auth_failure_scan_tail,
-                            chunk,
-                        ) {
-                            auth_failure_last_marked_at = Some(Instant::now());
-                            auth_failure_scan_tail.clear();
-                            let error_app = app.clone();
-                            let error_terminals = Arc::clone(&terminals);
-                            let error_cloud_state = cloud_mcp_state.clone();
-                            let error_pane_id = reader_pane_id.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let Some(instance) = terminal_activity_hook_current_instance(
-                                    &error_terminals,
-                                    &error_pane_id,
-                                    instance_id,
-                                )
-                                .await
-                                else {
-                                    return;
-                                };
-                                let runtime = terminal_runtime_snapshot(&instance);
-                                let event = json!({
-                                    "hook_event_name": "StopFailure",
-                                    "provider": "codex",
-                                    "session_id": runtime.provider_session_id,
-                                    "turn_id": runtime.provider_turn_id.or(runtime.turn_id),
-                                    "error": auth_error.get("safe_message").cloned().unwrap_or(Value::Null),
-                                    "error_code": auth_error.get("provider_code").cloned().unwrap_or(Value::Null),
-                                    "error_type": "Unauthorized",
-                                    "retryable": false,
-                                    "source": "pty_auth_observer",
-                                });
-                                let Some(payload) =
-                                    terminal_activity_hook_payload(&instance, &event)
-                                else {
-                                    return;
-                                };
-                                apply_terminal_activity_hook_payload(
-                                    &error_app,
-                                    &error_terminals,
-                                    &error_cloud_state,
-                                    &instance,
-                                    &event,
-                                    payload,
-                                    None,
-                                    "pty-auth-observer",
-                                );
-                            });
-                        }
-                    }
                     ssh_password_autofill_observe_output(
                         &terminals,
                         &reader_pane_id,
@@ -10741,17 +9969,6 @@ async fn terminal_open(
         );
     }
 
-    let harness_owned_pane =
-        cloud_mcp_agent_is_harness_owned(&terminal_metadata_for_log.agent_id)
-            || cloud_mcp_agent_is_harness_owned(&terminal_metadata_for_log.agent_kind);
-    /* Three states, not two: hook-observed, scraped, or — for a pane whose
-       state the harness publishes over RPC — observed not at all. */
-    let cloud_output_observer_enabled = !harness_owned_pane
-        && !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_id)
-        && !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind);
-    let rust_readiness_observer_enabled = !harness_owned_pane
-        && (cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_id)
-            || cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind));
     spawn_terminal_reader(
         app.clone(),
         Arc::clone(&state.terminals),
@@ -10765,9 +9982,6 @@ async fn terminal_open(
         output_channel,
         adoptable_output,
         prefer_output_transport,
-        cloud_output_observer_enabled,
-        rust_readiness_observer_enabled,
-        harness_owned_pane,
         reader,
     );
     spawn_terminal_activity_hook_watcher(
@@ -12126,395 +11340,6 @@ async fn terminal_write_to_audio_input_target(
     Ok(wrote)
 }
 
-fn terminal_input_gate_line_char_len(gate: &TerminalInputGate) -> usize {
-    gate.current_line.chars().count()
-}
-
-fn terminal_input_gate_clamp_cursor(gate: &mut TerminalInputGate) {
-    let len = terminal_input_gate_line_char_len(gate);
-    if gate.cursor_position > len {
-        gate.cursor_position = len;
-    }
-}
-
-fn terminal_input_gate_byte_index(line: &str, char_index: usize) -> usize {
-    if char_index == 0 {
-        return 0;
-    }
-
-    line.char_indices()
-        .nth(char_index)
-        .map(|(index, _)| index)
-        .unwrap_or(line.len())
-}
-
-fn terminal_input_gate_previous_word_boundary(line: &str, cursor: usize) -> usize {
-    let chars = line.chars().collect::<Vec<_>>();
-    let mut index = cursor.min(chars.len());
-    while index > 0 && chars[index - 1].is_whitespace() {
-        index -= 1;
-    }
-    while index > 0 && !chars[index - 1].is_whitespace() {
-        index -= 1;
-    }
-    index
-}
-
-fn terminal_input_gate_next_word_boundary(line: &str, cursor: usize) -> usize {
-    let chars = line.chars().collect::<Vec<_>>();
-    let mut index = cursor.min(chars.len());
-    while index < chars.len() && chars[index].is_whitespace() {
-        index += 1;
-    }
-    while index < chars.len() && !chars[index].is_whitespace() {
-        index += 1;
-    }
-    index
-}
-
-fn terminal_input_gate_replace_char_range(
-    gate: &mut TerminalInputGate,
-    start: usize,
-    end: usize,
-    replacement: &str,
-) {
-    terminal_input_gate_clamp_cursor(gate);
-    let len = terminal_input_gate_line_char_len(gate);
-    let safe_start = start.min(len);
-    let safe_end = end.min(len).max(safe_start);
-    let byte_start = terminal_input_gate_byte_index(&gate.current_line, safe_start);
-    let byte_end = terminal_input_gate_byte_index(&gate.current_line, safe_end);
-    gate.current_line
-        .replace_range(byte_start..byte_end, replacement);
-    gate.cursor_position = safe_start + replacement.chars().count();
-    gate.current_line_user_touched = true;
-}
-
-fn terminal_input_gate_insert_char(gate: &mut TerminalInputGate, character: char) {
-    terminal_input_gate_clamp_cursor(gate);
-    let byte_index = terminal_input_gate_byte_index(&gate.current_line, gate.cursor_position);
-    gate.current_line.insert(byte_index, character);
-    gate.cursor_position += 1;
-    gate.current_line_user_touched = true;
-}
-
-fn terminal_input_gate_delete_before_cursor(gate: &mut TerminalInputGate) {
-    terminal_input_gate_clamp_cursor(gate);
-    if gate.cursor_position == 0 {
-        return;
-    }
-
-    let start = terminal_input_gate_byte_index(&gate.current_line, gate.cursor_position - 1);
-    let end = terminal_input_gate_byte_index(&gate.current_line, gate.cursor_position);
-    gate.current_line.replace_range(start..end, "");
-    gate.cursor_position -= 1;
-    gate.current_line_user_touched = true;
-}
-
-fn terminal_input_gate_delete_at_cursor(gate: &mut TerminalInputGate) {
-    terminal_input_gate_clamp_cursor(gate);
-    if gate.cursor_position >= terminal_input_gate_line_char_len(gate) {
-        return;
-    }
-
-    let start = terminal_input_gate_byte_index(&gate.current_line, gate.cursor_position);
-    let end = terminal_input_gate_byte_index(&gate.current_line, gate.cursor_position + 1);
-    gate.current_line.replace_range(start..end, "");
-    gate.current_line_user_touched = true;
-}
-
-fn terminal_input_gate_delete_before_word(gate: &mut TerminalInputGate) {
-    terminal_input_gate_clamp_cursor(gate);
-    let start =
-        terminal_input_gate_previous_word_boundary(&gate.current_line, gate.cursor_position);
-    terminal_input_gate_replace_char_range(gate, start, gate.cursor_position, "");
-}
-
-fn terminal_input_gate_delete_after_word(gate: &mut TerminalInputGate) {
-    terminal_input_gate_clamp_cursor(gate);
-    let end = terminal_input_gate_next_word_boundary(&gate.current_line, gate.cursor_position);
-    terminal_input_gate_replace_char_range(gate, gate.cursor_position, end, "");
-}
-
-fn terminal_input_gate_apply_csi(gate: &mut TerminalInputGate) {
-    let Some(final_char) = gate.ansi_csi_buffer.chars().last() else {
-        return;
-    };
-    let params_text = gate
-        .ansi_csi_buffer
-        .strip_suffix(final_char)
-        .unwrap_or_default();
-    let params = params_text
-        .split(';')
-        .filter_map(|part| {
-            let clean = part.trim_start_matches('?');
-            if clean.is_empty() {
-                None
-            } else {
-                clean.parse::<usize>().ok()
-            }
-        })
-        .collect::<Vec<_>>();
-    let amount = params.first().copied().unwrap_or(1).max(1);
-    let modifier = params.get(1).copied().unwrap_or(1);
-    let word_mode = matches!(modifier, 3 | 4 | 5 | 6 | 7 | 8);
-
-    match final_char {
-        'C' => {
-            if word_mode {
-                gate.cursor_position = terminal_input_gate_next_word_boundary(
-                    &gate.current_line,
-                    gate.cursor_position,
-                );
-            } else {
-                gate.cursor_position =
-                    (gate.cursor_position + amount).min(terminal_input_gate_line_char_len(gate));
-            }
-        }
-        'D' => {
-            if word_mode {
-                gate.cursor_position = terminal_input_gate_previous_word_boundary(
-                    &gate.current_line,
-                    gate.cursor_position,
-                );
-            } else {
-                gate.cursor_position = gate.cursor_position.saturating_sub(amount);
-            }
-        }
-        'H' => {
-            gate.cursor_position = 0;
-        }
-        'F' => {
-            gate.cursor_position = terminal_input_gate_line_char_len(gate);
-        }
-        '~' => match params.first().copied().unwrap_or_default() {
-            1 | 7 => gate.cursor_position = 0,
-            3 => terminal_input_gate_delete_at_cursor(gate),
-            4 | 8 => gate.cursor_position = terminal_input_gate_line_char_len(gate),
-            _ => {}
-        },
-        _ => {}
-    }
-}
-
-fn terminal_observe_input_gate_submitted_prompt(
-    gate: &mut TerminalInputGate,
-    data: &str,
-) -> Option<String> {
-    const SHIFT_ENTER_MARKER: char = '\u{e000}';
-    let mut submitted = None;
-
-    if data == TERMINAL_SHIFT_ENTER_SEQUENCE {
-        terminal_input_gate_insert_char(gate, '\n');
-        gate.current_line_user_touched = true;
-        return None;
-    }
-
-    let normalized_data;
-    let data = if data.contains(TERMINAL_SHIFT_ENTER_SEQUENCE)
-        || data.contains(TERMINAL_ENTER_SEQUENCE)
-        || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1)
-    {
-        normalized_data = data
-            .replace(
-                TERMINAL_SHIFT_ENTER_SEQUENCE,
-                &SHIFT_ENTER_MARKER.to_string(),
-            )
-            .replace(TERMINAL_ENTER_SEQUENCE_MOD1, "\r")
-            .replace(TERMINAL_ENTER_SEQUENCE, "\r");
-        normalized_data.as_str()
-    } else {
-        data
-    };
-    let stripped_color_reply_data = strip_bare_terminal_color_reply_input(data);
-    let data = stripped_color_reply_data.as_deref().unwrap_or(data);
-
-    for character in data.chars() {
-        if gate.ansi_osc_active {
-            if gate.ansi_osc_escape_pending {
-                gate.ansi_osc_escape_pending = false;
-                if character == '\\' {
-                    gate.ansi_osc_active = false;
-                    gate.ansi_escape_active = false;
-                }
-                continue;
-            }
-            if character == '\u{1b}' {
-                gate.ansi_osc_escape_pending = true;
-                continue;
-            }
-            if character == '\u{7}' {
-                gate.ansi_osc_active = false;
-                gate.ansi_escape_active = false;
-                continue;
-            }
-            continue;
-        }
-
-        if gate.ansi_csi_active {
-            gate.ansi_csi_buffer.push(character);
-            let code = character as u32;
-            if (0x40..=0x7e).contains(&code) {
-                terminal_input_gate_apply_csi(gate);
-                gate.ansi_csi_buffer.clear();
-                gate.ansi_csi_active = false;
-                gate.ansi_escape_active = false;
-            }
-            continue;
-        }
-
-        if gate.ansi_ss3_active {
-            match character {
-                'C' => {
-                    gate.cursor_position =
-                        (gate.cursor_position + 1).min(terminal_input_gate_line_char_len(gate));
-                }
-                'D' => {
-                    gate.cursor_position = gate.cursor_position.saturating_sub(1);
-                }
-                'H' => {
-                    gate.cursor_position = 0;
-                }
-                'F' => {
-                    gate.cursor_position = terminal_input_gate_line_char_len(gate);
-                }
-                _ => {}
-            }
-            gate.ansi_ss3_active = false;
-            gate.ansi_escape_active = false;
-            continue;
-        }
-
-        if gate.ansi_escape_active {
-            match character {
-                '[' => {
-                    gate.ansi_csi_active = true;
-                    gate.ansi_csi_buffer.clear();
-                }
-                ']' | 'P' | '^' | '_' | 'X' => {
-                    gate.ansi_osc_active = true;
-                    gate.ansi_osc_escape_pending = false;
-                }
-                'O' => {
-                    gate.ansi_ss3_active = true;
-                }
-                'b' | 'B' => {
-                    gate.cursor_position = terminal_input_gate_previous_word_boundary(
-                        &gate.current_line,
-                        gate.cursor_position,
-                    );
-                    gate.ansi_escape_active = false;
-                }
-                'f' | 'F' => {
-                    gate.cursor_position = terminal_input_gate_next_word_boundary(
-                        &gate.current_line,
-                        gate.cursor_position,
-                    );
-                    gate.ansi_escape_active = false;
-                }
-                'd' => {
-                    terminal_input_gate_delete_after_word(gate);
-                    gate.ansi_escape_active = false;
-                }
-                '\u{7f}' => {
-                    terminal_input_gate_delete_before_word(gate);
-                    gate.ansi_escape_active = false;
-                }
-                _ => {
-                    gate.ansi_escape_active = false;
-                }
-            }
-            continue;
-        }
-
-        match character {
-            SHIFT_ENTER_MARKER => {
-                terminal_input_gate_insert_char(gate, '\n');
-                gate.current_line_user_touched = true;
-            }
-            '\r' | '\n' => {
-                let prompt = gate.current_line.trim().to_string();
-                gate.current_line.clear();
-                gate.cursor_position = 0;
-                gate.current_line_user_touched = false;
-                if !prompt.is_empty() && !is_terminal_color_reply_prompt(&prompt) {
-                    submitted = Some(prompt);
-                }
-            }
-            '\u{7f}' | '\u{8}' => {
-                terminal_input_gate_delete_before_cursor(gate);
-            }
-            '\u{15}' => {
-                gate.current_line.clear();
-                gate.cursor_position = 0;
-                gate.current_line_user_touched = true;
-            }
-            '\u{11}' => {
-                let start = gate
-                    .cursor_position
-                    .min(terminal_input_gate_line_char_len(gate));
-                let end = terminal_input_gate_line_char_len(gate);
-                terminal_input_gate_replace_char_range(gate, start, end, "");
-            }
-            '\u{17}' => {
-                terminal_input_gate_delete_before_word(gate);
-            }
-            '\u{1}' => {
-                gate.cursor_position = 0;
-            }
-            '\u{5}' => {
-                gate.cursor_position = terminal_input_gate_line_char_len(gate);
-            }
-            '\u{1b}' => {
-                gate.ansi_escape_active = true;
-                gate.ansi_csi_active = false;
-                gate.ansi_csi_buffer.clear();
-                gate.ansi_osc_active = false;
-                gate.ansi_osc_escape_pending = false;
-                gate.ansi_ss3_active = false;
-            }
-            character if character.is_control() => {}
-            character => {
-                terminal_input_gate_insert_char(gate, character);
-                if gate.current_line.len() > 8192 {
-                    let drain_to = gate.current_line.len().saturating_sub(4096);
-                    gate.current_line.drain(..drain_to);
-                    gate.cursor_position = terminal_input_gate_line_char_len(gate);
-                }
-            }
-        }
-    }
-
-    submitted
-}
-
-fn terminal_input_gate_diagnostic_snapshot(gate: &TerminalInputGate) -> Value {
-    let current_line = gate.current_line.as_str();
-    json!({
-        "ansi_csi_active": gate.ansi_csi_active,
-        "ansi_csi_buffer": clean_terminal_diagnostic_log_text(&gate.ansi_csi_buffer),
-        "ansi_escape_active": gate.ansi_escape_active,
-        "ansi_osc_active": gate.ansi_osc_active,
-        "ansi_osc_escape_pending": gate.ansi_osc_escape_pending,
-        "ansi_ss3_active": gate.ansi_ss3_active,
-        "current_line_len": current_line.len(),
-        "current_line_preview": clean_terminal_diagnostic_log_text(current_line),
-        "current_line_tail": clean_terminal_diagnostic_log_text(
-            &current_line
-                .chars()
-                .rev()
-                .take(180)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>(),
-        ),
-        "current_line_user_touched": gate.current_line_user_touched,
-        "cursor_position": gate.cursor_position,
-        "trimmed_line_len": current_line.trim().len(),
-    })
-}
-
 fn terminal_write_data_hex_prefix(data: &str) -> String {
     data.as_bytes()
         .iter()
@@ -12587,122 +11412,6 @@ fn terminal_input_write_diagnostic_kind(
     }
 
     None
-}
-
-fn terminal_input_gate_snapshot_u64(snapshot: &Value, key: &str) -> u64 {
-    snapshot
-        .get(key)
-        .and_then(Value::as_u64)
-        .unwrap_or_default()
-}
-
-fn terminal_prompt_observer_not_observed_reason(
-    data: &str,
-    input_gate_before: &Value,
-    input_gate_after: &Value,
-) -> &'static str {
-    if matches!(data, "\r" | "\n")
-        && terminal_input_gate_snapshot_u64(input_gate_before, "trimmed_line_len") == 0
-    {
-        return "submit_with_empty_input_gate";
-    }
-    if data.contains('\r') || data.contains('\n') {
-        return "submit_boundary_without_accepted_prompt";
-    }
-    if data.contains(TERMINAL_SHIFT_ENTER_SEQUENCE) {
-        return "shift_enter_without_submit";
-    }
-    if terminal_input_gate_snapshot_u64(input_gate_after, "trimmed_line_len") > 0 {
-        return "input_buffered_without_submit_boundary";
-    }
-
-    "control_or_empty_input"
-}
-
-fn find_bare_terminal_color_reply_start(data: &str) -> Option<usize> {
-    let lower = data.to_ascii_lowercase();
-    ["]10;rgb:", "]11;rgb:", "]12;rgb:"]
-        .iter()
-        .filter_map(|pattern| lower.find(pattern))
-        .filter(|index| *index == 0 || data.as_bytes().get(index.saturating_sub(1)) != Some(&0x1b))
-        .min()
-}
-
-fn strip_bare_terminal_color_reply_input(data: &str) -> Option<String> {
-    let mut cursor = 0;
-    let mut output = String::new();
-    let mut changed = false;
-
-    while cursor < data.len() {
-        let Some(mut start) =
-            find_bare_terminal_color_reply_start(&data[cursor..]).map(|index| cursor + index)
-        else {
-            output.push_str(&data[cursor..]);
-            break;
-        };
-
-        if start > cursor && data.as_bytes().get(start - 1) == Some(&b'\\') {
-            start -= 1;
-        }
-
-        output.push_str(&data[cursor..start]);
-        let mut end = data.len();
-        for (offset, character) in data[start..].char_indices() {
-            if character == '\\' || character == '\u{7}' {
-                end = start + offset + character.len_utf8();
-                break;
-            }
-            if character == '\r' || character == '\n' {
-                end = start + offset;
-                break;
-            }
-        }
-        cursor = end;
-        changed = true;
-    }
-
-    changed.then_some(output)
-}
-
-fn is_terminal_color_reply_prompt(prompt: &str) -> bool {
-    let text = prompt
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect::<String>()
-        .to_ascii_lowercase();
-
-    ["]10;rgb:", "]11;rgb:", "]12;rgb:"]
-        .iter()
-        .any(|pattern| text.contains(pattern))
-}
-
-fn normalize_terminal_enter_sequences_for_pty(data: String) -> String {
-    // Codex relies on the enhanced-enter escape sequence at the PTY boundary.
-    // The input-gate observer normalizes this sequence separately when it
-    // decides whether a submitted prompt was really observed.
-    data
-}
-
-async fn terminal_observe_submitted_prompt(
-    instance: &TerminalInstance,
-    data: &str,
-) -> (Option<String>, Value, Value) {
-    /* Reconstructing what the user typed by emulating the TUI's input line is
-       a shadow copy of someone else's composer: any keybinding this does not
-       model desynchronizes it, and an "authoritative" submission derived that
-       way arms downstream completion reporting. The harness mirrors its real
-       composer over input_mirror_v1, so a harness pane is never inferred. */
-    if cloud_mcp_agent_is_harness_owned(&instance.metadata.agent_id)
-        || cloud_mcp_agent_is_harness_owned(&instance.metadata.agent_kind)
-    {
-        return (None, Value::Null, Value::Null);
-    }
-    let mut gate = instance.input_gate.lock().await;
-    let before = terminal_input_gate_diagnostic_snapshot(&gate);
-    let submitted = terminal_observe_input_gate_submitted_prompt(&mut gate, data);
-    let after = terminal_input_gate_diagnostic_snapshot(&gate);
-
-    (submitted, before, after)
 }
 
 fn is_terminal_control_prompt(prompt: &str) -> bool {
@@ -12782,75 +11491,6 @@ fn is_terminal_model_picker_ui_prompt(prompt: &str) -> bool {
             && lower.contains("go back"))
 }
 
-fn terminal_prompt_task_title(prompt: &str) -> String {
-    let cleaned = clean_terminal_telemetry_text(prompt)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if cleaned.is_empty() {
-        return "Complete requested terminal task".to_string();
-    }
-
-    let lower = cleaned.to_ascii_lowercase();
-    let action = if lower.contains("pricing") && (lower.contains("half") || lower.contains("halve"))
-    {
-        "Halve pricing values"
-    } else if lower.contains("pricing") && lower.contains("double") {
-        "Double pricing values"
-    } else if lower.contains("pricing") && (lower.contains("redesign") || lower.contains("style")) {
-        "Redesign pricing page"
-    } else if lower.contains("pricing") || lower.contains("price") {
-        "Update pricing page"
-    } else if lower.contains("test") {
-        "Write tests"
-    } else if lower.contains("fix") || lower.contains("bug") {
-        "Fix requested issue"
-    } else if lower.contains("audit") || lower.contains("review") {
-        "Audit requested work"
-    } else if lower.contains("html")
-        || lower.contains("landing")
-        || lower.contains("splash")
-        || lower.contains("slash page")
-    {
-        "Create landing page"
-    } else if lower.contains("create") || lower.contains("make") || lower.contains("add") {
-        "Create requested implementation"
-    } else {
-        "Complete requested terminal task"
-    };
-    let subject = if lower.contains("black") && lower.contains("supercar") {
-        " for black supercar"
-    } else if lower.contains("supercar") {
-        " for supercar"
-    } else if lower.contains("car") {
-        " for car project"
-    } else if lower.contains("waitlist") || lower.contains("wishlist") {
-        " with list flow"
-    } else {
-        ""
-    };
-    let qualifier = if lower.contains("minimal") || lower.contains("simple") {
-        " minimally"
-    } else {
-        ""
-    };
-    format!("{action}{subject}{qualifier}")
-}
-
-fn terminal_placeholder_task_title(value: &str) -> bool {
-    matches!(
-        value.trim(),
-        "Agent preparing requested work" | "Complete requested terminal task"
-    )
-}
-
-fn terminal_placeholder_task_body(value: &str) -> bool {
-    let lower = value.trim().to_ascii_lowercase();
-    lower.is_empty()
-        || lower.contains("has not named the task yet")
-        || lower == "the agent is preparing the requested work and has not named the task yet."
-}
-
 fn terminal_parked_prompt_key(pane_id: &str, instance_id: u64, task_id: &str) -> String {
     format!("{pane_id}:{instance_id}:{task_id}")
 }
@@ -12887,24 +11527,6 @@ fn emit_terminal_input_error(
     );
 }
 
-async fn terminal_preview_submitted_prompt(
-    instance: &TerminalInstance,
-    data: &str,
-) -> Option<String> {
-    let gate = instance.input_gate.lock().await;
-    let mut preview = gate.clone();
-    terminal_observe_input_gate_submitted_prompt(&mut preview, data)
-}
-
-fn terminal_prompt_is_app_fork_command(prompt: &str) -> bool {
-    prompt
-        .replace('\u{00a0}', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .eq_ignore_ascii_case("fork")
-}
-
 fn emit_terminal_fork_requested(
     app: &AppHandle,
     instance: &TerminalInstance,
@@ -12921,44 +11543,6 @@ fn emit_terminal_fork_requested(
         provider_session_id,
     };
     let _ = app.emit(TERMINAL_FORK_REQUESTED_EVENT, payload);
-}
-
-async fn terminal_try_emit_app_fork_request(
-    app: &AppHandle,
-    instance: &TerminalInstance,
-    pane_id: &str,
-    thread_id: Option<&str>,
-    data: &str,
-    source: &str,
-) -> bool {
-    let Some(prompt) = terminal_preview_submitted_prompt(instance, data).await else {
-        return false;
-    };
-    if !terminal_prompt_is_app_fork_command(&prompt) {
-        return false;
-    }
-
-    let Some(provider_session_id) = terminal_current_recordable_provider_session_id(instance)
-    else {
-        return false;
-    };
-
-    let (_observed_prompt, input_gate_before, input_gate_after) =
-        terminal_observe_submitted_prompt(instance, data).await;
-    log_terminal_status_event(
-        "backend.terminal_write.fork_command_intercepted",
-        json!({
-            "input_gate_after": input_gate_after,
-            "input_gate_before": input_gate_before,
-            "instance_id": instance.id,
-            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-            "provider_session_id_present": true,
-            "source": source,
-            "thread_id": thread_id.unwrap_or_default(),
-        }),
-    );
-    emit_terminal_fork_requested(app, instance, provider_session_id);
-    true
 }
 
 /// Detects a local CLI slash command shaped like `^/[A-Za-z0-9_:-]+(\s|$)`
@@ -13277,7 +11861,6 @@ fn emit_terminal_prompt_submitted(
     instance: &TerminalInstance,
     prompt: &str,
     prompt_event_id: Option<&str>,
-    prompt_event_revision: Option<u64>,
     prompt_event_source: Option<&str>,
     prompt_event_submitted_at: Option<&str>,
     todo_id: Option<&str>,
@@ -13308,11 +11891,7 @@ fn emit_terminal_prompt_submitted(
             )
         });
     let prompt_event_id = Some(resolved_prompt_event_id.as_str());
-    if !terminal_prompt_submitted_source_is_authoritative(
-        prompt_source,
-        prompt_match,
-        observed_prompt,
-    ) {
+    if !terminal_prompt_submitted_source_is_authoritative(prompt_source, prompt_match) {
         let metadata = instance.metadata.clone();
         log_terminal_status_event(
             "backend.terminal.prompt_submitted_untrusted_skip",
@@ -13418,7 +11997,6 @@ fn emit_terminal_prompt_submitted(
         } else {
             None
         };
-    let mut direct_todo_item_id: Option<String> = None;
     if app_control_terminal_prompt {
         terminal_direct_prompt_mark_seen(&metadata.pane_id, prompt);
         log_terminal_status_event(
@@ -13436,7 +12014,7 @@ fn emit_terminal_prompt_submitted(
         );
     } else if direct_capture_candidate || synthetic_direct_todo_id.is_some() {
         if terminal_direct_prompt_should_capture(&metadata.pane_id, prompt) {
-            direct_todo_item_id = todo_dispatch_capture_direct_prompt_todo(
+            let _ = todo_dispatch_capture_direct_prompt_todo(
                 app,
                 &metadata.workspace_id,
                 &metadata.workspace_name,
@@ -13455,65 +12033,6 @@ fn emit_terminal_prompt_submitted(
     } else {
         terminal_direct_prompt_mark_seen(&metadata.pane_id, prompt);
     }
-    let _ = app.emit(
-        TERMINAL_PROMPT_SUBMITTED_EVENT,
-        TerminalPromptSubmittedPayload {
-            pane_id: metadata.pane_id,
-            instance_id: instance.id,
-            workspace_id: metadata.workspace_id,
-            workspace_name: metadata.workspace_name,
-            terminal_index: metadata.terminal_index,
-            thread_id: thread_id_override
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .unwrap_or(metadata.thread_id),
-            agent_id: metadata.agent_id,
-            agent_kind: metadata.agent_kind,
-            prompt_event_id: prompt_event_id
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            prompt_event_revision,
-            prompt_event_source: prompt_event_source
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            prompt_event_submitted_at: prompt_event_submitted_at
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            todo_id: todo_id
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            todo_dispatch_id: todo_dispatch_id
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            todo_command_id: todo_command_id
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            todo_action: todo_action
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            todo_resume_requested,
-            direct_todo_item_id,
-            expected_prompt: expected_prompt
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            observed_prompt: observed_prompt
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-            prompt_match,
-            prompt_source: prompt_source.to_string(),
-            prompt: prompt.to_string(),
-        },
-    );
 }
 
 fn terminal_activity_hook_string(event: &Value, keys: &[&str]) -> Option<String> {
@@ -13608,46 +12127,6 @@ fn terminal_activity_hook_text_from_value(value: &Value) -> Option<String> {
     }
 }
 
-fn terminal_activity_hook_lossless_text_from_value(value: &Value) -> Option<String> {
-    match value {
-        Value::String(value) => (!value.is_empty()).then(|| value.to_string()),
-        Value::Array(items) => {
-            let text = items
-                .iter()
-                .filter_map(terminal_activity_hook_lossless_text_from_value)
-                .collect::<Vec<_>>()
-                .join("\n");
-            (!text.is_empty()).then_some(text)
-        }
-        Value::Object(object) => {
-            for key in [
-                "text",
-                "content",
-                "delta",
-                "message",
-                "assistantMessage",
-                "assistant_message",
-                "assistantMessageSnapshot",
-                "assistant_message_snapshot",
-                "outputText",
-                "output_text",
-                "summary",
-                "thinking",
-                "reasoning",
-            ] {
-                if let Some(text) = object
-                    .get(key)
-                    .and_then(terminal_activity_hook_lossless_text_from_value)
-                {
-                    return Some(text);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
 fn terminal_activity_hook_message_text(event: &Value, keys: &[&str]) -> Option<String> {
     for key in keys {
         if let Some(text) = event
@@ -13658,52 +12137,6 @@ fn terminal_activity_hook_message_text(event: &Value, keys: &[&str]) -> Option<S
         }
     }
     None
-}
-
-fn terminal_activity_hook_lossless_message_text(event: &Value, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(text) = event
-            .get(*key)
-            .and_then(terminal_activity_hook_lossless_text_from_value)
-        {
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
-    }
-    None
-}
-
-fn terminal_activity_stream_debug_enabled() -> bool {
-    cfg!(debug_assertions)
-        && [
-            "RUST_DIFFFORGE_AGENT_STREAM_DEBUG",
-            "RUST_DIFFFORGE_USE_LOCAL_DOCKER_CLOUD",
-        ]
-        .iter()
-        .any(|key| {
-            std::env::var(key).ok().is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on" | "debug"
-                )
-            })
-        })
-}
-
-fn terminal_activity_text_debug_summary(value: Option<&str>) -> Value {
-    let Some(value) = value else {
-        return json!({ "present": false });
-    };
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    json!({
-        "present": true,
-        "bytes": value.len(),
-        "chars": value.chars().count(),
-        "hash": format!("{:016x}", hasher.finish()),
-    })
 }
 
 fn terminal_activity_hook_name_key(value: &str) -> String {
@@ -15363,11 +13796,7 @@ fn terminal_activity_line_is_tui_context(line: &str) -> bool {
     let compact = terminal_activity_compact_text(line);
     let lower = compact.to_ascii_lowercase();
     let deduped_lower = terminal_activity_collapse_duplicate_runs(&lower);
-    let status_line = |value: &str| {
-        cloud_mcp_terminal_output_has_mcp_startup_indicator(value)
-            || cloud_mcp_terminal_output_has_working_indicator(value)
-            || value.contains("context refresh")
-    };
+    let status_line = |value: &str| value.contains("context refresh");
     if status_line(&lower) || status_line(&deduped_lower) {
         return true;
     }
@@ -15416,18 +13845,6 @@ fn terminal_activity_tui_activity_text(value: &str) -> Option<String> {
     let lower = compact.to_ascii_lowercase();
     let deduped = terminal_activity_collapse_duplicate_runs(&compact);
     let deduped_lower = deduped.to_ascii_lowercase();
-    for candidate in [&compact, &deduped] {
-        let working_index = terminal_output_latest_working_indicator_index(candidate);
-        let mcp_startup_index = terminal_output_latest_mcp_startup_indicator_index(candidate);
-        match (working_index, mcp_startup_index) {
-            (Some(working), Some(startup)) if working > startup => {
-                return Some("Working".to_string());
-            }
-            (_, Some(_)) => return Some("MCP startup".to_string()),
-            (Some(_), None) => return Some("Working".to_string()),
-            (None, None) => {}
-        }
-    }
     if lower.contains("context refresh") || deduped_lower.contains("context refresh") {
         return Some("Context refresh".to_string());
     }
@@ -15450,11 +13867,6 @@ fn terminal_activity_hook_live_message_text(value: &str) -> Option<String> {
         .collect::<Vec<_>>();
     let text = lines.join("\n");
     (!text.trim().is_empty()).then_some(text)
-}
-
-fn terminal_activity_hook_structured_live_message_text(value: &str) -> Option<String> {
-    let cleaned = terminal_activity_strip_terminal_sequences(value);
-    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 fn terminal_activity_hook_activity_message_text(value: &str) -> Option<String> {
@@ -16481,7 +14893,6 @@ fn terminal_hook_prompt_submitted_observe(
             .turn_id
             .as_deref()
             .or(payload.provider_turn_id.as_deref()),
-        None,
         Some("cli-activity-hook"),
         payload
             .prompt_ready_at
@@ -16587,13 +14998,8 @@ fn terminal_activity_hook_next_poll_ms(current_poll_ms: u64) -> u64 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalActivityWatchdogAction {
-    StartupStop,
-    StartupDowngradeRunning,
-    McpStartupError,
-    StaleHotStop,
     WaitingRelease,
     PromptSubmitThinkingDecayIdle,
-    SettledDecayIdle,
 }
 
 fn terminal_activity_watchdog_launch_mode(runtime: &TerminalRuntimeSnapshot) -> &'static str {
@@ -16601,160 +15007,6 @@ fn terminal_activity_watchdog_launch_mode(runtime: &TerminalRuntimeSnapshot) -> 
         "terminal_start_agent"
     } else {
         "terminal_open"
-    }
-}
-
-fn terminal_activity_watchdog_runtime_is_paused_or_manual(
-    runtime: &TerminalRuntimeSnapshot,
-) -> bool {
-    let status = terminal_projection_text(&runtime.status, "");
-    let activity_status = terminal_projection_text(&runtime.activity_status, "");
-    let command_phase = terminal_projection_text(&runtime.command_phase, "");
-    [
-        status.as_str(),
-        activity_status.as_str(),
-        command_phase.as_str(),
-    ]
-    .iter()
-    .any(|value| {
-        matches!(
-            *value,
-            "paused"
-                | "awaiting_input"
-                | "awaiting-input"
-                | "awaiting_permission"
-                | "awaiting-permission"
-                | "awaiting_user"
-                | "awaiting-user"
-                | "manual_prompt"
-                | "manual-prompt"
-                | "needs_input"
-                | "needs-input"
-                | "permission"
-                | "permission_requested"
-                | "permission-requested"
-                | "prompting_user"
-                | "prompting-user"
-                | "requires_input"
-                | "requires-input"
-                | "requires_user_input"
-                | "requires-user-input"
-                | "uir"
-                | "user_input_required"
-                | "user-input-required"
-        )
-    })
-}
-
-fn terminal_activity_watchdog_runtime_is_active_tool(runtime: &TerminalRuntimeSnapshot) -> bool {
-    let activity_status = terminal_projection_text(&runtime.activity_status, "");
-    let command_phase = terminal_projection_text(&runtime.command_phase, "");
-    matches!(
-        activity_status.as_str(),
-        "shell" | "editing" | "mcp" | "tool_running" | "tool-running"
-    ) || matches!(
-        command_phase.as_str(),
-        "tool_running" | "tool-running" | "shell" | "editing" | "mcp"
-    )
-}
-
-fn terminal_activity_watchdog_runtime_is_stale_hot_candidate(
-    runtime: &TerminalRuntimeSnapshot,
-) -> bool {
-    terminal_projection_text(&runtime.canonical_state, "") != "waiting"
-        && terminal_runtime_snapshot_is_busy_turn(runtime)
-        && !terminal_runtime_snapshot_is_starting(runtime)
-        && !terminal_activity_watchdog_runtime_is_paused_or_manual(runtime)
-        && !terminal_activity_watchdog_runtime_is_active_tool(runtime)
-}
-
-fn terminal_activity_watchdog_starting_action(
-    runtime: &TerminalRuntimeSnapshot,
-    starting_age_ms: u64,
-    live_process: bool,
-    prompt_marker_visible: bool,
-    mcp_startup_visible: bool,
-    output_quiet: bool,
-    output_flowing: bool,
-) -> Option<TerminalActivityWatchdogAction> {
-    if !terminal_runtime_snapshot_is_starting(runtime)
-        || starting_age_ms < TERMINAL_STARTING_WATCHDOG_MS
-        || !live_process
-        || terminal_activity_watchdog_runtime_is_paused_or_manual(runtime)
-    {
-        return None;
-    }
-    if mcp_startup_visible {
-        return None;
-    }
-    if prompt_marker_visible || output_quiet {
-        return Some(TerminalActivityWatchdogAction::StartupStop);
-    }
-    if output_flowing {
-        return Some(TerminalActivityWatchdogAction::StartupDowngradeRunning);
-    }
-    None
-}
-
-fn terminal_activity_watchdog_pty_recovery_action(
-    metadata: &TerminalInstanceMetadata,
-    runtime: &TerminalRuntimeSnapshot,
-    starting_age_ms: u64,
-    live_process: bool,
-    prompt_marker_visible: bool,
-    mcp_startup_visible: bool,
-    output_quiet: bool,
-    output_flowing: bool,
-    stale_age_ms: u64,
-) -> Option<TerminalActivityWatchdogAction> {
-    if let Some(action) = terminal_activity_watchdog_starting_action(
-        runtime,
-        starting_age_ms,
-        live_process,
-        prompt_marker_visible,
-        mcp_startup_visible,
-        output_quiet,
-        output_flowing,
-    ) {
-        return Some(action);
-    }
-    if terminal_activity_provider_allows_pty_lifecycle_recovery(metadata) {
-        terminal_activity_watchdog_stale_hot_action(runtime, stale_age_ms)
-    } else {
-        None
-    }
-}
-
-fn terminal_activity_watchdog_mcp_startup_action(
-    runtime: &TerminalRuntimeSnapshot,
-    mcp_startup_visible: bool,
-    mcp_startup_age_ms: u64,
-) -> Option<TerminalActivityWatchdogAction> {
-    let status = terminal_projection_text(&runtime.status, "");
-    let activity_status = terminal_projection_text(&runtime.activity_status, "");
-    if mcp_startup_visible
-        && mcp_startup_age_ms >= TERMINAL_MCP_STARTUP_DEGRADED_MS
-        && !terminal_projection_state_is_error(&status)
-        && !terminal_projection_state_is_error(&activity_status)
-        && !terminal_projection_state_is_closed(&status)
-        && !terminal_projection_state_is_closed(&activity_status)
-    {
-        Some(TerminalActivityWatchdogAction::McpStartupError)
-    } else {
-        None
-    }
-}
-
-fn terminal_activity_watchdog_stale_hot_action(
-    runtime: &TerminalRuntimeSnapshot,
-    quiet_age_ms: u64,
-) -> Option<TerminalActivityWatchdogAction> {
-    if quiet_age_ms >= TERMINAL_HOT_STALE_WATCHDOG_MS
-        && terminal_activity_watchdog_runtime_is_stale_hot_candidate(runtime)
-    {
-        Some(TerminalActivityWatchdogAction::StaleHotStop)
-    } else {
-        None
     }
 }
 
@@ -16796,107 +15048,7 @@ fn terminal_activity_watchdog_prompt_submit_thinking_decay_action(
 /// live child. Claude panes spawn the CLI as the PTY child itself (prewarm
 /// explicitly excludes Claude), so child liveness observes the agent
 /// directly there.
-fn terminal_agent_may_run_inside_wrapper_shell(metadata: &TerminalInstanceMetadata) -> bool {
-    !terminal_metadata_is_claude(metadata)
-}
 
-/// interrupted/error decay: settled, turn closed, no open interaction, the
-/// CLI process alive and NOT visibly stuck in startup, and 30s since the
-/// runtime ENTERED the settled state — then project back to idle via the
-/// prompt-ready recovery path. The age is measured from the runtime's own
-/// update stamp, never the hook/output quiet clock: an interrupt after a
-/// long-quiet turn must still wait the full window.
-///
-/// `live_process` is NECESSARY but not SUFFICIENT for wrapper-shell panes
-/// (`agent_in_wrapper_shell`, i.e. every non-Claude provider): there the
-/// live child is only the wrapper shell, so decaying to idle on liveness
-/// alone lets dispatch type queued prompts into a bare shell after the agent
-/// crashed. Those panes additionally require POSITIVE agent-at-prompt
-/// evidence — the composer prompt marker visible in the output tail. The
-/// marker detector recognizes the `›`/`❯`/`❱` glyphs, `>`-prefixed composer
-/// lines, and OpenCode's "ctrl+p commands" footer; a provider whose composer
-/// renders none of these never satisfies the gate and therefore never
-/// decays — fail CLOSED by construction, because a false negative merely
-/// keeps the pane in its settled state while a false positive would feed
-/// prompts to a dead agent.
-fn terminal_activity_watchdog_settled_decay_action(
-    runtime: &TerminalRuntimeSnapshot,
-    settled_age_ms: u64,
-    live_process: bool,
-    mcp_startup_visible: bool,
-    agent_in_wrapper_shell: bool,
-    prompt_marker_visible: bool,
-) -> Option<TerminalActivityWatchdogAction> {
-    if settled_age_ms < TERMINAL_SETTLED_DECAY_WATCHDOG_MS || !live_process || mcp_startup_visible
-    {
-        return None;
-    }
-    if agent_in_wrapper_shell && !prompt_marker_visible {
-        return None;
-    }
-    let canonical = terminal_projection_text(&runtime.canonical_state, "");
-    (matches!(canonical.as_str(), "interrupted" | "error")
-        && !runtime.turn_active
-        && runtime.active_interaction_id.is_none())
-    .then_some(TerminalActivityWatchdogAction::SettledDecayIdle)
-}
-
-fn terminal_activity_watchdog_headless_total_bytes(
-    headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
-) -> u64 {
-    headless_output
-        .lock()
-        .map(|output| output.total_bytes)
-        .unwrap_or_default()
-}
-
-/// Prompt-marker liveness reads the CURRENT VT screen, never the raw output
-/// tail. The tail is an append-only byte journal: a TUI footer (OpenCode's
-/// "ctrl+p commands", a composer `›` line) stays in those bytes even after
-/// the CLI overwrote it in place or exited to its wrapper shell — scanning
-/// them lets a dead agent look input-ready and feeds queued prompts into a
-/// bare shell. The parsed grid only contains what is visible right now, so
-/// overwritten or scrolled-away markers cannot satisfy the gate. The scan is
-/// limited to the bottom rows of the visible screen (composer/footer
-/// territory) so stale transcript echoes higher up cannot satisfy it either.
-/// A raw-tail chunk scan remains acceptable only for paths with no VT state;
-/// every headless buffer here carries one, so none use it.
-fn terminal_headless_tail_has_prompt_marker(
-    headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
-) -> bool {
-    let Ok(output) = headless_output.lock() else {
-        return false;
-    };
-    let rows = output.vt_screen_bottom_rows(8);
-    if rows.is_empty() {
-        return false;
-    }
-    terminal_output_current_prompt_marker(&rows.join("\n"))
-}
-
-fn terminal_headless_tail_has_mcp_startup_marker(
-    headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
-) -> bool {
-    let Ok(output) = headless_output.lock() else {
-        return false;
-    };
-    let tail = output.tail.iter().copied().collect::<Vec<_>>();
-    if tail.is_empty() {
-        return false;
-    }
-    let start = tail.len().saturating_sub(TERMINAL_STARTUP_READY_SCAN_BYTES);
-    let text = String::from_utf8_lossy(&tail[start..]);
-    let mut recent_lines = text.lines().rev().take(8).collect::<Vec<_>>();
-    recent_lines.reverse();
-    terminal_output_current_mcp_startup_marker(&recent_lines.join("\n"))
-}
-
-async fn terminal_activity_watchdog_child_is_live(instance: &TerminalInstance) -> bool {
-    let mut child = instance.child.lock().await;
-    child
-        .as_mut()
-        .is_some_and(|child| !poll_terminal_child_exit(child.as_mut()))
-}
 
 fn terminal_activity_watchdog_event(
     instance: &TerminalInstance,
@@ -18970,10 +17122,7 @@ fn spawn_terminal_activity_hook_watcher(
         let mut last_debug_fingerprint: Option<TerminalActivityHookFileFingerprint> = None;
         let mut current_poll_ms = poll_ms;
         let mut unchanged_polls = 0u32;
-        let mut last_output_total_bytes = 0u64;
-        let mut last_output_activity_ms = terminal_now_ms();
-        let mut last_hook_or_output_activity_ms = last_output_activity_ms;
-        let mut mcp_startup_observed_at_ms: Option<u64> = None;
+        let mut last_hook_activity_ms = terminal_now_ms();
         loop {
             if app_shutdown_requested() {
                 break;
@@ -18985,31 +17134,6 @@ fn spawn_terminal_activity_hook_watcher(
             };
             let now_ms = terminal_now_ms();
             let runtime = terminal_runtime_snapshot(&instance);
-            let headless_output = Arc::clone(&instance.headless_output);
-            let output_total_bytes =
-                terminal_activity_watchdog_headless_total_bytes(&headless_output);
-            let output_changed = output_total_bytes != last_output_total_bytes;
-            if output_changed {
-                last_output_total_bytes = output_total_bytes;
-                last_output_activity_ms = now_ms;
-                last_hook_or_output_activity_ms = now_ms;
-            }
-            let output_quiet =
-                now_ms.saturating_sub(last_output_activity_ms) >= TERMINAL_WATCHDOG_OUTPUT_QUIET_MS;
-            let output_flowing = output_changed && !output_quiet;
-            let prompt_marker_visible = terminal_headless_tail_has_prompt_marker(&headless_output);
-            let mcp_startup_visible =
-                terminal_headless_tail_has_mcp_startup_marker(&headless_output);
-            if mcp_startup_visible {
-                mcp_startup_observed_at_ms.get_or_insert(now_ms);
-            } else {
-                mcp_startup_observed_at_ms = None;
-            }
-            let mcp_startup_age_ms = mcp_startup_observed_at_ms
-                .map(|observed_at_ms| now_ms.saturating_sub(observed_at_ms))
-                .unwrap_or_default();
-            let live_process = terminal_activity_watchdog_child_is_live(&instance).await;
-            let starting_age_ms = now_ms.saturating_sub(runtime.updated_at_ms);
             let prompt_submit_thinking_age_ms = now_ms.saturating_sub(runtime.updated_at_ms);
             let should_check_prompt_submit_todo =
                 prompt_submit_thinking_age_ms
@@ -19038,71 +17162,10 @@ fn spawn_terminal_activity_hook_watcher(
             } else {
                 false
             };
-            let runtime_activity = terminal_projection_text(&runtime.activity_status, "");
-            let runtime_interrupted = matches!(
-                runtime_activity.as_str(),
-                "cancelled" | "canceled" | "interrupted"
-            ) || terminal_projection_text(&runtime.event_type, "")
-                == "provider_turn_interrupted";
-            if mcp_startup_visible
-                && !runtime_interrupted
-                && runtime.event_type != "provider-mcp-starting"
-                && !terminal_projection_state_is_error(&runtime.status)
-                && !terminal_projection_state_is_error(&runtime.activity_status)
-            {
-                let event = terminal_activity_watchdog_event(
-                    &instance,
-                    &runtime,
-                    "McpStartup",
-                    "backend-mcp-startup-classifier",
-                    "mcp_startup_visible",
-                );
-                process_terminal_activity_hook_event(
-                    &app,
-                    &terminals,
-                    &cloud_mcp_state,
-                    &pane_id,
-                    instance_id,
-                    &instance,
-                    &event,
-                    "backend-mcp-startup-classifier",
-                )
-                .await;
-            }
-            let watchdog_action = terminal_activity_watchdog_mcp_startup_action(
+            let watchdog_action = terminal_activity_watchdog_waiting_release_action(
                 &runtime,
-                mcp_startup_visible,
-                mcp_startup_age_ms,
+                now_ms.saturating_sub(last_hook_activity_ms),
             )
-            .or_else(|| {
-                (!terminal_codex_hook_trust_discovery_blocks_idle(&pane_id, instance_id))
-                    .then(|| {
-                        terminal_activity_watchdog_pty_recovery_action(
-                            &instance.metadata,
-                            &runtime,
-                            starting_age_ms,
-                            live_process,
-                            prompt_marker_visible,
-                            mcp_startup_visible,
-                            output_quiet,
-                            output_flowing,
-                            now_ms.saturating_sub(last_hook_or_output_activity_ms),
-                        )
-                    })
-                    .flatten()
-            })
-            // OUTSIDE the pty-lifecycle-recovery gate: WAITING is Claude-only
-            // and Claude still rejects non-startup PTY recovery.
-            .or_else(|| {
-                terminal_activity_watchdog_waiting_release_action(
-                    &runtime,
-                    now_ms.saturating_sub(last_hook_or_output_activity_ms),
-                )
-            })
-            // Prompt-submit thinking decay is provider-agnostic and runs outside
-            // PTY recovery: it only releases a still-unproven submit latch when
-            // no pane-bound todo exists and no provider activity has overwritten
-            // the runtime's prompt-submit evidence.
             .or_else(|| {
                 terminal_activity_watchdog_prompt_submit_thinking_decay_action(
                     &runtime,
@@ -19110,47 +17173,9 @@ fn spawn_terminal_activity_hook_watcher(
                     pane_has_running_todo,
                     prompt_submit_decay_activity_changed_since_last_drain,
                 )
-            })
-            // Also outside the gate: interrupted/error decay applies to every
-            // provider. Age = time since the runtime last changed (i.e. since
-            // it ENTERED the settled state, plus benign metadata refreshes
-            // which only delay the decay).
-            .or_else(|| {
-                terminal_activity_watchdog_settled_decay_action(
-                    &runtime,
-                    now_ms.saturating_sub(runtime.updated_at_ms),
-                    live_process,
-                    mcp_startup_visible,
-                    terminal_agent_may_run_inside_wrapper_shell(&instance.metadata),
-                    prompt_marker_visible,
-                )
             });
             if let Some(action) = watchdog_action {
                 let (hook_event_name, source, reason) = match action {
-                    TerminalActivityWatchdogAction::StartupStop => (
-                        "Stop",
-                        "backend-startup-watchdog",
-                        if prompt_marker_visible {
-                            "starting_prompt_marker_visible"
-                        } else {
-                            "starting_output_quiet"
-                        },
-                    ),
-                    TerminalActivityWatchdogAction::StartupDowngradeRunning => (
-                        "Notification",
-                        "backend-startup-output-flowing",
-                        "starting_output_flowing",
-                    ),
-                    TerminalActivityWatchdogAction::McpStartupError => (
-                        "McpStartupError",
-                        "backend-mcp-startup-watchdog",
-                        "mcp_startup_deadline_exceeded",
-                    ),
-                    TerminalActivityWatchdogAction::StaleHotStop => (
-                        "Stop",
-                        "backend-stale-hot-watchdog",
-                        "stale_hot_no_hook_or_output",
-                    ),
                     TerminalActivityWatchdogAction::WaitingRelease => (
                         "Stop",
                         "backend-waiting-release-watchdog",
@@ -19161,15 +17186,6 @@ fn spawn_terminal_activity_hook_watcher(
                         "backend-prompt-submit-thinking-decay-watchdog",
                         "prompt_submit_without_todo_or_activity",
                     ),
-                    TerminalActivityWatchdogAction::SettledDecayIdle => (
-                        if terminal_projection_text(&runtime.canonical_state, "") == "error" {
-                            "PromptReadyAfterStartupError"
-                        } else {
-                            "PromptReadyAfterInterrupt"
-                        },
-                        "backend-settled-decay-watchdog",
-                        "interrupted_error_settled_ttl",
-                    ),
                 };
                 log_terminal_status_event(
                     "backend.terminal_activity_watchdog.transition",
@@ -19179,19 +17195,14 @@ fn spawn_terminal_activity_hook_watcher(
                         "hook_event_name": hook_event_name,
                         "instance_id": instance_id,
                         "launch_mode": terminal_activity_watchdog_launch_mode(&runtime),
-                        "output_quiet": output_quiet,
-                        "mcp_startup_age_ms": mcp_startup_age_ms,
-                        "mcp_startup_visible": mcp_startup_visible,
                         "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                        "prompt_marker_visible": prompt_marker_visible,
                         "provider": clean_terminal_diagnostic_log_text(&instance.metadata.agent_kind),
                         "prompt_submit_activity_changed_since_last_drain": prompt_submit_decay_activity_changed_since_last_drain,
                         "pane_has_running_todo": pane_has_running_todo,
                         "prompt_submit_thinking_age_ms": prompt_submit_thinking_age_ms,
                         "reason": reason,
                         "runtime_source": clean_terminal_diagnostic_log_text(&runtime.source),
-                        "starting_age_ms": starting_age_ms,
-                        "stale_age_ms": now_ms.saturating_sub(last_hook_or_output_activity_ms),
+                        "stale_age_ms": now_ms.saturating_sub(last_hook_activity_ms),
                     }),
                 );
                 let mut event = terminal_activity_watchdog_event(
@@ -19203,23 +17214,10 @@ fn spawn_terminal_activity_hook_watcher(
                 );
                 if matches!(
                     action,
-                    TerminalActivityWatchdogAction::SettledDecayIdle
-                        | TerminalActivityWatchdogAction::PromptSubmitThinkingDecayIdle
+                    TerminalActivityWatchdogAction::PromptSubmitThinkingDecayIdle
                 ) {
-                    // Both decay paths require an EXPLICIT matching generation;
-                    // the runtime's own value is exactly the turn being released.
                     if let Some(object) = event.as_object_mut() {
                         object.insert("turn_generation".to_string(), json!(runtime.turn_generation));
-                    }
-                }
-                if matches!(action, TerminalActivityWatchdogAction::McpStartupError) {
-                    if let Some(object) = event.as_object_mut() {
-                        object.insert("error_code".to_string(), json!("mcp_startup_timeout"));
-                        object.insert(
-                            "error".to_string(),
-                            json!("An MCP server is still starting. The terminal remains open; retry the MCP connection or sign in again if authentication failed."),
-                        );
-                        object.insert("retryable".to_string(), json!(true));
                     }
                 }
                 process_terminal_activity_hook_event(
@@ -19233,15 +17231,7 @@ fn spawn_terminal_activity_hook_watcher(
                     source,
                 )
                 .await;
-                last_hook_or_output_activity_ms = now_ms;
-                if matches!(
-                    action,
-                    TerminalActivityWatchdogAction::StartupStop
-                        | TerminalActivityWatchdogAction::StaleHotStop
-                        | TerminalActivityWatchdogAction::WaitingRelease
-                ) {
-                    last_output_activity_ms = now_ms;
-                }
+                last_hook_activity_ms = now_ms;
             }
 
             let activity_fingerprint =
@@ -19253,7 +17243,7 @@ fn spawn_terminal_activity_hook_watcher(
             if activity_changed && activity_fingerprint.is_some()
                 || debug_changed && debug_fingerprint.is_some()
             {
-                last_hook_or_output_activity_ms = terminal_now_ms();
+                last_hook_activity_ms = terminal_now_ms();
             }
             if activity_changed || debug_changed {
                 current_poll_ms = TERMINAL_ACTIVITY_HOOK_POLL_MS;
@@ -19450,7 +17440,6 @@ fn terminal_activity_hook_event_was_transport_delivered(event: &Value) -> bool {
 fn terminal_prompt_submitted_source_is_authoritative(
     prompt_source: &str,
     prompt_match: bool,
-    observed_prompt: Option<&str>,
 ) -> bool {
     if !prompt_match {
         return false;
@@ -19458,9 +17447,6 @@ fn terminal_prompt_submitted_source_is_authoritative(
 
     match prompt_source {
         "activity_hook_user_prompt_submit" | "cli_hook_user_prompt_submit" => true,
-        "observed_input_gate" => observed_prompt
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty()),
         "parked_resume_backend_submit"
         | "crash_todo_resume_backend_submit"
         | "todo_queue_backend_submit" => true,
@@ -19468,29 +17454,6 @@ fn terminal_prompt_submitted_source_is_authoritative(
     }
 }
 
-fn terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(
-    prompt_event_source: Option<&str>,
-) -> bool {
-    let source = prompt_event_source
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .replace('_', "-");
-
-    matches!(
-        source.as_str(),
-        "tui-terminal-direct-input"
-            | "terminal-direct-input"
-            | "tui-manual-input"
-            | "observed-terminal-prompt"
-            | "terminal-prompt-submitted"
-            | "terminal-view-drop"
-            | "todo-auto-queue"
-            | "voice-agent-queue"
-            | "voice-plan-queue"
-            | "remote-control"
-    ) || source.starts_with("tui-manual-input:")
-}
 
 fn terminal_input_queue_key(pane_id: &str, instance_id: Option<u64>) -> String {
     format!("{pane_id}:{}", instance_id.unwrap_or_default())
@@ -19531,13 +17494,8 @@ fn spawn_terminal_input_queue_worker(
                 payload.prompt_event_source,
                 payload.prompt_event_submitted_at,
                 payload.prompt_event_text,
-                payload.todo_id,
-                payload.todo_dispatch_id,
-                payload.todo_command_id,
                 payload.todo_action,
-                payload.todo_resume_requested,
                 payload.thread_id,
-                payload.app_fork_enabled,
                 None,
                 true,
                 true,
@@ -23888,19 +21846,14 @@ async fn terminal_write_inner(
     cloud_mcp_state: &CloudMcpState,
     pane_id: String,
     instance_id: Option<u64>,
-    mut data: String,
+    data: String,
     prompt_event_id: Option<String>,
     prompt_event_revision: Option<u64>,
     prompt_event_source: Option<String>,
     prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
-    todo_id: Option<String>,
-    todo_dispatch_id: Option<String>,
-    todo_command_id: Option<String>,
     todo_action: Option<String>,
-    todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
-    app_fork_enabled: Option<bool>,
     structured_answer_option_id: Option<String>,
     arm_structured_answer_confirmation: bool,
     _realtime_write: bool,
@@ -24040,21 +21993,6 @@ async fn terminal_write_inner(
             }),
         );
     }
-    if app_fork_enabled.unwrap_or(false) {
-        let fork_preview_data = normalize_terminal_enter_sequences_for_pty(data.clone());
-        if terminal_try_emit_app_fork_request(
-            &app,
-            &instance,
-            &pane_id,
-            thread_id.as_deref(),
-            &fork_preview_data,
-            "terminal_write",
-        )
-        .await
-        {
-            return Ok(());
-        }
-    }
     if prompt_submission_requested {
         if let Some(coordination) = instance.coordination.clone() {
             let readiness = tauri::async_runtime::spawn_blocking(move || {
@@ -24138,7 +22076,6 @@ async fn terminal_write_inner(
     }
     let _input_guard = instance.input_queue.lock().await;
     let original_data_diagnostic = terminal_write_data_diagnostic(&data);
-    let data = normalize_terminal_enter_sequences_for_pty(data);
     let normalized_data_diagnostic = terminal_write_data_diagnostic(&data);
     let input_write_diagnostic_kind =
         terminal_input_write_diagnostic_kind(&data, &prompt_event_id, &prompt_event_text);
@@ -24220,7 +22157,6 @@ async fn terminal_write_inner(
             cloud_mcp_state,
             &pane_id,
             &instance,
-            "escape_key",
             "Interrupted by Escape; the terminal remains open for follow-up instructions.",
         )
         .await?;
@@ -24241,31 +22177,6 @@ async fn terminal_write_inner(
             "escape_key",
         );
         return Ok(());
-    }
-
-    if let Some(diagnostic_kind) = input_write_diagnostic_kind {
-        let input_gate_before_write = {
-            let gate = instance.input_gate.lock().await;
-            terminal_input_gate_diagnostic_snapshot(&gate)
-        };
-        write_thread_bridge_diagnostic_log_entry(json!({
-            "ts_ms": current_time_ms(),
-            "phase": "backend.bridge.input_write_start",
-            "source": "backend",
-            "app_pid": std::process::id(),
-            "thread": terminal_diagnostic_thread_label(),
-            "fields": {
-                "diagnostic_kind": diagnostic_kind,
-                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                "input_gate_before_write": input_gate_before_write,
-                "instance_id": instance.id,
-                "normalized_data": normalized_data_diagnostic.clone(),
-                "original_data": original_data_diagnostic.clone(),
-                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                "thread_id": thread_id.as_deref().unwrap_or_default(),
-            },
-        }));
     }
 
     let mut claimed_structured_answer = None;
@@ -24416,450 +22327,6 @@ async fn terminal_write_inner(
         }));
     }
 
-    let (observed_prompt, input_gate_before, input_gate_after) =
-        terminal_observe_submitted_prompt(&instance, &data).await;
-    if let Some(prompt) = observed_prompt {
-        let requested_event_prompt = prompt_event_text
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        if is_terminal_control_prompt(&prompt) {
-            write_thread_bridge_diagnostic_log_entry(json!({
-                "ts_ms": current_time_ms(),
-                "phase": "backend.bridge.prompt_observed_control_skip",
-                "source": "backend",
-                "app_pid": std::process::id(),
-                "thread": terminal_diagnostic_thread_label(),
-                "fields": {
-                    "data_len": data.len(),
-                    "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                    "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                    "instance_id": instance.id,
-                    "normalized_data": normalized_data_diagnostic.clone(),
-                    "observed_prompt_len": prompt.len(),
-                    "original_data": original_data_diagnostic.clone(),
-                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    "prompt_prefix": clean_terminal_diagnostic_log_text(prompt.split_whitespace().next().unwrap_or_default()),
-                    "thread_id": thread_id.as_deref().unwrap_or_default(),
-                },
-            }));
-            return Ok(());
-        }
-        let prompt_event_text_matches_observed = requested_event_prompt
-            .as_ref()
-            .map(|value| value == &prompt)
-            .unwrap_or(true);
-        let event_prompt = prompt.clone();
-        let submitted_prompt_source = if prompt_event_text_matches_observed {
-            "observed_input_gate"
-        } else {
-            "observed_input_gate_mismatch"
-        };
-        let submitted_prompt_authoritative = terminal_prompt_submitted_source_is_authoritative(
-            submitted_prompt_source,
-            prompt_event_text_matches_observed,
-            Some(&prompt),
-        );
-        emit_terminal_prompt_submitted(
-            &app,
-            &instance,
-            &event_prompt,
-            prompt_event_id.as_deref(),
-            prompt_event_revision,
-            prompt_event_source.as_deref(),
-            prompt_event_submitted_at.as_deref(),
-            todo_id.as_deref(),
-            todo_dispatch_id.as_deref(),
-            todo_command_id.as_deref(),
-            todo_action.as_deref(),
-            todo_resume_requested.unwrap_or(false),
-            requested_event_prompt.as_deref(),
-            Some(&prompt),
-            prompt_event_text_matches_observed,
-            submitted_prompt_source,
-            thread_id.as_deref(),
-        );
-        if submitted_prompt_authoritative && !terminal_runtime_has_provider_session(&instance) {
-            // Harness session stores can materialize only after the first
-            // prompt, after launch-time discovery has elapsed. Re-arm exact
-            // prompt discovery so the provider session enters live state
-            // without waiting for periodic reconciliation. Native hook IDs
-            // still win whenever they arrive first.
-            let normalized_agent =
-                terminal_normalize_agent_kind(Some(&instance.metadata.agent_kind))
-                    .or_else(|| terminal_normalize_agent_kind(Some(&instance.metadata.agent_id)))
-                    .unwrap_or_default();
-            log_terminal_status_event(
-                "backend.terminal_provider_session.prompt_discovery_armed",
-                json!({
-                    "agent_id": normalized_agent.clone(),
-                    "instance_id": instance.id,
-                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                    "source": submitted_prompt_source,
-                    "workspace_id": clean_terminal_diagnostic_log_text(&instance.metadata.workspace_id),
-                }),
-            );
-            if normalized_agent == "codex" {
-                spawn_terminal_codex_session_discovery(
-                    app.clone(),
-                    Arc::clone(&state.terminals),
-                    pane_id.clone(),
-                    instance.id,
-                    terminal_now_ms().saturating_sub(30_000),
-                    "terminal_prompt_submitted",
-                    &TERMINAL_PROMPT_SESSION_DISCOVERY_DELAYS_MS,
-                );
-            } else if matches!(normalized_agent.as_str(), "claude" | "opencode") {
-                spawn_terminal_non_codex_session_discovery_for_prompt(
-                    app.clone(),
-                    Arc::clone(&state.terminals),
-                    pane_id.clone(),
-                    instance.id,
-                    event_prompt.clone(),
-                    "terminal_prompt_submitted",
-                );
-            }
-        }
-        log_terminal_status_event(
-            "backend.terminal_write.prompt_observed",
-            json!({
-                "event_prompt_len": event_prompt.len(),
-                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                "input_gate_after": input_gate_after,
-                "input_gate_before": input_gate_before,
-                "instance_id": instance.id,
-                "observed_prompt_len": prompt.len(),
-                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                "prompt_event_text_matches_observed": prompt_event_text_matches_observed,
-                "submitted_event_prompt_authoritative": submitted_prompt_authoritative,
-                "submitted_event_prompt_source": submitted_prompt_source,
-                "thread_id": thread_id.as_deref().unwrap_or_default(),
-            }),
-        );
-        write_thread_bridge_diagnostic_log_entry(json!({
-            "ts_ms": current_time_ms(),
-            "phase": "backend.bridge.prompt_observed",
-            "source": "backend",
-            "app_pid": std::process::id(),
-            "thread": terminal_diagnostic_thread_label(),
-            "fields": {
-                "data_len": data.len(),
-                "event_prompt_len": event_prompt.len(),
-                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                "input_gate_after": input_gate_after,
-                "input_gate_before": input_gate_before,
-                "instance_id": instance.id,
-                "normalized_data": normalized_data_diagnostic,
-                "observed_prompt_len": prompt.len(),
-                "observer_reason": "submitted_prompt_observed",
-                "original_data": original_data_diagnostic,
-                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                "prompt_event_text_len": requested_event_prompt.as_deref().map(str::len).unwrap_or_default(),
-                "prompt_event_text_matches_observed": prompt_event_text_matches_observed,
-                "submitted_event_prompt_authoritative": submitted_prompt_authoritative,
-                "submitted_event_prompt_source": submitted_prompt_source,
-                "thread_id": thread_id.as_deref().unwrap_or_default(),
-            },
-        }));
-        if submitted_prompt_authoritative && *instance.agent_started.lock().await {
-            let cloud_state = cloud_mcp_state.clone();
-            let pane_id_for_context = pane_id.clone();
-            let working_directory = instance.working_directory.as_ref().clone();
-            let coordination = instance.coordination.clone();
-            let session_mode = instance.session_mode;
-            let terminal_instance_id = instance.id;
-            let active_task = instance.active_task.lock().await.clone();
-            let local_task_id = active_task.as_ref().map(|task| task.task_id.clone());
-            let local_task_title = active_task.as_ref().map(|task| task.title.clone());
-            let metadata = instance.metadata.clone();
-            let prompt_metadata = CloudMcpTerminalPromptMetadata {
-                prompt_event_id: prompt_event_id.clone(),
-                prompt_event_source: prompt_event_source.clone(),
-                prompt_event_submitted_at: prompt_event_submitted_at.clone(),
-                todo_id: todo_id.clone(),
-                todo_dispatch_id: todo_dispatch_id.clone(),
-                todo_command_id: todo_command_id.clone(),
-                todo_action: todo_action.clone(),
-                todo_resume_requested: todo_resume_requested.unwrap_or(false),
-                terminal_index: metadata.terminal_index,
-                thread_id: thread_id
-                    .clone()
-                    .or_else(|| Some(metadata.thread_id.clone())),
-                workspace_id: metadata.workspace_id.clone(),
-                workspace_name: metadata.workspace_name.clone(),
-            };
-            let prompt_for_cloud = prompt.clone();
-            tauri::async_runtime::spawn(async move {
-                cloud_mcp_terminal_context_pack_for_prompt(
-                    cloud_state,
-                    pane_id_for_context,
-                    terminal_instance_id,
-                    working_directory,
-                    coordination,
-                    session_mode,
-                    local_task_id,
-                    local_task_title,
-                    prompt_for_cloud,
-                    Some(prompt_metadata),
-                )
-                .await;
-            });
-        }
-    } else if prompt_event_id
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-        || prompt_event_text
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-    {
-        let observer_reason = terminal_prompt_observer_not_observed_reason(
-            &data,
-            &input_gate_before,
-            &input_gate_after,
-        );
-        write_thread_bridge_diagnostic_log_entry(json!({
-            "ts_ms": current_time_ms(),
-            "phase": "backend.bridge.prompt_not_observed",
-            "source": "backend",
-            "app_pid": std::process::id(),
-            "thread": terminal_diagnostic_thread_label(),
-            "fields": {
-                "data_len": data.len(),
-                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                "has_prompt_event_text": prompt_event_text.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                "input_gate_after": input_gate_after,
-                "input_gate_before": input_gate_before,
-                "instance_id": instance.id,
-                "normalized_data": normalized_data_diagnostic,
-                "observer_reason": observer_reason,
-                "original_data": original_data_diagnostic,
-                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                "thread_id": thread_id.as_deref().unwrap_or_default(),
-            },
-        }));
-        log_terminal_status_event(
-            "backend.terminal_write.prompt_not_observed",
-            json!({
-                "data_len": data.len(),
-                "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                "input_gate_after": input_gate_after,
-                "input_gate_before": input_gate_before,
-                "instance_id": instance.id,
-                "observer_reason": observer_reason,
-                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                "prompt_text_len": prompt_event_text.as_deref().map(str::len).unwrap_or_default(),
-                "thread_id": thread_id.as_deref().unwrap_or_default(),
-            }),
-        );
-        if let Some(event_prompt) = prompt_event_text
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-        {
-            if observer_reason == "submit_with_empty_input_gate" {
-                if terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(
-                    prompt_event_source.as_deref(),
-                ) {
-                    log_terminal_status_event(
-                        "backend.terminal_write.prompt_event_text_empty_gate_diagnostic",
-                        json!({
-                            "data_len": data.len(),
-                            "instance_id": instance.id,
-                            "observer_reason": observer_reason,
-                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                            "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                            "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                            "prompt_text_len": event_prompt.len(),
-                            "thread_id": thread_id.as_deref().unwrap_or_default(),
-                        }),
-                    );
-                    write_thread_bridge_diagnostic_log_entry(json!({
-                        "ts_ms": current_time_ms(),
-                        "phase": "backend.bridge.prompt_event_text_empty_gate_diagnostic",
-                        "source": "backend",
-                        "app_pid": std::process::id(),
-                        "thread": terminal_diagnostic_thread_label(),
-                        "fields": {
-                            "data_len": data.len(),
-                            "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                            "has_prompt_event_text": true,
-                            "instance_id": instance.id,
-                            "normalized_data": normalized_data_diagnostic.clone(),
-                            "observer_reason": observer_reason,
-                            "original_data": original_data_diagnostic.clone(),
-                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                            "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                            "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                            "prompt_text_len": event_prompt.len(),
-                            "thread_id": thread_id.as_deref().unwrap_or_default(),
-                        },
-                    }));
-                } else {
-                    log_terminal_status_event(
-                        "backend.terminal_write.prompt_event_text_empty_gate_skip",
-                        json!({
-                            "data_len": data.len(),
-                            "instance_id": instance.id,
-                            "observer_reason": observer_reason,
-                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                            "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                            "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                            "prompt_text_len": event_prompt.len(),
-                            "status_truth": "prompt_submit_not_authoritative",
-                            "thread_id": thread_id.as_deref().unwrap_or_default(),
-                        }),
-                    );
-                    write_thread_bridge_diagnostic_log_entry(json!({
-                        "ts_ms": current_time_ms(),
-                        "phase": "backend.bridge.prompt_event_text_empty_gate_skip",
-                        "source": "backend",
-                        "app_pid": std::process::id(),
-                        "thread": terminal_diagnostic_thread_label(),
-                        "fields": {
-                            "data_len": data.len(),
-                            "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                            "has_prompt_event_text": true,
-                            "instance_id": instance.id,
-                            "normalized_data": normalized_data_diagnostic.clone(),
-                            "observer_reason": observer_reason,
-                            "original_data": original_data_diagnostic.clone(),
-                            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                            "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                            "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                            "prompt_text_len": event_prompt.len(),
-                            "thread_id": thread_id.as_deref().unwrap_or_default(),
-                        },
-                    }));
-                    return Ok(());
-                }
-            }
-            if is_terminal_control_prompt(&event_prompt) {
-                write_thread_bridge_diagnostic_log_entry(json!({
-                    "ts_ms": current_time_ms(),
-                    "phase": "backend.bridge.prompt_event_text_control_skip",
-                    "source": "backend",
-                    "app_pid": std::process::id(),
-                    "thread": terminal_diagnostic_thread_label(),
-                    "fields": {
-                        "data_len": data.len(),
-                        "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                        "has_prompt_event_text": true,
-                        "instance_id": instance.id,
-                        "normalized_data": normalized_data_diagnostic.clone(),
-                        "original_data": original_data_diagnostic.clone(),
-                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                        "prompt_prefix": clean_terminal_diagnostic_log_text(event_prompt.split_whitespace().next().unwrap_or_default()),
-                        "thread_id": thread_id.as_deref().unwrap_or_default(),
-                    },
-                }));
-                return Ok(());
-            }
-            if data.contains('\r') || data.contains('\n') {
-                log_terminal_status_event(
-                    "backend.terminal_write.prompt_event_submit_metadata_skip",
-                    json!({
-                        "data_len": data.len(),
-                        "instance_id": instance.id,
-                        "observer_reason": observer_reason,
-                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                        "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                        "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                        "prompt_text_len": event_prompt.len(),
-                        "status_truth": "prompt_submit_not_observed",
-                        "thread_id": thread_id.as_deref().unwrap_or_default(),
-                    }),
-                );
-                write_thread_bridge_diagnostic_log_entry(json!({
-                    "ts_ms": current_time_ms(),
-                    "phase": "backend.bridge.prompt_event_submit_metadata_skip",
-                    "source": "backend",
-                    "app_pid": std::process::id(),
-                    "thread": terminal_diagnostic_thread_label(),
-                    "fields": {
-                        "data_len": data.len(),
-                        "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                        "has_prompt_event_text": true,
-                        "instance_id": instance.id,
-                        "observer_reason": observer_reason,
-                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                        "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                        "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                        "prompt_text_len": event_prompt.len(),
-                        "thread_id": thread_id.as_deref().unwrap_or_default(),
-                    },
-                }));
-                return Ok(());
-            }
-            log_terminal_status_event(
-                "backend.terminal_write.prompt_event_text_unobserved_skip",
-                json!({
-                    "data_len": data.len(),
-                    "instance_id": instance.id,
-                    "observer_reason": observer_reason,
-                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                    "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                    "prompt_text_len": event_prompt.len(),
-                    "status_truth": "prompt_submit_not_authoritative",
-                    "thread_id": thread_id.as_deref().unwrap_or_default(),
-                }),
-            );
-            write_thread_bridge_diagnostic_log_entry(json!({
-                "ts_ms": current_time_ms(),
-                "phase": "backend.bridge.prompt_event_text_unobserved_skip",
-                "source": "backend",
-                "app_pid": std::process::id(),
-                "thread": terminal_diagnostic_thread_label(),
-                "fields": {
-                    "data_len": data.len(),
-                    "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                    "has_prompt_event_text": true,
-                    "instance_id": instance.id,
-                    "observer_reason": observer_reason,
-                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
-                    "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
-                    "prompt_text_len": event_prompt.len(),
-                    "thread_id": thread_id.as_deref().unwrap_or_default(),
-                },
-            }));
-            return Ok(());
-        }
-    } else if let Some(diagnostic_kind) = input_write_diagnostic_kind {
-        let observer_reason = terminal_prompt_observer_not_observed_reason(
-            &data,
-            &input_gate_before,
-            &input_gate_after,
-        );
-        write_thread_bridge_diagnostic_log_entry(json!({
-            "ts_ms": current_time_ms(),
-            "phase": "backend.bridge.input_observed_no_submit",
-            "source": "backend",
-            "app_pid": std::process::id(),
-            "thread": terminal_diagnostic_thread_label(),
-            "fields": {
-                "data_len": data.len(),
-                "diagnostic_kind": diagnostic_kind,
-                "input_gate_after": input_gate_after,
-                "input_gate_before": input_gate_before,
-                "instance_id": instance.id,
-                "normalized_data": normalized_data_diagnostic,
-                "observer_reason": observer_reason,
-                "original_data": original_data_diagnostic,
-                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                "thread_id": thread_id.as_deref().unwrap_or_default(),
-            },
-        }));
-    }
-
     Ok(())
 }
 
@@ -24876,13 +22343,8 @@ async fn terminal_write(
     prompt_event_source: Option<String>,
     prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
-    todo_id: Option<String>,
-    todo_dispatch_id: Option<String>,
-    todo_command_id: Option<String>,
     todo_action: Option<String>,
-    todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
-    app_fork_enabled: Option<bool>,
 ) -> Result<(), String> {
     terminal_write_inner(
         app.clone(),
@@ -24896,13 +22358,8 @@ async fn terminal_write(
         prompt_event_source,
         prompt_event_submitted_at,
         prompt_event_text,
-        todo_id,
-        todo_dispatch_id,
-        todo_command_id,
         todo_action,
-        todo_resume_requested,
         thread_id,
-        app_fork_enabled,
         None,
         true,
         false,
@@ -26455,13 +23912,8 @@ async fn terminal_answer_agent_prompt_remote_command(
         Some("agent_prompt_answer".to_string()),
         Some(cloud_mcp_rfc3339_now()),
         None,
-        None,
-        None,
-        None,
         Some("prompt_answer".to_string()),
-        Some(false),
         None,
-        Some(false),
         Some(option_id.clone()),
         awaiting_provider_confirmation,
         true,
@@ -26670,13 +24122,8 @@ async fn terminal_write_realtime(
     prompt_event_source: Option<String>,
     prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
-    todo_id: Option<String>,
-    todo_dispatch_id: Option<String>,
-    todo_command_id: Option<String>,
     todo_action: Option<String>,
-    todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
-    app_fork_enabled: Option<bool>,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
     if data.len() > MAX_TERMINAL_WRITE_BYTES {
@@ -26701,13 +24148,8 @@ async fn terminal_write_realtime(
             prompt_event_source,
             prompt_event_submitted_at,
             prompt_event_text,
-            todo_id,
-            todo_dispatch_id,
-            todo_command_id,
             todo_action,
-            todo_resume_requested,
             thread_id,
-            app_fork_enabled,
             None,
             true,
             true,
@@ -26769,146 +24211,6 @@ async fn terminal_refresh_theme(
     Ok(!signal_opencode_theme_refresh(root_pid)?.is_empty())
 }
 
-#[tauri::command(rename_all = "snake_case")]
-async fn terminal_delete_selection(
-    state: State<'_, TerminalState>,
-    pane_id: String,
-    instance_id: Option<u64>,
-    selection: String,
-    current_line: Option<String>,
-    selection_start: Option<usize>,
-    selection_end: Option<usize>,
-) -> Result<Value, String> {
-    validate_terminal_pane_id(&pane_id)?;
-    let selected_text = selection
-        .chars()
-        .filter(|character| !matches!(character, '\r' | '\n'))
-        .collect::<String>();
-
-    if selected_text.is_empty() {
-        return Ok(json!({
-            "deleted": false,
-            "reason": "empty_selection",
-        }));
-    }
-
-    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
-    else {
-        return Ok(json!({
-            "deleted": false,
-            "reason": "stale_or_missing_terminal",
-        }));
-    };
-    let Some(_operation) = terminal_operation_try_admit(&instance) else {
-        return Ok(json!({
-            "deleted": false,
-            "reason": "terminal_closing",
-        }));
-    };
-
-    let _input_guard = instance.input_queue.lock().await;
-    let mut gate = instance.input_gate.lock().await;
-    let observed_line = current_line
-        .unwrap_or_default()
-        .chars()
-        .filter(|character| !matches!(character, '\r' | '\n'))
-        .collect::<String>();
-    let current_line = if observed_line.trim().is_empty() {
-        gate.current_line.clone()
-    } else {
-        observed_line
-    };
-    let line_char_len = current_line.chars().count();
-    let offset_range = selection_start
-        .zip(selection_end)
-        .map(|(start, end)| (start.min(end), start.max(end)))
-        .filter(|(start, end)| *end > *start && *end <= line_char_len);
-    let text_range = if offset_range.is_some() {
-        offset_range
-    } else {
-        current_line.rfind(&selected_text).map(|start_byte| {
-            let start = current_line[..start_byte].chars().count();
-            let end = start + selected_text.chars().count();
-            (start, end)
-        })
-    };
-    let Some((start, end)) = text_range else {
-        return Ok(json!({
-            "deleted": false,
-            "reason": "selection_not_in_current_input",
-        }));
-    };
-
-    let start_byte = terminal_input_gate_byte_index(&current_line, start);
-    let end_byte = terminal_input_gate_byte_index(&current_line, end);
-    let mut next_line = current_line;
-    next_line.replace_range(start_byte..end_byte, "");
-    let rewrite_input = format!("\u{15}{next_line}");
-    if rewrite_input.len() > MAX_TERMINAL_WRITE_BYTES {
-        return Err("Terminal rewrite input is too large.".to_string());
-    }
-
-    {
-        let mut writer = instance.writer.lock().await;
-        log_terminal_crash_forensics_event(
-            "backend.terminal_selection_delete.write.begin",
-            json!({
-                "bytes": rewrite_input.len(),
-                "instance_id": instance.id,
-                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-            }),
-        );
-        if let Err(error) = writer.write_all(rewrite_input.as_bytes()) {
-            log_terminal_crash_forensics_event(
-                "backend.terminal_selection_delete.write.error",
-                json!({
-                    "bytes": rewrite_input.len(),
-                    "error": clean_terminal_diagnostic_log_text(&error.to_string()),
-                    "instance_id": instance.id,
-                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    "stage": "write_all",
-                }),
-            );
-            return Err(format!(
-                "Unable to write terminal selection delete: {error}"
-            ));
-        }
-        if let Err(error) = writer.flush() {
-            log_terminal_crash_forensics_event(
-                "backend.terminal_selection_delete.write.error",
-                json!({
-                    "bytes": rewrite_input.len(),
-                    "error": clean_terminal_diagnostic_log_text(&error.to_string()),
-                    "instance_id": instance.id,
-                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    "stage": "flush",
-                }),
-            );
-            return Err(format!(
-                "Unable to flush terminal selection delete: {error}"
-            ));
-        }
-        log_terminal_crash_forensics_event(
-            "backend.terminal_selection_delete.write.done",
-            json!({
-                "bytes": rewrite_input.len(),
-                "instance_id": instance.id,
-                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-            }),
-        );
-    }
-
-    gate.current_line = next_line;
-    gate.cursor_position = terminal_input_gate_line_char_len(&gate);
-    gate.current_line_user_touched = true;
-
-    Ok(json!({
-        "deleted": true,
-        "remaining_line": gate.current_line,
-        "remaining_chars": gate.current_line.chars().count(),
-        "removed_chars": selected_text.chars().count(),
-    }))
-}
 
 #[tauri::command(rename_all = "snake_case")]
 async fn terminal_cancel_parked_task(
@@ -27067,7 +24369,6 @@ async fn mark_terminal_active_task_interrupted(
     cloud_mcp_state: &CloudMcpState,
     pane_id: &str,
     instance: &TerminalInstance,
-    reason: &str,
     lifecycle_message: &str,
 ) -> Result<bool, String> {
     let active_task = instance.active_task.lock().await.clone();
@@ -27283,7 +24584,6 @@ async fn terminal_interrupt_agent_inner(
         cloud_mcp_state,
         &pane_id,
         &instance,
-        &reason,
         "Interrupted by Escape; the terminal remains open for follow-up instructions.",
     )
     .await?;
@@ -32211,16 +29511,6 @@ mod terminal_tests {
         assert!(terminal_provider_fork_args(AgentProvider::Codex, Some("   ")).is_empty());
     }
 
-    #[test]
-    fn app_fork_prompt_matcher_is_exact() {
-        assert!(terminal_prompt_is_app_fork_command("fork"));
-        assert!(terminal_prompt_is_app_fork_command("  fork  "));
-        assert!(terminal_prompt_is_app_fork_command("FORK"));
-        assert!(!terminal_prompt_is_app_fork_command("/fork"));
-        assert!(!terminal_prompt_is_app_fork_command("fork please"));
-    }
-
-    #[test]
     fn slash_command_submit_never_synthesizes_thinking() {
         // Command-shaped leading tokens (^/[A-Za-z0-9_:-]+(\s|$)) are local
         // slash commands, with or without arguments or surrounding whitespace.
@@ -32917,125 +30207,6 @@ mod terminal_tests {
         );
     }
 
-    fn shift_enter_sequence_adds_line_break_without_prompt_submission() {
-        let mut gate = TerminalInputGate::default();
-
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "first line"),
-            None
-        );
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, TERMINAL_SHIFT_ENTER_SEQUENCE),
-            None
-        );
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "second line\r"),
-            Some("first line\nsecond line".to_string())
-        );
-    }
-
-    #[test]
-    fn enhanced_enter_sequence_submits_prompt() {
-        let mut gate = TerminalInputGate::default();
-
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(
-                &mut gate,
-                &format!("send from overlay{TERMINAL_ENTER_SEQUENCE}"),
-            ),
-            Some("send from overlay".to_string())
-        );
-    }
-
-    #[test]
-    fn split_composer_sync_then_enter_submits_prompt() {
-        let mut gate = TerminalInputGate::default();
-
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "\x15hey there"),
-            None
-        );
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "\r"),
-            Some("hey there".to_string())
-        );
-    }
-
-    #[test]
-    fn embedded_shift_enter_sequence_preserves_multiline_prompt_sync() {
-        let mut gate = TerminalInputGate::default();
-
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(
-                &mut gate,
-                &format!("\x15first line{TERMINAL_SHIFT_ENTER_SEQUENCE}second line"),
-            ),
-            None
-        );
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "\r"),
-            Some("first line\nsecond line".to_string())
-        );
-    }
-
-    #[test]
-    fn prompt_submitted_authority_requires_observed_matching_submit() {
-        assert!(terminal_prompt_submitted_source_is_authoritative(
-            "observed_input_gate",
-            true,
-            Some("what else is there"),
-        ));
-        assert!(terminal_prompt_submitted_source_is_authoritative(
-            "activity_hook_user_prompt_submit",
-            true,
-            None,
-        ));
-        assert!(terminal_prompt_submitted_source_is_authoritative(
-            "cli_hook_user_prompt_submit",
-            true,
-            None,
-        ));
-        assert!(terminal_prompt_submitted_source_is_authoritative(
-            "parked_resume_backend_submit",
-            true,
-            None,
-        ));
-        assert!(terminal_prompt_submitted_source_is_authoritative(
-            "crash_todo_resume_backend_submit",
-            true,
-            None,
-        ));
-        assert!(terminal_prompt_submitted_source_is_authoritative(
-            "todo_queue_backend_submit",
-            true,
-            None,
-        ));
-        assert!(!terminal_prompt_submitted_source_is_authoritative(
-            "prompt_event_submit_metadata",
-            true,
-            None,
-        ));
-        assert!(!terminal_prompt_submitted_source_is_authoritative(
-            "observed_input_gate",
-            false,
-            Some("different prompt"),
-        ));
-        assert!(!terminal_prompt_submitted_source_is_authoritative(
-            "observed_input_gate",
-            true,
-            None,
-        ));
-        assert!(!terminal_prompt_submitted_source_is_authoritative(
-            "prompt_event_text_unobserved",
-            false,
-            None,
-        ));
-        assert!(!terminal_prompt_submitted_source_is_authoritative(
-            "prompt_event_text_unobserved",
-            true,
-            Some("what else is there"),
-        ));
-    }
 
     fn terminal_projection_test_metadata() -> TerminalInstanceMetadata {
         TerminalInstanceMetadata {
@@ -34417,36 +31588,6 @@ mod terminal_tests {
         assert!(current_session_cleared.active_interaction_id.is_none());
     }
 
-    #[test]
-    fn startup_watchdog_readiness_normalizes_to_starting_idle_boundary() {
-        let starting = TerminalRuntimeSnapshot::opened_starting(None, "terminal-open");
-        let mut stop = terminal_activity_hook_test_payload(
-            "provider-turn-completed",
-            "idle",
-            "completed",
-            true,
-            None,
-        );
-        stop.turn_generation = 0;
-        let event = json!({
-            "hook_event_name": "Stop",
-            "backend_watchdog": true,
-            "watchdog_reason": "starting_output_quiet",
-        });
-        assert!(terminal_activity_hook_is_startup_readiness_signal(
-            &event,
-            "backend-startup-watchdog",
-            &stop,
-            &starting,
-        ));
-        stop.event_type = "terminal-input-ready".to_string();
-        let ready = terminal_reduce_canonical_state(&starting, &stop, None, false, false);
-        assert_eq!(ready.canonical_state, "idle");
-        assert!(!ready.turn_active);
-        assert!(!ready.completion_accepted);
-    }
-
-    #[test]
     fn canonical_transition_table_rejects_direct_active_to_idle_shortcuts() {
         for transition in [
             ("starting", "idle"),
@@ -35317,105 +32458,6 @@ mod terminal_tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn terminal_prompt_ready_recovery_uses_provider_structured_lifecycle_for_claude() {
-        let mut runtime = TerminalRuntimeSnapshot {
-            status: "active".to_string(),
-            activity_status: "thinking".to_string(),
-            command_phase: "running".to_string(),
-            input_ready: false,
-            input_ready_at: None,
-            prompt_ready_at: Some("2026-06-19T00:00:00Z".to_string()),
-            completed_at: None,
-            provider_session_id: Some("session-1".to_string()),
-            native_session_id: Some("session-1".to_string()),
-            fork_from_provider_session_id: None,
-            provider_turn_id: Some("turn-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            source: "backend:prompt-submitted".to_string(),
-            event_type: "provider-turn-started".to_string(),
-            hook_event_name: "BackendPromptSubmit".to_string(),
-            updated_at_ms: 1,
-            canonical_state: "thinking".to_string(),
-            canonical_badge_label: "thinking".to_string(),
-            canonical_state_seq: 2,
-            turn_generation: 1,
-            turn_active: true,
-            ..TerminalRuntimeSnapshot::opened_idle(None)
-        };
-        let codex_metadata = terminal_projection_test_metadata();
-        let mut claude_metadata = codex_metadata.clone();
-        claude_metadata.agent_id = "claude".to_string();
-        claude_metadata.agent_kind = "claude".to_string();
-        let mut opencode_metadata = codex_metadata.clone();
-        opencode_metadata.agent_id = "opencode".to_string();
-        opencode_metadata.agent_kind = "opencode".to_string();
-
-        assert!(terminal_runtime_snapshot_is_busy_turn(&runtime));
-        assert!(!terminal_prompt_ready_recovery_allowed(
-            &codex_metadata,
-            &runtime
-        ));
-        assert!(!terminal_prompt_ready_recovery_allowed(
-            &claude_metadata,
-            &runtime
-        ));
-        assert!(terminal_prompt_ready_recovery_allowed(
-            &opencode_metadata,
-            &runtime
-        ));
-
-        runtime.status = "starting".to_string();
-        runtime.activity_status = "starting".to_string();
-        runtime.command_phase = "starting".to_string();
-        // Claude allows prompt-ready PTY recovery only during startup.
-        assert!(terminal_prompt_ready_recovery_allowed(
-            &claude_metadata,
-            &runtime
-        ));
-        assert!(terminal_prompt_ready_recovery_allowed(
-            &opencode_metadata,
-            &runtime
-        ));
-
-        runtime.status = "active".to_string();
-        runtime.activity_status = "interrupted".to_string();
-        runtime.command_phase = "interrupted".to_string();
-        runtime.event_type = "provider-turn-interrupted".to_string();
-        assert!(terminal_prompt_ready_recovery_allowed(
-            &codex_metadata,
-            &runtime
-        ));
-        assert!(!terminal_prompt_ready_recovery_allowed(
-            &claude_metadata,
-            &runtime
-        ));
-
-        runtime.status = "error".to_string();
-        runtime.activity_status = "error".to_string();
-        runtime.command_phase = "failed".to_string();
-        runtime.event_type = "provider-startup-error".to_string();
-        assert!(terminal_prompt_ready_recovery_allowed(
-            &codex_metadata,
-            &runtime
-        ));
-
-        runtime.input_ready = true;
-        runtime.activity_status = "idle".to_string();
-        runtime.command_phase = "completed".to_string();
-        assert!(!terminal_runtime_snapshot_is_busy_turn(&runtime));
-
-        runtime.input_ready = false;
-        runtime.activity_status = "paused".to_string();
-        runtime.command_phase = "awaiting_permission".to_string();
-        assert!(!terminal_runtime_snapshot_is_busy_turn(&runtime));
-
-        runtime.activity_status = "error".to_string();
-        runtime.command_phase = "failed".to_string();
-        assert!(!terminal_runtime_snapshot_is_busy_turn(&runtime));
-    }
-
-    #[test]
     fn claude_session_start_is_a_structured_idle_boundary() {
         assert_eq!(
             terminal_activity_hook_lifecycle_kind("SessionStart"),
@@ -35423,167 +32465,6 @@ mod terminal_tests {
         );
     }
 
-    #[test]
-    fn claude_disables_pty_lifecycle_watchdog_fallbacks() {
-        let mut claude_metadata = terminal_projection_test_metadata();
-        claude_metadata.agent_id = "claude".to_string();
-        claude_metadata.agent_kind = "claude".to_string();
-        let mut codex_metadata = claude_metadata.clone();
-        codex_metadata.agent_id = "codex".to_string();
-        codex_metadata.agent_kind = "codex".to_string();
-        let mut opencode_metadata = claude_metadata.clone();
-        opencode_metadata.agent_id = "opencode".to_string();
-        opencode_metadata.agent_kind = "opencode".to_string();
-
-        assert!(!terminal_activity_provider_allows_pty_lifecycle_recovery(
-            &claude_metadata
-        ));
-        assert!(terminal_activity_provider_allows_pty_lifecycle_recovery(
-            &codex_metadata
-        ));
-        assert!(terminal_activity_provider_allows_pty_lifecycle_recovery(
-            &opencode_metadata
-        ));
-    }
-
-    #[test]
-    fn claude_pty_watchdog_recovery_is_startup_only() {
-        let mut claude_metadata = terminal_projection_test_metadata();
-        claude_metadata.agent_id = "claude".to_string();
-        claude_metadata.agent_kind = "claude".to_string();
-        let starting = TerminalRuntimeSnapshot::opened_starting(None, "terminal-open");
-
-        assert_eq!(
-            terminal_activity_watchdog_pty_recovery_action(
-                &claude_metadata,
-                &starting,
-                TERMINAL_STARTING_WATCHDOG_MS,
-                true,
-                true,
-                false,
-                false,
-                false,
-                TERMINAL_HOT_STALE_WATCHDOG_MS,
-            ),
-            Some(TerminalActivityWatchdogAction::StartupStop)
-        );
-        assert_eq!(
-            terminal_activity_watchdog_pty_recovery_action(
-                &claude_metadata,
-                &starting,
-                TERMINAL_STARTING_WATCHDOG_MS,
-                true,
-                false,
-                false,
-                true,
-                false,
-                TERMINAL_HOT_STALE_WATCHDOG_MS,
-            ),
-            Some(TerminalActivityWatchdogAction::StartupStop)
-        );
-
-        let busy = TerminalRuntimeSnapshot {
-            status: "active".to_string(),
-            activity_status: "thinking".to_string(),
-            command_phase: "running".to_string(),
-            input_ready: false,
-            provider_turn_id: Some("turn-claude".to_string()),
-            turn_id: Some("turn-claude".to_string()),
-            turn_active: true,
-            canonical_state: "thinking".to_string(),
-            canonical_badge_label: "thinking".to_string(),
-            canonical_state_seq: 2,
-            turn_generation: 1,
-            updated_at_ms: 1,
-            ..TerminalRuntimeSnapshot::opened_idle(None)
-        };
-        assert_eq!(
-            terminal_activity_watchdog_pty_recovery_action(
-                &claude_metadata,
-                &busy,
-                TERMINAL_STARTING_WATCHDOG_MS,
-                true,
-                true,
-                false,
-                true,
-                false,
-                TERMINAL_HOT_STALE_WATCHDOG_MS,
-            ),
-            None,
-            "Claude prompt glyphs during a busy turn must not synthesize ready"
-        );
-    }
-
-    #[test]
-    fn codex_busy_prompt_ready_recovery_is_blocked() {
-        let runtime = TerminalRuntimeSnapshot {
-            status: "active".to_string(),
-            activity_status: "thinking".to_string(),
-            command_phase: "running".to_string(),
-            input_ready: false,
-            input_ready_at: None,
-            prompt_ready_at: None,
-            completed_at: None,
-            provider_session_id: Some("session-1".to_string()),
-            native_session_id: Some("session-1".to_string()),
-            fork_from_provider_session_id: None,
-            provider_turn_id: Some("turn-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            source: "cli-hook:provider-turn-started".to_string(),
-            event_type: "provider-turn-started".to_string(),
-            hook_event_name: "UserPromptSubmit".to_string(),
-            updated_at_ms: 1,
-            ..TerminalRuntimeSnapshot::opened_idle(None)
-        };
-        let mut codex_metadata = terminal_projection_test_metadata();
-        codex_metadata.agent_id = "codex".to_string();
-        codex_metadata.agent_kind = "codex".to_string();
-        let mut opencode_metadata = codex_metadata.clone();
-        opencode_metadata.agent_id = "opencode".to_string();
-        opencode_metadata.agent_kind = "opencode".to_string();
-
-        assert!(terminal_runtime_snapshot_is_busy_turn(&runtime));
-        assert!(!terminal_prompt_ready_recovery_allowed(
-            &codex_metadata,
-            &runtime
-        ));
-        assert!(terminal_prompt_ready_recovery_allowed(
-            &opencode_metadata,
-            &runtime
-        ));
-    }
-
-    #[test]
-    fn structured_prompt_runtime_is_guarded_from_stale_hot_watchdog() {
-        let runtime = TerminalRuntimeSnapshot {
-            status: "active".to_string(),
-            activity_status: "awaiting_input".to_string(),
-            command_phase: "awaiting_input".to_string(),
-            input_ready: false,
-            input_ready_at: None,
-            prompt_ready_at: None,
-            completed_at: None,
-            provider_session_id: Some("session-1".to_string()),
-            native_session_id: Some("session-1".to_string()),
-            fork_from_provider_session_id: None,
-            provider_turn_id: Some("turn-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            source: "cli-hook:manual-prompt".to_string(),
-            event_type: "provider-user-prompt-started".to_string(),
-            hook_event_name: "UserInputRequired".to_string(),
-            updated_at_ms: 1,
-            ..TerminalRuntimeSnapshot::opened_idle(None)
-        };
-        assert!(terminal_activity_watchdog_runtime_is_paused_or_manual(
-            &runtime
-        ));
-        assert_eq!(
-            terminal_activity_watchdog_stale_hot_action(&runtime, TERMINAL_HOT_STALE_WATCHDOG_MS),
-            None
-        );
-    }
-
-    #[test]
     fn parked_resume_lifecycle_states_do_not_project_to_idle_for_agent_providers() {
         for provider in ["codex", "claude", "opencode"] {
             let mut metadata = terminal_projection_test_metadata();
@@ -35641,122 +32522,6 @@ mod terminal_tests {
         }
     }
 
-    #[test]
-    fn activity_watchdog_transitions_stuck_starting_by_prompt_or_quiet_output() {
-        let runtime = TerminalRuntimeSnapshot::opened_starting(None, "terminal-open");
-        assert_eq!(
-            terminal_activity_watchdog_starting_action(
-                &runtime,
-                TERMINAL_STARTING_WATCHDOG_MS,
-                true,
-                true,
-                false,
-                false,
-                false,
-            ),
-            Some(TerminalActivityWatchdogAction::StartupStop)
-        );
-        assert_eq!(
-            terminal_activity_watchdog_starting_action(
-                &runtime,
-                TERMINAL_STARTING_WATCHDOG_MS,
-                true,
-                false,
-                false,
-                true,
-                false,
-            ),
-            Some(TerminalActivityWatchdogAction::StartupStop)
-        );
-        assert_eq!(
-            terminal_activity_watchdog_starting_action(
-                &runtime,
-                TERMINAL_STARTING_WATCHDOG_MS,
-                true,
-                false,
-                false,
-                false,
-                true,
-            ),
-            Some(TerminalActivityWatchdogAction::StartupDowngradeRunning)
-        );
-        assert_eq!(
-            terminal_activity_watchdog_starting_action(
-                &runtime,
-                TERMINAL_STARTING_WATCHDOG_MS - 1,
-                true,
-                true,
-                false,
-                true,
-                false,
-            ),
-            None
-        );
-        assert_eq!(
-            terminal_activity_watchdog_starting_action(
-                &runtime,
-                TERMINAL_STARTING_WATCHDOG_MS,
-                true,
-                false,
-                true,
-                true,
-                false,
-            ),
-            None,
-            "an MCP boot marker must block false startup readiness"
-        );
-        assert_eq!(
-            terminal_activity_watchdog_mcp_startup_action(
-                &runtime,
-                true,
-                TERMINAL_MCP_STARTUP_DEGRADED_MS,
-            ),
-            Some(TerminalActivityWatchdogAction::McpStartupError)
-        );
-    }
-
-    #[test]
-    fn activity_watchdog_stale_hot_skips_manual_and_active_tool_states() {
-        let mut runtime = TerminalRuntimeSnapshot {
-            status: "active".to_string(),
-            activity_status: "thinking".to_string(),
-            command_phase: "running".to_string(),
-            input_ready: false,
-            input_ready_at: None,
-            prompt_ready_at: None,
-            completed_at: None,
-            provider_session_id: Some("session-1".to_string()),
-            native_session_id: Some("session-1".to_string()),
-            fork_from_provider_session_id: None,
-            provider_turn_id: Some("turn-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            source: "cli-hook:provider-turn-started".to_string(),
-            event_type: "provider-turn-started".to_string(),
-            hook_event_name: "UserPromptSubmit".to_string(),
-            updated_at_ms: 1,
-            ..TerminalRuntimeSnapshot::opened_idle(None)
-        };
-        assert_eq!(
-            terminal_activity_watchdog_stale_hot_action(&runtime, TERMINAL_HOT_STALE_WATCHDOG_MS),
-            Some(TerminalActivityWatchdogAction::StaleHotStop)
-        );
-
-        runtime.activity_status = "paused".to_string();
-        runtime.command_phase = "awaiting_permission".to_string();
-        assert_eq!(
-            terminal_activity_watchdog_stale_hot_action(&runtime, TERMINAL_HOT_STALE_WATCHDOG_MS),
-            None
-        );
-
-        runtime.activity_status = "shell".to_string();
-        runtime.command_phase = "tool_running".to_string();
-        assert_eq!(
-            terminal_activity_watchdog_stale_hot_action(&runtime, TERMINAL_HOT_STALE_WATCHDOG_MS),
-            None
-        );
-    }
-
-    #[test]
     fn stray_startup_idle_is_ignored_during_busy_turns() {
         let startup_idle = json!({
             "hook_event_name": "Stop",
@@ -36169,7 +32934,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn waiting_accepts_interrupt_and_stale_hot_never_owns_it() {
+    fn waiting_accepts_interrupt() {
         // Interrupt from waiting settles (user pressed Escape while background
         // work ran) — guard + reducer agree.
         let mut waiting_runtime = waiting_test_runtime_thinking();
@@ -36183,11 +32948,6 @@ mod terminal_tests {
         assert_eq!(projection.canonical_state, "interrupted");
         assert!(projection.interrupt_accepted);
         assert!(!projection.turn_active);
-        // Stale-hot (10 min) must never own a waiting session — only the
-        // 30-min WaitingRelease may.
-        assert!(!terminal_activity_watchdog_runtime_is_stale_hot_candidate(
-            &waiting_runtime
-        ));
     }
 
     /// Round-5 hardening: settling WAITING always consults the origin gate.
@@ -36459,180 +33219,6 @@ mod terminal_tests {
     /// wrapper-shell panes (every non-Claude provider) liveness only proves
     /// the wrapper shell, so decay additionally requires the composer prompt
     /// marker as POSITIVE agent-at-prompt evidence.
-    #[test]
-    fn interrupted_and_error_decay_to_idle_after_thirty_seconds() {
-        let mut runtime = waiting_test_runtime_thinking();
-        runtime.canonical_state = "interrupted".to_string();
-        runtime.turn_active = false;
-        runtime.active_interaction_id = None;
-        // Direct-child pane (Claude): liveness observes the agent itself, no
-        // prompt marker required.
-        assert_eq!(
-            terminal_activity_watchdog_settled_decay_action(
-                &runtime,
-                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
-                true,
-                false,
-                false,
-                false,
-            ),
-            Some(TerminalActivityWatchdogAction::SettledDecayIdle)
-        );
-        // Wrapper-shell pane (Codex/OpenCode inside the prewarmed shell):
-        // a live child is only the wrapper — without the agent's composer
-        // prompt marker the agent may have crashed back to a bare shell, and
-        // decaying would let dispatch type prompts into it. Fail closed.
-        assert_eq!(
-            terminal_activity_watchdog_settled_decay_action(
-                &runtime,
-                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
-                true,
-                false,
-                true,
-                false,
-            ),
-            None
-        );
-        // With the marker visible the agent is provably at its prompt.
-        assert_eq!(
-            terminal_activity_watchdog_settled_decay_action(
-                &runtime,
-                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
-                true,
-                false,
-                true,
-                true,
-            ),
-            Some(TerminalActivityWatchdogAction::SettledDecayIdle)
-        );
-        // The marker alone is not enough either: live_process stays a
-        // necessary condition even for wrapper-shell panes.
-        assert_eq!(
-            terminal_activity_watchdog_settled_decay_action(
-                &runtime,
-                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
-                false,
-                false,
-                true,
-                true,
-            ),
-            None
-        );
-        // The age is SETTLED-ENTRY age (runtime update stamp), never the
-        // hook/output quiet clock: below the window nothing decays even if
-        // the pane had been quiet long before the interrupt.
-        assert_eq!(
-            terminal_activity_watchdog_settled_decay_action(
-                &runtime,
-                TERMINAL_SETTLED_DECAY_WATCHDOG_MS - 1,
-                true,
-                false,
-                false,
-                false,
-            ),
-            None
-        );
-        // A dead process or a visibly stuck MCP startup must never decay to
-        // input-ready (queued work would wake into a stuck CLI).
-        assert_eq!(
-            terminal_activity_watchdog_settled_decay_action(
-                &runtime,
-                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
-                false,
-                false,
-                false,
-                false,
-            ),
-            None
-        );
-        assert_eq!(
-            terminal_activity_watchdog_settled_decay_action(
-                &runtime,
-                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
-                true,
-                true,
-                false,
-                false,
-            ),
-            None
-        );
-        runtime.canonical_state = "error".to_string();
-        assert_eq!(
-            terminal_activity_watchdog_settled_decay_action(
-                &runtime,
-                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
-                true,
-                false,
-                false,
-                false,
-            ),
-            Some(TerminalActivityWatchdogAction::SettledDecayIdle)
-        );
-        // Guards: active turn, open interaction, busy/waiting states hold.
-        runtime.turn_active = true;
-        assert_eq!(
-            terminal_activity_watchdog_settled_decay_action(
-                &runtime,
-                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
-                true,
-                false,
-                false,
-                false,
-            ),
-            None
-        );
-        runtime.turn_active = false;
-        runtime.active_interaction_id = Some("uir:open".to_string());
-        assert_eq!(
-            terminal_activity_watchdog_settled_decay_action(
-                &runtime,
-                TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
-                true,
-                false,
-                false,
-                false,
-            ),
-            None
-        );
-        runtime.active_interaction_id = None;
-        for state in ["thinking", "waiting", "idle", "uir", "paused"] {
-            runtime.canonical_state = state.to_string();
-            assert_eq!(
-                terminal_activity_watchdog_settled_decay_action(
-                    &runtime,
-                    TERMINAL_SETTLED_DECAY_WATCHDOG_MS,
-                    true,
-                    false,
-                    false,
-                    false,
-                ),
-                None,
-                "{state}"
-            );
-        }
-
-        // The decay event (terminal-input-ready with the runtime's explicit
-        // generation and identity) is ACCEPTED by the reducer from both
-        // settled states and lands on idle.
-        for settled in ["interrupted", "error"] {
-            let mut settled_runtime = waiting_test_runtime_thinking();
-            settled_runtime.canonical_state = settled.to_string();
-            settled_runtime.turn_active = false;
-            settled_runtime.active_interaction_id = None;
-            let mut decay = waiting_test_payload("terminal-input-ready", false);
-            decay.hook_event_name = "PromptReadyAfterInterrupt".to_string();
-            decay.activity_status = "idle".to_string();
-            decay.command_phase = "ready".to_string();
-            decay.input_ready = true;
-            decay.turn_generation = settled_runtime.turn_generation;
-            decay.turn_generation_explicit = true;
-            let projection =
-                terminal_reduce_canonical_state(&settled_runtime, &decay, None, false, false);
-            assert_eq!(projection.canonical_state, "idle", "{settled}");
-        }
-    }
-
-    #[test]
     fn prompt_submit_thinking_decay_releases_unproven_submit_latch() {
         let runtime = prompt_submit_decay_test_runtime();
         assert_eq!(
@@ -37643,118 +34229,6 @@ mod terminal_tests {
         assert_eq!(result["terminal_instance_id"], json!(7));
     }
 
-    #[test]
-    fn prompt_ready_marker_must_follow_working_indicator() {
-        assert!(terminal_output_current_prompt_marker(
-            "Working (press esc to interrupt)\ncompleted\n> "
-        ));
-        assert!(!terminal_output_current_prompt_marker(
-            "> \nWorking (press esc to interrupt)"
-        ));
-        assert!(!terminal_output_current_prompt_marker(
-            "> \nBooting MCP server: codex_apps (12s • esc to interrupt)"
-        ));
-        assert!(terminal_output_current_prompt_marker(
-            "Booting MCP server: codex_apps (12s • esc to interrupt)\n> "
-        ));
-    }
-
-    #[test]
-    fn prompt_ready_scan_includes_the_current_final_pty_frame() {
-        let headless_output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::default()));
-        headless_output
-            .lock()
-            .unwrap()
-            .append(b"Booting MCP server: codex_apps\n");
-        assert!(!terminal_headless_tail_has_prompt_marker(&headless_output));
-
-        headless_output.lock().unwrap().append(b"> ");
-        assert!(terminal_headless_tail_has_prompt_marker(&headless_output));
-    }
-
-    /// Settled-decay liveness evidence must come from the LIVE screen: a
-    /// footer that the CLI overwrote (or that a screen clear removed) stays
-    /// in the append-only raw tail forever, and treating those stale bytes
-    /// as a current prompt marker lets a pane whose agent exited to its
-    /// wrapper shell decay to input-ready — queued prompts then get typed
-    /// into a bare shell.
-    #[test]
-    fn overwritten_footer_does_not_satisfy_the_prompt_marker() {
-        let headless_output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::default()));
-        // OpenCode-style footer currently visible on screen: marker holds.
-        headless_output
-            .lock()
-            .unwrap()
-            .append(b"opencode session\r\nctrl+p commands");
-        assert!(terminal_headless_tail_has_prompt_marker(&headless_output));
-
-        // The CLI exits: the live screen is cleared and only the wrapper
-        // shell remains. The footer bytes are still in the raw tail, but the
-        // VT screen no longer shows them — the marker must NOT hold.
-        headless_output
-            .lock()
-            .unwrap()
-            .append(b"\x1b[2J\x1b[Hbash-5.2$ ls src\r\n");
-        assert!(
-            !terminal_headless_tail_has_prompt_marker(&headless_output),
-            "a footer that is no longer on the live screen must not satisfy \
-             the settled-decay prompt marker"
-        );
-
-        // Same for a composer glyph overwritten IN PLACE on its own row.
-        let overwritten = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::default()));
-        overwritten.lock().unwrap().append(b"\xe2\x9d\xaf ");
-        assert!(terminal_headless_tail_has_prompt_marker(&overwritten));
-        overwritten
-            .lock()
-            .unwrap()
-            .append(b"\r\x1b[2Kprocess exited\r\n");
-        assert!(!terminal_headless_tail_has_prompt_marker(&overwritten));
-    }
-
-    #[test]
-    fn codex_turn_spinner_and_mcp_boot_are_distinct_activity_markers() {
-        let working = "Working (10s • esc to interrupt)";
-        let mcp_boot = "Booting MCP server: codex_apps (12s • esc to interrupt)";
-
-        assert!(terminal_output_latest_working_indicator_index(working).is_some());
-        assert!(terminal_output_latest_working_indicator_index(mcp_boot).is_none());
-        assert!(terminal_output_latest_working_indicator_index(
-            "Networking (10s • esc to interrupt)"
-        )
-        .is_none());
-        assert!(terminal_output_latest_working_indicator_index(
-            "not working (10s • esc to interrupt)"
-        )
-        .is_none());
-        assert!(terminal_output_latest_mcp_startup_indicator_index(mcp_boot).is_some());
-        assert_eq!(
-            terminal_activity_tui_activity_text(working).as_deref(),
-            Some("Working")
-        );
-        assert_eq!(
-            terminal_activity_tui_activity_text(mcp_boot).as_deref(),
-            Some("MCP startup")
-        );
-        assert_eq!(
-            terminal_activity_tui_activity_text(&format!("{mcp_boot}\n{working}")).as_deref(),
-            Some("Working"),
-            "a fresh turn spinner must supersede an older MCP startup line"
-        );
-        assert_eq!(
-            terminal_activity_tui_activity_text(&format!("{working}\n{mcp_boot}")).as_deref(),
-            Some("MCP startup"),
-            "a fresh MCP startup line must not inherit an older turn spinner"
-        );
-        assert!(!terminal_output_current_mcp_startup_marker(&format!(
-            "> stale\n{mcp_boot}\n{working}"
-        )));
-        assert!(terminal_output_current_mcp_startup_marker(&format!(
-            "> stale\n{working}\n{mcp_boot}"
-        )));
-    }
-
-    #[test]
     fn claude_stop_background_metadata_blocks_ready_completion() {
         assert!(!terminal_activity_hook_claude_stop_has_background_work(
             &json!({
@@ -37889,29 +34363,6 @@ mod terminal_tests {
         assert_eq!(message.as_deref(), Some("streamed token"));
     }
 
-    #[test]
-    fn live_text_sanitizer_drops_codex_tui_chrome() {
-        let tui = "\u{1b}[44;3H\u{1b}[2mWorking\u{1b}[22m\
- \u{1b}[2m(51s • esc to interrupt)\u{1b}[39m\
-\u{1b}[47;1H\u{1b}[1m›\u{1b}[47;3H\u{1b}[22mRun /review on my current changes\
-\u{1b}[49;3H\u{1b}[38;2;246;226;183;49mgpt-5.5 xhigh\u{1b}[39;49m · \
-\u{1b}[38;2;171;223;167;49m~/Documents/CODING/testforge\u{1b}[39m";
-
-        let compact =
-            terminal_activity_compact_text(&terminal_activity_strip_terminal_sequences(tui));
-        assert!(
-            terminal_output_latest_working_indicator_index(&compact).is_some(),
-            "compact={compact:?}"
-        );
-        assert!(cloud_mcp_terminal_output_has_working_indicator(&compact));
-        assert_eq!(terminal_activity_hook_live_message_text(tui), None);
-        assert_eq!(
-            terminal_activity_hook_activity_message_text(tui).as_deref(),
-            Some("Working")
-        );
-    }
-
-    #[test]
     fn live_text_sanitizer_keeps_prose_without_footer() {
         let tui = "I’ll inspect the hook path first.\n\
 \u{1b}[49;3H\u{1b}[38;2;246;226;183;49mgpt-5.5 xhigh\u{1b}[39;49m · \
@@ -37939,23 +34390,6 @@ mod terminal_tests {
             )
             .as_deref(),
             Some("Working (through the parser case) is content.")
-        );
-    }
-
-    #[test]
-    fn structured_live_text_preserves_markdown_table_spacing() {
-        let table = "| Component | Name |\n| --- | --- |\n|  R1  | 1kΩ |";
-        assert_eq!(
-            terminal_activity_hook_structured_live_message_text(table).as_deref(),
-            Some(table)
-        );
-        assert_eq!(
-            terminal_activity_hook_lossless_message_text(
-                &json!({ "assistant_message_snapshot": table }),
-                &["assistant_message_snapshot"],
-            )
-            .as_deref(),
-            Some(table)
         );
     }
 
@@ -38009,73 +34443,6 @@ mod terminal_tests {
         assert_ne!(first, different_prompt);
     }
 
-    #[test]
-    fn empty_gate_prompt_metadata_diagnostic_allows_known_local_submit_sources() {
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "tui-terminal-direct-input"
-            ),)
-        );
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "terminal-direct-input"
-            ),)
-        );
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "tui-manual-input"
-            ),)
-        );
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "tui-manual-input:terminal-screen-reconciled"
-            ),)
-        );
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "observed_terminal_prompt"
-            ),)
-        );
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "terminal-prompt-submitted"
-            ),)
-        );
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "terminal-view-drop"
-            ),)
-        );
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "todo-auto-queue"
-            ),)
-        );
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "voice-agent-queue"
-            ),)
-        );
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "voice-plan-queue"
-            ),)
-        );
-        assert!(
-            terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "remote-control"
-            ),)
-        );
-
-        assert!(
-            !terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(Some(
-                "pending-prompt"
-            ),)
-        );
-        assert!(!terminal_prompt_event_source_allows_empty_gate_metadata_diagnostic(None));
-    }
-
-    #[test]
     fn cli_activity_hooks_map_lifecycle_tool_and_subagent_events() {
         assert_eq!(
             terminal_activity_hook_lifecycle_kind("UserPromptSubmit"),
@@ -38380,111 +34747,6 @@ mod terminal_tests {
         .is_none());
     }
 
-    #[test]
-    fn input_gate_tracks_cursor_edits_before_submit() {
-        let mut gate = TerminalInputGate::default();
-
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "hello\u{1b}[D!\r"),
-            Some("hell!o".to_string())
-        );
-
-        let mut gate = TerminalInputGate::default();
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "hello\u{1b}[3DXX\r"),
-            Some("heXXllo".to_string())
-        );
-    }
-
-    #[test]
-    fn input_gate_tracks_delete_at_cursor_and_line_anchors() {
-        let mut gate = TerminalInputGate::default();
-
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "hello\u{1b}[D\u{1b}[3~\r"),
-            Some("hell".to_string())
-        );
-
-        let mut gate = TerminalInputGate::default();
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "ice\u{1}nice \u{5}!\r"),
-            Some("nice ice!".to_string())
-        );
-    }
-
-    #[test]
-    fn input_gate_tracks_word_cursor_edits_before_submit() {
-        let mut gate = TerminalInputGate::default();
-
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(
-                &mut gate,
-                "alpha beta gamma\u{1b}[1;5D!\r"
-            ),
-            Some("alpha beta !gamma".to_string())
-        );
-
-        let mut gate = TerminalInputGate::default();
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "alpha beta gamma\u{1b}b!\r"),
-            Some("alpha beta !gamma".to_string())
-        );
-    }
-
-    #[test]
-    fn enhanced_enter_sequence_is_preserved_before_pty_write() {
-        assert_eq!(
-            normalize_terminal_enter_sequences_for_pty(format!(
-                "send from overlay{TERMINAL_ENTER_SEQUENCE}"
-            )),
-            format!("send from overlay{TERMINAL_ENTER_SEQUENCE}")
-        );
-        assert_eq!(
-            normalize_terminal_enter_sequences_for_pty(format!(
-                "send from overlay{TERMINAL_ENTER_SEQUENCE_MOD1}"
-            )),
-            format!("send from overlay{TERMINAL_ENTER_SEQUENCE_MOD1}")
-        );
-        assert_eq!(
-            normalize_terminal_enter_sequences_for_pty(format!(
-                "first line{TERMINAL_SHIFT_ENTER_SEQUENCE}second line"
-            )),
-            format!("first line{TERMINAL_SHIFT_ENTER_SEQUENCE}second line")
-        );
-    }
-
-    #[test]
-    fn bare_osc_color_reply_is_not_submitted_as_prompt() {
-        let mut gate = TerminalInputGate::default();
-
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(
-                &mut gate,
-                "]10;rgb:e8e8/eeee/f8f8\\]11;rgb:0202/0303/0404\\\r",
-            ),
-            None
-        );
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(&mut gate, "idk\r"),
-            Some("idk".to_string())
-        );
-    }
-
-    #[test]
-    fn bare_osc_color_reply_is_stripped_around_real_prompt_text() {
-        let mut gate = TerminalInputGate::default();
-
-        assert_eq!(
-            terminal_observe_input_gate_submitted_prompt(
-                &mut gate,
-                "]10;rgb:e8e8/eeee/f8f8\\idk\r",
-            ),
-            Some("idk".to_string())
-        );
-    }
-
-
-    #[test]
     fn codex_app_server_launch_receives_trusted_app_control_and_permission_posture() {
         let coordination = terminal_test_coordination("codex_app_server_trusted_config");
         let app_control = (
