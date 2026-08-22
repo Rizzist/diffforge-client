@@ -901,7 +901,18 @@ fn haider_projection_export_row(
                 .unwrap_or_else(|| "Haider run failed".to_string()),
         ),
         "usage" => ("usage", "meta", String::new()),
-        _ => return None,
+        /* The role vocabulary is OPEN — it already grew past user/assistant/
+           tool once. An unrecognised role keeps its own name rather than
+           borrowing "assistant", so its text is shown without the transcript
+           claiming the MODEL said it; dropping it would make a future role
+           disappear with nothing to notice. A row with no role at all is not
+           a row. */
+        "" => return None,
+        other => (
+            "message",
+            other,
+            haider_projection_extract_text(item).unwrap_or_default(),
+        ),
     };
     let seq = haider_projection_seq(state, item, item);
     Some(haider_projection_row(
@@ -5373,6 +5384,34 @@ mod haider_projection_tests {
         assert_eq!((rows[1].seq, rows[1].role.as_str()), (19, "assistant"));
         assert_eq!((rows[2].seq, rows[2].kind.as_str()), (20, "tool"));
         assert_eq!(rows[2].text, "read src/parser.rs");
+    }
+
+    #[test]
+    fn haider_projection_keeps_roles_it_has_never_seen() {
+        /* The pipe's role set already grew beyond user/assistant/tool to
+           include error; assuming a closed set is how a future role vanishes.
+           An unknown role must render its text WITHOUT being attributed to
+           the model. */
+        let mut state = HaiderProjectionFoldState::default();
+        let row = haider_projection_export_row(
+            &mut state,
+            "local-session",
+            &json!({"role": "annotation", "text": "moved to branch b", "seq": 12}),
+        )
+        .expect("an unknown role must still produce a row");
+        assert_eq!(row.kind, "message");
+        assert_eq!(row.role, "annotation");
+        assert_eq!(row.text, "moved to branch b");
+
+        // The known roles keep their exact homes, error included.
+        let mut state = HaiderProjectionFoldState::default();
+        let error_row = haider_projection_export_row(
+            &mut state,
+            "local-session",
+            &json!({"role": "error", "presentation": "run failed", "seq": 13}),
+        )
+        .expect("error is a real role");
+        assert_eq!(error_row.kind, "error");
     }
 
     #[test]
