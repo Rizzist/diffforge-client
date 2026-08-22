@@ -2596,6 +2596,38 @@ fn haider_projection_refresh_pipe_route_with(
     haider_projection_resolve_pipe_route_cached_with(routes, provider_session_id, resolve)
 }
 
+/// Below this the row shapes genuinely differ and refusing is correct.
+const HAIDER_PROJECTION_PIPE_VERSION_FLOOR: i64 = 2;
+/// The newest version whose additions this reader actually understands. Reading
+/// above it is allowed and reported, never refused — see the header parser.
+const HAIDER_PROJECTION_PIPE_VERSION_KNOWN: i64 = 4;
+
+static HAIDER_PROJECTION_PIPE_VERSION_AHEAD: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/* Reading a format newer than we understand is a real condition the operator
+   should be able to see, so it is recorded rather than logged and forgotten.
+   Latched at the highest version observed: it is a property of the daemon we
+   are talking to, not of one file, and it must not flap per-read. */
+fn haider_projection_note_pipe_version_ahead(version: i64) {
+    let previous = HAIDER_PROJECTION_PIPE_VERSION_AHEAD
+        .fetch_max(version, std::sync::atomic::Ordering::Relaxed);
+    if previous < version {
+        eprintln!(
+            "[ade-pipe] reading Haider pipe version {version}, newer than the {HAIDER_PROJECTION_PIPE_VERSION_KNOWN} this build understands; \
+             additive fields ride through untouched but new row kinds will render generically."
+        );
+    }
+}
+
+/// Highest pipe version seen that this build does not fully understand, or None.
+fn haider_projection_pipe_version_ahead() -> Option<i64> {
+    match HAIDER_PROJECTION_PIPE_VERSION_AHEAD.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        version => Some(version),
+    }
+}
+
 fn haider_projection_parse_pipe_header(
     value: &Value,
     provider_session_id: &str,
@@ -2609,16 +2641,32 @@ fn haider_projection_parse_pipe_header(
     let version = haider_projection_json_i64(object.get("version"))
         .ok_or_else(|| "Haider pipe header version was missing.".to_string())?;
     // v2 = 0.0.932 baseline; v3 (0.0.934) adds args_preview/result_preview on
-    // tool rows — additive, and they ride into row meta untouched. v4 (0.0.939)
-    // adds sealed `reasoning` on assistant rows, a `compaction_boundary` row
-    // kind carrying no role, and a `segment_end` terminator.
+    // tool rows; v4 (0.0.939) adds sealed `reasoning`, a `compaction_boundary`
+    // row kind carrying no role, and a `segment_end` terminator. Every bump so
+    // far has been ADDITIVE.
     //
-    // The v4 bump REBUILDS every sidecar on disk rather than leaving old files
-    // on the old format, so refusing a version here is not a graceful
-    // degradation — it takes the whole transcript offline for every session at
-    // once. That is what happened when 939 landed against a 2..=3 gate.
-    if !(2..=4).contains(&version) {
-        return Err(format!("Unsupported Haider pipe version {version}."));
+    // A version bump rebuilds every sidecar at once, so a closed upper bound is
+    // not graceful degradation — it takes every session's transcript offline
+    // together. That happened when 939 landed against a `2..=3` gate, and the
+    // rejection was an Err no log carried: closed AND silent, which removes the
+    // capability and the evidence in one move.
+    //
+    // So the upper bound is OPEN. A newer-than-known version is read with what
+    // we understand: unfamiliar roles keep their own name, unfamiliar kinds
+    // reach the generic door, and unknown fields ride through in meta. Partial
+    // rendering beats a blank transcript, and it is the honest outcome for an
+    // additive format. What is NOT acceptable is doing that quietly, so reading
+    // ahead of our knowledge says so.
+    //
+    // The floor stays closed: below it the shapes genuinely differ, and
+    // refusing loudly is correct.
+    if version < HAIDER_PROJECTION_PIPE_VERSION_FLOOR {
+        return Err(format!(
+            "Haider pipe version {version} is older than the supported floor {HAIDER_PROJECTION_PIPE_VERSION_FLOOR}."
+        ));
+    }
+    if version > HAIDER_PROJECTION_PIPE_VERSION_KNOWN {
+        haider_projection_note_pipe_version_ahead(version);
     }
     let session_id = object
         .get("session_id")
@@ -6041,14 +6089,15 @@ mod haider_projection_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /* The upper bound is OPEN by design. A closed one turned a routine daemon
+       release into an outage across every session at once, and the refusal was
+       silent on top of it. The floor stays closed because below it the shapes
+       genuinely differ.
+
+       This test is the reason a future bump is not an incident: it must keep
+       passing when the daemon ships a version this build has never heard of. */
     #[test]
-    fn haider_projection_parses_v2_v3_v4_headers_and_rejects_future_version() {
-        // v4 moved from "future" to "current" when 0.0.939 shipped. The bump
-        // rebuilds every sidecar at once, so a gate that refuses the live
-        // version takes every session's transcript offline together — which is
-        // exactly what it did. Keep the rejection for genuinely unknown
-        // versions; it is the only thing standing between us and folding a
-        // format nobody has read.
+    fn a_pipe_version_newer_than_this_build_is_read_and_reported_not_refused() {
         for (version, generation) in [(2, 7), (3, 8), (4, 9)] {
             let header = haider_projection_parse_pipe_header(
                 &json!({
@@ -6062,17 +6111,41 @@ mod haider_projection_tests {
             .unwrap();
             assert_eq!(header.generation, generation);
         }
-        assert!(haider_projection_parse_pipe_header(
+
+        // A version nobody here has heard of is READ, not refused.
+        let ahead = haider_projection_parse_pipe_header(
             &json!({
                 "pipe":"haider.session.jsonl",
-                "version":5,
+                "version":97,
                 "session_id":"session-test",
                 "generation":9
             }),
             "session-test",
         )
-        .unwrap_err()
-        .contains("Unsupported"));
+        .expect("a newer additive version must still be read");
+        assert_eq!(ahead.generation, 9);
+        // ...and never silently: the condition is recorded for the operator.
+        assert_eq!(haider_projection_pipe_version_ahead(), Some(97));
+
+        // The floor is still closed, and it fails loudly.
+        let too_old = haider_projection_parse_pipe_header(
+            &json!({
+                "pipe":"haider.session.jsonl",
+                "version":1,
+                "session_id":"session-test",
+                "generation":9
+            }),
+            "session-test",
+        );
+        assert!(too_old.is_err());
+        assert!(too_old.unwrap_err().contains("older than the supported floor"));
+
+        // Magic is still enforced regardless of version.
+        assert!(haider_projection_parse_pipe_header(
+            &json!({"pipe":"not.haider","version":4,"session_id":"s","generation":1}),
+            "s",
+        )
+        .is_err());
     }
 
     #[test]
