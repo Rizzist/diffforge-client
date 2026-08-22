@@ -188,17 +188,14 @@ function dayLabel(atMs) {
    cluster; day dividers slot in where the calendar date changes. Cluster
    keys pin to the FIRST row's identity — append-only rows keep them stable
    so React state (expansion) survives live growth. */
-/* Journal items that record the daemon's own bookkeeping rather than work
-   the agent did. They arrive as items like everything else, but a reader
-   learns nothing from "the graph committed a node" — they are noise between
-   the user and the answer. */
+/* Graph bookkeeping only. Deliberately NOT hidden: model_selected (which
+   model answered is part of the story), context_compaction (the context was
+   rewritten — that explains later behaviour), and the session/run state
+   items (a turn's lifecycle). Those are events a reader can act on; a node
+   being committed to the graph is not. */
 const INTERNAL_ITEM_NAMES = new Set([
   "node_committed",
-  "model_selected",
   "extension",
-  "context_compaction",
-  "session_state",
-  "run_state",
 ]);
 
 function isInternalToolRow(row) {
