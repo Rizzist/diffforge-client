@@ -1298,10 +1298,15 @@ fn haider_projection_fold_pipe_value_locked(
     observed through run/watch/export must not suppress later pipe growth:
     doing so advanced the byte cursor while silently dropping the row.
 
-    This also carries v4's reasoning, and it is why compat rows must never be
-    dropped on this path: EVERY reasoning row the daemon writes is marked
-    compat: true, so the documented "safe to drop" reading of that flag costs
-    100% of the thinking. */
+    This also carries v4's reasoning. Under 0.0.939 every reasoning row was
+    marked compat: true, so the documented "safe to drop" reading of that flag
+    cost 100% of the thinking; 0.0.940 stopped marking reasoning-bearing rows,
+    which makes the flag trustworthy again for rows written since.
+
+    We branch on the ROLE VALUE and never read the compat flag, so neither
+    daemon version changes what this door does. That is deliberate: a reader
+    keyed on a producer's advisory flag inherits every change to its meaning,
+    and this one changed under us mid-session. Do not start reading it. */
     let mut step = HaiderProjectionFoldStep::default();
     let reasoning = haider_projection_pipe_reasoning_row(state, session_id, payload);
     let has_reasoning = reasoning.is_some();
