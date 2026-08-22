@@ -261,8 +261,15 @@ export default function SessionTrajectory({ session }) {
         };
       }
     }
-    /* Anthropic-shaped usage reports cache reads OUTSIDE input_tokens; when
-       cached exceeds input, the true share is cached / (input + cached). */
+    /* ESTIMATE, and rendered with a ~ so it never reads as measurement. The
+       harness measures this properly as cache_reread_hit_basis_points, but that
+       lives on AgentUsageMetrics which the TUI reads in-process — it is on no
+       door the ADE can reach, so deriving it here is filling a gap rather than
+       duplicating an available number. Delete this the day it is published.
+
+       Anthropic-shaped usage reports cache reads OUTSIDE input_tokens; when
+       cached exceeds input, the true share is cached / (input + cached). That
+       branch is exactly the inference that makes this an approximation. */
     const cacheDenominator = cachedTotal > inputTotal
       ? inputTotal + cachedTotal
       : inputTotal;
@@ -562,9 +569,9 @@ export default function SessionTrajectory({ session }) {
           </Metric>
         )}
         {derived.cachePct != null && (
-          <Metric title="Share of input tokens served from the provider prompt cache">
+          <Metric title="Approximate share of input tokens served from the provider prompt cache. Estimated by the ADE from provider-shaped usage totals — the denominator is inferred, not reported. The harness measures this properly; once it publishes the figure this estimate goes away.">
             <em>Cache</em>
-            <span>{derived.cachePct}%</span>
+            <span>~{derived.cachePct}%</span>
           </Metric>
         )}
         <Legend>
