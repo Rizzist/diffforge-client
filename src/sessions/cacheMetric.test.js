@@ -76,3 +76,36 @@ test("the promoted top-level rate is preferred, and the deep one still works", (
     0,
   );
 });
+
+/* The defect one layer below the `promoted || nested` trap.
+
+   Testing that the promoted value is a usable number still falls through when
+   it is present-but-null — letting a stale nested projection overwrite a fresh
+   "the daemon answered, and the answer is that it did not measure this". The
+   contract permits an explicit null here, so presence is the only test that
+   closes both cases. */
+test("a present-but-null promoted field is an answer, not a reason to fall back", () => {
+  assert.equal(
+    measuredCacheRereadBasisPoints({
+      cache_reread_hit_basis_points: null,
+      agent_metrics: { usage: { cache_reread_hit_basis_points: 9058 } },
+    }),
+    null,
+  );
+
+  // Absent — not present-but-null — is what legitimately reaches the older path.
+  assert.equal(
+    measuredCacheRereadBasisPoints({
+      agent_metrics: { usage: { cache_reread_hit_basis_points: 9058 } },
+    }),
+    9058,
+  );
+
+  // And the nested path obeys the same rule at its own level.
+  assert.equal(
+    measuredCacheRereadBasisPoints({
+      agent_metrics: { usage: { cache_reread_hit_basis_points: null } },
+    }),
+    null,
+  );
+});

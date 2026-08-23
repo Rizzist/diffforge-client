@@ -22,16 +22,31 @@ export function measuredCacheRereadBasisPoints(session) {
 
      The nested path stays permanently, not as a migration step. Sessions
      written by every daemon up to 942 keep only the deep shape, and this
-     client reads whatever is on the other end of the socket. */
-  for (const value of [
-    session?.cache_reread_hit_basis_points,
-    session?.agent_metrics?.usage?.cache_reread_hit_basis_points,
-  ]) {
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return value;
-    }
+     client reads whatever is on the other end of the socket.
+
+     Selection is on PRESENCE, not on the value being usable. A promoted field
+     that is present says the current daemon answered, and its answer stands
+     even when that answer is null — falling through to the older nested number
+     would let a stale projection overwrite a fresh "not measured".
+
+     `promoted || nested` is the obvious form and is wrong for a measured 0.
+     Testing `typeof value === "number"` fixes that case and still falls
+     through on a present null, which is the same defect one layer down. Only
+     presence closes both. No live session currently sends an explicit null
+     here — checked across 100 — but that is a fact about today's serialization,
+     not a promise the wire makes. */
+  if (session && Object.hasOwn(session, "cache_reread_hit_basis_points")) {
+    return finiteOrNull(session.cache_reread_hit_basis_points);
+  }
+  const usage = session?.agent_metrics?.usage;
+  if (usage && Object.hasOwn(usage, "cache_reread_hit_basis_points")) {
+    return finiteOrNull(usage.cache_reread_hit_basis_points);
   }
   return null;
+}
+
+function finiteOrNull(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 /** Basis points to a display string. 10000bp = 100%.
