@@ -153,7 +153,10 @@ const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH: usize = 2048;
 const MAX_FILE_EXPLORER_ENTRIES: usize = 600;
 const MAX_WORKSPACE_PROJECT_MOUNTS: usize = 64;
 const MAX_SAFE_WORKSPACE_ROOT_IMMEDIATE_ENTRIES: usize = 256;
-const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH: usize = 2;
+// The scanner must visit two container layers to discover project markers at
+// paths such as portfolio/product-a/frontend. Fanout and total-directory caps
+// still bound the work independently of this depth.
+const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH: usize = 3;
 const WORKSPACE_PROJECT_MOUNT_SCAN_ROOT_FANOUT: usize = 100;
 const WORKSPACE_PROJECT_MOUNT_SCAN_CHILD_FANOUT: usize = 20;
 const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DIRECTORIES: usize = 500;
