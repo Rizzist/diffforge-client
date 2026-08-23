@@ -17,14 +17,24 @@ function toolRow(item, seq, overrides = {}) {
   };
 }
 
-test("session_seen rows do not produce transcript blocks", () => {
-  const metadataNamed = toolRow("session_seen", 1);
-  const textNamed = toolRow("unclassified", 2, {
+test("session_seen and session_renamed rows do not produce transcript blocks", () => {
+  const metadataNamedSeen = toolRow("session_seen", 1);
+  const textNamedSeen = toolRow("unclassified", 2, {
     text: "session_seen · completed",
     meta: {},
   });
+  const metadataNamedRenamed = toolRow("session_renamed", 3);
+  const textNamedRenamed = toolRow("unclassified", 4, {
+    text: "session_renamed · completed",
+    meta: {},
+  });
 
-  assert.deepEqual(buildTranscriptBlocks([metadataNamed, textNamed]), []);
+  assert.deepEqual(buildTranscriptBlocks([
+    metadataNamedSeen,
+    textNamedSeen,
+    metadataNamedRenamed,
+    textNamedRenamed,
+  ]), []);
 });
 
 test("owner-approved state rows remain visible in transcript blocks", () => {
@@ -33,7 +43,6 @@ test("owner-approved state rows remain visible in transcript blocks", () => {
     "context_compaction",
     "session_state",
     "run_state",
-    "session_renamed",
   ];
   const blocks = buildTranscriptBlocks(
     visibleNames.map((item, index) => toolRow(item, index + 1)),
