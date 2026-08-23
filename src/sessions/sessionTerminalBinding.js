@@ -95,13 +95,22 @@ export function applyLegacySessionBinding(state, announcement) {
   };
 }
 
+/* Only a PER-PANE fact may produce a pane-addressed announcement.
+
+   OSC 7791 qualifies by construction: it arrives inside one pane's own PTY
+   stream, so it cannot describe any other pane. The daemon's
+   resident_session_binding does not: the registry keeps N publishers keyed by
+   connection and collapses them to a single most-recent winner, dropping the
+   owner before the frame is sent. It says "something in this profile is bound
+   to X" and names nothing else.
+
+   This used to pair the protocol fact with whichever surface happened to be
+   mounted when it arrived, which reads as careful — the surface is real, the
+   timing is fenced — but it manufactures an identity the fact never carried.
+   With one shell open it is right by coincidence. With two, an in-TUI hop in
+   one rehomed the other and nothing errored. */
 export function sessionBindingAnnouncement(state) {
   if (!state.known) return null;
   if (state.authority === "osc") return state.legacyAnnouncement;
-  const source = state.observedSurface;
-  if (!source?.paneId || !source?.hostSessionId) return null;
-  return {
-    ...source,
-    providerSessionId: state.sessionId,
-  };
+  return null;
 }

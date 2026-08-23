@@ -113,10 +113,19 @@ export default function SessionTerminal({
     let themeObserver = null;
     let detachPushToTalk = () => {};
     const announceTuiAttached = (providerSessionId) => {
-      /* A capable daemon's typed frame has sole authority. Keep parsing OSC
-         so old daemons work and the control sequence stays swallowed, but it
-         cannot write once protocol authority is established. */
-      if (bindingAuthorityRef.current === "protocol") return;
+      /* OSC 7791 is PER-PANE BY CONSTRUCTION: it arrives inside this pane's own
+         PTY stream, so it can only ever describe this pane. That is what makes
+         it the right source for "which session is this shell showing", and it
+         stays authoritative for that on every daemon.
+
+         The daemon's resident_session_binding frame is NOT a replacement for
+         it. That frame is profile-global — the daemon keeps N publishers keyed
+         by connection and collapses them to a single most-recent winner before
+         broadcasting, discarding the owner. With several shells open it reports
+         whichever published last, which may be none of the panes being
+         rendered. Suppressing this announce when that frame was available made
+         an in-TUI session hop in one shell rehome a different shell, and
+         nothing errored. */
       onTuiAttachedRef.current?.({
         paneId,
         providerSessionId: providerSessionId || null,

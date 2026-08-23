@@ -661,19 +661,23 @@ export default function SessionSurface({
     rehomeAttachedTui(announcement, target);
   }, [onSessionsRefresh, rehomeAttachedTui, sessions]);
 
-  /* Each protocol observation is delivered exactly once to the surface that
-     was active and mounted when it arrived. A cached binding never follows a
-     later navigation. Legacy announcements retain their exact emitting pane. */
+  /* A PROTOCOL OBSERVATION MUST NOT REHOME A PANE.
+
+     resident_session_binding is profile-global. The daemon holds N publishers
+     keyed by connection and collapses them to a single most-recent winner,
+     discarding the owner before the frame goes out. So it answers "is anything
+     in this profile bound, and to what" — a real fact, and the one that let the
+     terminal scrape retire — but it cannot answer "which session is THIS pane
+     showing". Routing it into handleTuiAttached inferred a pane from a fact
+     that never named one: with two shells open, a hop in one rehomed the
+     other, and nothing errored.
+
+     Per-pane identity stays with OSC 7791, which is per-pane BY CONSTRUCTION
+     because it arrives inside that pane's own stream. These are two different
+     facts at two different scopes — not two sources for one fact — so both may
+     live at once, provided neither is ever read as the other. */
   useEffect(() => {
-    if (sessionBinding.authority === "protocol") {
-      if (!sessionBinding.known) return;
-      const deliveryKey = `protocol\u0000${sessionBinding.observation}`;
-      if (deliveredBindingRef.current === deliveryKey) return;
-      deliveredBindingRef.current = deliveryKey;
-      const announcement = sessionBindingAnnouncement(sessionBinding);
-      if (announcement) handleTuiAttached(announcement);
-      return;
-    }
+    if (sessionBinding.authority === "protocol") return;
     const announcement = sessionBindingAnnouncement(sessionBinding);
     if (!announcement) return;
     const deliveryKey = [
