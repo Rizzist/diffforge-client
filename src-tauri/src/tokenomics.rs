@@ -21257,6 +21257,7 @@ mod tokenomics_tests {
         let local_device_id = tokenomics_local_device_id();
         let local_device_ids = tokenomics_local_device_id_set(&conn).unwrap();
         let scope = tokenomics_billing_scope_from_parts(Some("personal"), None, "test");
+        let observed_at = tokenomics_now_iso_like();
         let summary = json!({
             "limits": [
                 {
@@ -21267,7 +21268,7 @@ mod tokenomics_tests {
                     "window_kind": "weekly",
                     "used_percent": 80,
                     "remaining_percent": 20,
-                    "updated_at": "2026-05-30T05:00:00Z"
+                    "updated_at": observed_at
                 },
                 {
                     "provider": "openai",
@@ -21276,7 +21277,7 @@ mod tokenomics_tests {
                     "window_kind": "weekly",
                     "used_percent": 70,
                     "remaining_percent": 30,
-                    "updated_at": "2026-05-30T05:00:00Z"
+                    "updated_at": observed_at
                 },
                 {
                     "device_id": "remote-device",
@@ -21286,7 +21287,7 @@ mod tokenomics_tests {
                     "window_kind": "weekly",
                     "used_percent": 35,
                     "remaining_percent": 65,
-                    "updated_at": "2026-05-30T05:00:00Z"
+                    "updated_at": observed_at
                 }
             ],
             "limit_samples": [
@@ -21298,7 +21299,7 @@ mod tokenomics_tests {
                     "window_kind": "weekly",
                     "used_percent": 80,
                     "remaining_percent": 20,
-                    "sample_at": "2026-05-30T05:00:00Z"
+                    "sample_at": observed_at
                 },
                 {
                     "provider": "openai",
@@ -21307,7 +21308,7 @@ mod tokenomics_tests {
                     "window_kind": "weekly",
                     "used_percent": 70,
                     "remaining_percent": 30,
-                    "sample_at": "2026-05-30T05:00:00Z"
+                    "sample_at": observed_at
                 },
                 {
                     "device_id": "remote-device",
@@ -21317,7 +21318,7 @@ mod tokenomics_tests {
                     "window_kind": "weekly",
                     "used_percent": 35,
                     "remaining_percent": 65,
-                    "sample_at": "2026-05-30T05:00:00Z"
+                    "sample_at": observed_at
                 }
             ]
         });
