@@ -135,8 +135,15 @@ export default function SessionsRail({
 
   /* AI sessions and media sessions (kind: "media", local demo rows) share
      ONE recency ordering; media rows are visually distinct + DEV-badged. */
+  const measuredRecency = (session) => (
+    Object.hasOwn(session || {}, "latest_at_ms")
+      && session.latest_at_ms != null
+      && Number.isFinite(Number(session.latest_at_ms))
+      ? Number(session.latest_at_ms)
+      : Number.NEGATIVE_INFINITY
+  );
   const sorted = [...sessions, ...mediaSessions].sort(
-    (a, b) => (b.latest_at_ms || 0) - (a.latest_at_ms || 0),
+    (a, b) => measuredRecency(b) - measuredRecency(a),
   );
   /* Rail search narrows both groups by title or the opening user message. */
   const query = searchQuery.trim().toLowerCase();

@@ -651,6 +651,17 @@ fn terminal_clean_provider_session_id(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn terminal_haider_roster_contains(roster: &[Value], provider_session_id: &str) -> bool {
+    let expected = provider_session_id.trim();
+    !expected.is_empty()
+        && roster.iter().any(|summary| {
+            summary
+                .get("session_id")
+                .and_then(Value::as_str)
+                .is_some_and(|session_id| session_id == expected)
+        })
+}
+
 fn terminal_provider_session_exists_on_device(
     agent_id: &str,
     provider_session_id: &str,
@@ -683,9 +694,9 @@ fn terminal_provider_session_exists_on_device(
         AgentProvider::OpenCode => {
             resolve_opencode_resume_session(&provider_session_id, working_directory).is_ok()
         }
-        // Haider's daemon owns session selection until its CLI exposes a
-        // stable session lookup contract.
-        AgentProvider::Haider => true,
+        AgentProvider::Haider => {
+            return Err("Haider session existence requires a complete daemon roster.".to_string())
+        }
     })
 }
 
@@ -743,18 +754,28 @@ async fn terminal_provider_session_exists(
     };
     let has_frozen_binding = pane_id.is_some();
     let binding_for_probe = has_frozen_binding.then_some(frozen_binding.clone());
-    let agent_id_for_probe = agent_id.clone();
-    let provider_session_id_for_probe = provider_session_id.clone();
-    let exists = tauri::async_runtime::spawn_blocking(move || {
-        terminal_provider_session_exists_on_device(
-            &agent_id_for_probe,
-            &provider_session_id_for_probe,
-            &working_directory,
-            binding_for_probe.as_ref(),
-        )
-    })
-    .await
-    .map_err(|error| format!("Provider session existence check failed: {error}"))??;
+    let exists = if provider == AgentProvider::Haider {
+        if let Some(binding) = binding_for_probe.as_ref() {
+            binding.validate_frozen_account(provider, true)?;
+        }
+        let roster = haider_rpc_ade::session_roster_snapshot_rpc()
+            .await
+            .ok_or_else(|| "Unable to verify Haider session existence without a live daemon roster.".to_string())??;
+        terminal_haider_roster_contains(&roster, &provider_session_id)
+    } else {
+        let agent_id_for_probe = agent_id.clone();
+        let provider_session_id_for_probe = provider_session_id.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            terminal_provider_session_exists_on_device(
+                &agent_id_for_probe,
+                &provider_session_id_for_probe,
+                &working_directory,
+                binding_for_probe.as_ref(),
+            )
+        })
+        .await
+        .map_err(|error| format!("Provider session existence check failed: {error}"))??
+    };
     if let Some(pane_id) = pane_id.as_deref() {
         if exists {
             terminal_store_frozen_resume_binding(
@@ -35121,6 +35142,17 @@ mod terminal_tests {
         assert!(!env_vars
             .iter()
             .any(|(key, _)| key == OPENCODE_TUI_CONFIG_ENV));
+    }
+
+    #[test]
+    fn haider_session_existence_comes_from_complete_roster_membership() {
+        let roster = vec![
+            json!({"session_id": "session-present"}),
+            json!({"session_id": "session-other"}),
+        ];
+        assert!(terminal_haider_roster_contains(&roster, "session-present"));
+        assert!(!terminal_haider_roster_contains(&roster, "session-missing"));
+        assert!(!terminal_haider_roster_contains(&roster, ""));
     }
 
 

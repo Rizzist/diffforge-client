@@ -15,9 +15,6 @@ import { Send } from "@styled-icons/material-rounded/Send";
    deliberately no fallback catalog: presenting commands without the
    command_door_v1 feature would advertise a UI that cannot execute. */
 
-const EFFORT_OPTIONS = ["default", "low", "medium", "high", "xhigh"];
-const SPEED_OPTIONS = ["default", "fast"];
-
 export default function SessionComposer({
   disabled = false,
   onSubmit,
@@ -241,11 +238,9 @@ export default function SessionComposer({
     }
   }, []);
 
-  const chip = (key, label, fallbackOptions = []) => {
+  const chip = (key, label) => {
     const current = chipValues[key] == null ? "unknown" : String(chipValues[key]);
-    const options = Array.isArray(chipOptions[key]) && chipOptions[key].length
-      ? chipOptions[key]
-      : fallbackOptions;
+    const options = Array.isArray(chipOptions[key]) ? chipOptions[key] : [];
     const display = current === "default" ? "Default" : current === "unknown" ? "Unknown" : current;
     /* Switching is gated per chip by the harness capability sniff; until the
        daemon exposes a headless door, menus browse the library read-only. */
@@ -359,8 +354,8 @@ export default function SessionComposer({
     <ComposerRoot ref={rootRef}>
       <ChipsRow>
         {modelChip()}
-        {chip("effort", "Effort", EFFORT_OPTIONS)}
-        {chipOptions.speedApplicable ? chip("speed", "Speed", SPEED_OPTIONS) : null}
+        {chip("effort", "Effort")}
+        {chipOptions.speedApplicable ? chip("speed", "Speed") : null}
       </ChipsRow>
 
       <ComposerBarWrap>

@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import styled from "styled-components";
 import NeedsInputCard from "./NeedsInputCard.jsx";
+import { projectionCaughtUp } from "./sessionSync.js";
 import { buildTranscriptBlocks, projectionRowKey } from "./sessionTranscriptBlocks.js";
 
 /* Virtualized transcript for the session UI view, fed by the Rust
@@ -318,7 +319,7 @@ export default function SessionTranscript({
   const [liveTail, setLiveTail] = useState(null);
   const [windowState, setWindowState] = useState({ start: 0, rows: [] });
   const [loadState, setLoadState] = useState("loading"); // loading | ready | empty | error
-  const [caughtUp, setCaughtUp] = useState(true);
+  const [caughtUp, setCaughtUp] = useState(null);
   /* Additive sync lift (Session Deck): report whether this projection is
      still catching up — cold load or a live fold gap — so the shell's rail
      pill can show it. Read through a ref so an inline callback prop can't
@@ -357,7 +358,7 @@ export default function SessionTranscript({
       });
       setTotalRows(Number(result?.total_rows) || 0);
       setLiveTail(result?.live_tail || null);
-      setCaughtUp(result?.caught_up !== false);
+      setCaughtUp(projectionCaughtUp(result));
       setWindowState({
         start: Number(result?.start_index) || 0,
         rows: Array.isArray(result?.rows) ? result.rows : [],
@@ -378,6 +379,7 @@ export default function SessionTranscript({
     heightsRef.current = new Map();
     stickBottomRef.current = true;
     setLoadState("loading");
+    setCaughtUp(null);
     setWindowState({ start: 0, rows: [] });
     setLiveTail(null);
 
@@ -409,6 +411,7 @@ export default function SessionTranscript({
         return;
       }
       const nextTotal = Number(payload.total_rows) || 0;
+      setCaughtUp(projectionCaughtUp(payload));
       setTotalRows(nextTotal);
       setLiveTail(payload.live_tail || null);
       setLoadState("ready");

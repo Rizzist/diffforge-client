@@ -243,6 +243,25 @@ test("an explicit Close that lands while the async session probe is pending wins
   });
 });
 
+test("an unavailable existence probe stays unknown", async () => {
+  assert.deepEqual(await probeTerminalSessionForRestart(
+    async () => null,
+    () => false,
+  ), {
+    explicit_close_requested: false,
+    provider_session_exists: null,
+  });
+  assert.deepEqual(resolveTerminalSessionOpenBinding({
+    providerSessionExists: null,
+    threadProviderSessionId: "unverified-session",
+  }), {
+    fresh_session: false,
+    fork_from_provider_session_id: "",
+    provider_session_id: "unverified-session",
+    provider_session_missing: false,
+  });
+});
+
 test("prepared agent start binds only the session the backend actually resumed", () => {
   assert.deepEqual(resolveTerminalStartedSessionBinding({
     paneResult: { effective_provider_session_id: null, started: true },

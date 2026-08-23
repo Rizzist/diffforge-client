@@ -7,6 +7,7 @@ import {
   credentialStatus,
   librarySnapshotNeedsRetry,
   modelGroupsFromLibrary,
+  modelOptionCatalog,
   providerAuthOptions,
 } from "./haiderClientContract.js";
 
@@ -114,4 +115,26 @@ test("provider choices come only from provider.list auth_methods", () => {
   };
   assert.deepEqual(providerAuthOptions(library, "oauth"), ["oauth-provider"]);
   assert.deepEqual(providerAuthOptions(library, "api_key"), ["key-provider"]);
+});
+
+test("composer catalogs come from the selected model detail verbatim", () => {
+  const catalog = modelOptionCatalog({
+    models: [{
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      supported_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      supported_speeds: ["normal", "fast", "warp"],
+    }],
+  }, "openai", "gpt-5.6-sol");
+
+  assert.deepEqual(catalog, {
+    effort: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    speed: ["normal", "fast", "warp"],
+    speedApplicable: true,
+  });
+  assert.deepEqual(modelOptionCatalog({ models: [] }, "openai", "missing"), {
+    effort: [],
+    speed: [],
+    speedApplicable: false,
+  });
 });

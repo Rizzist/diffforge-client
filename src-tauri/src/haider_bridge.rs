@@ -354,9 +354,10 @@ fn haider_bridge_collect_sessions(
     value: &Value,
     inherited_id: Option<&str>,
     sessions: &mut Vec<HaiderBridgeSession>,
+    lineage_available: bool,
 ) {
     if let Some(session) = haider_bridge_parse_session(value, inherited_id) {
-        if !haider_bridge_is_subagent_session(value, &session.id) {
+        if !haider_bridge_is_subagent_session(value, lineage_available) {
             sessions.push(session);
         }
         return;
@@ -365,10 +366,10 @@ fn haider_bridge_collect_sessions(
     match value {
         Value::Array(values) => {
             if let [Value::String(id), session] = values.as_slice() {
-                haider_bridge_collect_sessions(session, Some(id), sessions);
+                haider_bridge_collect_sessions(session, Some(id), sessions, lineage_available);
             } else {
                 for value in values {
-                    haider_bridge_collect_sessions(value, None, sessions);
+                    haider_bridge_collect_sessions(value, None, sessions, lineage_available);
                 }
             }
         }
@@ -379,15 +380,15 @@ fn haider_bridge_collect_sessions(
                 };
                 if let Value::Object(keyed_sessions) = container {
                     for (id, value) in keyed_sessions {
-                        haider_bridge_collect_sessions(value, Some(id), sessions);
+                        haider_bridge_collect_sessions(value, Some(id), sessions, lineage_available);
                     }
                 } else {
-                    haider_bridge_collect_sessions(container, None, sessions);
+                    haider_bridge_collect_sessions(container, None, sessions, lineage_available);
                 }
             }
             for key in ["data", "result", "response", "body"] {
                 if let Some(container) = object.get(key) {
-                    haider_bridge_collect_sessions(container, None, sessions);
+                    haider_bridge_collect_sessions(container, None, sessions, lineage_available);
                 }
             }
         }
@@ -395,13 +396,14 @@ fn haider_bridge_collect_sessions(
     }
 }
 
-/// New harnesses describe lineage directly. A present typed kind wins over
-/// the legacy id convention, while a non-empty parent is independently
-/// sufficient to identify a child. Old summaries still use the daemon's
-/// `session-child-…` marker.
-fn haider_bridge_is_subagent_session(value: &Value, id: &str) -> bool {
+/// Lineage is meaningful only when its owning feature was negotiated. An id
+/// prefix is never lineage evidence.
+fn haider_bridge_is_subagent_session(value: &Value, lineage_available: bool) -> bool {
+    if !lineage_available {
+        return false;
+    }
     let Some(object) = value.as_object() else {
-        return id.starts_with("session-child-");
+        return false;
     };
     let kind = haider_bridge_object_value(object, &["kind"], &["summary", "metadata", "session"])
         .and_then(Value::as_str)
@@ -418,13 +420,23 @@ fn haider_bridge_is_subagent_session(value: &Value, id: &str) -> bool {
     match kind {
         Some(kind) => kind == "subagent" || parent_session_id.is_some(),
         None if parent_session_id.is_some() => true,
-        None => id.starts_with("session-child-"),
+        None => false,
     }
 }
 
 fn haider_bridge_parse_session_list(value: &Value) -> Vec<HaiderBridgeSession> {
+    haider_bridge_parse_session_list_with_lineage(
+        value,
+        haider_rpc_ade::rpc_feature_advertised("session_lineage_v1"),
+    )
+}
+
+fn haider_bridge_parse_session_list_with_lineage(
+    value: &Value,
+    lineage_available: bool,
+) -> Vec<HaiderBridgeSession> {
     let mut sessions = Vec::new();
-    haider_bridge_collect_sessions(value, None, &mut sessions);
+    haider_bridge_collect_sessions(value, None, &mut sessions, lineage_available);
     sessions.sort_by(|left, right| left.id.cmp(&right.id));
     sessions.dedup_by(|left, right| left.id == right.id);
     sessions
@@ -539,6 +551,12 @@ fn haider_bridge_reconcile_store_with_policy(
         let replace_harness =
             row.harness != session.harness && !policy.preserves_stored_harness(&row.harness);
         let mut row_changed = replace_harness;
+        if row.dir.trim().is_empty() {
+            if let Some(cwd) = haider_bridge_session_cwd(session) {
+                row.dir = cwd.to_string_lossy().into_owned();
+                row_changed = true;
+            }
+        }
         if row.provider_session_id.trim().is_empty() {
             row.provider_session_id = session.id.clone();
             row_changed = true;
@@ -554,16 +572,15 @@ fn haider_bridge_reconcile_store_with_policy(
 
         transaction
             .execute(
-                "UPDATE sessions SET provider_session_id = ?2, harness_json = ?3 WHERE id = ?1",
-                rusqlite::params![row.id, row.provider_session_id, harness_json,],
+                "UPDATE sessions SET provider_session_id = ?2, harness_json = ?3, dir = ?4 WHERE id = ?1",
+                rusqlite::params![row.id, row.provider_session_id, harness_json, row.dir],
             )
             .map_err(|error| format!("Unable to reconcile Haider session: {error}"))?;
         changed = true;
     }
     // Import daemon sessions the store doesn't know (created directly in the
     // haider CLI/TUI) so the home view can continue them. No directory is
-    // known until the harness exposes cwd, so they land as pinned rows with
-    // an empty dir and attach at the default working directory.
+    // imported summary's typed workspace is the only authoritative cwd.
     let bound: std::collections::HashSet<&str> = rows
         .iter()
         .filter(|row| !row.provider_session_id.trim().is_empty())
@@ -577,6 +594,9 @@ fn haider_bridge_reconcile_store_with_policy(
             continue;
         }
         let now_ms = sessions_now_ms();
+        let dir = haider_bridge_session_cwd(session)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let harness_json = serde_json::to_string(&session.harness)
             .map_err(|error| format!("Unable to encode imported Haider summary: {error}"))?;
         transaction
@@ -584,8 +604,8 @@ fn haider_bridge_reconcile_store_with_policy(
                 "INSERT INTO sessions (
                     id, slug, dir, kind, provider_session_id, created_at_ms,
                     pinned, title_locked, harness_json, first_user_message
-                 ) VALUES (?1, '', '', 'pinned', ?2, ?3, 0, NULL, ?4, '')",
-                rusqlite::params![sessions_new_id(now_ms), session.id, now_ms, harness_json,],
+                 ) VALUES (?1, '', ?3, 'pinned', ?2, ?4, 0, NULL, ?5, '')",
+                rusqlite::params![sessions_new_id(now_ms), session.id, dir, now_ms, harness_json],
             )
             .map_err(|error| format!("Unable to import Haider session: {error}"))?;
         changed = true;
@@ -974,10 +994,24 @@ fn haider_library_catalog_models(
     flattened
 }
 
+fn haider_library_model_features_present(features: &[String]) -> bool {
+    [
+        "provider_management_v1",
+        "provider_models_v1",
+        "models_list_v1",
+    ]
+    .iter()
+    .all(|required| features.iter().any(|feature| feature == required))
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn haider_library_snapshot() -> Value {
     let features = haider_rpc_ade::rpc_features().await;
-    let provider_snapshot = if features.iter().any(|feature| feature == "provider_management_v1") {
+    let model_features_present = haider_library_model_features_present(&features);
+    let provider_snapshot = if features
+        .iter()
+        .any(|feature| feature == "provider_management_v1")
+    {
         match haider_rpc_ade::provider_list_rpc(None).await {
             Ok(snapshot) => Some(snapshot),
             Err(_) => None,
@@ -990,12 +1024,30 @@ async fn haider_library_snapshot() -> Value {
     } else {
         None
     };
-    let models = provider_snapshot
-        .as_ref()
-        .map(|snapshot| {
+    let models = if model_features_present {
+        provider_snapshot.as_ref().map(|snapshot| {
             haider_library_catalog_models(&snapshot.providers, snapshot.availability.as_ref())
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let providers = provider_snapshot.as_ref().map(|snapshot| {
+        snapshot
+            .providers
+            .iter()
+            .cloned()
+            .map(|mut provider| {
+                if !model_features_present {
+                    if let Some(object) = provider.as_object_mut() {
+                        object.remove("models");
+                        object.remove("model_details");
+                    }
+                }
+                provider
+            })
+            .collect::<Vec<_>>()
+    });
     let mut efforts = models
         .iter()
         .flat_map(|model| model.supported_efforts.iter().cloned())
@@ -1011,7 +1063,7 @@ async fn haider_library_snapshot() -> Value {
     json!({
         "version": 3,
         "models": models,
-        "providers": provider_snapshot.as_ref().map(|snapshot| &snapshot.providers),
+        "providers": providers,
         "provider_revision": provider_snapshot.as_ref().map(|snapshot| snapshot.revision),
         "provider_availability": provider_snapshot.as_ref().and_then(|snapshot| snapshot.availability.as_ref()),
         "accounts": account_snapshot.as_ref().map(|snapshot| &snapshot.descriptors),
@@ -1207,26 +1259,18 @@ mod haider_bridge_tests {
     }
 
     #[test]
-    fn haider_bridge_subagent_sessions_never_reach_the_rail() {
+    fn absent_lineage_does_not_infer_from_session_id_prefix() {
         let sample = json!({
             "sessions": [
                 {"id": "session-abc123", "title": "Real work", "updated_at": 5_i64},
                 {"id": "session-child-deadbeef", "title": "Delegated task: pick", "updated_at": 6_i64},
             ]
         });
-        let parsed = haider_bridge_parse_session_list(&sample);
-        assert_eq!(parsed.len(), 1);
+        let parsed = haider_bridge_parse_session_list_with_lineage(&sample, true);
+        assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].id, "session-abc123");
-        // Excluded from the parsed roster ⇒ the roster-absence prune removes
-        // any child row an older build already imported.
-        assert!(haider_bridge_is_subagent_session(
-            &json!({}),
-            "session-child-deadbeef"
-        ));
-        assert!(!haider_bridge_is_subagent_session(
-            &json!({}),
-            "session-abc123"
-        ));
+        assert_eq!(parsed[1].id, "session-child-deadbeef");
+        assert!(!haider_bridge_is_subagent_session(&json!({}), true));
     }
 
     #[test]
@@ -1245,7 +1289,7 @@ mod haider_bridge_tests {
                 }
             ]
         });
-        let parsed = haider_bridge_parse_session_list(&sample);
+        let parsed = haider_bridge_parse_session_list_with_lineage(&sample, true);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "session-child-direct");
     }
@@ -1259,7 +1303,21 @@ mod haider_bridge_tests {
                 "title": "Child by parent"
             }]
         });
-        assert!(haider_bridge_parse_session_list(&sample).is_empty());
+        assert!(haider_bridge_parse_session_list_with_lineage(&sample, true).is_empty());
+    }
+
+    #[test]
+    fn model_inventory_requires_both_owner_bits_and_composed_list_bit() {
+        let strings = |values: &[&str]| values.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+        assert!(!haider_library_model_features_present(&strings(&[
+            "provider_management_v1",
+            "provider_models_v1",
+        ])));
+        assert!(haider_library_model_features_present(&strings(&[
+            "provider_management_v1",
+            "provider_models_v1",
+            "models_list_v1",
+        ])));
     }
 
     #[test]

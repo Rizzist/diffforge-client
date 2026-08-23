@@ -37,7 +37,9 @@ import {
   buildCommandSlots,
   librarySnapshotNeedsRetry,
   modelGroupsFromLibrary,
+  modelOptionCatalog,
 } from "./haiderClientContract.js";
+import { surfaceStatusLabel } from "./sessionStatus.js";
 import {
   rehomeSessionPane,
   rehomeSessionViewMode,
@@ -83,27 +85,6 @@ const SUBMIT_WAKE_ATTEMPTS = 6;
 const SUBMIT_WAKE_BACKOFF_MS = 700;
 const SUBMIT_HOLD_CLEAR_MS = 6000;
 
-
-/* The TUI's status strip arrives whole ("[ ‖ IDLE (i) ] 3.7k tok · …"):
-   extract the state word for the pill, drop key-hint parentheticals, keep
-   the full line for the tooltip. Falls back to a trimmed head for lines
-   without the bracket form. */
-function compactSurfaceStatus(line) {
-  const trimmed = (line || "").trim();
-  if (!trimmed) return "";
-  // Unicode-aware: the first LETTER (any script) starts the state; key-hint
-  // parentheticals go first so "[ ⏳ 运行中 (i) ]" yields "运行中", not "I)".
-  const bracket = /\[\s*[^\p{L}\]]*([\p{L}][^\]]*?)\s*\]/u.exec(trimmed);
-  if (bracket) {
-    const state = bracket[1].replace(/\s*\([^)]*\)/g, "").trim();
-    if (state) {
-      return /^[A-Za-z][A-Za-z\s-]*$/.test(state)
-        ? state.charAt(0).toUpperCase() + state.slice(1).toLowerCase()
-        : state;
-    }
-  }
-  return trimmed.length > 26 ? `${trimmed.slice(0, 26)}…` : trimmed;
-}
 
 const PANEL_KINDS = {
   web: { label: "Web", Icon: Language },
@@ -834,13 +815,11 @@ export default function SessionSurface({
     };
   };
   const chipOptionsFor = (session) => {
-    const config = session ? sessionConfigs[session.id] : null;
+    const values = chipValuesFor(session);
+    const catalog = modelOptionCatalog(library, values.modelProvider, values.model);
     return {
       modelGroups: modelGroupsFromLibrary(library),
-      speedApplicable: Boolean(
-        (config && Object.hasOwn(config, "speed"))
-        || (session && Object.hasOwn(session, "speed")),
-      ),
+      ...catalog,
     };
   };
   /* Bound sessions apply through the harness (session_config_set) so the
@@ -1439,24 +1418,8 @@ export default function SessionSurface({
     const rawStatusLine = (surfaceEntry?.line || "").trim();
     /* status_segment_structured_v1: {state, detail} skip the strip parser
        entirely; the unicode compactor stays as the pre-structured fallback. */
-    const structuredStatus = (surfaceEntry?.detail || surfaceEntry?.state || "").trim();
-    /* state_raw holds the LAST RUN'S outcome ("cancelled"/"completed") — a
-       past-tense vocabulary. It may fill the pill only while a run is
-       actually alive; on a settled session it flashed "Cancelled" for a
-       frame before the live strip arrived. Settled = the bucket word. */
-    const sessionActive = session
-      && (session.status === "running" || session.status === "waiting" || session.status === "error");
     const statusLine = session && session.id !== "draft"
-      ? (structuredStatus
-        || compactSurfaceStatus(rawStatusLine)
-        || (sessionActive ? (session.state_raw || "").trim() : "")
-        || (session.status === "running"
-          ? "Running"
-          : session.status === "waiting"
-            ? "Waiting"
-            : session.status === "error"
-              ? "Error"
-              : "Idle"))
+      ? surfaceStatusLabel(surfaceEntry, session)
       : "";
     return (
       <FloatingControls>
@@ -1710,11 +1673,10 @@ export default function SessionSurface({
                         const entry = surfaceStatus[session.id] || null;
                         if ((entry?.state || "").toLowerCase() === "idle") return "";
                         const structured = (entry?.detail || entry?.state || "").trim();
-                        const compact = structured || compactSurfaceStatus(entry?.line || "");
-                        if (/^idle\b/i.test(compact)) return "";
+                        if (/^idle\b/i.test(structured)) return "";
                         const fallback = (session.state_raw || "").trim();
-                        if (!compact && /^idle\b/i.test(fallback)) return "";
-                        return compact || fallback || "working…";
+                        if (!structured && /^idle\b/i.test(fallback)) return "";
+                        return structured || fallback || "working…";
                       })()}
                       session={session}
                     />

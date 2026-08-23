@@ -7,7 +7,7 @@ const HAIDER_PROJECTION_MAX_EXPORT_BYTES: u64 = 32 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_WINDOW_ROWS: i64 = 1_000;
 const HAIDER_PROJECTION_WATCH_LIMIT: usize = 6;
-const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 6;
+const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 7;
 const HAIDER_PROJECTION_PIPE_BATCH_LINES: usize = 256;
 const HAIDER_PROJECTION_PIPE_SAFETY_POLL: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_PIPE_STOP_POLL: Duration = Duration::from_millis(100);
@@ -30,7 +30,7 @@ struct SessionProjectionRow {
     role: String,
     text: String,
     meta: Value,
-    at_ms: i64,
+    at_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,7 +41,7 @@ struct SessionProjectionWindow {
     live_tail: Option<SessionProjectionRow>,
     covered_through_seq: Option<i64>,
     head_seq: Option<i64>,
-    caught_up: bool,
+    caught_up: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,7 +52,6 @@ struct HaiderProjectionTail {
 
 #[derive(Clone, Debug)]
 struct HaiderProjectionFoldState {
-    next_fallback_seq: i64,
     total_rows: i64,
     persisted_max_key: Option<(i64, i64, i64)>,
     window_anchors: HashMap<i64, (i64, i64, i64)>,
@@ -71,7 +70,6 @@ struct HaiderProjectionFoldState {
 impl Default for HaiderProjectionFoldState {
     fn default() -> Self {
         Self {
-            next_fallback_seq: 1,
             total_rows: 0,
             persisted_max_key: None,
             window_anchors: HashMap::new(),
@@ -103,7 +101,7 @@ struct HaiderProjectionFrame {
     covered_through_seq: Option<i64>,
     head_seq: Option<i64>,
     pipe_max_seq: Option<i64>,
-    caught_up: bool,
+    caught_up: Option<bool>,
     sync_changed: bool,
     rows: Vec<SessionProjectionRow>,
     start_total: Option<i64>,
@@ -119,7 +117,7 @@ struct HaiderProjectionEvent {
     live_tail: Option<SessionProjectionRow>,
     covered_through_seq: Option<i64>,
     head_seq: Option<i64>,
-    caught_up: bool,
+    caught_up: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rows: Option<Vec<SessionProjectionRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,7 +258,7 @@ struct HaiderProjectionPipeRoute {
 struct HaiderProjectionSync {
     covered_through_seq: Option<i64>,
     head_seq: Option<i64>,
-    caught_up: bool,
+    caught_up: Option<bool>,
 }
 
 enum HaiderProjectionPipeLine {
@@ -395,7 +393,7 @@ fn haider_projection_migrate_database(connection: &mut rusqlite::Connection) -> 
                 role TEXT NOT NULL,
                 text TEXT NOT NULL,
                 meta TEXT NOT NULL,
-                at_ms INTEGER NOT NULL,
+                at_ms INTEGER,
                 PRIMARY KEY (session_id, seq, ordinal, projection_order)
              );
              CREATE INDEX IF NOT EXISTS idx_session_projection_rows_order
@@ -582,7 +580,6 @@ fn haider_projection_initialize_state_with_connection(
     states
         .entry(session_id.to_string())
         .or_insert_with(|| HaiderProjectionFoldState {
-            next_fallback_seq: max_seq.saturating_add(1).max(1),
             total_rows,
             persisted_max_key: (total_rows > 0).then_some((
                 max_seq,
@@ -700,24 +697,17 @@ fn haider_projection_kind(value: &Value, key: &str) -> Option<String> {
 }
 
 fn haider_projection_seq(
-    state: &mut HaiderProjectionFoldState,
+    _state: &mut HaiderProjectionFoldState,
     envelope: &Value,
     item: &Value,
-) -> i64 {
-    let explicit = envelope
+) -> Option<i64> {
+    envelope
         .as_object()
         .and_then(|object| haider_projection_json_i64(object.get("seq")))
         .or_else(|| {
             item.as_object()
                 .and_then(|object| haider_projection_json_i64(object.get("seq")))
-        });
-    if let Some(seq) = explicit {
-        state.next_fallback_seq = state.next_fallback_seq.max(seq.saturating_add(1));
-        return seq;
-    }
-    let seq = state.next_fallback_seq.max(1);
-    state.next_fallback_seq = seq.saturating_add(1);
-    seq
+        })
 }
 
 fn haider_projection_ordinal(envelope: &Value, item: &Value) -> i64 {
@@ -742,18 +732,18 @@ fn haider_projection_branch_id(envelope: &Value, item: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn haider_projection_at_ms(envelope: &Value, item: &Value) -> i64 {
+fn haider_projection_at_ms(envelope: &Value, item: &Value) -> Option<i64> {
     for value in [envelope, item] {
         let Some(object) = value.as_object() else {
             continue;
         };
-        for key in ["committed_at_ms", "at_ms", "created_at_ms", "timestamp_ms"] {
+        for key in ["committed_at_ms", "at_ms"] {
             if let Some(timestamp) = haider_projection_json_i64(object.get(key)) {
-                return timestamp;
+                return Some(timestamp);
             }
         }
     }
-    sessions_now_ms()
+    None
 }
 
 fn haider_projection_row(
@@ -765,7 +755,7 @@ fn haider_projection_row(
     role: &str,
     text: String,
     meta: Value,
-    at_ms: i64,
+    at_ms: Option<i64>,
 ) -> SessionProjectionRow {
     SessionProjectionRow {
         session_id: session_id.to_string(),
@@ -853,7 +843,7 @@ fn haider_projection_row_from_item(
     if kind.is_empty() {
         return None;
     }
-    let seq = haider_projection_seq(state, envelope, item);
+    let seq = haider_projection_seq(state, envelope, item)?;
     let at_ms = haider_projection_at_ms(envelope, item);
     let text = if kind == "tool" {
         haider_projection_tool_summary(item)
@@ -923,7 +913,7 @@ fn haider_projection_export_row(
             haider_projection_extract_text(item).unwrap_or_default(),
         ),
     };
-    let seq = haider_projection_seq(state, item, item);
+    let seq = haider_projection_seq(state, item, item)?;
     Some(haider_projection_row(
         session_id,
         seq,
@@ -1111,7 +1101,9 @@ fn haider_projection_fold_value_locked(
                 && object.get("role").and_then(Value::as_str) != Some("usage")
         })
     {
-        let seq = haider_projection_seq(state, value, payload);
+        let Some(seq) = haider_projection_seq(state, value, payload) else {
+            return step;
+        };
         state.metadata.insert("usage".to_string(), payload.clone());
         step.rows.push(haider_projection_row(
             session_id,
@@ -1146,7 +1138,9 @@ fn haider_projection_fold_value_locked(
         .to_ascii_lowercase();
     match payload_type.as_str() {
         "user_message" => {
-            let seq = haider_projection_seq(state, value, payload);
+            let Some(seq) = haider_projection_seq(state, value, payload) else {
+                return step;
+            };
             let text = haider_projection_extract_text(payload).unwrap_or_default();
             step.rows.push(haider_projection_row(
                 session_id,
@@ -1165,7 +1159,9 @@ fn haider_projection_fold_value_locked(
             haider_projection_fold_item_event(state, session_id, value, payload, &mut step);
         }
         "tool_result" => {
-            let seq = haider_projection_seq(state, value, payload);
+            let Some(seq) = haider_projection_seq(state, value, payload) else {
+                return step;
+            };
             step.rows.push(haider_projection_row(
                 session_id,
                 seq,
@@ -1179,7 +1175,9 @@ fn haider_projection_fold_value_locked(
             ));
         }
         "run_failed" => {
-            let seq = haider_projection_seq(state, value, payload);
+            let Some(seq) = haider_projection_seq(state, value, payload) else {
+                return step;
+            };
             let text = payload_object
                 .and_then(|object| {
                     ["presentation", "message", "code"]
@@ -1219,7 +1217,9 @@ fn haider_projection_fold_value_locked(
                     .unwrap_or_else(|| "effect completed".to_string());
                 let outcome = haider_projection_kind(payload, "outcome")
                     .unwrap_or_else(|| "unknown".to_string());
-                let seq = haider_projection_seq(state, value, payload);
+                let Some(seq) = haider_projection_seq(state, value, payload) else {
+                    return step;
+                };
                 step.rows.push(haider_projection_row(
                     session_id,
                     seq,
@@ -1238,7 +1238,9 @@ fn haider_projection_fold_value_locked(
             if payload_type == "usage" {
                 // Usage snapshots become rows so the trajectory view gets
                 // per-turn token/cache points; the transcript skips the kind.
-                let seq = haider_projection_seq(state, value, payload);
+                let Some(seq) = haider_projection_seq(state, value, payload) else {
+                    return step;
+                };
                 step.rows.push(haider_projection_row(
                     session_id,
                     seq,
@@ -1341,7 +1343,7 @@ fn haider_projection_pipe_kind_row(
     }
     Some(haider_projection_row(
         session_id,
-        haider_projection_seq(state, payload, payload),
+        haider_projection_seq(state, payload, payload)?,
         haider_projection_ordinal(payload, payload),
         String::new(),
         "compaction_boundary",
@@ -1369,7 +1371,7 @@ fn haider_projection_pipe_reasoning_row(
     let reasoning = haider_projection_text(object.get("reasoning"))?;
     Some(haider_projection_row(
         session_id,
-        haider_projection_seq(state, payload, payload),
+        haider_projection_seq(state, payload, payload)?,
         haider_projection_ordinal(payload, payload),
         haider_projection_branch_id(payload, payload),
         "thinking",
@@ -1699,12 +1701,14 @@ fn haider_projection_caught_up(
     head_seq: Option<i64>,
     journal_covered_through_seq: Option<i64>,
     pipe_eof_max_seq: Option<i64>,
-) -> bool {
+) -> Option<bool> {
     let Some(head_seq) = head_seq else {
-        return true;
+        return None;
     };
-    journal_covered_through_seq.is_some_and(|coverage| coverage >= head_seq)
-        || pipe_eof_max_seq.is_some_and(|max_seq| max_seq >= head_seq)
+    Some(
+        journal_covered_through_seq.is_some_and(|coverage| coverage >= head_seq)
+            || pipe_eof_max_seq.is_some_and(|max_seq| max_seq >= head_seq),
+    )
 }
 
 fn haider_projection_sync(
@@ -1791,12 +1795,8 @@ fn haider_projection_ingest_value(
     let provider_session_id = haider_projection_resolve_provider_session(session_id)
         .ok()
         .map(|(_, provider_session_id)| provider_session_id);
-    let sync = haider_projection_sync(session_id, provider_session_id.as_deref()).unwrap_or(
-        HaiderProjectionSync {
-            caught_up: true,
-            ..HaiderProjectionSync::default()
-        },
-    );
+    let sync = haider_projection_sync(session_id, provider_session_id.as_deref())
+        .unwrap_or_default();
     let from_seq = (appended > 0)
         .then(|| all_rows.iter().map(|row| row.seq).min())
         .flatten();
@@ -4333,32 +4333,15 @@ async fn session_projection_window(
     })?
 }
 
-/// Alias-tolerant token count: usage payload shapes differ across harness
-/// versions and providers; nested "usage" objects are searched too.
-fn haider_projection_usage_number(meta: &Value, keys: &[&str]) -> Option<i64> {
-    let object = meta.as_object()?;
-    for key in keys {
-        if let Some(value) = object.get(*key).and_then(haider_projection_json_i64_value) {
-            return Some(value);
+fn haider_projection_exact_request(meta: &Value) -> Option<Value> {
+    let request = meta.get("request")?.as_object()?;
+    let mut exact = serde_json::Map::new();
+    for key in ["ordinal", "input", "output", "cached"] {
+        if let Some(value) = request.get(key) {
+            exact.insert(key.to_string(), value.clone());
         }
     }
-    let nested = object.get("usage")?;
-    let nested_object = nested.as_object()?;
-    for key in keys {
-        if let Some(value) = nested_object
-            .get(*key)
-            .and_then(haider_projection_json_i64_value)
-        {
-            return Some(value);
-        }
-    }
-    None
-}
-
-fn haider_projection_json_i64_value(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_f64().map(|number| number as i64))
+    Some(Value::Object(exact))
 }
 
 /// Lean full-session feed for the trajectory strip: one small point per row,
@@ -4385,7 +4368,7 @@ async fn session_projection_trajectory(session_id: String) -> Result<Value, Stri
                     let role: String = row.get(5)?;
                     let text: String = row.get(6)?;
                     let meta_text: String = row.get(7)?;
-                    let at_ms: i64 = row.get(8)?;
+                    let at_ms: Option<i64> = row.get(8)?;
                     Ok((
                         seq,
                         ordinal,
@@ -4427,29 +4410,16 @@ async fn session_projection_trajectory(session_id: String) -> Result<Value, Stri
                         if kind == "usage" {
                             let meta: Value =
                                 serde_json::from_str(&meta_text).unwrap_or(Value::Null);
-                            let input = haider_projection_usage_number(
-                                &meta,
-                                &["input", "input_tokens", "prompt_tokens"],
-                            );
-                            let output = haider_projection_usage_number(
-                                &meta,
-                                &["output", "output_tokens", "completion_tokens"],
-                            );
-                            let cached = haider_projection_usage_number(
-                                &meta,
-                                &[
-                                    "cached",
-                                    "cached_tokens",
-                                    "cache_read",
-                                    "cache_read_input_tokens",
-                                    "cached_input",
-                                    "cached_input_tokens",
-                                ],
-                            );
                             if let Some(object) = point.as_object_mut() {
-                                object.insert("input".to_string(), json!(input));
-                                object.insert("output".to_string(), json!(output));
-                                object.insert("cached".to_string(), json!(cached));
+                                if let Some(request) = haider_projection_exact_request(&meta) {
+                                    object.insert("request".to_string(), request);
+                                }
+                                if let Some(run_id) = meta
+                                    .pointer("/scope/run")
+                                    .and_then(Value::as_str)
+                                {
+                                    object.insert("run_id".to_string(), json!(run_id));
+                                }
                             }
                         }
                         point
@@ -4725,7 +4695,7 @@ mod haider_projection_tests {
             if seq % 2 == 0 { "assistant" } else { "user" },
             format!("row-{seq}-{ordinal}"),
             json!({"seq":seq,"ordinal":ordinal}),
-            1_700_000_000_000 + seq * 10 + ordinal,
+            Some(1_700_000_000_000 + seq * 10 + ordinal),
         )
     }
 
@@ -4744,7 +4714,7 @@ mod haider_projection_tests {
             covered_through_seq: None,
             head_seq: None,
             pipe_max_seq: None,
-            caught_up: true,
+            caught_up: Some(true),
             sync_changed: false,
             start_total: (!rows.is_empty()).then_some(start_total),
             rows,
@@ -5437,21 +5407,21 @@ mod haider_projection_tests {
     }
 
     #[test]
-    fn haider_projection_unknown_head_is_caught_up() {
-        assert!(haider_projection_caught_up(None, Some(0), Some(0)));
+    fn haider_projection_unknown_head_stays_unknown() {
+        assert_eq!(haider_projection_caught_up(None, Some(0), Some(0)), None);
     }
 
     #[test]
     fn haider_projection_final_unterminated_eof_is_required_for_pipe_head() {
-        assert!(!haider_projection_caught_up(Some(9), None, None));
-        assert!(haider_projection_caught_up(Some(9), None, Some(9)));
-        assert!(!haider_projection_caught_up(Some(9), None, Some(8)));
+        assert_eq!(haider_projection_caught_up(Some(9), None, None), Some(false));
+        assert_eq!(haider_projection_caught_up(Some(9), None, Some(9)), Some(true));
+        assert_eq!(haider_projection_caught_up(Some(9), None, Some(8)), Some(false));
     }
 
     #[test]
     fn haider_projection_journal_coverage_can_independently_prove_head() {
-        assert!(haider_projection_caught_up(Some(9), Some(9), None));
-        assert!(!haider_projection_caught_up(Some(9), Some(8), None));
+        assert_eq!(haider_projection_caught_up(Some(9), Some(9), None), Some(true));
+        assert_eq!(haider_projection_caught_up(Some(9), Some(8), None), Some(false));
     }
 
     #[test]
@@ -5476,11 +5446,34 @@ mod haider_projection_tests {
                 haider_projection_fold_value_locked(&mut state, "local-session", item).rows,
             );
         }
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2);
         assert_eq!((rows[0].seq, rows[0].role.as_str()), (7, "user"));
         assert_eq!((rows[1].seq, rows[1].role.as_str()), (19, "assistant"));
-        assert_eq!((rows[2].seq, rows[2].kind.as_str()), (20, "tool"));
-        assert_eq!(rows[2].text, "read src/parser.rs");
+    }
+
+    #[test]
+    fn missing_event_timestamp_serializes_as_null() {
+        let mut state = HaiderProjectionFoldState::default();
+        let row = haider_projection_export_row(
+            &mut state,
+            "local-session",
+            &json!({"role":"assistant", "text":"answer", "seq":20}),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(row).unwrap()["at_ms"], Value::Null);
+    }
+
+    #[test]
+    fn trajectory_usage_uses_exact_nested_request_not_cumulative_snapshot() {
+        let meta = json!({
+            "input": 1000,
+            "output": 100,
+            "request": {"ordinal": 3, "input": 9, "output": 0, "cached": 0},
+        });
+        assert_eq!(
+            haider_projection_exact_request(&meta),
+            Some(json!({"ordinal":3, "input":9, "output":0, "cached":0}))
+        );
     }
 
     #[test]
@@ -5763,7 +5756,7 @@ mod haider_projection_tests {
         let usage = haider_projection_fold_value_locked(
             &mut state,
             "local",
-            &json!({"payload":{"type":"usage", "input":10, "output":3}}),
+            &json!({"seq":61, "payload":{"type":"usage", "input":10, "output":3}}),
         );
         assert_eq!(usage.rows.len(), 1);
         assert_eq!(usage.rows[0].kind, "usage");
@@ -5833,7 +5826,7 @@ mod haider_projection_tests {
             "assistant",
             "Hello".to_string(),
             json!({"source":"test"}),
-            1_700_000_000_000,
+            Some(1_700_000_000_000),
         );
         let value = serde_json::to_value(row).unwrap();
         assert_eq!(
@@ -6567,7 +6560,7 @@ mod haider_projection_tests {
             &route,
         )
         .unwrap();
-        assert!(first.caught_up, "an unterminated EOF does prove head");
+        assert_eq!(first.caught_up, Some(true), "an unterminated EOF does prove head");
 
         // Now the segment seals, naming a successor that is not on disk yet.
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -6593,8 +6586,9 @@ mod haider_projection_tests {
         ) {
             // Loud failure is acceptable — it is visible and recoverable.
             Err(_) => {}
-            Ok(sealed) => assert!(
-                !sealed.caught_up,
+            Ok(sealed) => assert_eq!(
+                sealed.caught_up,
+                Some(false),
                 "a seal whose successor is missing must not inherit the earlier at-head proof"
             ),
         }
@@ -6662,7 +6656,7 @@ mod haider_projection_tests {
         )
         .unwrap();
         assert_eq!(sealed.covered_through_seq, Some(9));
-        assert!(!sealed.caught_up);
+        assert_eq!(sealed.caught_up, Some(false));
         let cursor = haider_projection_load_pipe_cursor(&test_session.session_id)
             .unwrap()
             .unwrap();
@@ -6681,7 +6675,7 @@ mod haider_projection_tests {
             &route,
         )
         .unwrap();
-        assert!(final_segment.caught_up);
+        assert_eq!(final_segment.caught_up, Some(true));
 
         fs::remove_dir_all(root).unwrap();
     }

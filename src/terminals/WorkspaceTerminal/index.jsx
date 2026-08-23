@@ -11533,7 +11533,7 @@ function WorkspaceTerminal({
           && !forkFromProviderSessionIdForThisStart
           && !forceFreshSessionForThisStart
         ) {
-          let providerSessionExists = false;
+          let providerSessionExists = null;
           try {
             providerSessionExists = await invoke("terminal_provider_session_exists", {
               agent_id: terminalAgentKind,
@@ -11556,6 +11556,9 @@ function WorkspaceTerminal({
 
           if (isDisposed) {
             return;
+          }
+          if (providerSessionExists == null) {
+            throw new Error("Unable to verify whether the provider session still exists.");
           }
 
           const validatedBinding = resolveTerminalSessionOpenBinding({
@@ -17219,7 +17222,7 @@ function WorkspaceTerminal({
       return fail("Another terminal restart coordinator is already running.");
     }
 
-    let providerSessionExists = restartFreshSession ? null : false;
+    let providerSessionExists = null;
     if (!restartFreshSession) {
       try {
         const probeResult = await probeTerminalSessionForRestart(
@@ -17246,7 +17249,10 @@ function WorkspaceTerminal({
           workspace_id: workspace?.id || "",
         });
       }
-      if (providerSessionExists !== true) {
+      if (providerSessionExists == null) {
+        return fail("Unable to verify whether the provider session still exists.");
+      }
+      if (providerSessionExists === false) {
         restartFreshSession = true;
         resultBase.fresh_session = true;
       }

@@ -4,6 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 
 import { cacheRereadMetric } from "./cacheMetric.js";
+import {
+  exactTrajectoryUsagePoints,
+  trajectorySummaryMetrics,
+} from "./trajectoryMetrics.js";
 
 /* Trajectory view: a canvas strip of the session's event stream (Input /
    Model / Tools lanes + a tokens bar lane), metrics header, and a synced
@@ -52,8 +56,8 @@ function formatTokens(n) {
 }
 
 function formatClock(ms) {
-  if (!ms) return "";
-  return new Date(ms).toLocaleTimeString(undefined, {
+  if (ms == null || !Number.isFinite(Number(ms))) return "";
+  return new Date(Number(ms)).toLocaleTimeString(undefined, {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -82,31 +86,6 @@ function eventClass(point) {
     return { lane: 0, color: "input" };
   }
   return { lane: 1, color: "model" };
-}
-
-/* Usage snapshots may be per-turn or cumulative running totals. Growing
-   context makes per-turn INPUT nondecreasing too, so input alone proves
-   nothing — only treat the series as cumulative when input AND output are
-   both nondecreasing over 3+ points. (The real fix is a fold-side tag once
-   the harness marks its usage semantics; this heuristic then retires.) */
-function usageDeltas(usagePoints) {
-  const known = usagePoints.filter((p) => p.input != null || p.output != null);
-  if (known.length < 3) {
-    return known.map((p) => ({ ...p }));
-  }
-  const nondecreasing = (field) =>
-    known.every((p, i) => i === 0 || (p[field] ?? 0) >= (known[i - 1][field] ?? 0));
-  if (!nondecreasing("input") || !nondecreasing("output")) {
-    return known.map((p) => ({ ...p }));
-  }
-  return known.map((p, i) => {
-    if (i === 0) return { ...p };
-    const prev = known[i - 1];
-    const delta = (field) => (p[field] == null
-      ? null
-      : Math.max(0, p[field] - (prev[field] ?? 0)));
-    return { ...p, input: delta("input"), output: delta("output"), cached: delta("cached") };
-  });
 }
 
 export default function SessionTrajectory({ session }) {
@@ -243,15 +222,11 @@ export default function SessionTrajectory({ session }) {
         lastAssistant = entry;
       }
     }
-    const deltas = usageDeltas(usageRaw);
+    const exactUsage = exactTrajectoryUsagePoints(usageRaw);
     const byKey = new Map(events.map((entry) => [entry.key, entry]));
-    let tokenTotal = 0;
     let cacheKnown = false;
-    for (const usage of deltas) {
+    for (const usage of exactUsage) {
       const anchor = usage.anchorKey != null ? byKey.get(usage.anchorKey) : null;
-      const input = usage.input ?? 0;
-      const output = usage.output ?? 0;
-      tokenTotal += input + output;
       if (usage.cached != null) {
         cacheKnown = true;
       }
@@ -263,16 +238,17 @@ export default function SessionTrajectory({ session }) {
         };
       }
     }
-    const stamps = events.map((e) => e.at_ms).filter((t) => t > 0);
+    const stamps = events
+      .map((event) => event.at_ms)
+      .filter((stamp) => stamp != null && Number.isFinite(Number(stamp)))
+      .map(Number);
     return {
       events,
-      turns: events.filter((e) => e.role === "user").length,
-      calls: events.filter((e) => e.kind === "tool").length,
       durationMs: stamps.length ? Math.max(...stamps) - Math.min(...stamps) : 0,
-      tokenTotal,
       cacheKnown,
     };
   }, [points]);
+  const summaryMetrics = useMemo(() => trajectorySummaryMetrics(session), [session]);
 
   /* Layout geometry is pure data — the draw effect and hit-testing share it. */
   const geometry = useMemo(() => {
@@ -543,16 +519,16 @@ export default function SessionTrajectory({ session }) {
         </Metric>
         <Metric title="User turns">
           <em>Turns</em>
-          <span>{derived.turns}</span>
+          <span>{summaryMetrics.turns ?? "—"}</span>
         </Metric>
         <Metric title="Tool calls">
           <em>Calls</em>
-          <span>{derived.calls}</span>
+          <span>{summaryMetrics.calls ?? "—"}</span>
         </Metric>
-        {derived.tokenTotal > 0 && (
+        {summaryMetrics.tokenTotal != null && (
           <Metric title="Total tokens across model calls">
             <em>Tokens</em>
-            <span>{formatTokens(derived.tokenTotal)}</span>
+            <span>{formatTokens(summaryMetrics.tokenTotal)}</span>
           </Metric>
         )}
         {/* Only the harness measurement may create a cache header metric.

@@ -110,6 +110,27 @@ export function modelGroupsFromLibrary(library) {
   return groups;
 }
 
+/* Testable seam for the composer menus. This initially preserves the legacy
+   catalog so the contract regression can demonstrate the defect before the
+   provider-owned model detail is wired through. */
+export function modelOptionCatalog(library, provider, model) {
+  const providerId = text(provider);
+  const modelId = text(model);
+  const detail = (Array.isArray(library?.models) ? library.models : []).find((entry) => (
+    text(entry?.provider) === providerId && text(entry?.model) === modelId
+  ));
+  const unique = (values) => [...new Set((Array.isArray(values) ? values : [])
+    .map(text)
+    .filter(Boolean))];
+  const efforts = unique(detail?.supported_efforts);
+  const speeds = unique(detail?.supported_speeds);
+  return {
+    effort: efforts,
+    speed: speeds,
+    speedApplicable: speeds.length > 0,
+  };
+}
+
 /* §9.2: omitted availability on a legacy daemon is ambiguous. Only an
    explicit available state can turn [] into the fact “there are no rows.” */
 export function snapshotState(snapshot) {

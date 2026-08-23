@@ -131,11 +131,18 @@ impl SessionRow {
             .unwrap_or_else(|| "New session".to_string())
     }
 
-    fn latest_at_ms(&self) -> i64 {
-        ["latest_at_ms", "updated_at_ms"]
-            .iter()
-            .find_map(|key| sessions_harness_value(self, key).and_then(Value::as_i64))
-            .unwrap_or(self.created_at_ms)
+    fn latest_at_ms(&self) -> Option<i64> {
+        if self.provider_session_id.trim().is_empty() {
+            return Some(self.created_at_ms);
+        }
+        sessions_harness_value(self, "last_activity_ms")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                sessions_harness_value(self, "metadata")
+                    .and_then(Value::as_object)
+                    .and_then(|metadata| metadata.get("created_at_ms"))
+                    .and_then(Value::as_i64)
+            })
     }
 
     fn needs_input(&self) -> Value {
@@ -760,9 +767,7 @@ fn sessions_list_blocking() -> Result<Vec<SessionRow>, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to decode session row: {error}"))?;
     rows.sort_by(|left, right| {
-        right
-            .latest_at_ms()
-            .cmp(&left.latest_at_ms())
+        right.latest_at_ms().cmp(&left.latest_at_ms())
             .then_with(|| right.id.cmp(&left.id))
     });
     Ok(rows)
@@ -1262,7 +1267,7 @@ mod sessions_tests {
         assert_eq!(row.harness["run_state"], "idle");
         let row_json = serde_json::to_value(&row).unwrap();
         assert_eq!(row_json["title"], "Old row");
-        assert_eq!(row_json["latest_at_ms"], 2);
+        assert_eq!(row_json["latest_at_ms"], Value::Null);
         assert_eq!(row_json["status"], "idle");
         assert_eq!(row_json["effort"], Value::Null);
         assert_eq!(row_json["speed"], Value::Null);
@@ -1408,7 +1413,7 @@ mod sessions_tests {
         assert_eq!(serialized["model"], "daemon-model");
         assert_eq!(serialized["status"], "running");
         assert_eq!(serialized["state_raw"], "running");
-        assert_eq!(serialized["latest_at_ms"], 20);
+        assert_eq!(serialized["latest_at_ms"], Value::Null);
         drop(connection);
 
         fs::remove_dir_all(directory).unwrap();
@@ -1791,7 +1796,7 @@ mod sessions_tests {
         assert_eq!(serialized["model"], "gpt-future");
         assert_eq!(serialized["status"], "running");
         assert_eq!(serialized["state_raw"], "running_tool: cargo");
-        assert_eq!(serialized["latest_at_ms"], 1_777_777_777_123_i64);
+        assert_eq!(serialized["latest_at_ms"], 30);
         assert_eq!(serialized["speed"], "fast");
         assert_eq!(serialized["waiting_kind"], "permission");
         assert_eq!(serialized["waiting_menu_id"], "menu-936");
@@ -1812,6 +1817,47 @@ mod sessions_tests {
         drop(connection);
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn imported_session_repairs_empty_dir_from_published_workspace() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("published-workspace");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let mut row = sessions_test_row("workspace", Path::new(""), "pinned");
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        let published = "/daemon/published/workspace";
+        assert!(haider_bridge_reconcile(&[HaiderBridgeSession {
+            id: row.provider_session_id.clone(),
+            harness: json!({
+                "session_id": row.provider_session_id,
+                "workspace_cwd": published,
+            }),
+        }])
+        .unwrap());
+
+        let connection = sessions_open_database().unwrap();
+        row = sessions_row_by_id(&connection, "workspace").unwrap();
+        assert_eq!(row.dir, published);
+        assert_eq!(row.serialized_value()["workspace_cwd"], published);
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn daemon_recency_uses_last_activity_presence_including_zero() {
+        let mut row = sessions_test_row("recency", Path::new(""), "pinned");
+        row.created_at_ms = 999;
+        row.harness = json!({"last_activity_ms": 0, "updated_at_ms": 888});
+        assert_eq!(row.latest_at_ms(), Some(0));
+        row.harness = json!({"updated_at_ms": 888});
+        assert_eq!(row.latest_at_ms(), None);
+        row.harness = json!({"metadata": {"created_at_ms": 0}});
+        assert_eq!(row.latest_at_ms(), Some(0));
     }
 
     #[test]

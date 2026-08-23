@@ -57,6 +57,7 @@ const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
 const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
 const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
+const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
 const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
@@ -1478,6 +1479,19 @@ struct ActorHandle {
 
 #[cfg(unix)]
 static ACTOR: OnceLock<ActorHandle> = OnceLock::new();
+
+#[cfg(unix)]
+pub(crate) fn rpc_feature_advertised(feature: &str) -> bool {
+    ACTOR.get().is_some_and(|handle| {
+        let connection = handle.connection.borrow();
+        connection.connected && connection.features.contains(feature)
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn rpc_feature_advertised(_feature: &str) -> bool {
+    false
+}
 
 #[cfg(unix)]
 static ROSTER_WATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -2993,11 +3007,16 @@ async fn session_needs_input_summary(session_id: &str) -> Result<Option<Value>, 
 }
 
 #[cfg(unix)]
+fn config_provider_feature_gate() -> [&'static str; 2] {
+    [FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1]
+}
+
+#[cfg(unix)]
 async fn config_providers(capability: Capability) -> Result<Option<Vec<Value>>, String> {
     let Some(response) = config_request(
         RequestBody::ProviderList { provider: None },
         capability,
-        &[FEATURE_PROVIDER_MANAGEMENT_V1],
+        &config_provider_feature_gate(),
     )
     .await?
     else {
@@ -6976,6 +6995,14 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn config_model_details_require_provider_models_owner_bit() {
+        assert_eq!(
+            config_provider_feature_gate(),
+            [FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1]
+        );
+    }
+
     #[tokio::test]
     async fn live_daemon_handshake_advertises_ade_features_when_socket_exists() {
         let Some(path) = resolve_socket_path() else {

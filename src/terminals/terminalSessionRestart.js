@@ -126,7 +126,8 @@ export async function probeTerminalSessionForRestart(
   probe,
   explicitCloseRequested = () => false,
 ) {
-  const providerSessionExists = await probe() === true;
+  const probed = await probe();
+  const providerSessionExists = typeof probed === "boolean" ? probed : null;
   return {
     explicit_close_requested: Boolean(explicitCloseRequested()),
     provider_session_exists: providerSessionExists,

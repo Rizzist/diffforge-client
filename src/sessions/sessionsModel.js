@@ -24,6 +24,11 @@ export function normalizeSessionRow(row) {
      them and needs a guaranteed type. Adding a name here for any other reason
      re-creates the mirror. Absent stays absent — it means "the daemon didn't
      say", which is neither zero nor empty. */
+  const latestAtMs = Object.hasOwn(row, "latest_at_ms")
+    && row.latest_at_ms != null
+    && Number.isFinite(Number(row.latest_at_ms))
+    ? Number(row.latest_at_ms)
+    : null;
   return {
     ...row,
     id,
@@ -34,7 +39,7 @@ export function normalizeSessionRow(row) {
     provider: row.provider == null ? null : String(row.provider),
     provider_session_id: String(row.provider_session_id || ""),
     created_at_ms: Number(row.created_at_ms) || 0,
-    latest_at_ms: Number(row.latest_at_ms) || Number(row.created_at_ms) || 0,
+    latest_at_ms: latestAtMs,
     status: row.status == null ? "unknown" : String(row.status),
     first_user_message: String(row.first_user_message || ""),
     model: row.model == null ? null : String(row.model),
@@ -89,6 +94,15 @@ export async function deleteSession(id, { deleteDir = false } = {}) {
 /* The agent's cwd: generated sessions work inside work/, pinned sessions run
    at the pinned folder itself. */
 export function sessionWorkingDirectory(session) {
+  const providerSessionId = String(session?.provider_session_id || "").trim();
+  if (providerSessionId) {
+    const workspace = Object.hasOwn(session || {}, "workspace_cwd")
+      ? String(session.workspace_cwd || "").trim()
+      : Object.hasOwn(session?.metadata || {}, "cwd")
+        ? String(session.metadata.cwd || "").trim()
+        : "";
+    return workspace;
+  }
   if (!session?.dir) {
     return "";
   }
@@ -126,11 +140,17 @@ export function groupSessionsByDay(sessions, nowMs = Date.now()) {
   const groups = [];
   const byKey = new Map();
   for (const session of sessions) {
-    const stamp = session.latest_at_ms || session.created_at_ms || 0;
-    const key = String(startOfLocalDay(stamp || nowMs));
+    const hasPublishedRecency = Object.hasOwn(session, "latest_at_ms");
+    const stamp = hasPublishedRecency ? session.latest_at_ms : session.created_at_ms;
+    const known = stamp != null && Number.isFinite(Number(stamp));
+    const key = known ? String(startOfLocalDay(Number(stamp))) : "unknown";
     let group = byKey.get(key);
     if (!group) {
-      group = { key, label: sessionDayLabel(stamp || nowMs, nowMs), sessions: [] };
+      group = {
+        key,
+        label: known ? sessionDayLabel(Number(stamp), nowMs) : "Unknown",
+        sessions: [],
+      };
       byKey.set(key, group);
       groups.push(group);
     }
@@ -140,10 +160,11 @@ export function groupSessionsByDay(sessions, nowMs = Date.now()) {
 }
 
 export function formatSessionRelativeTime(ms, nowMs = Date.now()) {
-  if (!ms) {
+  if (ms == null || !Number.isFinite(Number(ms))) {
     return "";
   }
-  const delta = Math.max(0, nowMs - ms);
+  const measured = Number(ms);
+  const delta = Math.max(0, nowMs - measured);
   if (delta < 60_000) {
     return "now";
   }
@@ -156,5 +177,5 @@ export function formatSessionRelativeTime(ms, nowMs = Date.now()) {
   if (delta < 7 * SESSION_DAY_MS) {
     return `${Math.floor(delta / SESSION_DAY_MS)}d`;
   }
-  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return new Date(measured).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }

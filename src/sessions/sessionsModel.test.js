@@ -9,6 +9,9 @@ import {
 } from "./sessionPaneOwnership.js";
 import {
   normalizeSessionRow,
+  groupSessionsByDay,
+  formatSessionRelativeTime,
+  sessionWorkingDirectory,
   sessionModelProviderFallback,
 } from "./sessionsModel.js";
 
@@ -135,6 +138,45 @@ test("the model-provider fallback rejects only the bootstrap sentinel", () => {
   assert.equal(sessionModelProviderFallback("haider"), "");
   assert.equal(sessionModelProviderFallback("haider-code"), "haider-code");
   assert.equal(sessionModelProviderFallback(null), "");
+});
+
+test("daemon recency preserves measured zero and keeps absence unknown", () => {
+  const measured = normalizeSessionRow({
+    id: "measured-zero",
+    provider_session_id: "session-1",
+    created_at_ms: 99,
+    latest_at_ms: 0,
+  });
+  const absent = normalizeSessionRow({
+    id: "absent",
+    provider_session_id: "session-2",
+    created_at_ms: 99,
+  });
+
+  assert.equal(measured.latest_at_ms, 0);
+  assert.notEqual(formatSessionRelativeTime(0, 1_000), "");
+  assert.equal(absent.latest_at_ms, null);
+  assert.equal(groupSessionsByDay([absent], 3 * 24 * 60 * 60 * 1000)[0].label, "Unknown");
+});
+
+test("bound sessions use only the published workspace cwd", () => {
+  assert.equal(sessionWorkingDirectory({
+    provider_session_id: "session-imported",
+    workspace_cwd: "/published/workspace",
+    dir: "/client/import/default",
+    kind: "pinned",
+  }), "/published/workspace");
+  assert.equal(sessionWorkingDirectory({
+    provider_session_id: "session-legacy",
+    dir: "/client/import/default",
+    kind: "pinned",
+  }), "");
+  assert.equal(sessionWorkingDirectory({
+    provider_session_id: "session-typed-metadata",
+    metadata: { cwd: "/typed/metadata/workspace" },
+    dir: "/client/import/default",
+    kind: "pinned",
+  }), "/typed/metadata/workspace");
 });
 
 test("session pane rehome swaps identities instead of aliasing one pane", () => {
