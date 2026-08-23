@@ -20,7 +20,7 @@ export function needsInputFailureCode(failure) {
 export function needsInputFailureMessage(failure, fallback = "The answer did not go through.") {
   const text = needsInputFailureText(failure);
   const code = needsInputFailureCode(failure);
-  if (code === NEEDS_INPUT_NO_CONNECTION || code === "haider_needs_input_unavailable") {
+  if (code === NEEDS_INPUT_NO_CONNECTION) {
     return "No live connection to the Haider daemon. Start or restart Haider; opening the Shell cannot restore this RPC route.";
   }
   if (code === NEEDS_INPUT_FEATURE_MISSING) {
@@ -28,6 +28,11 @@ export function needsInputFailureMessage(failure, fallback = "The answer did not
   }
   if (code === NEEDS_INPUT_RPC_FAILED) {
     return "DiffForge reached Haider, but could not list or attach this session. Opening the Shell cannot fix this RPC failure.";
+  }
+  /* Older side actions still collapse their RPC failures into this legacy
+     code. Do not invent a connection diagnosis from it. */
+  if (code === "haider_needs_input_unavailable") {
+    return "DiffForge could not complete this Haider RPC request. Opening the Shell cannot restore the RPC route.";
   }
   if (code === "haider_needs_input_answer_uncertain") {
     return "The reply may not have been confirmed — pressing again is safe.";

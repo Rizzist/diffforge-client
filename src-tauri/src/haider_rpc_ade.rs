@@ -45,6 +45,7 @@ const FEATURE_SESSION_EFFORT_SELECT_V1: &str = "session_effort_select_v1";
 const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
 const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
 const FEATURE_RESIDENT_TURN_SUBMIT_V1: &str = "resident_turn_submit_v1";
+const FEATURE_RESIDENT_SESSION_BINDING_V1: &str = "resident_session_binding_v1";
 const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
 const FEATURE_SESSION_NEEDS_INPUT_V1: &str = "session_needs_input_v1";
 const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
@@ -70,6 +71,7 @@ const MAX_ACCOUNT_RESTAGE_RETRIES: usize = 3;
 /// the whole ladder before the daemon can drain. One short breath per rung.
 const ACCOUNT_RETRY_BACKOFF: Duration = Duration::from_millis(120);
 const SURFACE_EVENT: &str = "session-surface";
+const RESIDENT_SESSION_BINDING_EVENT: &str = "resident-session-binding";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const FEATURE_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
@@ -276,6 +278,41 @@ struct SessionSurfacePayload {
     session_id: String,
     input: Option<SurfaceInput>,
     status: Option<SurfaceStatus>,
+}
+
+/// Cached authority and value for the daemon's unsolicited resident binding.
+/// `supported: None` means no Welcome has established the authority yet;
+/// `known: true, session_id: None` is the daemon's explicit unbound state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ResidentSessionBindingSnapshot {
+    supported: Option<bool>,
+    known: bool,
+    session_id: Option<String>,
+    worker_generation: Option<u64>,
+}
+
+impl ResidentSessionBindingSnapshot {
+    fn for_features(features: &BTreeSet<String>) -> Self {
+        Self {
+            supported: Some(features.contains(FEATURE_RESIDENT_SESSION_BINDING_V1)),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn legacy() -> Self {
+        Self {
+            supported: Some(false),
+            ..Self::default()
+        }
+    }
+
+    fn without_binding(&self) -> Self {
+        Self {
+            supported: self.supported,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -850,6 +887,11 @@ enum WireFrame {
         #[serde(default)]
         status: Option<SurfaceStatusWire>,
     },
+    ResidentSessionBinding {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        worker_generation: u64,
+    },
     MenuAnswer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
@@ -1300,6 +1342,7 @@ enum ActorCommand {
 struct ActorHandle {
     commands: mpsc::UnboundedSender<ActorCommand>,
     connection: watch::Sender<ConnectionSnapshot>,
+    resident_binding: watch::Sender<ResidentSessionBindingSnapshot>,
 }
 
 #[cfg(unix)]
@@ -1313,10 +1356,16 @@ fn actor_handle() -> &'static ActorHandle {
     ACTOR.get_or_init(|| {
         let (commands, receiver) = mpsc::unbounded_channel();
         let (connection, _) = watch::channel(ConnectionSnapshot::default());
-        tauri::async_runtime::spawn(run_actor(receiver, connection.clone()));
+        let (resident_binding, _) = watch::channel(ResidentSessionBindingSnapshot::default());
+        tauri::async_runtime::spawn(run_actor(
+            receiver,
+            connection.clone(),
+            resident_binding.clone(),
+        ));
         ActorHandle {
             commands,
             connection,
+            resident_binding,
         }
     })
 }
@@ -1344,6 +1393,18 @@ pub async fn rpc_features() -> Vec<String> {
     }
     #[cfg(not(unix))]
     Vec::new()
+}
+
+/// Returns the latest resident binding without collapsing an explicit
+/// unbound frame into the pre-frame unknown state.
+#[tauri::command]
+pub async fn resident_session_binding_snapshot() -> ResidentSessionBindingSnapshot {
+    #[cfg(unix)]
+    {
+        return actor_handle().resident_binding.borrow().clone();
+    }
+    #[cfg(not(unix))]
+    ResidentSessionBindingSnapshot::legacy()
 }
 
 /// Starts (or refreshes) a local subscription for one provider session.
@@ -2963,6 +3024,27 @@ fn nudge_rpc_reconnect() {
 }
 
 #[cfg(unix)]
+fn session_answer_menu_prepare<T>(
+    context: Result<T, String>,
+    reachability: SessionNeedsInputReachability,
+    reconnect: impl FnOnce(),
+) -> Result<T, String> {
+    // Fence/context failure wins even while offline. This ordering is part of
+    // the public contract: reachability must never disguise a stale card.
+    let context = context?;
+    match reachability {
+        SessionNeedsInputReachability::NoConnection => {
+            reconnect();
+            Err(HAIDER_NEEDS_INPUT_NO_CONNECTION.to_string())
+        }
+        SessionNeedsInputReachability::FeatureMissing => {
+            Err(HAIDER_NEEDS_INPUT_FEATURE_MISSING.to_string())
+        }
+        SessionNeedsInputReachability::Ready => Ok(context),
+    }
+}
+
+#[cfg(unix)]
 fn session_answer_menu_pre_answer_error(
     initial_reachability: SessionNeedsInputReachability,
     detail: Option<&str>,
@@ -2975,6 +3057,30 @@ fn session_answer_menu_pre_answer_error(
     }
     let detail = detail.unwrap_or("session.list or session.attach disconnected or timed out");
     format!("{HAIDER_NEEDS_INPUT_RPC_FAILED}: {detail}")
+}
+
+#[cfg(unix)]
+fn session_answer_menu_result(
+    initial_reachability: SessionNeedsInputReachability,
+    answer: Result<Option<Value>, SessionAnswerMenuRpcError>,
+) -> Result<Value, String> {
+    match answer {
+        Ok(Some(receipt)) => Ok(receipt),
+        Ok(None) => Err(session_answer_menu_pre_answer_error(
+            initial_reachability,
+            None,
+        )),
+        Err(SessionAnswerMenuRpcError::BeforeAnswer(error)) => Err(
+            session_answer_menu_pre_answer_error(initial_reachability, Some(&error)),
+        ),
+        // The actor checks this gate before writing menu.answer, so feature
+        // loss here is conclusive and must receive the same public feature
+        // diagnosis as feature loss during session.list/session.attach.
+        Err(SessionAnswerMenuRpcError::Answer(error)) if error.starts_with("missing_feature:") => {
+            Err(HAIDER_NEEDS_INPUT_FEATURE_MISSING.to_string())
+        }
+        Err(SessionAnswerMenuRpcError::Answer(error)) => Err(error),
+    }
 }
 
 fn session_answer_menu_option_index(
@@ -3502,33 +3608,26 @@ pub async fn session_answer_menu(
         let context_session_id = session_id;
         let context_menu_id = menu_id.clone();
         let context_option_key = option_key.clone();
-        let (provider_session_id, option_index, command_id) =
-            tauri::async_runtime::spawn_blocking(move || {
-                session_answer_menu_context(
-                    &context_session_id,
-                    &context_menu_id,
-                    request_seq,
-                    worker_generation,
-                    &context_option_key,
-                )
-            })
-            .await
-            .map_err(|error| format!("Session menu answer worker failed: {error}"))??;
+        let context = tauri::async_runtime::spawn_blocking(move || {
+            session_answer_menu_context(
+                &context_session_id,
+                &context_menu_id,
+                request_seq,
+                worker_generation,
+                &context_option_key,
+            )
+        })
+        .await
+        .map_err(|error| format!("Session menu answer worker failed: {error}"))?;
         let initial_reachability =
             session_needs_input_reachability(&actor_handle().connection.borrow());
-        match initial_reachability {
-            SessionNeedsInputReachability::NoConnection => {
-                // Unlike the old snapshot-only gate, this reaches the RPC
-                // actor. During disconnected backoff the command wakes the
-                // outer loop and starts a new socket attempt immediately.
-                nudge_rpc_reconnect();
-                return Err(HAIDER_NEEDS_INPUT_NO_CONNECTION.to_string());
-            }
-            SessionNeedsInputReachability::FeatureMissing => {
-                return Err(HAIDER_NEEDS_INPUT_FEATURE_MISSING.to_string());
-            }
-            SessionNeedsInputReachability::Ready => {}
-        }
+        // Unlike the old snapshot-only gate, the disconnected arm reaches the
+        // actor. During backoff it wakes the loop and starts a socket attempt.
+        let (provider_session_id, option_index, command_id) = session_answer_menu_prepare(
+            context,
+            initial_reachability,
+            nudge_rpc_reconnect,
+        )?;
         let answer = session_answer_menu_rpc_inner(
             command_id.clone(),
             provider_session_id.clone(),
@@ -3540,17 +3639,7 @@ pub async fn session_answer_menu(
         )
         .await;
         session_answer_menu_update_replay(&command_id, &provider_session_id, option_index, &answer);
-        return match answer {
-            Ok(Some(receipt)) => Ok(receipt),
-            Ok(None) => Err(session_answer_menu_pre_answer_error(
-                initial_reachability,
-                None,
-            )),
-            Err(SessionAnswerMenuRpcError::BeforeAnswer(error)) => Err(
-                session_answer_menu_pre_answer_error(initial_reachability, Some(&error)),
-            ),
-            Err(SessionAnswerMenuRpcError::Answer(error)) => Err(error),
-        };
+        return session_answer_menu_result(initial_reachability, answer);
     }
     #[cfg(not(unix))]
     {
@@ -3762,6 +3851,7 @@ async fn command_answer(
 async fn run_actor(
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
     connection_tx: watch::Sender<ConnectionSnapshot>,
+    resident_binding_tx: watch::Sender<ResidentSessionBindingSnapshot>,
 ) {
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
     let mut last_published_revision: HashMap<String, u64> = HashMap::new();
@@ -3798,7 +3888,8 @@ async fn run_actor(
             continue;
         };
 
-        let attempt = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_and_handshake(&socket_path)).await;
+        let attempt =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_and_handshake(&socket_path)).await;
         #[cfg(debug_assertions)]
         match &attempt {
             Err(_) => eprintln!("[ade-rpc] handshake TIMEOUT on {socket_path:?}"),
@@ -3843,6 +3934,11 @@ async fn run_actor(
                 continue;
             }
         };
+        publish_resident_binding(
+            &resident_binding_tx,
+            roster_app.as_ref(),
+            ResidentSessionBindingSnapshot::for_features(&snapshot.features),
+        );
         let mut next_request = 1_u64;
         let mut setup_failed = false;
         if roster_app.is_some() && snapshot.can_watch_roster() {
@@ -3893,10 +3989,25 @@ async fn run_actor(
                 &mut last_published_revision,
                 &mut roster_app,
                 &mut next_request,
+                &resident_binding_tx,
             )
             .await;
         }
+        let binding = resident_binding_tx.borrow().without_binding();
+        publish_resident_binding(&resident_binding_tx, roster_app.as_ref(), binding);
         publish_disconnected(&connection_tx);
+    }
+}
+
+#[cfg(unix)]
+fn publish_resident_binding(
+    binding_tx: &watch::Sender<ResidentSessionBindingSnapshot>,
+    app: Option<&AppHandle>,
+    snapshot: ResidentSessionBindingSnapshot,
+) {
+    binding_tx.send_replace(snapshot.clone());
+    if let Some(app) = app {
+        let _ = app.emit(RESIDENT_SESSION_BINDING_EVENT, snapshot);
     }
 }
 
@@ -3977,6 +4088,7 @@ async fn run_connected(
     last_published_revision: &mut HashMap<String, u64>,
     roster_app: &mut Option<AppHandle>,
     next_request: &mut u64,
+    resident_binding_tx: &watch::Sender<ResidentSessionBindingSnapshot>,
 ) {
     let mut heartbeat = tokio::time::interval(PING_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -4072,6 +4184,18 @@ async fn run_connected(
                 status,
             } => {
                 emit_surface(subscriptions, &connection, session_id, input, status);
+            }
+            WireFrame::ResidentSessionBinding {
+                session_id,
+                worker_generation,
+            } => {
+                if let Some(snapshot) = resident_binding_snapshot_for_frame(
+                    &connection.features,
+                    session_id,
+                    worker_generation,
+                ) {
+                    publish_resident_binding(resident_binding_tx, roster_app.as_ref(), snapshot);
+                }
             }
             WireFrame::Ping { nonce } => {
                 if write_frame(
@@ -4349,6 +4473,21 @@ fn gated_surface_snapshot(
     (input, status)
 }
 
+fn resident_binding_snapshot_for_frame(
+    features: &BTreeSet<String>,
+    session_id: Option<String>,
+    worker_generation: u64,
+) -> Option<ResidentSessionBindingSnapshot> {
+    features
+        .contains(FEATURE_RESIDENT_SESSION_BINDING_V1)
+        .then_some(ResidentSessionBindingSnapshot {
+            supported: Some(true),
+            known: true,
+            session_id,
+            worker_generation: Some(worker_generation),
+        })
+}
+
 #[cfg(unix)]
 fn response_result(body: ResponseBody, error_style: RpcErrorStyle) -> Result<ResponseBody, String> {
     match body {
@@ -4482,6 +4621,7 @@ fn wire_frame_kind(frame: &WireFrame) -> &'static str {
         WireFrame::Response { .. } => "response",
         WireFrame::SessionRosterDelta { .. } => "session_roster_delta",
         WireFrame::SessionSurfaceDelta { .. } => "session_surface_delta",
+        WireFrame::ResidentSessionBinding { .. } => "resident_session_binding",
         WireFrame::MenuAnswer { .. } => "menu_answer",
         WireFrame::Ping { .. } => "ping",
         WireFrame::Pong { .. } => "pong",
@@ -5728,18 +5868,26 @@ mod tests {
             "request_seq": 1843,
             "options": [{"key":"retry"}]
         });
-        let error = session_answer_menu_option_index(
+        let context = session_answer_menu_option_index(
             &missing_worker_generation,
             "effect-recovery-1",
             1843,
             122,
             "retry",
         )
+        .map(|_| ());
+        let reconnect_called = std::cell::Cell::new(false);
+        let error = session_answer_menu_prepare(
+            context,
+            SessionNeedsInputReachability::NoConnection,
+            || reconnect_called.set(true),
+        )
         .unwrap_err();
         assert_eq!(error, HAIDER_NEEDS_INPUT_STALE);
         assert_ne!(error, HAIDER_NEEDS_INPUT_NO_CONNECTION);
         assert_ne!(error, HAIDER_NEEDS_INPUT_FEATURE_MISSING);
         assert!(!error.starts_with(HAIDER_NEEDS_INPUT_RPC_FAILED));
+        assert!(!reconnect_called.get());
     }
 
     #[test]
@@ -6039,6 +6187,17 @@ mod tests {
             ),
             HAIDER_NEEDS_INPUT_FEATURE_MISSING
         );
+        let reconnect_called = std::cell::Cell::new(false);
+        assert_eq!(
+            session_answer_menu_prepare(
+                Ok(()),
+                SessionNeedsInputReachability::FeatureMissing,
+                || reconnect_called.set(true),
+            )
+            .unwrap_err(),
+            HAIDER_NEEDS_INPUT_FEATURE_MISSING
+        );
+        assert!(!reconnect_called.get());
         connection
             .features
             .insert(FEATURE_SESSION_NEEDS_INPUT_V1.to_string());
@@ -6065,19 +6224,103 @@ mod tests {
             session_answer_menu_pre_answer_error(SessionNeedsInputReachability::NoConnection, None),
             HAIDER_NEEDS_INPUT_NO_CONNECTION
         );
+        let reconnect_called = std::cell::Cell::new(false);
+        assert_eq!(
+            session_answer_menu_prepare(
+                Ok(()),
+                SessionNeedsInputReachability::NoConnection,
+                || reconnect_called.set(true),
+            )
+            .unwrap_err(),
+            HAIDER_NEEDS_INPUT_NO_CONNECTION
+        );
+        assert!(reconnect_called.get());
     }
 
     #[cfg(unix)]
     #[test]
     fn menu_answer_connected_pre_answer_failure_is_an_rpc_route_failure() {
-        let error = session_answer_menu_pre_answer_error(
+        let error = session_answer_menu_result(
             SessionNeedsInputReachability::Ready,
-            Some("session.attach timed out"),
-        );
+            Err(SessionAnswerMenuRpcError::BeforeAnswer(
+                "session.attach timed out".to_string(),
+            )),
+        )
+        .unwrap_err();
         assert!(error.starts_with(HAIDER_NEEDS_INPUT_RPC_FAILED));
         assert!(error.contains("session.attach timed out"));
         assert_ne!(error, HAIDER_NEEDS_INPUT_NO_CONNECTION);
         assert_ne!(error, HAIDER_NEEDS_INPUT_FEATURE_MISSING);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn menu_answer_feature_loss_before_final_write_uses_the_feature_case() {
+        let error = session_answer_menu_result(
+            SessionNeedsInputReachability::Ready,
+            Err(SessionAnswerMenuRpcError::Answer(format!(
+                "missing_feature: daemon does not advertise {FEATURE_SESSION_NEEDS_INPUT_V1}"
+            ))),
+        )
+        .unwrap_err();
+        assert_eq!(error, HAIDER_NEEDS_INPUT_FEATURE_MISSING);
+    }
+
+    #[test]
+    fn resident_session_binding_frame_preserves_bound_and_unbound_states() {
+        let bound = decode_body(
+            br#"{"v":1,"kind":"resident_session_binding","session_id":"session-1","worker_generation":129}"#,
+            DEFAULT_FRAME_LIMIT,
+        )
+        .expect("decode bound resident binding");
+        assert!(matches!(
+            bound,
+            WireFrame::ResidentSessionBinding {
+                session_id: Some(ref session_id),
+                worker_generation: 129,
+            } if session_id == "session-1"
+        ));
+
+        let unbound = decode_body(
+            br#"{"v":1,"kind":"resident_session_binding","worker_generation":129}"#,
+            DEFAULT_FRAME_LIMIT,
+        )
+        .expect("decode unbound resident binding");
+        assert!(matches!(
+            unbound,
+            WireFrame::ResidentSessionBinding {
+                session_id: None,
+                worker_generation: 129,
+            }
+        ));
+    }
+
+    #[test]
+    fn resident_session_binding_frames_require_the_advertised_feature() {
+        assert!(resident_binding_snapshot_for_frame(
+            &BTreeSet::new(),
+            Some("session-legacy".to_string()),
+            128,
+        )
+        .is_none());
+
+        let features = BTreeSet::from([FEATURE_RESIDENT_SESSION_BINDING_V1.to_string()]);
+        let bound = resident_binding_snapshot_for_frame(
+            &features,
+            Some("session-protocol".to_string()),
+            129,
+        )
+        .expect("feature-gated bound frame");
+        assert_eq!(bound.supported, Some(true));
+        assert!(bound.known);
+        assert_eq!(bound.session_id.as_deref(), Some("session-protocol"));
+        assert_eq!(bound.worker_generation, Some(129));
+
+        let unbound = resident_binding_snapshot_for_frame(&features, None, 129)
+            .expect("feature-gated unbound frame");
+        assert!(unbound.known);
+        assert_eq!(unbound.session_id, None);
+        assert_ne!(unbound, ResidentSessionBindingSnapshot::default());
     }
 
     #[cfg(unix)]
@@ -6120,7 +6363,7 @@ mod tests {
             ));
             write_raw_json_frame(
                 &mut server_stream,
-                br#"{"v":1,"kind":"resident_session_binding","session_id":"session-1"}"#,
+                br#"{"v":1,"kind":"resident_session_binding","session_id":"session-1","worker_generation":7}"#,
             )
             .await;
             write_frame(

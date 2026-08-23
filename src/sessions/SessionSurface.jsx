@@ -1,6 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import styled from "styled-components";
 import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Forum } from "@styled-icons/material-rounded/Forum";
@@ -23,11 +29,21 @@ import SessionComposer from "./SessionComposer.jsx";
 import {
   rehomeSessionPane,
   rehomeSessionViewMode,
+  sessionPaneId,
 } from "./sessionPaneOwnership.js";
+import {
+  applyLegacySessionBinding,
+  applyResidentBindingSnapshot,
+  initialSessionBindingState,
+  sessionBindingAnnouncement,
+} from "./sessionTerminalBinding.js";
 import SessionTerminal from "./SessionTerminal.jsx";
 import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
-import { formatSessionRelativeTime } from "./sessionsModel.js";
+import {
+  formatSessionRelativeTime,
+  sessionModelProviderFallback,
+} from "./sessionsModel.js";
 
 /* Main-pane surface for sessions — the Session Deck workspace.
 
@@ -259,11 +275,116 @@ export default function SessionSurface({
   const [paneOverrides, setPaneOverrides] = useState({});
   const paneOverridesRef = useRef(paneOverrides);
   paneOverridesRef.current = paneOverrides;
+  const [sessionBinding, setSessionBinding] = useState(initialSessionBindingState);
+  const deliveredBindingRef = useRef("");
+  /* The binding frame has no pane id, so capture the active mounted resident
+     surface at the instant the observation arrives. Keeping this in a ref
+     lets the one long-lived listener see the current render without making
+     a cached observation follow later navigation. The predicate deliberately
+     mirrors the SessionTerminal render conditions below. */
+  const residentSurfaceRef = useRef(null);
+  let residentSurface = null;
+  if (draftOpen) {
+    const mounted = (viewModes.draft || "ui") === "terminal"
+      || Boolean(shellTouched.draft);
+    if (mounted) {
+      residentSurface = {
+        paneId: paneOverridesRef.current.draft || sessionPaneId("draft"),
+        hostSessionId: "draft",
+      };
+    }
+  } else if (
+    activeSessionId
+    && openSessions.some((session) => session.id === activeSessionId)
+  ) {
+    const tabsState = sessionTabs[activeSessionId]
+      || { tabs: [{ id: "chat" }], activeTabId: "chat" };
+    const tabs = Array.isArray(tabsState.tabs) && tabsState.tabs.length
+      ? tabsState.tabs
+      : [{ id: "chat" }];
+    const activeTab = tabs.find((tab) => tab.id === tabsState.activeTabId) || tabs[0];
+    const chatTabActive = activeTab.id === "chat";
+    const mode = viewModes[activeSessionId] || "ui";
+    const pref = shellPrefs[activeSessionId];
+    const mounted = pref === true
+      || (chatTabActive && (
+        mode === "terminal"
+        || (shellTouched[activeSessionId] && pref !== false)
+      ));
+    if (mounted) {
+      residentSurface = {
+        paneId: paneOverridesRef.current[activeSessionId]
+          || sessionPaneId(activeSessionId),
+        hostSessionId: activeSessionId,
+      };
+    }
+  }
+  /* Native events must see only committed UI state. A render React later
+     discards must not become the owner of a binding observation. */
+  useLayoutEffect(() => {
+    residentSurfaceRef.current = residentSurface;
+    return () => {
+      residentSurfaceRef.current = null;
+    };
+  }, [residentSurface?.hostSessionId, residentSurface?.paneId]);
   /* A new TUI-created session can announce before the roster refresh that
      makes its provider id resolvable. Keep the latest announcement per pane
      and finish the same rehome when that row arrives. */
   const pendingTuiAttachmentsRef = useRef(new Map());
   const [surfaceStatus, setSurfaceStatus] = useState({});
+
+  /* The daemon push is unsolicited and can beat React mounting, so listen
+     first and then read the Rust-side cache. A push that lands during the
+     snapshot call wins; worker_generation cannot order unbound -> bound
+     because both frames intentionally share one generation. */
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    let pushes = 0;
+    void listen("resident-session-binding", (event) => {
+      if (disposed) return;
+      pushes += 1;
+      setSessionBinding((current) => (
+        applyResidentBindingSnapshot(
+          current,
+          event?.payload,
+          residentSurfaceRef.current,
+        )
+      ));
+    }).then((stop) => {
+      if (disposed) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+      void invoke("resident_session_binding_snapshot").then((snapshot) => {
+        /* The cache is bootstrap-only. If the live listener has observed any
+           push — before or during this invoke — applying the same cached
+           frame again would invent a second protocol observation. */
+        if (disposed || pushes !== 0) return;
+        setSessionBinding((current) => (
+          applyResidentBindingSnapshot(
+            current,
+            snapshot,
+            residentSurfaceRef.current,
+          )
+        ));
+      }).catch(() => {});
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  /* OSC and terminal_open are one legacy lane. While capability negotiation
+     is unknown the last announcement is buffered; a capable Welcome drops
+     it, while an older daemon releases it as the fallback source of truth. */
+  const handleLegacyTuiAttached = useCallback((announcement) => {
+    setSessionBinding((current) => (
+      applyLegacySessionBinding(current, announcement)
+    ));
+  }, []);
 
   /* Config fetches are LATEST-WINS per session: a slow menu-open GET must
      never overwrite the state a later post-SET GET already applied. */
@@ -520,8 +641,8 @@ export default function SessionSurface({
     onOpenSession?.(target);
   }, [onOpenSession]);
 
-  /* tui_attach_announce_v1: the TUI told us which session its PTY now
-     serves — auto-select it and re-home the live pane under it. */
+  /* The selected binding authority told us which session the resident
+     surface now serves — auto-select it and re-home the live pane under it. */
   const handleTuiAttached = useCallback((announcement) => {
     const { paneId, providerSessionId } = announcement;
     if (!providerSessionId) {
@@ -540,7 +661,36 @@ export default function SessionSurface({
     rehomeAttachedTui(announcement, target);
   }, [onSessionsRefresh, rehomeAttachedTui, sessions]);
 
-  /* The OSC and roster lanes are independent. Resolve announcements that
+  /* Each protocol observation is delivered exactly once to the surface that
+     was active and mounted when it arrived. A cached binding never follows a
+     later navigation. Legacy announcements retain their exact emitting pane. */
+  useEffect(() => {
+    if (sessionBinding.authority === "protocol") {
+      if (!sessionBinding.known) return;
+      const deliveryKey = `protocol\u0000${sessionBinding.observation}`;
+      if (deliveredBindingRef.current === deliveryKey) return;
+      deliveredBindingRef.current = deliveryKey;
+      const announcement = sessionBindingAnnouncement(sessionBinding);
+      if (announcement) handleTuiAttached(announcement);
+      return;
+    }
+    const announcement = sessionBindingAnnouncement(sessionBinding);
+    if (!announcement) return;
+    const deliveryKey = [
+      sessionBinding.authority,
+      announcement.paneId,
+      announcement.hostSessionId,
+      announcement.providerSessionId ?? "<unbound>",
+    ].join("\u0000");
+    if (deliveredBindingRef.current === deliveryKey) return;
+    deliveredBindingRef.current = deliveryKey;
+    handleTuiAttached(announcement);
+  }, [
+    handleTuiAttached,
+    sessionBinding,
+  ]);
+
+  /* The binding and roster lanes are independent. Resolve announcements that
      arrived first as soon as their freshly-created session is imported. */
   useEffect(() => {
     for (const [paneId, announcement] of pendingTuiAttachmentsRef.current) {
@@ -557,8 +707,9 @@ export default function SessionSurface({
      single coherent choice (a deepseek model can never ride an openai
      account). The menu groups the catalog by provider; selecting applies
      "provider/model" through the harness. */
-  /* The roster row's `provider` is the INTEGRATION id ("haider"), never the
-     model provider — derive that from the models library instead. */
+  /* Current summaries carry the model provider. Older/partial rows can leave
+     it unknown, so the library remains an unambiguous fallback rather than a
+     guessed provider. */
   const libraryProviderFor = (model) => {
     if (!model) return "";
     const models = Array.isArray(library?.models) ? library.models : [];
@@ -578,6 +729,7 @@ export default function SessionSurface({
       model,
       modelProvider: config?.provider
         || (prefs.model || "").split("/")[0]
+        || sessionModelProviderFallback(session?.provider)
         || libraryProviderFor(model),
       /* 935 roster scalars: rows carry effort/speed once installed — the
          summary becomes a complete chip source; null rows (934) fall back
@@ -1231,7 +1383,8 @@ export default function SessionSurface({
               <TerminalHostLayer data-visible={draftMode === "terminal" ? "true" : "false"}>
                 <SessionTerminal
                   active={draftMode === "terminal"}
-                  onTuiAttached={handleTuiAttached}
+                  bindingAuthority={sessionBinding.authority}
+                  onTuiAttached={handleLegacyTuiAttached}
                   paneIdOverride={paneOverrides.draft}
                   session={draftSession}
                 />
@@ -1370,7 +1523,8 @@ export default function SessionSurface({
                 >
                   <SessionTerminal
                     active={chatTabActive && active && mode === "terminal"}
-                    onTuiAttached={handleTuiAttached}
+                    bindingAuthority={sessionBinding.authority}
+                    onTuiAttached={handleLegacyTuiAttached}
                     paneIdOverride={paneOverrides[session.id]}
                     session={session}
                   />

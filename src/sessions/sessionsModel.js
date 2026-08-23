@@ -31,7 +31,7 @@ export function normalizeSessionRow(row) {
     slug: String(row.slug || ""),
     dir: String(row.dir || ""),
     kind: row.kind === "pinned" ? "pinned" : "generated",
-    provider: String(row.provider || "haider"),
+    provider: row.provider == null ? null : String(row.provider),
     provider_session_id: String(row.provider_session_id || ""),
     created_at_ms: Number(row.created_at_ms) || 0,
     latest_at_ms: Number(row.latest_at_ms) || Number(row.created_at_ms) || 0,
@@ -42,6 +42,14 @@ export function normalizeSessionRow(row) {
     title_locked: row.title_locked === true || row.title_locked === 1,
     state_raw: String(row.state_raw || ""),
   };
+}
+
+/* "haider" is the local bootstrap integration sentinel, not a provider.
+   Keep it out of provider/model labels while preserving real ids such as
+   "haider-code". */
+export function sessionModelProviderFallback(provider) {
+  const value = String(provider || "").trim();
+  return value === "haider" ? "" : value;
 }
 
 export async function listSessions() {

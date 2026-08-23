@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -35,6 +36,13 @@ test("connected session list or attach failure gets RPC route copy", () => {
   assert.equal(
     rpcFailed,
     "DiffForge reached Haider, but could not list or attach this session. Opening the Shell cannot fix this RPC failure.",
+  );
+});
+
+test("legacy side-action failures do not invent a no-connection diagnosis", () => {
+  assert.equal(
+    needsInputFailureMessage("haider_needs_input_unavailable"),
+    "DiffForge could not complete this Haider RPC request. Opening the Shell cannot restore the RPC route.",
   );
 });
 
@@ -86,4 +94,17 @@ test("needs-input cards require the complete fence before exposing answers", () 
   assert.equal(isNeedsInputCardAnswerable(complete), true);
   const { worker_generation: _omitted, ...missingWorkerGeneration } = complete;
   assert.equal(isNeedsInputCardAnswerable(missingWorkerGeneration), false);
+});
+
+test("NeedsInputCard routes answers through RPC recovery without a Shell wake callback", () => {
+  const cardSource = readFileSync(new URL("./NeedsInputCard.jsx", import.meta.url), "utf8");
+  const transcriptSource = readFileSync(new URL("./SessionTranscript.jsx", import.meta.url), "utf8");
+  const surfaceSource = readFileSync(new URL("./SessionSurface.jsx", import.meta.url), "utf8");
+  assert.match(cardSource, /answerNeedsInputWithReconnect\s*\(/);
+  assert.match(cardSource, /invoke\("session_answer_menu"/);
+  assert.match(cardSource, /setError\(needsInputFailureMessage\(failure\)\)/);
+  assert.ok(!cardSource.includes("onEnsureShell"));
+  assert.ok(!transcriptSource.includes("onEnsureShell"));
+  assert.ok(!surfaceSource.includes("onEnsureShell"));
+  assert.ok(!cardSource.includes("open its Shell, then try again"));
 });

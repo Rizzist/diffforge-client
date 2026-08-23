@@ -73,9 +73,17 @@ function measureSessionTerminalGrid({ container, term }) {
   };
 }
 
-export default function SessionTerminal({ session, active, paneIdOverride, onTuiAttached }) {
+export default function SessionTerminal({
+  session,
+  active,
+  bindingAuthority = "unknown",
+  paneIdOverride,
+  onTuiAttached,
+}) {
   const onTuiAttachedRef = useRef(onTuiAttached);
   onTuiAttachedRef.current = onTuiAttached;
+  const bindingAuthorityRef = useRef(bindingAuthority);
+  bindingAuthorityRef.current = bindingAuthority;
   const containerRef = useRef(null);
   const mountRef = useRef(null);
   const xtermRef = useRef(null);
@@ -105,6 +113,10 @@ export default function SessionTerminal({ session, active, paneIdOverride, onTui
     let themeObserver = null;
     let detachPushToTalk = () => {};
     const announceTuiAttached = (providerSessionId) => {
+      /* A capable daemon's typed frame has sole authority. Keep parsing OSC
+         so old daemons work and the control sequence stays swallowed, but it
+         cannot write once protocol authority is established. */
+      if (bindingAuthorityRef.current === "protocol") return;
       onTuiAttachedRef.current?.({
         paneId,
         providerSessionId: providerSessionId || null,
@@ -222,10 +234,9 @@ export default function SessionTerminal({ session, active, paneIdOverride, onTui
       term.parser.registerOscHandler(10, swallowOscColorQuery);
       term.parser.registerOscHandler(11, applyHarnessBackground);
       term.parser.registerOscHandler(12, swallowOscColorQuery);
-      // tui_attach_announce_v1: the TUI announces its bound session on every
-      // attach/hop/detach — OSC 7791 "haider;attached=<id>" (empty = back at
-      // the launcher). This is THE honest PTY↔session correlation; harnesses
-      // without the feature simply never emit it.
+      // tui_attach_announce_v1 fallback: older daemons announce every
+      // attach/hop/detach through OSC 7791 "haider;attached=<id>". Newer
+      // daemons keep this handler only as a swallowing, non-writing parser.
       term.parser.registerOscHandler(7791, (data) => {
         const text = String(data || "");
         if (!text.startsWith("haider;attached=")) {
@@ -302,9 +313,8 @@ export default function SessionTerminal({ session, active, paneIdOverride, onTui
       if (result && Number(result.instance_id)) {
         instanceIdRef.current = Number(result.instance_id);
       }
-      /* Adoption returns the live binding, which can differ from the request.
-         Treat it exactly like an OSC announcement: a replay ring need not
-         still contain the TUI's last 7791 frame. */
+      /* Adoption is part of the same legacy lane as OSC: a replay ring need
+         not contain the last 7791 frame. Protocol authority gates it too. */
       const liveProviderId = String(result?.provider_session_id || "").trim();
       if (liveProviderId) {
         announceTuiAttached(liveProviderId);

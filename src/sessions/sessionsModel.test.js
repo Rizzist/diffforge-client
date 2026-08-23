@@ -7,7 +7,10 @@ import {
   rehomeSessionViewMode,
   sessionPaneId,
 } from "./sessionPaneOwnership.js";
-import { normalizeSessionRow } from "./sessionsModel.js";
+import {
+  normalizeSessionRow,
+  sessionModelProviderFallback,
+} from "./sessionsModel.js";
 
 /* normalizeSessionRow USED TO build a FRESH row object, so any harness field
    it did not name was silently discarded — no error, nothing to notice. That
@@ -116,6 +119,22 @@ test("absent harness fields stay absent, never a fabricated default", () => {
       `${field} was fabricated as ${JSON.stringify(row[field])}`,
     );
   }
+});
+
+test("a null session provider stays unknown instead of becoming haider", () => {
+  const row = normalizeSessionRow({
+    id: "provider-unknown",
+    provider: null,
+  });
+
+  assert.equal(row.provider, null);
+  assert.notEqual(row.provider, "haider");
+});
+
+test("the model-provider fallback rejects only the bootstrap sentinel", () => {
+  assert.equal(sessionModelProviderFallback("haider"), "");
+  assert.equal(sessionModelProviderFallback("haider-code"), "haider-code");
+  assert.equal(sessionModelProviderFallback(null), "");
 });
 
 test("session pane rehome swaps identities instead of aliasing one pane", () => {

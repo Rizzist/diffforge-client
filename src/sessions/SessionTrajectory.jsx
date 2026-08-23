@@ -572,15 +572,30 @@ export default function SessionTrajectory({ session }) {
             <span>{formatTokens(derived.tokenTotal)}</span>
           </Metric>
         )}
+        {/* These two are DIFFERENT QUANTITIES and must never share a noun.
+            The measured one is the re-read rate — of the context that could
+            have been served from cache, how much was. The fallback is a
+            lifetime-ish share over all input, which includes the first turn
+            (can never hit) and every turn's new content (was never cacheable),
+            so it cannot reach 100% even on a perfect cache.
+
+            They previously both rendered as "Cache", which meant a reader
+            comparing two rows in this column was silently comparing a re-read
+            rate against a lifetime share. The `~` did not save it: a tilde
+            reads as "approximately this quantity", not "a different quantity".
+            The distinction has to live in the noun.
+
+            "re-read" is the qualifier the harness footer uses too, so one
+            session shows one number under one name on both surfaces. */}
         {measuredCacheReread != null ? (
-          <Metric title="Share of re-readable context actually served from the provider prompt cache, as measured by the harness. Not an estimate.">
-            <em>Cache</em>
+          <Metric title="Of the context that could have been served from the provider prompt cache, the share that actually was. Measured by the harness, not estimated.">
+            <em>Cache re-read</em>
             <span>{formatBasisPoints(measuredCacheReread)}</span>
           </Metric>
         ) : (
           derived.cachePct != null && (
-            <Metric title="Approximate share of input tokens served from the provider prompt cache. Estimated by the ADE from provider-shaped usage totals — the denominator is inferred, not reported. Shown only because the harness has not measured this session yet.">
-              <em>Cache</em>
+            <Metric title="A DIFFERENT measure from the re-read rate: the share of all input tokens served from cache, estimated by the ADE with an inferred denominator. It counts turns that could never have hit, so it cannot reach 100% even on a perfect cache. Shown only until the harness measures this session.">
+              <em>Cache ~lifetime</em>
               <span>~{derived.cachePct}%</span>
             </Metric>
           )

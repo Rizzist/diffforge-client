@@ -176,6 +176,13 @@ impl SessionRow {
             .unwrap_or_default();
         let provider = sessions_harness_text(self, &["provider", "last_provider"])
             .or_else(|| {
+                sessions_harness_value(self, "metadata")
+                    .and_then(Value::as_object)
+                    .and_then(|metadata| metadata.get("provider"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .or_else(|| {
                 ["model", "last_model"]
                     .iter()
                     .find_map(|key| sessions_harness_value(self, key))
@@ -183,8 +190,7 @@ impl SessionRow {
                     .and_then(|model| model.get("provider"))
                     .and_then(Value::as_str)
                     .map(str::to_string)
-            })
-            .unwrap_or_else(|| "haider".to_string());
+            });
         let speed = object.get("speed").cloned().unwrap_or_else(|| {
             if object.get("fast").and_then(Value::as_bool) == Some(true) {
                 Value::String("fast".to_string())
@@ -211,7 +217,10 @@ impl SessionRow {
         // Stable frontend aliases are projected at read time. The source
         // object remains the base, so additive daemon fields pass through.
         object.insert("title".to_string(), Value::String(self.title()));
-        object.insert("provider".to_string(), Value::String(provider));
+        object.insert(
+            "provider".to_string(),
+            provider.map(Value::String).unwrap_or(Value::Null),
+        );
         object.insert("model".to_string(), Value::String(model));
         object.insert("status".to_string(), Value::String(status));
         object.insert("state_raw".to_string(), Value::String(state_raw));
@@ -1059,6 +1068,39 @@ mod sessions_tests {
                 ],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn sessions_serialized_provider_reads_metadata_provider() {
+        let mut row = sessions_test_row("nested-provider", Path::new(""), "pinned");
+        row.harness = json!({
+            "session_id": "provider-nested-provider",
+            "metadata": {"provider": "openai-oauth"},
+        });
+
+        assert_eq!(row.serialized_value()["provider"], "openai-oauth");
+    }
+
+    #[test]
+    fn sessions_serialized_provider_prefers_top_level_provider() {
+        let mut row = sessions_test_row("preferred-provider", Path::new(""), "pinned");
+        row.harness = json!({
+            "session_id": "provider-preferred-provider",
+            "provider": "anthropic-oauth",
+            "metadata": {"provider": "openai-oauth"},
+        });
+
+        assert_eq!(row.serialized_value()["provider"], "anthropic-oauth");
+    }
+
+    #[test]
+    fn sessions_serialized_provider_is_null_when_unknown() {
+        let mut row = sessions_test_row("unknown-provider", Path::new(""), "pinned");
+        row.harness = json!({"session_id": "provider-unknown-provider"});
+
+        let provider = &row.serialized_value()["provider"];
+        assert_eq!(provider, &Value::Null);
+        assert_ne!(provider, "haider");
     }
 
     #[test]
