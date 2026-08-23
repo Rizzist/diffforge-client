@@ -56,6 +56,9 @@ const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
 const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
+const HAIDER_NEEDS_INPUT_NO_CONNECTION: &str = "haider_needs_input_no_connection";
+const HAIDER_NEEDS_INPUT_FEATURE_MISSING: &str = "haider_needs_input_feature_missing";
+const HAIDER_NEEDS_INPUT_RPC_FAILED: &str = "haider_needs_input_rpc_failed";
 const HAIDER_NEEDS_INPUT_STALE: &str =
     "haider_needs_input_stale: This park moved on; re-read the card.";
 const HAIDER_NEEDS_INPUT_ANSWER_UNCERTAIN: &str =
@@ -73,6 +76,8 @@ const FEATURE_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
+const MAX_PRE_WELCOME_FRAMES: usize = 16;
 #[cfg(unix)]
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(unix)]
@@ -1249,6 +1254,9 @@ type PendingRpcRequest = (RpcReply, RpcErrorStyle);
 
 #[cfg(unix)]
 enum ActorCommand {
+    /// Interrupts a disconnected backoff so the outer loop attempts the
+    /// daemon socket again. It is deliberately a no-op while connected.
+    ReconnectNow,
     RosterAttach {
         app: AppHandle,
     },
@@ -2924,8 +2932,49 @@ fn session_seen_available(connection: &ConnectionSnapshot) -> bool {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionNeedsInputReachability {
+    NoConnection,
+    FeatureMissing,
+    Ready,
+}
+
+#[cfg(unix)]
+fn session_needs_input_reachability(
+    connection: &ConnectionSnapshot,
+) -> SessionNeedsInputReachability {
+    if !connection.connected {
+        SessionNeedsInputReachability::NoConnection
+    } else if !connection.features.contains(FEATURE_SESSION_NEEDS_INPUT_V1) {
+        SessionNeedsInputReachability::FeatureMissing
+    } else {
+        SessionNeedsInputReachability::Ready
+    }
+}
+
+#[cfg(unix)]
 fn session_needs_input_available(connection: &ConnectionSnapshot) -> bool {
-    connection.connected && connection.features.contains(FEATURE_SESSION_NEEDS_INPUT_V1)
+    session_needs_input_reachability(connection) == SessionNeedsInputReachability::Ready
+}
+
+#[cfg(unix)]
+fn nudge_rpc_reconnect() {
+    let _ = actor_handle().commands.send(ActorCommand::ReconnectNow);
+}
+
+#[cfg(unix)]
+fn session_answer_menu_pre_answer_error(
+    initial_reachability: SessionNeedsInputReachability,
+    detail: Option<&str>,
+) -> String {
+    if detail.is_some_and(|error| error.starts_with("missing_feature:")) {
+        return HAIDER_NEEDS_INPUT_FEATURE_MISSING.to_string();
+    }
+    if initial_reachability == SessionNeedsInputReachability::NoConnection && detail.is_none() {
+        return HAIDER_NEEDS_INPUT_NO_CONNECTION.to_string();
+    }
+    let detail = detail.unwrap_or("session.list or session.attach disconnected or timed out");
+    format!("{HAIDER_NEEDS_INPUT_RPC_FAILED}: {detail}")
 }
 
 fn session_answer_menu_option_index(
@@ -3448,9 +3497,8 @@ pub async fn session_answer_menu(
 ) -> Result<Value, String> {
     #[cfg(unix)]
     {
-        if !session_needs_input_available(&actor_handle().connection.borrow()) {
-            return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
-        }
+        // Validate the complete daemon fence before considering reachability.
+        // An offline route must never disguise a stale or incomplete card.
         let context_session_id = session_id;
         let context_menu_id = menu_id.clone();
         let context_option_key = option_key.clone();
@@ -3466,6 +3514,21 @@ pub async fn session_answer_menu(
             })
             .await
             .map_err(|error| format!("Session menu answer worker failed: {error}"))??;
+        let initial_reachability =
+            session_needs_input_reachability(&actor_handle().connection.borrow());
+        match initial_reachability {
+            SessionNeedsInputReachability::NoConnection => {
+                // Unlike the old snapshot-only gate, this reaches the RPC
+                // actor. During disconnected backoff the command wakes the
+                // outer loop and starts a new socket attempt immediately.
+                nudge_rpc_reconnect();
+                return Err(HAIDER_NEEDS_INPUT_NO_CONNECTION.to_string());
+            }
+            SessionNeedsInputReachability::FeatureMissing => {
+                return Err(HAIDER_NEEDS_INPUT_FEATURE_MISSING.to_string());
+            }
+            SessionNeedsInputReachability::Ready => {}
+        }
         let answer = session_answer_menu_rpc_inner(
             command_id.clone(),
             provider_session_id.clone(),
@@ -3479,14 +3542,14 @@ pub async fn session_answer_menu(
         session_answer_menu_update_replay(&command_id, &provider_session_id, option_index, &answer);
         return match answer {
             Ok(Some(receipt)) => Ok(receipt),
-            Ok(None) => Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string()),
-            Err(SessionAnswerMenuRpcError::BeforeAnswer(error))
-                if error.starts_with("missing_feature:") =>
-            {
-                Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string())
-            }
-            Err(SessionAnswerMenuRpcError::BeforeAnswer(error))
-            | Err(SessionAnswerMenuRpcError::Answer(error)) => Err(error),
+            Ok(None) => Err(session_answer_menu_pre_answer_error(
+                initial_reachability,
+                None,
+            )),
+            Err(SessionAnswerMenuRpcError::BeforeAnswer(error)) => Err(
+                session_answer_menu_pre_answer_error(initial_reachability, Some(&error)),
+            ),
+            Err(SessionAnswerMenuRpcError::Answer(error)) => Err(error),
         };
     }
     #[cfg(not(unix))]
@@ -3872,6 +3935,7 @@ fn apply_disconnected_command(
     roster_app: &mut Option<AppHandle>,
 ) {
     match command {
+        ActorCommand::ReconnectNow => {}
         ActorCommand::RosterAttach { app } => *roster_app = Some(app),
         ActorCommand::RpcRequest { reply, .. } => {
             let _ = reply.send(None);
@@ -4051,6 +4115,7 @@ async fn apply_connected_command(
     next_request: &mut u64,
 ) -> bool {
     match command {
+        ActorCommand::ReconnectNow => true,
         ActorCommand::RosterAttach { app } => {
             *roster_app = Some(app);
             let active = connection.can_watch_roster();
@@ -4361,7 +4426,14 @@ fn request_id(next_request: &mut u64) -> String {
 
 #[cfg(unix)]
 async fn connect_and_handshake(path: &Path) -> std::io::Result<(UnixStream, Welcome)> {
-    let mut stream = UnixStream::connect(path).await?;
+    let stream = UnixStream::connect(path).await?;
+    handshake_connected_stream(stream).await
+}
+
+#[cfg(unix)]
+async fn handshake_connected_stream(
+    mut stream: UnixStream,
+) -> std::io::Result<(UnixStream, Welcome)> {
     write_frame(
         &mut stream,
         &hello_frame(),
@@ -4369,21 +4441,53 @@ async fn connect_and_handshake(path: &Path) -> std::io::Result<(UnixStream, Welc
         WireEncoding::Json,
     )
     .await?;
-    let welcome = match read_frame(&mut stream, DEFAULT_FRAME_LIMIT).await? {
-        WireFrame::Welcome(welcome) => welcome,
-        WireFrame::ProtocolError(error) => {
-            return Err(invalid_data(format!(
-                "Haider handshake rejected ({}): {}",
-                error.code, error.message
-            )));
+    let mut skipped = 0;
+    let welcome = loop {
+        let frame = read_frame(&mut stream, DEFAULT_FRAME_LIMIT).await?;
+        match frame {
+            WireFrame::Welcome(welcome) => break welcome,
+            WireFrame::ProtocolError(error) => {
+                return Err(invalid_data(format!(
+                    "Haider handshake rejected ({}): {}",
+                    error.code, error.message
+                )));
+            }
+            frame => {
+                skipped += 1;
+                eprintln!(
+                    "[ade-rpc] skipped unexpected {} frame before Welcome ({skipped}/{MAX_PRE_WELCOME_FRAMES})",
+                    wire_frame_kind(&frame)
+                );
+                if skipped >= MAX_PRE_WELCOME_FRAMES {
+                    return Err(invalid_data(format!(
+                        "Haider Welcome was not received within {MAX_PRE_WELCOME_FRAMES} pre-Welcome frames"
+                    )));
+                }
+            }
         }
-        _ => return Err(invalid_data("expected Haider Welcome frame")),
     };
     if welcome.protocol != WIRE_PROTOCOL_VERSION || welcome.frame_limit == 0 {
         return Err(invalid_data("invalid Haider Welcome negotiation"));
     }
     WireEncoding::from_welcome(&welcome)?;
     Ok((stream, welcome))
+}
+
+#[cfg(unix)]
+fn wire_frame_kind(frame: &WireFrame) -> &'static str {
+    match frame {
+        WireFrame::Hello(_) => "hello",
+        WireFrame::Welcome(_) => "welcome",
+        WireFrame::Request { .. } => "request",
+        WireFrame::Response { .. } => "response",
+        WireFrame::SessionRosterDelta { .. } => "session_roster_delta",
+        WireFrame::SessionSurfaceDelta { .. } => "session_surface_delta",
+        WireFrame::MenuAnswer { .. } => "menu_answer",
+        WireFrame::Ping { .. } => "ping",
+        WireFrame::Pong { .. } => "pong",
+        WireFrame::ProtocolError(_) => "protocol_error",
+        WireFrame::Unknown => "unknown",
+    }
 }
 
 #[cfg(unix)]
@@ -5591,6 +5695,11 @@ mod tests {
                 "worker_generation": 123,
                 "options": [{"key":"retry"}]
             }),
+            serde_json::json!({
+                "menu_id": "effect-recovery-1",
+                "request_seq": 1843,
+                "options": [{"key":"retry"}]
+            }),
             Value::Null,
         ] {
             assert_eq!(
@@ -5610,6 +5719,27 @@ mod tests {
                 .unwrap_err(),
             HAIDER_NEEDS_INPUT_STALE
         );
+    }
+
+    #[test]
+    fn menu_answer_missing_worker_generation_takes_the_stale_path() {
+        let missing_worker_generation = serde_json::json!({
+            "menu_id": "effect-recovery-1",
+            "request_seq": 1843,
+            "options": [{"key":"retry"}]
+        });
+        let error = session_answer_menu_option_index(
+            &missing_worker_generation,
+            "effect-recovery-1",
+            1843,
+            122,
+            "retry",
+        )
+        .unwrap_err();
+        assert_eq!(error, HAIDER_NEEDS_INPUT_STALE);
+        assert_ne!(error, HAIDER_NEEDS_INPUT_NO_CONNECTION);
+        assert_ne!(error, HAIDER_NEEDS_INPUT_FEATURE_MISSING);
+        assert!(!error.starts_with(HAIDER_NEEDS_INPUT_RPC_FAILED));
     }
 
     #[test]
@@ -5843,6 +5973,32 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnect_nudge_interrupts_the_actor_backoff() {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let mut subscriptions = HashMap::new();
+        let mut revisions = HashMap::new();
+        let mut roster_app = None;
+        commands
+            .send(ActorCommand::ReconnectNow)
+            .expect("queue reconnect nudge");
+
+        let continued = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_disconnected(
+                &mut receiver,
+                &mut subscriptions,
+                &mut revisions,
+                &mut roster_app,
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("reconnect nudge must not wait for the five-second backoff");
+        assert!(continued);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn session_seen_requires_a_live_feature_advertisement() {
         let mut connection = ConnectionSnapshot {
@@ -5864,22 +6020,155 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn menu_answer_requires_a_live_feature_advertisement() {
+    fn menu_answer_reports_missing_feature_only_on_a_live_connection() {
         let mut connection = ConnectionSnapshot {
             connected: true,
-            features: BTreeSet::from([FEATURE_SESSION_NEEDS_INPUT_V1.to_string()]),
             ..ConnectionSnapshot::default()
         };
-        assert!(session_needs_input_available(&connection));
-
-        connection.features.clear();
         assert!(!session_needs_input_available(&connection));
-
+        assert_eq!(
+            session_needs_input_reachability(&connection),
+            SessionNeedsInputReachability::FeatureMissing
+        );
+        assert_eq!(
+            session_answer_menu_pre_answer_error(
+                SessionNeedsInputReachability::FeatureMissing,
+                Some(&format!(
+                    "missing_feature: daemon does not advertise {FEATURE_SESSION_NEEDS_INPUT_V1}"
+                )),
+            ),
+            HAIDER_NEEDS_INPUT_FEATURE_MISSING
+        );
         connection
             .features
             .insert(FEATURE_SESSION_NEEDS_INPUT_V1.to_string());
-        connection.connected = false;
+        assert_eq!(
+            session_needs_input_reachability(&connection),
+            SessionNeedsInputReachability::Ready
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn menu_answer_reports_no_connection_even_if_old_features_are_retained() {
+        let connection = ConnectionSnapshot {
+            connected: false,
+            features: BTreeSet::from([FEATURE_SESSION_NEEDS_INPUT_V1.to_string()]),
+            ..ConnectionSnapshot::default()
+        };
         assert!(!session_needs_input_available(&connection));
+        assert_eq!(
+            session_needs_input_reachability(&connection),
+            SessionNeedsInputReachability::NoConnection
+        );
+        assert_eq!(
+            session_answer_menu_pre_answer_error(SessionNeedsInputReachability::NoConnection, None),
+            HAIDER_NEEDS_INPUT_NO_CONNECTION
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn menu_answer_connected_pre_answer_failure_is_an_rpc_route_failure() {
+        let error = session_answer_menu_pre_answer_error(
+            SessionNeedsInputReachability::Ready,
+            Some("session.attach timed out"),
+        );
+        assert!(error.starts_with(HAIDER_NEEDS_INPUT_RPC_FAILED));
+        assert!(error.contains("session.attach timed out"));
+        assert_ne!(error, HAIDER_NEEDS_INPUT_NO_CONNECTION);
+        assert_ne!(error, HAIDER_NEEDS_INPUT_FEATURE_MISSING);
+    }
+
+    #[cfg(unix)]
+    fn handshake_test_welcome() -> Welcome {
+        Welcome {
+            protocol: WIRE_PROTOCOL_VERSION,
+            instance_id: "daemon-handshake-test".to_owned(),
+            daemon_generation: 7,
+            frame_limit: 1_048_576,
+            profile_id: "profile-handshake-test".to_owned(),
+            daemon_version: "test".to_owned(),
+            lifecycle_phase: "ready".to_owned(),
+            capabilities_granted: BTreeSet::from([Capability::View, Capability::Control]),
+            features: BTreeSet::from([FEATURE_SESSION_NEEDS_INPUT_V1.to_owned()]),
+            encoding: None,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn write_raw_json_frame(stream: &mut UnixStream, body: &[u8]) {
+        stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .expect("write raw frame prefix");
+        stream.write_all(body).await.expect("write raw frame body");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_skips_resident_binding_before_welcome() {
+        let (client, mut server_stream) = UnixStream::pair().expect("test socket pair");
+        let expected_welcome = handshake_test_welcome();
+        let server_welcome = expected_welcome.clone();
+        let server = tokio::spawn(async move {
+            assert!(matches!(
+                read_frame(&mut server_stream, DEFAULT_FRAME_LIMIT)
+                    .await
+                    .expect("read Hello"),
+                WireFrame::Hello(_)
+            ));
+            write_raw_json_frame(
+                &mut server_stream,
+                br#"{"v":1,"kind":"resident_session_binding","session_id":"session-1"}"#,
+            )
+            .await;
+            write_frame(
+                &mut server_stream,
+                &WireFrame::Welcome(server_welcome),
+                DEFAULT_FRAME_LIMIT,
+                WireEncoding::Json,
+            )
+            .await
+            .expect("write Welcome");
+        });
+
+        let (_, welcome) = handshake_connected_stream(client)
+            .await
+            .expect("handshake should tolerate a pre-Welcome push");
+        assert_eq!(welcome, expected_welcome);
+        server.await.expect("test server");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_without_welcome_fails_after_bounded_skips() {
+        let (client, mut server_stream) = UnixStream::pair().expect("test socket pair");
+        let server = tokio::spawn(async move {
+            assert!(matches!(
+                read_frame(&mut server_stream, DEFAULT_FRAME_LIMIT)
+                    .await
+                    .expect("read Hello"),
+                WireFrame::Hello(_)
+            ));
+            for nonce in 0..MAX_PRE_WELCOME_FRAMES as u64 {
+                write_frame(
+                    &mut server_stream,
+                    &WireFrame::Ping { nonce },
+                    DEFAULT_FRAME_LIMIT,
+                    WireEncoding::Json,
+                )
+                .await
+                .expect("write pre-Welcome frame");
+            }
+        });
+
+        let error = handshake_connected_stream(client)
+            .await
+            .expect_err("a stream without Welcome must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("Welcome was not received"));
+        server.await.expect("test server");
     }
 
     #[test]
