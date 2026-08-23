@@ -3,14 +3,16 @@ import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 
-import { formatBasisPoints, measuredCacheRereadBasisPoints } from "./cacheMetric.js";
+import { cacheRereadMetric } from "./cacheMetric.js";
 
 /* Trajectory view: a canvas strip of the session's event stream (Input /
    Model / Tools lanes + a tokens bar lane), metrics header, and a synced
    detail list. Fed by session_projection_trajectory — lean points only,
    payloads never cross the wire. Usage rows fold into per-turn token/cache
    stats anchored to the preceding assistant event; cache-miss shading only
-   appears when the harness actually reported cache counts.
+   appears when the harness actually reported cache counts. The header never
+   derives a cache percentage from those counts: outside this UI, a labelled
+   estimate is too easily mistaken for the harness measurement.
 
    The canvas is viewport-sized and sticky inside the scroller (a spacer div
    carries the logical width): browser canvases cap at ~32k device px, so a
@@ -110,7 +112,7 @@ function usageDeltas(usagePoints) {
 export default function SessionTrajectory({ session }) {
   const sessionId = session?.id || "";
   // Absent and zero are different facts; see cacheMetric.js.
-  const measuredCacheReread = measuredCacheRereadBasisPoints(session);
+  const cacheMetric = cacheRereadMetric(session);
   const [points, setPoints] = useState([]);
   const [loadState, setLoadState] = useState("loading");
   const [selectedKey, setSelectedKey] = useState(null);
@@ -244,18 +246,14 @@ export default function SessionTrajectory({ session }) {
     const deltas = usageDeltas(usageRaw);
     const byKey = new Map(events.map((entry) => [entry.key, entry]));
     let tokenTotal = 0;
-    let cachedTotal = 0;
-    let inputTotal = 0;
     let cacheKnown = false;
     for (const usage of deltas) {
       const anchor = usage.anchorKey != null ? byKey.get(usage.anchorKey) : null;
       const input = usage.input ?? 0;
       const output = usage.output ?? 0;
       tokenTotal += input + output;
-      inputTotal += input;
       if (usage.cached != null) {
         cacheKnown = true;
-        cachedTotal += usage.cached;
       }
       if (anchor) {
         anchor.tokens = {
@@ -265,18 +263,6 @@ export default function SessionTrajectory({ session }) {
         };
       }
     }
-    /* ESTIMATE, and rendered with a ~ so it never reads as measurement. The
-       harness measures this properly as cache_reread_hit_basis_points, but that
-       lives on AgentUsageMetrics which the TUI reads in-process — it is on no
-       door the ADE can reach, so deriving it here is filling a gap rather than
-       duplicating an available number. Delete this the day it is published.
-
-       Anthropic-shaped usage reports cache reads OUTSIDE input_tokens; when
-       cached exceeds input, the true share is cached / (input + cached). That
-       branch is exactly the inference that makes this an approximation. */
-    const cacheDenominator = cachedTotal > inputTotal
-      ? inputTotal + cachedTotal
-      : inputTotal;
     const stamps = events.map((e) => e.at_ms).filter((t) => t > 0);
     return {
       events,
@@ -284,9 +270,6 @@ export default function SessionTrajectory({ session }) {
       calls: events.filter((e) => e.kind === "tool").length,
       durationMs: stamps.length ? Math.max(...stamps) - Math.min(...stamps) : 0,
       tokenTotal,
-      cachePct: cacheKnown && cacheDenominator > 0
-        ? Math.min(100, Math.round((cachedTotal / cacheDenominator) * 100))
-        : null,
       cacheKnown,
     };
   }, [points]);
@@ -572,33 +555,16 @@ export default function SessionTrajectory({ session }) {
             <span>{formatTokens(derived.tokenTotal)}</span>
           </Metric>
         )}
-        {/* These two are DIFFERENT QUANTITIES and must never share a noun.
-            The measured one is the re-read rate — of the context that could
-            have been served from cache, how much was. The fallback is a
-            lifetime-ish share over all input, which includes the first turn
-            (can never hit) and every turn's new content (was never cacheable),
-            so it cannot reach 100% even on a perfect cache.
-
-            They previously both rendered as "Cache", which meant a reader
-            comparing two rows in this column was silently comparing a re-read
-            rate against a lifetime share. The `~` did not save it: a tilde
-            reads as "approximately this quantity", not "a different quantity".
-            The distinction has to live in the noun.
-
-            "re-read" is the qualifier the harness footer uses too, so one
-            session shows one number under one name on both surfaces. */}
-        {measuredCacheReread != null ? (
+        {/* Only the harness measurement may create a cache header metric.
+            Token counts cannot supply a substitute: a tilde or special label
+            is lost when the number is screenshotted, quoted, or compared on
+            another surface. When the measurement is absent, the metric is
+            absent too. "re-read" remains the shared harness qualifier. */}
+        {cacheMetric != null && (
           <Metric title="Of the context that could have been served from the provider prompt cache, the share that actually was. Measured by the harness, not estimated.">
-            <em>Cache re-read</em>
-            <span>{formatBasisPoints(measuredCacheReread)}</span>
+            <em>{cacheMetric.label}</em>
+            <span>{cacheMetric.value}</span>
           </Metric>
-        ) : (
-          derived.cachePct != null && (
-            <Metric title="A DIFFERENT measure from the re-read rate: the share of all input tokens served from cache, estimated by the ADE with an inferred denominator. It counts turns that could never have hit, so it cannot reach 100% even on a perfect cache. Shown only until the harness measures this session.">
-              <em>Cache ~lifetime</em>
-              <span>~{derived.cachePct}%</span>
-            </Metric>
-          )
         )}
         <Legend>
           <i data-color="input" /> Input

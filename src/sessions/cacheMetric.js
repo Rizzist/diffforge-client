@@ -1,10 +1,11 @@
 /* The harness measures prompt-cache re-read and publishes it in basis points on
-   the opaque session payload. Nothing between the daemon and here names the
-   field, which is why it appeared the moment the roster stopped being
-   overwritten by the lossier CLI projection.
+   the opaque session payload. This is the only cache percentage the client may
+   render: the harness contract forbids calculating a substitute from token
+   counts. A labelled estimate is still indistinguishable from a measurement
+   once it is screenshotted, quoted, or compared outside its original UI.
 
-   Lives in its own module rather than inside the component so the one rule that
-   matters can be tested: ABSENT AND ZERO ARE DIFFERENT FACTS. */
+   Lives in its own module rather than inside the component so both rules can be
+   tested: ABSENT AND ZERO ARE DIFFERENT FACTS, and absent produces no metric. */
 
 /** Reads the harness-measured re-read rate, in basis points, or null.
  *
@@ -43,6 +44,16 @@ export function measuredCacheRereadBasisPoints(session) {
     return finiteOrNull(usage.cache_reread_hit_basis_points);
   }
   return null;
+}
+
+/** Returns the cache header metric backed by a harness measurement, or null. */
+export function cacheRereadMetric(session) {
+  const basisPoints = measuredCacheRereadBasisPoints(session);
+  if (basisPoints == null) return null;
+  return {
+    label: "Cache re-read",
+    value: formatBasisPoints(basisPoints),
+  };
 }
 
 function finiteOrNull(value) {

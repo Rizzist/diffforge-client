@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  cacheRereadMetric,
   formatBasisPoints,
   measuredCacheRereadBasisPoints,
 } from "./cacheMetric.js";
@@ -33,6 +34,20 @@ test("an unmeasured session reports nothing, never zero", () => {
   ]) {
     assert.equal(measuredCacheRereadBasisPoints(session), null);
   }
+});
+
+test("a session with no measured cache value produces no cache metric at all", () => {
+  const session = {
+    agent_metrics: {
+      usage: {
+        input_tokens: 2400,
+        cached_input_tokens: 1800,
+        cache_read_input_tokens: 1800,
+      },
+    },
+  };
+
+  assert.equal(cacheRereadMetric(session), null);
 });
 
 test("a small real rate never rounds away to the measured-zero string", () => {
