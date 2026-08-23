@@ -70,6 +70,19 @@ test("item-stream held thinking is emitted above its assistant reply", () => {
   assert.deepEqual(visibleKinds(blocks), ["thinking", "message"]);
 });
 
+test("multiple held item-stream thinking rows keep wire-relative order before one reply", () => {
+  const blocks = buildTranscriptBlocks([
+    row({ seq: 62, kind: "thinking", text: "second step", meta: { item: "reasoning" } }),
+    row({ seq: 61, kind: "thinking", text: "first step", meta: { item: "reasoning" } }),
+    row({ seq: 63, text: "answer", meta: { item: "agent_message" } }),
+  ]);
+
+  assert.deepEqual(
+    blocks.map((block) => block.row?.text),
+    ["first step", "second step", "answer"],
+  );
+});
+
 test("reasoning remains a separate row and never joins a tool group", () => {
   const blocks = buildTranscriptBlocks([
     row({ seq: 50, kind: "thinking", text: "plan", meta: { item: "reasoning" } }),

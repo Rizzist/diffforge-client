@@ -4,6 +4,7 @@
 const INTERNAL_ITEM_NAMES = new Set([
   "node_committed",
   "extension",
+  "session_seen",
 ]);
 
 function isInternalToolRow(row) {
