@@ -48,3 +48,31 @@ test("ordinary rates read as whole percentages", () => {
   assert.equal(formatBasisPoints(8266), "83%");
   assert.equal(formatBasisPoints(1000), "10%");
 });
+
+/* 0.0.943 promoted this to a top-level field. Old sessions keep only the deep
+   one, so both paths are permanent — a client reads whatever is on the other
+   end of the socket, not whatever is current. */
+test("the promoted top-level rate is preferred, and the deep one still works", () => {
+  assert.equal(
+    measuredCacheRereadBasisPoints({ cache_reread_hit_basis_points: 9058 }),
+    9058,
+  );
+
+  // A pre-943 session carries only the nested shape.
+  assert.equal(
+    measuredCacheRereadBasisPoints({
+      agent_metrics: { usage: { cache_reread_hit_basis_points: 6370 } },
+    }),
+    6370,
+  );
+
+  // A measured zero at the top level must not fall through to the deep path —
+  // 0 is a result, and `||` here would silently prefer the older number.
+  assert.equal(
+    measuredCacheRereadBasisPoints({
+      cache_reread_hit_basis_points: 0,
+      agent_metrics: { usage: { cache_reread_hit_basis_points: 9058 } },
+    }),
+    0,
+  );
+});

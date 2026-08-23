@@ -14,8 +14,24 @@
  * invent a measurement the daemon never took, so this returns null only for
  * genuinely absent values and passes a real 0 through untouched. */
 export function measuredCacheRereadBasisPoints(session) {
-  const value = session?.agent_metrics?.usage?.cache_reread_hit_basis_points;
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+  /* 0.0.943 promoted this to a top-level field, copied from the same snapshot
+     rather than recomputed, so the two cannot disagree. Prefer it: the nested
+     path sits behind TWO Options, which means three different absences — no
+     metrics snapshot, no usage, no measured rate — all arriving as "no
+     number", and a reader has to flatten them anyway.
+
+     The nested path stays permanently, not as a migration step. Sessions
+     written by every daemon up to 942 keep only the deep shape, and this
+     client reads whatever is on the other end of the socket. */
+  for (const value of [
+    session?.cache_reread_hit_basis_points,
+    session?.agent_metrics?.usage?.cache_reread_hit_basis_points,
+  ]) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return null;
 }
 
 /** Basis points to a display string. 10000bp = 100%.
