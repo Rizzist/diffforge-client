@@ -39365,9 +39365,6 @@ fn cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
             requested,
         );
     }
-    if cloud_mcp_workspace_terminal_empty_clear_is_explicit(workspace, snapshot_reason, requested) {
-        return true;
-    }
     let workspace_clear_reason =
         cloud_mcp_payload_text(workspace, &["workspace_clear_reason"]).unwrap_or_default();
     let workspace_event_reason =
@@ -39422,11 +39419,6 @@ fn cloud_mcp_workspace_panel_empty_clear_is_explicit(
         return true;
     }
     if !workspace_active {
-        if cloud_mcp_panel_empty_clear_reason_is_explicit(requested_panel_clear_reason)
-            || cloud_mcp_panel_empty_clear_reason_is_explicit(snapshot_reason)
-        {
-            return true;
-        }
         let workspace_clear_reason =
             cloud_mcp_payload_text(workspace, &["workspace_clear_reason"]).unwrap_or_default();
         let workspace_event_reason =
