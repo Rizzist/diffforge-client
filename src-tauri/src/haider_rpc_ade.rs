@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         OnceLock,
     },
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,8 @@ const FEATURE_ACCOUNT_OAUTH_DEVICE_V1: &str = "account_oauth_device_v1";
 const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
 const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
 const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
+const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
+const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
 const HAIDER_NEEDS_INPUT_NO_CONNECTION: &str = "haider_needs_input_no_connection";
@@ -84,8 +86,6 @@ const FEATURE_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(unix)]
-const MAX_PRE_WELCOME_FRAMES: usize = 16;
 #[cfg(unix)]
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(unix)]
@@ -143,23 +143,40 @@ pub(crate) struct SessionReadResult {
     pub envelopes: Vec<Value>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SnapshotAvailabilityWire {
+    Available,
+    Unavailable {
+        #[serde(default)]
+        reason: String,
+    },
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AccountListResult {
     pub descriptors: Vec<Value>,
     pub revision: Option<u64>,
     pub provider_active: Vec<Value>,
     pub provider_defaults: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<SnapshotAvailabilityWire>,
 }
 
-impl AccountListResult {
-    fn subsystem_absent() -> Self {
-        Self {
-            descriptors: Vec::new(),
-            revision: None,
-            provider_active: Vec::new(),
-            provider_defaults: Vec::new(),
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderListResult {
+    pub providers: Vec<Value>,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<SnapshotAvailabilityWire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UsageReportResult {
+    pub report: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<SnapshotAvailabilityWire>,
 }
 
 #[derive(Clone, Serialize)]
@@ -169,6 +186,8 @@ pub struct AccountOauthStartResult {
     pub flow_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authorization_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -577,7 +596,8 @@ enum RequestBody {
     CommandInvoke {
         command_id: String,
         command: String,
-        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     #[serde(rename = "artifact.put")]
     ArtifactPut { data_base64: String },
@@ -604,7 +624,12 @@ enum RequestBody {
         range: SessionReadRange,
     },
     #[serde(rename = "provider.list")]
-    ProviderList {},
+    ProviderList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    #[serde(rename = "usage.report")]
+    UsageReport {},
     #[serde(rename = "session.observe")]
     SessionObserve {
         session_id: String,
@@ -791,6 +816,15 @@ enum ResponseBody {
     ProviderList {
         #[serde(default)]
         providers: Vec<Value>,
+        revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
+    },
+    #[serde(rename = "usage.report")]
+    UsageReport {
+        report: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
     },
     #[serde(rename = "session.observe")]
     SessionObserve { digest: Value },
@@ -867,6 +901,8 @@ enum ResponseBody {
         provider_active: Vec<Value>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         provider_defaults: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
     },
     #[serde(rename = "vault.stage")]
     VaultStage {
@@ -883,6 +919,8 @@ enum ResponseBody {
         flow_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authorization_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_code: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_origin: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1792,15 +1830,15 @@ pub async fn command_invoke(
     {
         let local_session_id = session_id.trim().to_string();
         let provider_session_id = if local_session_id.is_empty() {
-            String::new()
+            None
         } else {
             let lookup_id = local_session_id.clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            Some(tauri::async_runtime::spawn_blocking(move || {
                 super::session_provider_session_id_blocking(&lookup_id)
             })
             .await
             .map_err(|_| HAIDER_COMMAND_INVOKE_FAILED.to_string())?
-            .map_err(|_| HAIDER_COMMAND_INVOKE_FAILED.to_string())?
+            .map_err(|_| HAIDER_COMMAND_INVOKE_FAILED.to_string())?)
         };
         let command_id = if command_id.trim().is_empty() {
             format!("diffforge-command-{}", uuid::Uuid::new_v4())
@@ -2052,15 +2090,17 @@ pub async fn account_list(provider: Option<String>) -> Result<AccountListResult,
                 revision,
                 provider_active,
                 provider_defaults,
+                availability,
             })) => Ok(AccountListResult {
                 descriptors,
                 revision,
                 provider_active,
                 provider_defaults,
+                availability,
             }),
             Some(Ok(_)) => Err("account.list response method mismatch".to_string()),
             Some(Err(error)) if error.starts_with("missing_feature:") => {
-                Ok(AccountListResult::subsystem_absent())
+                Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
             }
             Some(Err(error)) => Err(error),
             None => Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string()),
@@ -2071,6 +2111,73 @@ pub async fn account_list(provider: Option<String>) -> Result<AccountListResult,
         let _ = provider;
         Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
     }
+}
+
+/// Reads the daemon-published provider/model inventory. An unavailable
+/// subsystem remains a successful typed snapshot carrying its availability;
+/// a missing feature is not rewritten into an empty inventory.
+pub(crate) async fn provider_list_rpc(
+    provider: Option<String>,
+) -> Result<ProviderListResult, String> {
+    #[cfg(unix)]
+    {
+        return match rpc_request_with_feature_gate(
+            RequestBody::ProviderList { provider },
+            Capability::View,
+            FeatureGate::all(BTreeSet::from([FEATURE_PROVIDER_MANAGEMENT_V1.to_string()])),
+            true,
+        )
+        .await
+        {
+            Some(Ok(ResponseBody::ProviderList {
+                providers,
+                revision,
+                availability,
+            })) => Ok(ProviderListResult {
+                providers,
+                revision,
+                availability,
+            }),
+            Some(Ok(_)) => Err("provider.list response method mismatch".to_string()),
+            Some(Err(error)) => Err(error),
+            None => Err("provider.list unavailable: no ADE connection".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = provider;
+        Err("provider.list unavailable on this platform".to_string())
+    }
+}
+
+/// Reads the cross-account usage snapshot. In particular, generated_at_ms=0
+/// is retained as data; only the additive availability state can classify an
+/// unavailable current daemon response.
+pub(crate) async fn usage_report_rpc() -> Result<UsageReportResult, String> {
+    #[cfg(unix)]
+    {
+        return match rpc_request_with_feature_gate(
+            RequestBody::UsageReport {},
+            Capability::View,
+            FeatureGate::all(BTreeSet::from([FEATURE_USAGE_REPORT_V1.to_string()])),
+            true,
+        )
+        .await
+        {
+            Some(Ok(ResponseBody::UsageReport {
+                report,
+                availability,
+            })) => Ok(UsageReportResult {
+                report,
+                availability,
+            }),
+            Some(Ok(_)) => Err("usage.report response method mismatch".to_string()),
+            Some(Err(error)) => Err(error),
+            None => Err("usage.report unavailable: no ADE connection".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    Err("usage.report unavailable on this platform".to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -2150,6 +2257,7 @@ pub async fn account_oauth_start(
                 availability,
                 flow_id,
                 authorization_url,
+                user_code,
                 provider_origin,
                 loopback_port,
                 expires_at_ms,
@@ -2157,6 +2265,7 @@ pub async fn account_oauth_start(
                 availability,
                 flow_id,
                 authorization_url,
+                user_code,
                 provider_origin,
                 loopback_port,
                 expires_at_ms,
@@ -2885,12 +2994,29 @@ async fn session_needs_input_summary(session_id: &str) -> Result<Option<Value>, 
 
 #[cfg(unix)]
 async fn config_providers(capability: Capability) -> Result<Option<Vec<Value>>, String> {
-    let Some(response) = config_request(RequestBody::ProviderList {}, capability, &[]).await?
+    let Some(response) = config_request(
+        RequestBody::ProviderList { provider: None },
+        capability,
+        &[FEATURE_PROVIDER_MANAGEMENT_V1],
+    )
+    .await?
     else {
         return Ok(None);
     };
     match response {
-        ResponseBody::ProviderList { providers } => Ok(Some(providers)),
+        ResponseBody::ProviderList {
+            providers,
+            availability,
+            ..
+        } => match availability {
+            Some(SnapshotAvailabilityWire::Unavailable { reason }) => Err(format!(
+                "provider.list unavailable while reading session config: {reason}"
+            )),
+            Some(SnapshotAvailabilityWire::Unknown) => Err(
+                "provider.list availability is unknown while reading session config".to_string(),
+            ),
+            _ => Ok(Some(providers)),
+        },
         _ => Err("provider.list response method mismatch".to_string()),
     }
 }
@@ -4217,7 +4343,7 @@ async fn run_actor(
             }
         }
 
-        let _ = connection_tx.send(snapshot.clone());
+        publish_connection(&connection_tx, snapshot.clone());
 
         if !setup_failed {
             run_connected(
@@ -4252,12 +4378,20 @@ fn publish_resident_binding(
 }
 
 #[cfg(unix)]
+fn publish_connection(
+    connection_tx: &watch::Sender<ConnectionSnapshot>,
+    snapshot: ConnectionSnapshot,
+) {
+    connection_tx.send_replace(snapshot);
+}
+
+#[cfg(unix)]
 fn publish_disconnected(connection_tx: &watch::Sender<ConnectionSnapshot>) {
     let mut snapshot = connection_tx.borrow().clone();
     snapshot.connected = false;
     snapshot.roster_watch_active = false;
     ROSTER_WATCH_ACTIVE.store(false, Ordering::Release);
-    let _ = connection_tx.send(snapshot);
+    publish_connection(connection_tx, snapshot);
 }
 
 #[cfg(unix)]
@@ -4806,12 +4940,20 @@ fn request_id(next_request: &mut u64) -> String {
 #[cfg(unix)]
 async fn connect_and_handshake(path: &Path) -> std::io::Result<(UnixStream, Welcome)> {
     let stream = UnixStream::connect(path).await?;
-    handshake_connected_stream(stream).await
+    handshake_connected_stream_for_profile(stream, expected_profile_id().as_deref()).await
 }
 
 #[cfg(unix)]
 async fn handshake_connected_stream(
+    stream: UnixStream,
+) -> std::io::Result<(UnixStream, Welcome)> {
+    handshake_connected_stream_for_profile(stream, None).await
+}
+
+#[cfg(unix)]
+async fn handshake_connected_stream_for_profile(
     mut stream: UnixStream,
+    expected_profile_id: Option<&str>,
 ) -> std::io::Result<(UnixStream, Welcome)> {
     write_frame(
         &mut stream,
@@ -4820,33 +4962,28 @@ async fn handshake_connected_stream(
         WireEncoding::Json,
     )
     .await?;
-    let mut skipped = 0;
-    let welcome = loop {
-        let frame = read_frame(&mut stream, DEFAULT_FRAME_LIMIT).await?;
-        match frame {
-            WireFrame::Welcome(welcome) => break welcome,
-            WireFrame::ProtocolError(error) => {
-                return Err(invalid_data(format!(
-                    "Haider handshake rejected ({}): {}",
-                    error.code, error.message
-                )));
-            }
-            frame => {
-                skipped += 1;
-                eprintln!(
-                    "[ade-rpc] skipped unexpected {} frame before Welcome ({skipped}/{MAX_PRE_WELCOME_FRAMES})",
-                    wire_frame_kind(&frame)
-                );
-                if skipped >= MAX_PRE_WELCOME_FRAMES {
-                    return Err(invalid_data(format!(
-                        "Haider Welcome was not received within {MAX_PRE_WELCOME_FRAMES} pre-Welcome frames"
-                    )));
-                }
-            }
+    let welcome = match read_frame(&mut stream, DEFAULT_FRAME_LIMIT).await? {
+        WireFrame::Welcome(welcome) => welcome,
+        WireFrame::ProtocolError(error) => {
+            return Err(invalid_data(format!(
+                "Haider handshake rejected ({}): {}",
+                error.code, error.message
+            )));
+        }
+        frame => {
+            return Err(invalid_data(format!(
+                "first Haider daemon frame was {}; expected Welcome",
+                wire_frame_kind(&frame)
+            )));
         }
     };
     if welcome.protocol != WIRE_PROTOCOL_VERSION || welcome.frame_limit == 0 {
         return Err(invalid_data("invalid Haider Welcome negotiation"));
+    }
+    if !welcome.profile_id.is_empty()
+        && expected_profile_id.is_some_and(|expected| expected != welcome.profile_id.as_str())
+    {
+        return Err(invalid_data("Haider Welcome profile_id mismatch"));
     }
     WireEncoding::from_welcome(&welcome)?;
     Ok((stream, welcome))
@@ -4896,32 +5033,21 @@ async fn read_frame(stream: &mut UnixStream, frame_limit: usize) -> std::io::Res
     decode_body(&body, frame_limit)
 }
 
-/// Resolves the published endpoint exactly like `haider-client`, then uses the
-/// requested `.haiderd-*` newest-entry compatibility fallback if the
-/// deterministic endpoint is absent.
-fn resolve_socket_path() -> Option<PathBuf> {
+/// Resolves only the deterministic endpoint published by the client
+/// contract. Directory scanning can silently connect this profile to a
+/// different daemon and is therefore never a compatibility fallback.
+pub(crate) fn resolve_socket_path() -> Option<PathBuf> {
     #[cfg(unix)]
     {
         let uid = unsafe { libc::geteuid() };
         let runtime_dir = runtime_dir(uid);
-        let deterministic = deterministic_endpoint(
+        deterministic_endpoint(
             std::env::var_os("HAIDER_PROFILE_DIR")
                 .as_deref()
                 .map(Path::new),
             std::env::var_os("HOME").as_deref().map(Path::new),
             &runtime_dir,
-        );
-        /* `exists()` was the original test and it is the wrong one: a stale
-           socket file from a dead daemon exists just as well as a live one,
-           so a single unlucky leftover pinned the ADE to an endpoint that
-           could never answer. Require that it actually accepts. */
-        if deterministic.as_ref().is_some_and(|path| socket_is_live(path)) {
-            return deterministic;
-        }
-        let fallback_dir = PathBuf::from("/tmp").join(format!("haider-{uid}"));
-        newest_live_endpoint(&fallback_dir)
-            .or_else(|| newest_live_endpoint(&runtime_dir))
-            .or(deterministic)
+        )
     }
     #[cfg(not(unix))]
     None
@@ -4945,7 +5071,7 @@ fn is_owner_private_directory(path: &Path, uid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-        metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0
+        metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o777 == 0o700
     })
 }
 
@@ -4978,89 +5104,30 @@ fn deterministic_endpoint(
     Some(runtime_dir.join(format!("haider-{}.sock", &endpoint_digest[..32])))
 }
 
-/// A socket FILE proves nothing: the runtime dir accumulates one leftover per
-/// daemon that ever ran (1259 of them on this machine), and a stale entry is
-/// indistinguishable from a live one by name, mtime or metadata. Only a
-/// connect answers the question, so candidates are probed newest-first and the
-/// first one that accepts is the endpoint.
-fn socket_is_live(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        std::os::unix::net::UnixStream::connect(path).is_ok()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        false
-    }
-}
-
-/// Endpoints appear under BOTH names: the daemon binds `.haiderd-<random>`
-/// and renames it to `haider-<digest>.sock`, so at rest the staging name is
-/// gone. Scanning only for staging found nothing and left the ADE permanently
-/// unable to reach a running daemon.
-fn endpoint_candidates(runtime_dir: &Path) -> Vec<PathBuf> {
-    let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
-        return Vec::new();
+pub(crate) fn expected_profile_id() -> Option<String> {
+    let profile_dir = std::env::var_os("HAIDER_PROFILE_DIR");
+    let home = std::env::var_os("HOME");
+    let store_dir = match profile_dir.as_deref().map(Path::new) {
+        Some(path) => path.to_owned(),
+        None => home
+            .as_deref()
+            .map(Path::new)
+            .filter(|path| !path.as_os_str().is_empty())?
+            .join(".haider")
+            .join("dev-profile"),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let named = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.starts_with(".haiderd-")
-                    || (name.starts_with("haider-") && name.ends_with(".sock"))
-            });
-        if !named {
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        found.push((modified, path));
-    }
-    found.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-    found.into_iter().map(|(_, path)| path).collect()
-}
-
-/// Newest-first, but bounded: probing every leftover would mean up to a
-/// thousand connects on a cold resolve.
-const ENDPOINT_PROBE_LIMIT: usize = 8;
-
-fn newest_live_endpoint(runtime_dir: &Path) -> Option<PathBuf> {
-    endpoint_candidates(runtime_dir)
-        .into_iter()
-        .take(ENDPOINT_PROBE_LIMIT)
-        .find(|path| socket_is_live(path))
-}
-
-#[allow(dead_code)]
-fn newest_staging_socket(runtime_dir: &Path) -> Option<PathBuf> {
-    let mut newest: Option<(SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(runtime_dir).ok()?.flatten() {
-        let path = entry.path();
-        let is_staging = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".haiderd-"));
-        if !is_staging {
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        if newest
-            .as_ref()
-            .is_none_or(|(best_time, best_path)| (modified, &path) > (*best_time, best_path))
-        {
-            newest = Some((modified, path));
-        }
-    }
-    newest.map(|(_, path)| path)
+    let absolute = if store_dir.is_absolute() {
+        store_dir
+    } else {
+        std::env::current_dir().ok()?.join(store_dir)
+    };
+    std::fs::create_dir_all(&absolute).ok()?;
+    let canonical = absolute.canonicalize().ok()?;
+    let canonical_text = canonical.to_str()?;
+    let mut material = Vec::with_capacity(PROFILE_ID_TAG.len() + canonical_text.len());
+    material.extend_from_slice(PROFILE_ID_TAG);
+    material.extend_from_slice(canonical_text.as_bytes());
+    Some(hex(&blake3_hash(&material)))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -5269,6 +5336,24 @@ fn blake3_g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn connection_snapshot_publication_is_durable_without_an_active_receiver() {
+        let (connection_tx, initial_receiver) = watch::channel(ConnectionSnapshot::default());
+        drop(initial_receiver);
+        let expected_feature = FEATURE_PROVIDER_MANAGEMENT_V1.to_string();
+        let snapshot = ConnectionSnapshot {
+            connected: true,
+            features: BTreeSet::from([expected_feature.clone()]),
+            ..ConnectionSnapshot::default()
+        };
+
+        publish_connection(&connection_tx, snapshot);
+
+        assert!(connection_tx.borrow().connected);
+        assert!(connection_tx.borrow().features.contains(&expected_feature));
+    }
 
     #[test]
     fn frame_encode_decode_round_trip_uses_big_endian_json_prefix() {
@@ -5721,16 +5806,18 @@ mod tests {
                 query: "".to_owned(),
                 in_session: true,
                 slots: serde_json::json!({
-                    "models": ["openai/gpt-5"],
-                    "efforts": ["high"],
-                    "custom_commands": ["release-notes"]
+                    "providers": [["openai", "OpenAI"]],
+                    "models": [["openai/gpt-5", "OpenAI · GPT-5"]],
+                    "accounts": [["work", "Work"]],
+                    "efforts": [["high", "High"]],
+                    "custom_commands": [["release-notes", "Release notes"]]
                 }),
             },
         };
         let framed = encode_framed(&list, DEFAULT_FRAME_LIMIT).expect("encode command.list");
         assert_eq!(
             std::str::from_utf8(&framed[4..]).expect("command.list JSON"),
-            r#"{"v":1,"kind":"request","request_id":"req-command-list","body":{"method":"command.list","query":"","in_session":true,"slots":{"custom_commands":["release-notes"],"efforts":["high"],"models":["openai/gpt-5"]}}}"#
+            r#"{"v":1,"kind":"request","request_id":"req-command-list","body":{"method":"command.list","query":"","in_session":true,"slots":{"accounts":[["work","Work"]],"custom_commands":[["release-notes","Release notes"]],"efforts":[["high","High"]],"models":[["openai/gpt-5","OpenAI · GPT-5"]],"providers":[["openai","OpenAI"]]}}}"#
         );
         assert_eq!(
             decode_body(&framed[4..], DEFAULT_FRAME_LIMIT).expect("decode command.list"),
@@ -5742,7 +5829,7 @@ mod tests {
             body: RequestBody::CommandInvoke {
                 command_id: "diffforge-command-1".to_owned(),
                 command: "/rename new title".to_owned(),
-                session_id: "session-1".to_owned(),
+                session_id: Some("session-1".to_owned()),
             },
         };
         let framed = encode_framed(&invoke, DEFAULT_FRAME_LIMIT).expect("encode command.invoke");
@@ -5753,6 +5840,20 @@ mod tests {
         assert_eq!(
             decode_body(&framed[4..], DEFAULT_FRAME_LIMIT).expect("decode command.invoke"),
             invoke
+        );
+
+        let launcher = WireFrame::Request {
+            request_id: "req-launcher-invoke".to_owned(),
+            body: RequestBody::CommandInvoke {
+                command_id: "diffforge-command-2".to_owned(),
+                command: "/new".to_owned(),
+                session_id: None,
+            },
+        };
+        let framed = encode_framed(&launcher, DEFAULT_FRAME_LIMIT).expect("encode launcher invoke");
+        assert_eq!(
+            std::str::from_utf8(&framed[4..]).expect("launcher command.invoke JSON"),
+            r#"{"v":1,"kind":"request","request_id":"req-launcher-invoke","body":{"method":"command.invoke","command_id":"diffforge-command-2","command":"/new"}}"#
         );
     }
 
@@ -5773,6 +5874,70 @@ mod tests {
         assert_eq!(items[0].value.as_deref(), Some("gpt-5"));
         assert_eq!(items[1].kind, CommandKindWire::Unknown);
         assert_eq!(items[1].ownership, CommandOwnershipWire::ClientView);
+    }
+
+    #[test]
+    fn snapshot_availability_decodes_released_944_compat_shapes_without_zero_sentinels() {
+        let response = |body: Value| {
+            serde_json::from_value::<VersionedFrame>(serde_json::json!({
+                "v": 1,
+                "kind": "response",
+                "request_id": "snapshot-fixture",
+                "body": body,
+            }))
+            .expect("released snapshot fixture must decode")
+            .frame
+        };
+
+        let WireFrame::Response {
+            body: ResponseBody::AccountList { availability, .. },
+            ..
+        } = response(serde_json::json!({"method":"account.list", "descriptors":[]}))
+        else {
+            panic!("account.list response expected");
+        };
+        assert_eq!(availability, None, "legacy omission stays ambiguous");
+
+        let WireFrame::Response {
+            body: ResponseBody::ProviderList {
+                revision,
+                availability,
+                ..
+            },
+            ..
+        } = response(serde_json::json!({
+            "method":"provider.list",
+            "providers":[],
+            "revision":0,
+            "availability":{"state":"unavailable", "reason":"registry_down"}
+        }))
+        else {
+            panic!("provider.list response expected");
+        };
+        assert_eq!(revision, 0, "zero remains the supplied revision");
+        assert_eq!(
+            availability,
+            Some(SnapshotAvailabilityWire::Unavailable {
+                reason: "registry_down".to_string(),
+            })
+        );
+
+        let WireFrame::Response {
+            body: ResponseBody::UsageReport {
+                report,
+                availability,
+            },
+            ..
+        } = response(serde_json::json!({
+            "method":"usage.report",
+            "report":{"generated_at_ms":0, "accounts":[]},
+            "availability":{"state":"unknown"}
+        }))
+        else {
+            panic!("usage.report response expected");
+        };
+        assert_eq!(report["generated_at_ms"], 0);
+        assert_eq!(availability, Some(SnapshotAvailabilityWire::Unknown));
     }
 
     #[test]
@@ -6288,7 +6453,7 @@ mod tests {
         assert_eq!(
             encoded(WireFrame::Request {
                 request_id: "req-provider".to_string(),
-                body: RequestBody::ProviderList {},
+                body: RequestBody::ProviderList { provider: None },
             }),
             r#"{"v":1,"kind":"request","request_id":"req-provider","body":{"method":"provider.list"}}"#
         );
@@ -6720,10 +6885,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn handshake_skips_resident_binding_before_welcome() {
+    async fn handshake_rejects_a_push_before_welcome() {
         let (client, mut server_stream) = UnixStream::pair().expect("test socket pair");
-        let expected_welcome = handshake_test_welcome();
-        let server_welcome = expected_welcome.clone();
+        let welcome = handshake_test_welcome();
         let server = tokio::spawn(async move {
             assert!(matches!(
                 read_frame(&mut server_stream, DEFAULT_FRAME_LIMIT)
@@ -6736,27 +6900,27 @@ mod tests {
                 br#"{"v":1,"kind":"resident_session_binding","session_id":"session-1","worker_generation":7}"#,
             )
             .await;
-            write_frame(
+            let _ = write_frame(
                 &mut server_stream,
-                &WireFrame::Welcome(server_welcome),
+                &WireFrame::Welcome(welcome),
                 DEFAULT_FRAME_LIMIT,
                 WireEncoding::Json,
             )
-            .await
-            .expect("write Welcome");
+            .await;
         });
 
-        let (_, welcome) = handshake_connected_stream(client)
+        let error = handshake_connected_stream(client)
             .await
-            .expect("handshake should tolerate a pre-Welcome push");
-        assert_eq!(welcome, expected_welcome);
+            .expect_err("the first daemon frame must be Welcome");
+        assert!(error.to_string().contains("expected Welcome"));
         server.await.expect("test server");
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn handshake_without_welcome_fails_after_bounded_skips() {
+    async fn handshake_rejects_profile_mismatch() {
         let (client, mut server_stream) = UnixStream::pair().expect("test socket pair");
+        let welcome = handshake_test_welcome();
         let server = tokio::spawn(async move {
             assert!(matches!(
                 read_frame(&mut server_stream, DEFAULT_FRAME_LIMIT)
@@ -6764,28 +6928,26 @@ mod tests {
                     .expect("read Hello"),
                 WireFrame::Hello(_)
             ));
-            for nonce in 0..MAX_PRE_WELCOME_FRAMES as u64 {
-                write_frame(
-                    &mut server_stream,
-                    &WireFrame::Ping { nonce },
-                    DEFAULT_FRAME_LIMIT,
-                    WireEncoding::Json,
-                )
-                .await
-                .expect("write pre-Welcome frame");
-            }
+            write_frame(
+                &mut server_stream,
+                &WireFrame::Welcome(welcome),
+                DEFAULT_FRAME_LIMIT,
+                WireEncoding::Json,
+            )
+            .await
+            .expect("write Welcome");
         });
 
-        let error = handshake_connected_stream(client)
+        let error = handshake_connected_stream_for_profile(client, Some("another-profile"))
             .await
-            .expect_err("a stream without Welcome must fail");
+            .expect_err("a nonempty mismatched profile id must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("Welcome was not received"));
+        assert!(error.to_string().contains("profile_id mismatch"));
         server.await.expect("test server");
     }
 
     #[test]
-    fn socket_path_resolution_matches_profile_hash_and_newest_fallback() {
+    fn socket_path_resolution_matches_profile_hash_without_directory_scanning() {
         assert_eq!(
             hex(&blake3_hash(b"")),
             "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
@@ -6809,13 +6971,6 @@ mod tests {
             .expect("endpoint basename");
         assert!(name.starts_with("haider-") && name.ends_with(".sock"));
         assert_eq!(name.len(), "haider-".len() + 32 + ".sock".len());
-
-        let older = runtime.join(".haiderd-older");
-        let newer = runtime.join(".haiderd-newer");
-        std::fs::write(&older, []).expect("older fallback");
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(&newer, []).expect("newer fallback");
-        assert_eq!(newest_staging_socket(&runtime), Some(newer));
 
         std::fs::remove_dir_all(root).expect("remove test directory");
     }
