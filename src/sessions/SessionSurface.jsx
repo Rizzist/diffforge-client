@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -26,6 +27,11 @@ import {
 } from "../app/appStyles.js";
 import { PlanFlame } from "../app/PlanFlame.jsx";
 import SessionComposer from "./SessionComposer.jsx";
+import {
+  COMMAND_DOOR_FEATURE,
+  catalogToSlashCommands,
+  createCommandDoorExecutor,
+} from "./commandDoor.js";
 import {
   rehomeSessionPane,
   rehomeSessionViewMode,
@@ -245,6 +251,10 @@ export default function SessionSurface({
   const [mirrorAttachments, setMirrorAttachments] = useState({});
   const [usageMeta, setUsageMeta] = useState(null);
   const [library, setLibrary] = useState(null);
+  const [rpcFeatures, setRpcFeatures] = useState([]);
+  const [commandCatalogState, setCommandCatalogState] = useState({ key: "", items: [] });
+  const [commandResults, setCommandResults] = useState({});
+  const [commandMenuRequests, setCommandMenuRequests] = useState({});
   const [draftError, setDraftError] = useState("");
   const submitBusyRef = useRef(false);
 
@@ -261,10 +271,89 @@ export default function SessionSurface({
         setLibrary(snapshot);
       }
     }).catch(() => {});
+    void invoke("rpc_features").then((features) => {
+      if (!disposed && Array.isArray(features)) setRpcFeatures(features);
+    }).catch(() => {});
     return () => {
       disposed = true;
     };
   }, []);
+
+  const commandSlots = useMemo(() => {
+    const models = (Array.isArray(library?.models) ? library.models : [])
+      .map((entry) => {
+        if (typeof entry === "string") return entry;
+        if (!entry?.model) return "";
+        return entry.provider ? `${entry.provider}/${entry.model}` : entry.model;
+      })
+      .filter(Boolean);
+    const efforts = (Array.isArray(library?.efforts) ? library.efforts : [])
+      .filter((entry) => typeof entry === "string" && entry);
+    const customCommands = (Array.isArray(library?.custom_commands)
+      ? library.custom_commands
+      : [])
+      .map((entry) => (typeof entry === "string" ? entry : entry?.name))
+      .filter(Boolean);
+    return { models, efforts, custom_commands: customCommands };
+  }, [library]);
+  const commandSlotsKey = useMemo(() => JSON.stringify(commandSlots), [commandSlots]);
+  const commandContextId = draftOpen ? "draft" : activeSessionId;
+  const commandInSession = Boolean(commandContextId && commandContextId !== "draft");
+  const commandContextKey = `${commandContextId || "none"}:${commandInSession}:${commandSlotsKey}`;
+  const commandText = composerTexts[commandContextId] || "";
+  const slashInputActive = commandText.startsWith("/") && !commandText.includes("\n");
+  const commandDoorAvailable = rpcFeatures.includes(COMMAND_DOOR_FEATURE);
+
+  /* Re-sniff when a slash interaction begins so a daemon upgraded or started
+     after the surface mounted can expose its door. Until the bit is present,
+     the composer receives an empty catalog and cannot present a false UI. */
+  useEffect(() => {
+    if (!slashInputActive) return undefined;
+    let disposed = false;
+    void invoke("rpc_features").then((features) => {
+      if (!disposed && Array.isArray(features)) setRpcFeatures(features);
+    }).catch(() => {});
+    return () => { disposed = true; };
+  }, [commandContextId, slashInputActive]);
+
+  /* Palette enumeration is disposable display state, keyed by the full
+     command context. Crossing launcher/session (or any session/slots change)
+     immediately exposes an EMPTY list, never the prior context's ownership.
+     Submission performs another list below and never consumes this state. */
+  useEffect(() => {
+    if (!slashInputActive || !commandDoorAvailable || !commandContextId) {
+      setCommandCatalogState({ key: commandContextKey, items: [] });
+      return undefined;
+    }
+    let disposed = false;
+    setCommandCatalogState({ key: commandContextKey, items: [] });
+    void invoke("command_list", {
+      query: "",
+      in_session: commandInSession,
+      slots: commandSlots,
+    }).then((items) => {
+      if (!disposed) {
+        setCommandCatalogState({
+          key: commandContextKey,
+          items: Array.isArray(items) ? items : [],
+        });
+      }
+    }).catch(() => {
+      if (!disposed) setCommandCatalogState({ key: commandContextKey, items: [] });
+    });
+    return () => { disposed = true; };
+  }, [
+    commandContextId,
+    commandContextKey,
+    commandDoorAvailable,
+    commandInSession,
+    commandSlots,
+    slashInputActive,
+  ]);
+
+  const slashCommands = commandCatalogState.key === commandContextKey
+    ? catalogToSlashCommands(commandCatalogState.items)
+    : [];
 
   /* Chips show REALITY (the session's actual model/provider, the harness's
      actual account), never an unapplied local preference — switching stays
@@ -909,24 +998,133 @@ export default function SessionSurface({
      place while the session comes up, rather than failing silently. */
   const [submitHold, setSubmitHold] = useState({});
 
+  const submitCommand = useCallback(async (session, prompt) => {
+    const contextId = session?.id || "draft";
+    const inSession = Boolean(session);
+    const gen = editGenRef.current[contextId] || 0;
+    const clearComposer = () => {
+      if ((editGenRef.current[contextId] || 0) !== gen) return;
+      setComposerText(contextId, "");
+      setComposerPastesFor(contextId, []);
+      if (session) publishMirror(session, "");
+    };
+    const executeLocal = (action) => {
+      if (action.action === "model") {
+        if (action.argument) {
+          handleChipChange(contextId, "model", action.argument);
+          return {
+            type: "client_action",
+            message: `Model set to ${action.argument} for this launcher context.`,
+          };
+        }
+        setCommandMenuRequests((current) => ({
+          ...current,
+          [contextId]: {
+            menu: "model",
+            sequence: (current[contextId]?.sequence || 0) + 1,
+          },
+        }));
+        return { type: "client_action", message: "Choose a model from the model menu." };
+      }
+      if (action.action === "theme") {
+        const requested = String(action.argument || "").toLowerCase();
+        const alreadyRequested = (requested === "light" && appThemeIsLight)
+          || (requested === "dark" && !appThemeIsLight);
+        if (!alreadyRequested) onToggleTheme?.();
+        return {
+          type: "client_action",
+          message: requested
+            ? `Theme set to ${requested}.`
+            : "Theme toggled.",
+        };
+      }
+      if (action.action === "help") {
+        return {
+          type: "client_action",
+          message: "Type / to browse the commands offered for this context.",
+        };
+      }
+      if (action.action === "sessions") {
+        return { type: "client_action", message: "Sessions are available in the session rail." };
+      }
+      if (action.action === "accounts") {
+        return { type: "client_action", message: "Account controls are available from the provider account menu." };
+      }
+      return null;
+    };
+    const execute = createCommandDoorExecutor({
+      /* This list is intentionally fresh even if the palette just listed the
+         same text. Palette state is display-only and may belong to a prior
+         launcher/session boundary; ownership is decided only here. */
+      listCommands: (args) => invoke("command_list", args),
+      invokeCommand: ({ command }) => invoke("command_invoke", {
+        command_id: globalThis.crypto?.randomUUID?.()
+          || `diffforge-command-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`,
+        command,
+        session_id: session?.id || "",
+      }),
+      executeLocal,
+    });
+    const result = await execute({ command: prompt, inSession, slots: commandSlots });
+
+    if (result.type === "parked") {
+      /* Rust has already persisted the opaque card. Refreshing makes the
+         existing SessionTranscript -> NeedsInputCard path render it; no
+         command-specific answer callback exists here. */
+      clearComposer();
+      setCommandResults((current) => {
+        if (!(contextId in current)) return current;
+        const next = { ...current };
+        delete next[contextId];
+        return next;
+      });
+      onSessionsRefresh?.();
+      return true;
+    }
+
+    if (result.type === "custom") {
+      if ((editGenRef.current[contextId] || 0) === gen) {
+        const expansion = result.expansion || "";
+        setComposerText(contextId, expansion);
+        setComposerPastesFor(contextId, []);
+        if (session) publishMirror(session, expansion);
+      }
+      setCommandResults((current) => ({ ...current, [contextId]: result }));
+      return true;
+    }
+
+    setCommandResults((current) => ({ ...current, [contextId]: result }));
+    if (["receipt", "client_action", "unsupported"].includes(result.type)) {
+      clearComposer();
+      return true;
+    }
+    /* Feature/offline failures, unknown ownership, version-skewed client
+       commands, and unknown outcomes stay in the composer for correction or
+       retry, with the visible result above it. */
+    return false;
+  }, [
+    appThemeIsLight,
+    commandSlots,
+    handleChipChange,
+    onSessionsRefresh,
+    onToggleTheme,
+    publishMirror,
+    setComposerPastesFor,
+    setComposerText,
+  ]);
+
   const submitDraft = useCallback(async (prompt, attachments) => {
     if (submitBusyRef.current) {
       return false;
     }
     submitBusyRef.current = true;
     setDraftError("");
-    /* A command is an instruction to the harness, not a message to a model.
-       Sending one as the opening prompt created a session whose entire
-       content was the word "/model" and asked an agent to interpret it —
-       burning a session on a request that was never a question. Commands
-       are not answerable from a new chat yet (the harness has no door for
-       them), so say that rather than doing something surprising. */
     if (/^\/\S/.test(prompt.trim())) {
-      setDraftError(
-        `${prompt.trim().split(/\s+/)[0]} is a harness command — open a chat first, or use the controls below the composer.`,
-      );
-      submitBusyRef.current = false;
-      return false;
+      try {
+        return await submitCommand(null, prompt);
+      } finally {
+        submitBusyRef.current = false;
+      }
     }
     /* Same generation guard as bound submits: the draft's clear applies only
        if the user hasn't typed again while materialization ran. */
@@ -959,7 +1157,13 @@ export default function SessionSurface({
     } finally {
       submitBusyRef.current = false;
     }
-  }, [composerPrefs, onDraftMaterialized, setComposerPastesFor, setComposerText]);
+  }, [
+    composerPrefs,
+    onDraftMaterialized,
+    setComposerPastesFor,
+    setComposerText,
+    submitCommand,
+  ]);
 
   /* A stop button exists only when the harness has named the run to stop.
      run_id and worker_generation are ONE observation and ride verbatim: the
@@ -988,6 +1192,9 @@ export default function SessionSurface({
   }, [onSessionsRefresh]);
 
   const submitIntoSession = useCallback(async (session, prompt, attachments) => {
+    if (/^\/\S/.test(prompt.trim())) {
+      return submitCommand(session, prompt);
+    }
     /* Clearing is SURFACE-owned and generation-guarded: a completion that
        lands after the user edited again (or switched away and back) clears
        nothing. The empty mirror publish rides the same history-recording
@@ -1056,7 +1263,14 @@ export default function SessionSurface({
         }, SUBMIT_HOLD_CLEAR_MS);
       }
     }
-  }, [onShellWarm, publishMirror, setComposerPastesFor, setComposerText, setModeFor]);
+  }, [
+    onShellWarm,
+    publishMirror,
+    setComposerPastesFor,
+    setComposerText,
+    setModeFor,
+    submitCommand,
+  ]);
 
   /* Session title chrome: the title is the workspace's first content line;
      its ellipsis menu carries Pin/Unpin + Rename (the same harness doors the
@@ -1370,9 +1584,18 @@ export default function SessionSurface({
               <SessionComposer
                 attachments={composerAttachments.draft || []}
                 autoFocus
-                chipCapabilities={library?.capabilities || {}}
+                chipCapabilities={{
+                  ...(library?.capabilities || {}),
+                  /* At the launcher `/model` is explicitly client_view: this
+                     menu chooses first-run defaults and mutates no daemon
+                     session truth. */
+                  model_switch: commandDoorAvailable
+                    || library?.capabilities?.model_switch === true,
+                }}
                 chipOptions={chipOptionsFor(null)}
                 chipValues={chipValuesFor(null)}
+                commandMenuRequest={commandMenuRequests.draft || null}
+                commandNotice={commandResults.draft || null}
                 onAttachmentsChange={(next) => handleAttachmentsChange({ id: "draft" }, next)}
                 onChipChange={(key, option) => handleChipChange("draft", key, option)}
                 onSubmit={submitDraft}
@@ -1380,6 +1603,7 @@ export default function SessionSurface({
                 onValueChange={(text) => setComposerText("draft", text)}
                 pastedBlocks={composerPastes.draft || []}
                 placeholder="Message Haider…"
+                slashCommands={commandDoorAvailable ? slashCommands : []}
                 value={composerTexts.draft || ""}
               />
             </ChatHostLayer>
@@ -1488,6 +1712,8 @@ export default function SessionSurface({
                       chipCapabilities={library?.capabilities || {}}
                       chipOptions={chipOptionsFor(session)}
                       chipValues={chipValuesFor(session)}
+                      commandMenuRequest={commandMenuRequests[session.id] || null}
+                      commandNotice={commandResults[session.id] || null}
                       onChipChange={(key, option) => handleChipChange(session.id, key, option)}
                       onChipMenuOpen={() => refreshConfig(session.id)}
                       attachments={composerAttachments[session.id] || []}
@@ -1500,6 +1726,7 @@ export default function SessionSurface({
                       onPastedBlocksChange={(blocks) => setComposerPastesFor(session.id, blocks)}
                       onValueChange={(text) => setComposerText(session.id, text)}
                       pastedBlocks={composerPastes[session.id] || []}
+                      slashCommands={commandDoorAvailable ? slashCommands : []}
                       value={composerTexts[session.id] || ""}
                     />
                   </ChatHostLayer>

@@ -697,6 +697,50 @@ fn sessions_row_by_id(connection: &rusqlite::Connection, id: &str) -> Result<Ses
     }
 }
 
+/* command_door_v1: command.invoke names provider sessions, while the ADE UI
+   names its local mirror row. Keep that translation at the store boundary so
+   JS never guesses which id domain an RPC expects. */
+fn session_provider_session_id_blocking(local_session_id: &str) -> Result<String, String> {
+    let connection = sessions_open_database()?;
+    let row = sessions_row_by_id(&connection, local_session_id.trim())?;
+    let provider_session_id = row.provider_session_id.trim();
+    if provider_session_id.is_empty() {
+        return Err("Session is not attached to the Haider daemon.".to_string());
+    }
+    Ok(provider_session_id.to_string())
+}
+
+/* A parked command joins the ONE existing human-input path. Persist the
+   daemon's opaque card before returning command.invoke to JS: menu.answer
+   validates its full fence against this row, so a transient UI-only card
+   would be visible but unanswerable. The shared write lock serializes this
+   narrow merge with bridge reconciliation and preserves every other summary
+   field. */
+fn session_store_needs_input_blocking(
+    local_session_id: &str,
+    needs_input: Value,
+) -> Result<SessionRow, String> {
+    let _write_guard = sessions_write_lock()
+        .lock()
+        .map_err(|_| "Sessions write lock is unavailable.".to_string())?;
+    let connection = sessions_open_database()?;
+    let mut row = sessions_row_by_id(&connection, local_session_id.trim())?;
+    let harness = row
+        .harness
+        .as_object_mut()
+        .ok_or_else(|| "Session harness summary is not an object.".to_string())?;
+    harness.insert("needs_input".to_string(), needs_input);
+    let harness_json = serde_json::to_string(&row.harness)
+        .map_err(|error| format!("Unable to encode command menu: {error}"))?;
+    connection
+        .execute(
+            "UPDATE sessions SET harness_json = ?2 WHERE id = ?1",
+            rusqlite::params![row.id, harness_json],
+        )
+        .map_err(|error| format!("Unable to store command menu: {error}"))?;
+    sessions_row_by_id(&connection, &row.id)
+}
+
 fn sessions_list_blocking() -> Result<Vec<SessionRow>, String> {
     let connection = sessions_open_database()?;
     let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions");
@@ -1851,6 +1895,39 @@ mod sessions_tests {
             Value::Null
         );
         drop(connection);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn command_parked_card_is_stored_verbatim_on_the_existing_needs_input_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let directory = sessions_test_directory("command-parked");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let mut row = sessions_test_row("command-parked", Path::new(""), "pinned");
+        row.harness["future_summary_field"] = json!({"kept": true});
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        let card = json!({
+            "kind": "choice",
+            "title": "Choose a model",
+            "safe_body": ["Pick the model for this session."],
+            "menu_id": "command-model-1",
+            "request_seq": 1843_u64,
+            "worker_generation": 122_u64,
+            "options": [{"key": "gpt", "label": "GPT"}],
+            "future_card_field": {"opaque": [1, 2, 3]}
+        });
+        let stored = session_store_needs_input_blocking("command-parked", card.clone()).unwrap();
+        assert_eq!(stored.needs_input(), card);
+        assert_eq!(stored.harness["future_summary_field"], json!({"kept": true}));
+        assert_eq!(
+            session_provider_session_id_blocking("command-parked").unwrap(),
+            "provider-command-parked"
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

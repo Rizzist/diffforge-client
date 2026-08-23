@@ -11,21 +11,9 @@ import { Send } from "@styled-icons/material-rounded/Send";
    a chips row (MODEL / EFFORT / SPEED / PROVIDER / ACCOUNT) above a pill
    input with mic + circular send. Enter submits, Shift+Enter newlines.
 
-   Typing "/" at the start opens a native slash-command palette. The command
-   list ships with the documented harness baseline and is replaced wholesale
-   by the daemon's enumeration once the harness exposes it (pass
-   `slashCommands`). Chip options likewise: current values come from the
-   harness snapshot; option lists grow as the harness exposes levers —
-   selections are session-local hints until then. */
-
-const BASELINE_SLASH_COMMANDS = [
-  { command: "/help", hint: "Show harness help" },
-  { command: "/sessions", hint: "List sessions" },
-  { command: "/model", hint: "Switch model" },
-  { command: "/accounts", hint: "Provider accounts" },
-  { command: "/export", hint: "Export this session" },
-  { command: "/theme", hint: "TUI theme" },
-];
+   Typing "/" at the start opens the daemon-listed command palette. There is
+   deliberately no fallback catalog: presenting commands without the
+   command_door_v1 feature would advertise a UI that cannot execute. */
 
 const EFFORT_OPTIONS = ["default", "low", "medium", "high", "xhigh"];
 const SPEED_OPTIONS = ["default", "fast"];
@@ -50,7 +38,9 @@ export default function SessionComposer({
   onMirrorType = null,
   onChipChange = null,
   onChipMenuOpen = null,
-  slashCommands = null,
+  slashCommands = [],
+  commandNotice = null,
+  commandMenuRequest = null,
   /* input_mirror_attachments_v1: refs staged on ANOTHER surface (the TUI)
      render as read-only chips. Local attachments are SURFACE-owned like the
      paste blocks (the composer unmounts on every view switch — local state
@@ -75,6 +65,13 @@ export default function SessionComposer({
      the daemon surface through onMirrorType. */
   const [busy, setBusy] = useState(false);
   const [openMenu, setOpenMenu] = useState("");
+  const handledCommandMenuRef = useRef(0);
+  useEffect(() => {
+    const sequence = Number(commandMenuRequest?.sequence || 0);
+    if (!sequence || sequence === handledCommandMenuRef.current) return;
+    handledCommandMenuRef.current = sequence;
+    if (commandMenuRequest?.menu === "model") setOpenMenu("model");
+  }, [commandMenuRequest]);
   /* Ref-backed stable identity: the surface passes a fresh inline callback
      every render, and several callers live inside memoized callbacks whose
      dependency arrays must not need to track it. */
@@ -110,9 +107,7 @@ export default function SessionComposer({
     }
   }, []);
 
-  const commands = Array.isArray(slashCommands) && slashCommands.length
-    ? slashCommands
-    : BASELINE_SLASH_COMMANDS;
+  const commands = Array.isArray(slashCommands) ? slashCommands : [];
   const slashActive = value.startsWith("/") && !value.includes("\n");
   const slashMatches = useMemo(() => {
     if (!slashActive) {
@@ -437,6 +432,11 @@ export default function SessionComposer({
         )}
         {/* The text is already held un-editable while a submit is in flight;
             without this the user just sees a frozen composer and no reason. */}
+        {commandNotice?.message && (
+          <CommandNotice data-type={commandNotice.type || "result"} role="status">
+            {commandNotice.message}
+          </CommandNotice>
+        )}
         {holdNotice && <HoldNotice role="status">{holdNotice}</HoldNotice>}
         <ComposerField data-busy={busy || holdNotice ? "true" : undefined}>
           <ComposerRoundButton
@@ -687,6 +687,21 @@ const HoldNotice = styled.p`
   padding-left: 2px;
   color: var(--forge-amber);
   font-size: 11.5px;
+`;
+
+const CommandNotice = styled.p`
+  margin: 0 0 6px;
+  padding-left: 2px;
+  color: var(--forge-text-soft);
+  font-size: 11.5px;
+  line-height: 1.4;
+
+  &[data-type="error"],
+  &[data-type="refused"],
+  &[data-type="unhandled"],
+  &[data-type="unsupported"] {
+    color: var(--forge-amber);
+  }
 `;
 
 const AttachmentChips = styled.div`

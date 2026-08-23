@@ -6258,6 +6258,8 @@ fn run_app(daemon: bool) {
             app_close_listener_ready,
             session_config_set,
             haider_rpc_ade::rpc_features,
+            haider_rpc_ade::command_list,
+            haider_rpc_ade::command_invoke,
             haider_rpc_ade::resident_session_binding_snapshot,
             haider_rpc_ade::surface_attach,
             haider_rpc_ade::surface_detach,

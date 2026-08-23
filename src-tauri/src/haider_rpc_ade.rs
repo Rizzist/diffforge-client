@@ -48,6 +48,7 @@ const FEATURE_RESIDENT_TURN_SUBMIT_V1: &str = "resident_turn_submit_v1";
 const FEATURE_RESIDENT_SESSION_BINDING_V1: &str = "resident_session_binding_v1";
 const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
 const FEATURE_SESSION_NEEDS_INPUT_V1: &str = "session_needs_input_v1";
+const FEATURE_COMMAND_DOOR_V1: &str = "command_door_v1";
 const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
 const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
 const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
@@ -64,6 +65,11 @@ const HAIDER_NEEDS_INPUT_STALE: &str =
     "haider_needs_input_stale: This park moved on; re-read the card.";
 const HAIDER_NEEDS_INPUT_ANSWER_UNCERTAIN: &str =
     "haider_needs_input_answer_uncertain: Answer may have landed; retrying is safe.";
+const HAIDER_COMMAND_NO_CONNECTION: &str = "haider_command_no_connection";
+const HAIDER_COMMAND_FEATURE_MISSING: &str = "haider_command_feature_missing";
+const HAIDER_COMMAND_LIST_FAILED: &str = "haider_command_list_failed";
+const HAIDER_COMMAND_INVOKE_FAILED: &str = "haider_command_invoke_failed";
+const HAIDER_COMMAND_PARK_FAILED: &str = "haider_command_park_failed";
 #[cfg(unix)]
 const SESSION_ANSWER_MENU_REPLAY_LIMIT: usize = 64;
 const MAX_ACCOUNT_RESTAGE_RETRIES: usize = 3;
@@ -490,9 +496,89 @@ enum AccountAddMethod {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKindWire {
+    BuiltIn,
+    Argument,
+    Custom,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOwnershipWire {
+    DaemonOperation,
+    ClientView,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Forward-compatible catalog row. `Argument` keeps the parent command in
+/// name and the argument in value; neither Rust nor JS flattens it into a
+/// second standalone command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandCatalogItemWire {
+    #[serde(default)]
+    pub kind: CommandKindWire,
+    #[serde(default)]
+    pub ownership: CommandOwnershipWire,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_hint: Option<String>,
+    #[serde(default)]
+    pub session_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandInvokeOutcomeWire {
+    Receipt {
+        receipt: Value,
+    },
+    Parked {
+        needs_input: Value,
+    },
+    /// Kept opaque because the daemon may grow the client-owned command
+    /// descriptor. JS rechecks ownership against the just-listed catalog
+    /// before executing anything locally.
+    ClientOwned {
+        command: Value,
+    },
+    Unsupported {
+        command: Value,
+        #[serde(default)]
+        reason: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method")]
 enum RequestBody {
+    #[serde(rename = "command.list")]
+    CommandList {
+        query: String,
+        in_session: bool,
+        slots: Value,
+    },
+    #[serde(rename = "command.invoke")]
+    CommandInvoke {
+        command_id: String,
+        command: String,
+        session_id: String,
+    },
     #[serde(rename = "artifact.put")]
     ArtifactPut { data_base64: String },
     /// Opens the System Settings pane for an unresolved OS permission park.
@@ -681,6 +767,13 @@ enum RequestBody {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method")]
 enum ResponseBody {
+    #[serde(rename = "command.list")]
+    CommandList {
+        #[serde(default)]
+        items: Vec<CommandCatalogItemWire>,
+    },
+    #[serde(rename = "command.invoke")]
+    CommandInvoke { outcome: CommandInvokeOutcomeWire },
     #[serde(rename = "artifact.put")]
     ArtifactPut { artifact: String, bytes: u64 },
     #[serde(rename = "session.list")]
@@ -1603,6 +1696,153 @@ async fn rpc_request_with_feature_gate(
         .await
         .ok()?
         .ok()?
+}
+
+#[cfg(unix)]
+fn command_feature_gate() -> FeatureGate {
+    FeatureGate::all(BTreeSet::from([FEATURE_COMMAND_DOOR_V1.to_string()]))
+}
+
+#[cfg(unix)]
+fn command_preflight(
+    connection: &ConnectionSnapshot,
+    capability: Capability,
+    failure_code: &str,
+) -> Result<(), String> {
+    if !connection.connected {
+        return Err(HAIDER_COMMAND_NO_CONNECTION.to_string());
+    }
+    if !connection.features.contains(FEATURE_COMMAND_DOOR_V1) {
+        return Err(HAIDER_COMMAND_FEATURE_MISSING.to_string());
+    }
+    if !connection.grants(capability) {
+        return Err(failure_code.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn command_request(
+    body: RequestBody,
+    capability: Capability,
+    failure_code: &str,
+) -> Result<ResponseBody, String> {
+    command_preflight(
+        &actor_handle().connection.borrow(),
+        capability,
+        failure_code,
+    )?;
+    match rpc_request_with_feature_gate(body, capability, command_feature_gate(), true).await {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) if error.starts_with("missing_feature:") => {
+            Err(HAIDER_COMMAND_FEATURE_MISSING.to_string())
+        }
+        Some(Err(_)) => Err(failure_code.to_string()),
+        None if !actor_handle().connection.borrow().connected => {
+            Err(HAIDER_COMMAND_NO_CONNECTION.to_string())
+        }
+        None => Err(failure_code.to_string()),
+    }
+}
+
+/// Lists the context-sensitive command catalog. No result is cached: callers
+/// must re-list after moving between the launcher and an attached session,
+/// where ownership (notably `/model`) can change.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn command_list(
+    query: String,
+    in_session: bool,
+    slots: Value,
+) -> Result<Vec<CommandCatalogItemWire>, String> {
+    #[cfg(unix)]
+    {
+        return match command_request(
+            RequestBody::CommandList {
+                query,
+                in_session,
+                slots,
+            },
+            Capability::View,
+            HAIDER_COMMAND_LIST_FAILED,
+        )
+        .await?
+        {
+            ResponseBody::CommandList { items } => Ok(items),
+            _ => Err(HAIDER_COMMAND_LIST_FAILED.to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (query, in_session, slots);
+        Err(HAIDER_COMMAND_NO_CONNECTION.to_string())
+    }
+}
+
+/// Invokes a daemon-owned command. A Parked result is merged into the local
+/// session mirror before this returns, then the frontend refreshes and the
+/// existing NeedsInputCard/menu.answer path owns rendering and answering.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn command_invoke(
+    app: AppHandle,
+    command_id: String,
+    command: String,
+    session_id: String,
+) -> Result<CommandInvokeOutcomeWire, String> {
+    #[cfg(unix)]
+    {
+        let local_session_id = session_id.trim().to_string();
+        let provider_session_id = if local_session_id.is_empty() {
+            String::new()
+        } else {
+            let lookup_id = local_session_id.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                super::session_provider_session_id_blocking(&lookup_id)
+            })
+            .await
+            .map_err(|_| HAIDER_COMMAND_INVOKE_FAILED.to_string())?
+            .map_err(|_| HAIDER_COMMAND_INVOKE_FAILED.to_string())?
+        };
+        let command_id = if command_id.trim().is_empty() {
+            format!("diffforge-command-{}", uuid::Uuid::new_v4())
+        } else {
+            command_id
+        };
+        let outcome = match command_request(
+            RequestBody::CommandInvoke {
+                command_id,
+                command,
+                session_id: provider_session_id,
+            },
+            Capability::Control,
+            HAIDER_COMMAND_INVOKE_FAILED,
+        )
+        .await?
+        {
+            ResponseBody::CommandInvoke { outcome } => outcome,
+            _ => return Err(HAIDER_COMMAND_INVOKE_FAILED.to_string()),
+        };
+
+        if let CommandInvokeOutcomeWire::Parked { needs_input } = &outcome {
+            if local_session_id.is_empty() {
+                return Err(HAIDER_COMMAND_PARK_FAILED.to_string());
+            }
+            let store_id = local_session_id;
+            let card = needs_input.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                super::session_store_needs_input_blocking(&store_id, card)
+            })
+            .await
+            .map_err(|_| HAIDER_COMMAND_PARK_FAILED.to_string())?
+            .map_err(|_| HAIDER_COMMAND_PARK_FAILED.to_string())?;
+            super::sessions_emit_changed(&app);
+        }
+        Ok(outcome)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, command_id, command, session_id);
+        Err(HAIDER_COMMAND_NO_CONNECTION.to_string())
+    }
 }
 
 /// Reads one bounded inclusive range from the daemon's committed journal.
@@ -5474,6 +5714,136 @@ mod tests {
     }
 
     #[test]
+    fn command_door_request_frames_match_daemon_reference_json_bytes() {
+        let list = WireFrame::Request {
+            request_id: "req-command-list".to_owned(),
+            body: RequestBody::CommandList {
+                query: "".to_owned(),
+                in_session: true,
+                slots: serde_json::json!({
+                    "models": ["openai/gpt-5"],
+                    "efforts": ["high"],
+                    "custom_commands": ["release-notes"]
+                }),
+            },
+        };
+        let framed = encode_framed(&list, DEFAULT_FRAME_LIMIT).expect("encode command.list");
+        assert_eq!(
+            std::str::from_utf8(&framed[4..]).expect("command.list JSON"),
+            r#"{"v":1,"kind":"request","request_id":"req-command-list","body":{"method":"command.list","query":"","in_session":true,"slots":{"custom_commands":["release-notes"],"efforts":["high"],"models":["openai/gpt-5"]}}}"#
+        );
+        assert_eq!(
+            decode_body(&framed[4..], DEFAULT_FRAME_LIMIT).expect("decode command.list"),
+            list
+        );
+
+        let invoke = WireFrame::Request {
+            request_id: "req-command-invoke".to_owned(),
+            body: RequestBody::CommandInvoke {
+                command_id: "diffforge-command-1".to_owned(),
+                command: "/rename new title".to_owned(),
+                session_id: "session-1".to_owned(),
+            },
+        };
+        let framed = encode_framed(&invoke, DEFAULT_FRAME_LIMIT).expect("encode command.invoke");
+        assert_eq!(
+            std::str::from_utf8(&framed[4..]).expect("command.invoke JSON"),
+            r#"{"v":1,"kind":"request","request_id":"req-command-invoke","body":{"method":"command.invoke","command_id":"diffforge-command-1","command":"/rename new title","session_id":"session-1"}}"#
+        );
+        assert_eq!(
+            decode_body(&framed[4..], DEFAULT_FRAME_LIMIT).expect("decode command.invoke"),
+            invoke
+        );
+    }
+
+    #[test]
+    fn command_catalog_preserves_argument_parent_and_unknown_ownership() {
+        let response = br#"{"v":1,"kind":"response","request_id":"req-command-list","body":{"method":"command.list","items":[{"kind":"argument","ownership":"future_owner","label":"GPT-5","description":"Choose GPT-5.","name":"model","value":"gpt-5","arg_hint":"<model>","session_only":false},{"kind":"future_kind","ownership":"client_view","label":"Future","description":"Added later.","name":"future","value":null,"arg_hint":null,"session_only":true}]}}"#;
+        let WireFrame::Response {
+            body: ResponseBody::CommandList { items },
+            ..
+        } = decode_body(response, DEFAULT_FRAME_LIMIT).expect("decode command.list response")
+        else {
+            panic!("expected command.list response");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, CommandKindWire::Argument);
+        assert_eq!(items[0].ownership, CommandOwnershipWire::Unknown);
+        assert_eq!(items[0].name, "model");
+        assert_eq!(items[0].value.as_deref(), Some("gpt-5"));
+        assert_eq!(items[1].kind, CommandKindWire::Unknown);
+        assert_eq!(items[1].ownership, CommandOwnershipWire::ClientView);
+    }
+
+    #[test]
+    fn command_invoke_decodes_all_outcomes_and_preserves_the_park_fence() {
+        let decode_outcome = |fixture: &[u8]| {
+            let WireFrame::Response {
+                body: ResponseBody::CommandInvoke { outcome },
+                ..
+            } = decode_body(fixture, DEFAULT_FRAME_LIMIT).expect("decode command.invoke response")
+            else {
+                panic!("expected command.invoke response");
+            };
+            outcome
+        };
+
+        assert!(matches!(
+            decode_outcome(br#"{"v":1,"kind":"response","request_id":"r1","body":{"method":"command.invoke","outcome":{"kind":"receipt","receipt":{"durable":true,"message":"Renamed."}}}}"#),
+            CommandInvokeOutcomeWire::Receipt { receipt }
+                if receipt["durable"] == true && receipt["message"] == "Renamed."
+        ));
+        let parked = decode_outcome(br#"{"v":1,"kind":"response","request_id":"r2","body":{"method":"command.invoke","outcome":{"kind":"parked","needs_input":{"kind":"choice","title":"Choose","menu_id":"command-model-1","request_seq":1843,"worker_generation":122,"options":[{"key":"gpt","label":"GPT"}],"future_card_field":[1,2,3]}}}}"#);
+        let CommandInvokeOutcomeWire::Parked { needs_input } = parked else {
+            panic!("expected Parked outcome");
+        };
+        assert_eq!(needs_input["menu_id"], "command-model-1");
+        assert_eq!(needs_input["request_seq"], 1843);
+        assert_eq!(needs_input["worker_generation"], 122);
+        assert_eq!(
+            needs_input["future_card_field"],
+            serde_json::json!([1, 2, 3])
+        );
+
+        assert!(matches!(
+            decode_outcome(br#"{"v":1,"kind":"response","request_id":"r3","body":{"method":"command.invoke","outcome":{"kind":"client_owned","command":{"kind":"custom","ownership":"client_view","name":"release-notes"}}}}"#),
+            CommandInvokeOutcomeWire::ClientOwned { command }
+                if command["name"] == "release-notes"
+        ));
+        assert!(matches!(
+            decode_outcome(br#"{"v":1,"kind":"response","request_id":"r4","body":{"method":"command.invoke","outcome":{"kind":"unsupported","command":"/future","reason":"Upgrade the client."}}}"#),
+            CommandInvokeOutcomeWire::Unsupported { command, reason }
+                if command == "/future" && reason == "Upgrade the client."
+        ));
+        assert!(matches!(
+            decode_outcome(br#"{"v":1,"kind":"response","request_id":"r5","body":{"method":"command.invoke","outcome":{"kind":"future_outcome","added":true}}}"#),
+            CommandInvokeOutcomeWire::Unknown
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_door_preflight_names_a_missing_feature_on_a_live_connection() {
+        let connection = ConnectionSnapshot {
+            connected: true,
+            capabilities_granted: BTreeSet::from([Capability::View, Capability::Control]),
+            ..ConnectionSnapshot::default()
+        };
+        assert_eq!(
+            command_preflight(&connection, Capability::View, HAIDER_COMMAND_LIST_FAILED),
+            Err(HAIDER_COMMAND_FEATURE_MISSING.to_string())
+        );
+        assert_eq!(
+            command_preflight(
+                &ConnectionSnapshot::default(),
+                Capability::View,
+                HAIDER_COMMAND_LIST_FAILED,
+            ),
+            Err(HAIDER_COMMAND_NO_CONNECTION.to_string())
+        );
+    }
+
+    #[test]
     fn account_management_frames_match_reference_json_bytes() {
         let encoded = |frame: WireFrame| {
             let framed = encode_framed(&frame, DEFAULT_FRAME_LIMIT).expect("encode account frame");
@@ -6478,6 +6848,7 @@ mod tests {
             FEATURE_SESSION_MODEL_SELECT_V1,
             FEATURE_SESSION_EFFORT_SELECT_V1,
             FEATURE_SESSION_FAST_SELECT_V1,
+            FEATURE_COMMAND_DOOR_V1,
         ] {
             assert!(
                 welcome.features.contains(feature),
