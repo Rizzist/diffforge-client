@@ -99,8 +99,7 @@ fn sessions_status_from_run_state(run_state: Option<&Value>) -> &'static str {
     .any(|needle| normalized.contains(needle))
     {
         "running"
-    } else if normalized.is_empty()
-        || [
+    } else if [
             "idle",
             "ready",
             "paused",
@@ -120,20 +119,14 @@ fn sessions_status_from_run_state(run_state: Option<&Value>) -> &'static str {
     {
         "idle"
     } else {
-        // A state this list has never seen is the daemon naming something it is
-        // DOING — it does not invent vocabulary for sitting still. Bucketing it
-        // as idle would tell the user a working session is quiet, which is the
-        // failure that hides work. Over-reporting activity is visible and
-        // dismissable; under-reporting it is not. Degrade toward being seen.
-        "running"
+        "unknown"
     }
 }
 
 impl SessionRow {
     fn title(&self) -> String {
-        self.title_override
-            .clone()
-            .or_else(|| sessions_harness_text(self, &["title"]))
+        sessions_harness_text(self, &["title"])
+            .or_else(|| self.title_override.clone())
             .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| "New session".to_string())
     }
@@ -172,8 +165,7 @@ impl SessionRow {
                             .find_map(|key| model.get(*key).and_then(Value::as_str))
                     })
                     .map(str::to_string)
-            })
-            .unwrap_or_default();
+            });
         let provider = sessions_harness_text(self, &["provider", "last_provider"])
             .or_else(|| {
                 sessions_harness_value(self, "metadata")
@@ -192,10 +184,10 @@ impl SessionRow {
                     .map(str::to_string)
             });
         let speed = object.get("speed").cloned().unwrap_or_else(|| {
-            if object.get("fast").and_then(Value::as_bool) == Some(true) {
-                Value::String("fast".to_string())
-            } else {
-                Value::Null
+            match object.get("fast").and_then(Value::as_bool) {
+                Some(true) => Value::String("fast".to_string()),
+                Some(false) => Value::String("normal".to_string()),
+                None => Value::Null,
             }
         });
         let waiting_why = object.get("waiting_why").and_then(Value::as_object);
@@ -216,16 +208,28 @@ impl SessionRow {
 
         // Stable frontend aliases are projected at read time. The source
         // object remains the base, so additive daemon fields pass through.
+        let title_source = if sessions_harness_text(self, &["title"])
+            .is_some_and(|title| !title.trim().is_empty())
+        {
+            "daemon"
+        } else if self.title_override.is_some() {
+            "local_fallback"
+        } else {
+            "placeholder"
+        };
         object.insert("title".to_string(), Value::String(self.title()));
+        object.insert("title_source".to_string(), Value::String(title_source.to_string()));
         object.insert(
             "provider".to_string(),
             provider.map(Value::String).unwrap_or(Value::Null),
         );
-        object.insert("model".to_string(), Value::String(model));
+        object.insert(
+            "model".to_string(),
+            model.map(Value::String).unwrap_or(Value::Null),
+        );
         object.insert("status".to_string(), Value::String(status));
         object.insert("state_raw".to_string(), Value::String(state_raw));
         object.insert("latest_at_ms".to_string(), json!(self.latest_at_ms()));
-        object.entry("effort".to_string()).or_insert(Value::Null);
         object.insert("speed".to_string(), speed);
         for key in [
             "seen_at_ms",
@@ -245,6 +249,9 @@ impl SessionRow {
         object.insert("id".to_string(), Value::String(self.id.clone()));
         object.insert("slug".to_string(), Value::String(self.slug.clone()));
         object.insert("dir".to_string(), Value::String(self.dir.clone()));
+        if let Some(session_kind) = object.get("kind").cloned() {
+            object.insert("session_kind".to_string(), session_kind);
+        }
         object.insert("kind".to_string(), Value::String(self.kind.clone()));
         object.insert(
             "provider_session_id".to_string(),
@@ -1277,17 +1284,16 @@ mod sessions_tests {
     // `title` column, and it now holds the locked title itself. A row that was
     // renamed by hand before the upgrade is the only place that rename exists,
     // so the rebuild has to carry it across rather than reconstruct it.
-    // A fallback that asserts a REAL STATE is the dangerous kind. Bucketing an
-    // unrecognised run_state as idle would report a working session as quiet,
-    // which is the direction that hides work from the person watching.
+    // Missing or future run-state vocabulary remains unknown. A conservative
+    // guess of either idle or running would still assert a fact the daemon did
+    // not publish.
     #[test]
-    fn an_unrecognised_run_state_is_never_reported_as_idle() {
+    fn absent_and_unrecognised_run_state_remain_unknown() {
         let invented = json!({"status": "summarising_for_handoff"});
-        assert_eq!(sessions_status_from_run_state(Some(&invented)), "running");
+        assert_eq!(sessions_status_from_run_state(Some(&invented)), "unknown");
 
-        // Saying nothing still means idle — absent is not the same as unknown.
-        assert_eq!(sessions_status_from_run_state(None), "idle");
-        assert_eq!(sessions_status_from_run_state(Some(&json!(""))), "idle");
+        assert_eq!(sessions_status_from_run_state(None), "unknown");
+        assert_eq!(sessions_status_from_run_state(Some(&json!(""))), "unknown");
 
         // And a state the daemon names that genuinely IS quiet stays idle.
         for quiet in ["idle", "done", "completed", "interrupted", "offline"] {
@@ -1374,7 +1380,7 @@ mod sessions_tests {
         assert!(session_rename_blocking("rename".to_string(), "  \n".to_string()).is_err());
         let renamed =
             session_rename_blocking("rename".to_string(), "User title".to_string()).unwrap();
-        assert_eq!(renamed.title(), "User title");
+        assert_eq!(renamed.title(), "Original title");
         assert_eq!(renamed.slug, "original-title");
         assert_eq!(renamed.dir, "");
         assert!(renamed.title_override.is_some());
@@ -1393,11 +1399,12 @@ mod sessions_tests {
         .unwrap());
         let connection = sessions_open_database().unwrap();
         let reconciled = sessions_row_by_id(&connection, "rename").unwrap();
-        assert_eq!(reconciled.title(), "User title");
+        assert_eq!(reconciled.title(), "Daemon title");
         assert!(reconciled.title_override.is_some());
         assert_eq!(reconciled.harness["title"], "Daemon title");
         let serialized = reconciled.serialized_value();
-        assert_eq!(serialized["title"], "User title");
+        assert_eq!(serialized["title"], "Daemon title");
+        assert_eq!(serialized["title_source"], "daemon");
         assert_eq!(serialized["model"], "daemon-model");
         assert_eq!(serialized["status"], "running");
         assert_eq!(serialized["state_raw"], "running");
@@ -1456,7 +1463,7 @@ mod sessions_tests {
             first_user_message: Some("Automatic title".to_string()),
         })
         .unwrap();
-        assert_eq!(updated.title(), "User title");
+        assert_eq!(updated.title(), "Original title");
         assert_eq!(updated.slug, "original-title");
         assert_eq!(updated.dir, session_directory.to_string_lossy());
         assert_eq!(updated.first_user_message, "Automatic title");

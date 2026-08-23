@@ -242,11 +242,11 @@ export default function SessionComposer({
   }, []);
 
   const chip = (key, label, fallbackOptions = []) => {
-    const current = String(chipValues[key] || "default");
+    const current = chipValues[key] == null ? "unknown" : String(chipValues[key]);
     const options = Array.isArray(chipOptions[key]) && chipOptions[key].length
       ? chipOptions[key]
       : fallbackOptions;
-    const display = current === "default" ? "Default" : current;
+    const display = current === "default" ? "Default" : current === "unknown" ? "Unknown" : current;
     /* Switching is gated per chip by the harness capability sniff; until the
        daemon exposes a headless door, menus browse the library read-only. */
     const switchable = chipCapabilities[`${key}_switch`] === true;
@@ -300,7 +300,7 @@ export default function SessionComposer({
 
   const modelChip = () => {
     const groups = Array.isArray(chipOptions.modelGroups) ? chipOptions.modelGroups : [];
-    const current = String(chipValues.model || "default");
+    const current = chipValues.model == null ? "unknown" : String(chipValues.model);
     const provider = String(chipValues.modelProvider || "");
     const switchable = chipCapabilities.model_switch === true;
     return (
@@ -315,7 +315,7 @@ export default function SessionComposer({
         >
           <em>Model</em>
           {provider && <ChipDim>{provider}/</ChipDim>}
-          <span>{current === "default" ? "Default" : current}</span>
+          <span>{current === "default" ? "Default" : current === "unknown" ? "Unknown" : current}</span>
           <ChipCaret aria-hidden="true">▾</ChipCaret>
         </Chip>
         {openMenu === "model" && (
@@ -324,7 +324,7 @@ export default function SessionComposer({
               <ChipGroup key={group.provider} data-unavailable={group.available ? undefined : "true"}>
                 <ChipGroupHead>
                   <span>{group.provider}</span>
-                  <em>{group.available ? (group.auth_state || "ready") : "no credential"}</em>
+                  <em>{group.status || (group.available ? "ready" : "unavailable")}</em>
                 </ChipGroupHead>
                 {group.models.map((model) => (
                   <ChipMenuItem

@@ -5,6 +5,12 @@ import styled from "styled-components";
 import { Add } from "@styled-icons/material-rounded/Add";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { Edit } from "@styled-icons/material-rounded/Edit";
+import {
+  accountAuthMethodLabel,
+  accountListPresentation,
+  credentialStatus,
+  providerAuthOptions,
+} from "../sessions/haiderClientContract.js";
 
 /* Harness-owned account management (936 account_* doors). The daemon's vault
    is the single credential authority for every surface — this view LISTS,
@@ -18,9 +24,6 @@ const LIST_POLL_MS = 5000;
 const LABEL_MAX = 64;
 const OAUTH_POLL_MS = 1500;
 
-/* OAuth-capable providers by daemon registration (contract §4); API-key
-   providers come from the model library's auth_methods. */
-const OAUTH_PROVIDERS = ["openai-oauth", "anthropic-oauth", "kimi-oauth", "grok-oauth"];
 const IMPORT_SOURCES = [
   { source: "codex", label: "Codex CLI" },
   { source: "claude-code", label: "Claude Code" },
@@ -257,10 +260,6 @@ function CliProfilesSection() {
   );
 }
 
-function statusOf(descriptor) {
-  return String(descriptor?.status?.status || descriptor?.status || "ok");
-}
-
 function errorCode(error) {
   return String(error?.message || error || "");
 }
@@ -277,16 +276,6 @@ function publicCodeMessage(code) {
   return code || "The request failed.";
 }
 
-/* Device flows embed the user code in the authorization URL (contract §4);
-   surface it separately so "enter the code at …" reads like the TUI. */
-function parseUserCode(url) {
-  try {
-    return new URL(url).searchParams.get("user_code") || "";
-  } catch {
-    return "";
-  }
-}
-
 export default function AccountsView({ active = false }) {
   const [snapshot, setSnapshot] = useState(null);
   const [loadError, setLoadError] = useState("");
@@ -294,7 +283,7 @@ export default function AccountsView({ active = false }) {
   const [notice, setNotice] = useState(null); // {tone: "ok"|"error", text}
   const [addMode, setAddMode] = useState(""); // "" | "api" | "oauth"
   const [apiForm, setApiForm] = useState({ provider: "", alias: "", key: "" });
-  const [oauthForm, setOauthForm] = useState({ provider: OAUTH_PROVIDERS[0], alias: "" });
+  const [oauthForm, setOauthForm] = useState({ provider: "", alias: "" });
   const [oauthFlow, setOauthFlow] = useState(null); // {provider, alias, flow_id, attempt_id, url, user_code, phase, detail}
   const [confirmRemove, setConfirmRemove] = useState("");
   const [renamingAlias, setRenamingAlias] = useState("");
@@ -476,7 +465,7 @@ export default function AccountsView({ active = false }) {
         flow_id: result?.flow_id,
         attempt_id: result?.attempt_id,
         url,
-        user_code: parseUserCode(url),
+        user_code: result?.user_code || "",
         phase: "polling",
         detail: "",
       });
@@ -530,7 +519,8 @@ export default function AccountsView({ active = false }) {
       });
   }, [run, scanDevice]);
 
-  const descriptors = snapshot?.descriptors || [];
+  const accountPresentation = accountListPresentation(snapshot, loadError);
+  const descriptors = accountPresentation.descriptors || [];
   const grouped = useMemo(() => {
     const byProvider = new Map();
     for (const descriptor of descriptors) {
@@ -541,16 +531,8 @@ export default function AccountsView({ active = false }) {
     return [...byProvider.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   }, [descriptors]);
 
-  const apiProviders = useMemo(() => {
-    const providers = (library?.providers || library?.models || [])
-      .map((entry) => entry?.provider)
-      .filter(Boolean);
-    const known = new Set([...providers, "openai", "anthropic", "deepseek", "gemini", "openai-compatible"]);
-    OAUTH_PROVIDERS.forEach((provider) => known.delete(provider));
-    return [...known].sort();
-  }, [library]);
-
-  const unavailable = loadError.includes("haider_accounts_unavailable");
+  const apiProviders = useMemo(() => providerAuthOptions(library, "api_key"), [library]);
+  const oauthProviders = useMemo(() => providerAuthOptions(library, "oauth"), [library]);
 
   return (
     <Root aria-label="Accounts" data-active={active ? "true" : undefined}>
@@ -571,21 +553,31 @@ export default function AccountsView({ active = false }) {
         </Notice>
       )}
 
-      {unavailable ? (
+      {(accountPresentation.state === "legacy_unknown" || accountPresentation.state === "unknown")
+        && descriptors.length > 0 && (
+        <Notice data-tone="warning" role="status">
+          Account rows are from a compatibility snapshot whose availability is unknown.
+        </Notice>
+      )}
+
+      {accountPresentation.state === "unavailable" ? (
         <EmptyState>
-          The harness connection is unavailable — accounts appear when the
-          daemon is reachable.
+          Account inventory is unavailable
+          {accountPresentation.reason ? ` — ${accountPresentation.reason}` : ""}.
         </EmptyState>
-      ) : !snapshot ? (
+      ) : accountPresentation.state === "loading" ? (
         <EmptyState>Loading accounts…</EmptyState>
-      ) : snapshot.revision == null && !descriptors.length ? (
+      ) : accountPresentation.state === "empty" ? (
         <EmptyState>No accounts yet — add one below.</EmptyState>
+      ) : (accountPresentation.state === "legacy_unknown"
+          || accountPresentation.state === "unknown") && !descriptors.length ? (
+        <EmptyState>Account inventory availability is unknown.</EmptyState>
       ) : (
         grouped.map(([provider, entries]) => (
           <ProviderGroup key={provider}>
             <ProviderName>{provider}</ProviderName>
             {entries.map((descriptor) => {
-              const status = statusOf(descriptor);
+              const status = credentialStatus(descriptor);
               return (
                 <AccountRow key={descriptor.alias}>
                   {renamingAlias === descriptor.alias ? (
@@ -622,7 +614,7 @@ export default function AccountsView({ active = false }) {
                       {descriptor.label ? `${descriptor.identity || descriptor.alias} · ` : ""}
                       {descriptor.alias}
                       {" · "}
-                      {descriptor.auth_method === "oauth" ? "OAuth" : "API key"}
+                      {accountAuthMethodLabel(descriptor)}
                     </span>
                   </AccountIdentity>
                   )}
@@ -801,7 +793,8 @@ export default function AccountsView({ active = false }) {
               onChange={(event) => setOauthForm((form) => ({ ...form, provider: event.target.value }))}
               value={oauthForm.provider}
             >
-              {OAUTH_PROVIDERS.map((provider) => (
+              <option value="">Choose…</option>
+              {oauthProviders.map((provider) => (
                 <option key={provider} value={provider}>{provider}</option>
               ))}
             </select>
@@ -816,7 +809,7 @@ export default function AccountsView({ active = false }) {
               value={oauthForm.alias}
             />
           </FormField>
-          <ConfirmButton disabled={busy === "add:oauth"} type="submit">
+          <ConfirmButton disabled={!oauthForm.provider || busy === "add:oauth"} type="submit">
             {busy === "add:oauth" ? "Starting…" : "Start sign-in"}
           </ConfirmButton>
         </AddForm>

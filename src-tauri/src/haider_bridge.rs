@@ -4,7 +4,6 @@ const HAIDER_BRIDGE_FULL_RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 
 const HAIDER_BRIDGE_WATCH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const HAIDER_BRIDGE_MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 const HAIDER_BRIDGE_GHOST_MAX_AGE_MS: i64 = 10 * 60 * 1_000;
-const HAIDER_LIBRARY_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HaiderBridgeSession {
@@ -138,11 +137,6 @@ fn haider_bridge_head_seq(session_id: &str) -> Option<i64> {
 fn haider_bridge_reconcile_trackers() -> &'static StdMutex<HaiderBridgeReconcileTrackers> {
     static TRACKERS: OnceLock<StdMutex<HaiderBridgeReconcileTrackers>> = OnceLock::new();
     TRACKERS.get_or_init(|| StdMutex::new(HaiderBridgeReconcileTrackers::default()))
-}
-
-fn haider_library_cache() -> &'static StdMutex<Option<(Instant, Value)>> {
-    static CACHE: OnceLock<StdMutex<Option<(Instant, Value)>>> = OnceLock::new();
-    CACHE.get_or_init(|| StdMutex::new(None))
 }
 
 fn haider_bridge_sync_lock() -> &'static StdMutex<()> {
@@ -909,52 +903,25 @@ struct HaiderLibraryModel {
     model: String,
     provider: String,
     available: bool,
-    auth_state: Option<String>,
+    legacy_availability: bool,
+    supported_efforts: Vec<String>,
+    supported_speeds: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-struct HaiderLibraryAccount {
-    alias: String,
-    provider: String,
-}
-
-fn haider_library_observed_models(value: &Value) -> Vec<HaiderLibraryModel> {
-    let mut models = haider_bridge_parse_session_list(value)
-        .into_iter()
-        .filter_map(|session| {
-            let summary = session.harness.as_object()?;
-            let model_value = summary.get("model").or_else(|| summary.get("last_model"))?;
-            Some(HaiderLibraryModel {
-                model: model_value
-                    .as_str()
-                    .or_else(|| model_value.get("model").and_then(Value::as_str))?
-                    .trim()
-                    .to_string(),
-                provider: summary
-                    .get("provider")
-                    .or_else(|| summary.get("last_provider"))
-                    .or_else(|| model_value.get("provider"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string(),
-                available: true,
-                auth_state: None,
-            })
-        })
-        .filter(|entry| !entry.model.is_empty())
-        .collect::<Vec<_>>();
-    models.sort_by(|left, right| {
-        left.model
-            .cmp(&right.model)
-            .then_with(|| left.provider.cmp(&right.provider))
-    });
-    models.dedup();
-    models
-}
-
-fn haider_library_catalog_models(value: &Value) -> Option<Vec<HaiderLibraryModel>> {
-    let providers = value.get("providers")?.as_array()?;
+fn haider_library_catalog_models(
+    providers: &[Value],
+    availability: Option<&haider_rpc_ade::SnapshotAvailabilityWire>,
+) -> Vec<HaiderLibraryModel> {
+    if matches!(
+        availability,
+        Some(
+            haider_rpc_ade::SnapshotAvailabilityWire::Unavailable { .. }
+                | haider_rpc_ade::SnapshotAvailabilityWire::Unknown
+        )
+    ) {
+        return Vec::new();
+    }
+    let legacy_availability = availability.is_none();
     let mut flattened = Vec::new();
     for provider in providers {
         let Some(provider) = provider.as_object() else {
@@ -967,163 +934,104 @@ fn haider_library_catalog_models(value: &Value) -> Option<Vec<HaiderLibraryModel
         let available = provider
             .get("availability")
             .and_then(Value::as_str)
-            .is_some_and(|availability| availability.trim() == "available")
-            || provider
-                .get("has_credential")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-        let auth_state = provider.get("auth_state").and_then(haider_bridge_text);
+            .is_some_and(|availability| availability == "available")
+            && provider.get("enabled").and_then(Value::as_bool) == Some(true);
+        let model_details = provider
+            .get("model_details")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let Some(models) = provider.get("models").and_then(Value::as_array) else {
             continue;
         };
         for model in models {
-            let model = haider_bridge_text(model).or_else(|| {
-                let model = model.as_object()?;
-                ["model", "id", "name"]
-                    .iter()
-                    .find_map(|key| model.get(*key).and_then(haider_bridge_text))
-            });
+            let model = haider_bridge_text(model);
             let Some(model) = model else {
                 continue;
+            };
+            let detail = model_details.iter().find(|detail| {
+                detail.get("name").and_then(Value::as_str) == Some(model.as_str())
+            });
+            let string_list = |key: &str| {
+                detail
+                    .and_then(|detail| detail.get(key))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(haider_bridge_text)
+                    .collect::<Vec<_>>()
             };
             flattened.push(HaiderLibraryModel {
                 model,
                 provider: provider_id.clone(),
                 available,
-                auth_state: auth_state.clone(),
+                legacy_availability,
+                supported_efforts: string_list("supported_efforts"),
+                supported_speeds: string_list("supported_speeds"),
             });
         }
     }
-    Some(flattened)
-}
-
-fn haider_library_catalog_accounts(value: &Value) -> Vec<String> {
-    let mut aliases = HashSet::new();
-    value
-        .get("providers")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_object)
-        .filter(|provider| {
-            provider
-                .get("has_credential")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
-        .filter_map(|provider| {
-            let alias = ["account_alias", "alias"]
-                .iter()
-                .find_map(|key| provider.get(*key).and_then(haider_bridge_text))?;
-            aliases.insert(alias.clone()).then_some(alias)
-        })
-        .collect()
-}
-
-fn haider_library_status_has_session_config(value: &Value) -> bool {
-    fn matches(value: &Value) -> bool {
-        match value {
-            Value::String(feature) => feature.trim() == "session_config_v1",
-            Value::Array(features) => features.iter().any(matches),
-            Value::Object(features) => features.iter().any(|(feature, enabled)| {
-                feature.trim() == "session_config_v1" && enabled.as_bool().unwrap_or(true)
-            }),
-            _ => false,
-        }
-    }
-
-    value
-        .as_object()
-        .and_then(|status| status.get("features"))
-        .is_some_and(matches)
-}
-
-fn haider_library_account(value: &Value) -> Option<HaiderLibraryAccount> {
-    fn visit(value: &Value, active_only: bool) -> Option<HaiderLibraryAccount> {
-        match value {
-            Value::Object(object) => {
-                let active = object.get("active").and_then(Value::as_bool);
-                let alias = ["alias", "account_alias"]
-                    .iter()
-                    .find_map(|key| object.get(*key).and_then(haider_bridge_text));
-                let provider = ["provider", "provider_id"]
-                    .iter()
-                    .find_map(|key| object.get(*key).and_then(haider_bridge_text));
-                if (!active_only || active == Some(true)) && alias.is_some() && provider.is_some() {
-                    return Some(HaiderLibraryAccount {
-                        alias: alias.unwrap_or_default(),
-                        provider: provider.unwrap_or_default(),
-                    });
-                }
-                object.values().find_map(|value| visit(value, active_only))
-            }
-            Value::Array(values) => values.iter().find_map(|value| visit(value, active_only)),
-            _ => None,
-        }
-    }
-
-    visit(value, true).or_else(|| visit(value, false))
-}
-
-fn haider_library_snapshot_blocking() -> Value {
-    if let Ok(cache) = haider_library_cache().lock() {
-        if let Some((cached_at, snapshot)) = cache.as_ref() {
-            if cached_at.elapsed() < HAIDER_LIBRARY_CACHE_TTL {
-                return snapshot.clone();
-            }
-        }
-    }
-
-    let catalog = haider_bridge_json_args(&["models", "--json"]);
-    let sessions = catalog
-        .is_none()
-        .then(|| haider_bridge_json_command("sessions").unwrap_or(Value::Null));
-    let status = haider_bridge_json_command("status").unwrap_or(Value::Null);
-    let models = catalog
-        .as_ref()
-        .and_then(haider_library_catalog_models)
-        .unwrap_or_else(|| {
-            haider_library_observed_models(sessions.as_ref().unwrap_or(&Value::Null))
-        });
-    let accounts = catalog
-        .as_ref()
-        .map(haider_library_catalog_accounts)
-        .unwrap_or_default();
-    let session_config = haider_library_status_has_session_config(&status);
-    let snapshot = json!({
-        "version": 2,
-        "models": models,
-        "account": haider_library_account(&status),
-        "accounts": accounts,
-        "efforts": ["default", "low", "medium", "high", "xhigh"],
-        "speeds": ["default", "fast"],
-        "capabilities": {
-            "model_switch": session_config,
-            "effort_switch": session_config,
-            "speed_switch": session_config,
-            "account_switch": session_config,
-        },
-    });
-    if let Ok(mut cache) = haider_library_cache().lock() {
-        *cache = Some((Instant::now(), snapshot.clone()));
-    }
-    snapshot
+    flattened
 }
 
 #[tauri::command(rename_all = "snake_case")]
 async fn haider_library_snapshot() -> Value {
-    tauri::async_runtime::spawn_blocking(haider_library_snapshot_blocking)
-        .await
-        .unwrap_or(Value::Null)
+    let features = haider_rpc_ade::rpc_features().await;
+    let provider_snapshot = if features.iter().any(|feature| feature == "provider_management_v1") {
+        match haider_rpc_ade::provider_list_rpc(None).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let account_snapshot = if features.iter().any(|feature| feature == "account_management_v1") {
+        haider_rpc_ade::account_list(None).await.ok()
+    } else {
+        None
+    };
+    let models = provider_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            haider_library_catalog_models(&snapshot.providers, snapshot.availability.as_ref())
+        })
+        .unwrap_or_default();
+    let mut efforts = models
+        .iter()
+        .flat_map(|model| model.supported_efforts.iter().cloned())
+        .collect::<Vec<_>>();
+    efforts.sort();
+    efforts.dedup();
+    let mut speeds = models
+        .iter()
+        .flat_map(|model| model.supported_speeds.iter().cloned())
+        .collect::<Vec<_>>();
+    speeds.sort();
+    speeds.dedup();
+    json!({
+        "version": 3,
+        "models": models,
+        "providers": provider_snapshot.as_ref().map(|snapshot| &snapshot.providers),
+        "provider_revision": provider_snapshot.as_ref().map(|snapshot| snapshot.revision),
+        "provider_availability": provider_snapshot.as_ref().and_then(|snapshot| snapshot.availability.as_ref()),
+        "accounts": account_snapshot.as_ref().map(|snapshot| &snapshot.descriptors),
+        "account_revision": account_snapshot.as_ref().and_then(|snapshot| snapshot.revision),
+        "account_availability": account_snapshot.as_ref().and_then(|snapshot| snapshot.availability.as_ref()),
+        "efforts": efforts,
+        "speeds": speeds,
+        "custom_commands": [],
+        "capabilities": {
+            "model_switch": features.iter().any(|feature| feature == "session_model_select_v1"),
+            "effort_switch": features.iter().any(|feature| feature == "session_effort_select_v1"),
+            "speed_switch": features.iter().any(|feature| feature == "session_fast_select_v1"),
+            "account_switch": features.iter().any(|feature| feature == "session_account_select_v1"),
+        },
+    })
 }
 
 #[tauri::command]
 async fn haider_usage_snapshot() -> Value {
-    tauri::async_runtime::spawn_blocking(|| haider_bridge_json_command("status"))
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(Value::Null)
+    serde_json::to_value(haider_rpc_ade::usage_report_rpc().await.ok()).unwrap_or(Value::Null)
 }
 
 #[cfg(test)]
@@ -1163,7 +1071,7 @@ mod haider_bridge_tests {
         for state in ["idle", "paused", "closed"] {
             assert_eq!(sessions_status_from_run_state(Some(&json!(state))), "idle");
         }
-        assert_eq!(sessions_status_from_run_state(None), "idle");
+        assert_eq!(sessions_status_from_run_state(None), "unknown");
 
         // This expectation was REVERSED deliberately. It used to assert that an
         // unrecognised state buckets as idle, which reads as defensive and is
@@ -1175,7 +1083,7 @@ mod haider_bridge_tests {
         // activity is visible and self-correcting.
         assert_eq!(
             sessions_status_from_run_state(Some(&json!("future_unknown_state"))),
-            "running"
+            "unknown"
         );
     }
 
@@ -1681,118 +1589,45 @@ mod haider_bridge_tests {
     }
 
     #[test]
-    fn haider_library_observed_models_are_sorted_and_deduplicated() {
-        let sample = json!({
-            "sessions": [
-                {"id":"3", "model":"zeta", "provider":"openai", "head_seq":3},
-                {"id":"1", "model":"alpha", "provider":"anthropic", "head_seq":1},
-                {"id":"2", "last_model":{"model":"alpha", "provider":"anthropic"}, "head_seq":2},
-                {"id":"4", "model":"alpha", "provider":"openai", "head_seq":4}
-            ]
-        });
-        assert_eq!(
-            haider_library_observed_models(&sample),
-            vec![
-                HaiderLibraryModel {
-                    model: "alpha".to_string(),
-                    provider: "anthropic".to_string(),
-                    available: true,
-                    auth_state: None,
-                },
-                HaiderLibraryModel {
-                    model: "alpha".to_string(),
-                    provider: "openai".to_string(),
-                    available: true,
-                    auth_state: None,
-                },
-                HaiderLibraryModel {
-                    model: "zeta".to_string(),
-                    provider: "openai".to_string(),
-                    available: true,
-                    auth_state: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn haider_library_catalog_flattens_models_in_provider_order() {
-        let sample = json!({
-            "schema": "haider.models.v1",
-            "providers": [
-                {
-                    "provider": "anthropic",
-                    "availability": "unavailable",
-                    "auth_state": "missing",
-                    "has_credential": false,
-                    "models": ["claude-a", "claude-b"]
-                },
-                {
-                    "provider": "openai",
-                    "availability": "unavailable",
-                    "auth_state": "authenticated",
-                    "has_credential": true,
-                    "account_alias": "work",
-                    "models": ["gpt-z"]
-                },
-                {
-                    "provider": "local",
-                    "availability": "available",
-                    "auth_state": "not_required",
-                    "has_credential": false,
-                    "account_alias": "ignored-without-credential",
-                    "models": [{"model": "local-model"}]
-                }
-            ]
-        });
-        assert_eq!(
-            haider_library_catalog_models(&sample).unwrap(),
-            vec![
-                HaiderLibraryModel {
-                    model: "claude-a".to_string(),
-                    provider: "anthropic".to_string(),
-                    available: false,
-                    auth_state: Some("missing".to_string()),
-                },
-                HaiderLibraryModel {
-                    model: "claude-b".to_string(),
-                    provider: "anthropic".to_string(),
-                    available: false,
-                    auth_state: Some("missing".to_string()),
-                },
-                HaiderLibraryModel {
-                    model: "gpt-z".to_string(),
-                    provider: "openai".to_string(),
-                    available: true,
-                    auth_state: Some("authenticated".to_string()),
-                },
-                HaiderLibraryModel {
-                    model: "local-model".to_string(),
-                    provider: "local".to_string(),
-                    available: true,
-                    auth_state: Some("not_required".to_string()),
-                },
-            ]
+    fn haider_library_honors_snapshot_availability_and_published_model_details() {
+        let providers = json!([{
+            "provider": "openai",
+            "availability": "available",
+            "enabled": true,
+            "models": ["gpt-test"],
+            "model_details": [{
+                "name": "gpt-test",
+                "supported_efforts": ["low", "high"],
+                "supported_speeds": ["normal", "fast"]
+            }]
+        }]);
+        let providers = providers.as_array().unwrap();
+        let models = haider_library_catalog_models(
+            providers,
+            Some(&haider_rpc_ade::SnapshotAvailabilityWire::Available),
         );
         assert_eq!(
-            haider_library_catalog_accounts(&sample),
-            vec!["work".to_string()]
+            models,
+            vec![HaiderLibraryModel {
+                model: "gpt-test".to_string(),
+                provider: "openai".to_string(),
+                available: true,
+                legacy_availability: false,
+                supported_efforts: vec!["low".to_string(), "high".to_string()],
+                supported_speeds: vec!["normal".to_string(), "fast".to_string()],
+            }]
         );
-    }
-
-    #[test]
-    fn haider_library_capabilities_follow_session_config_feature() {
-        assert!(haider_library_status_has_session_config(&json!({
-            "features": ["session_observe_v1", "session_config_v1"]
-        })));
-        assert!(haider_library_status_has_session_config(&json!({
-            "features": {"session_config_v1": true}
-        })));
-        assert!(!haider_library_status_has_session_config(&json!({
-            "features": ["session_observe_v1", "models_list_v1"]
-        })));
-        assert!(!haider_library_status_has_session_config(&json!({
-            "features": {"session_config_v1": false}
-        })));
+        assert!(haider_library_catalog_models(
+            providers,
+            Some(&haider_rpc_ade::SnapshotAvailabilityWire::Unavailable {
+                reason: "registry_down".to_string(),
+            }),
+        )
+        .is_empty());
+        assert!(haider_library_catalog_models(
+            providers,
+            Some(&haider_rpc_ade::SnapshotAvailabilityWire::Unknown),
+        )
+        .is_empty());
     }
 }
