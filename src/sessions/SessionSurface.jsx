@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Forum } from "@styled-icons/material-rounded/Forum";
@@ -33,6 +34,11 @@ import {
   createCommandDoorExecutor,
 } from "./commandDoor.js";
 import {
+  buildCommandSlots,
+  librarySnapshotNeedsRetry,
+  modelGroupsFromLibrary,
+} from "./haiderClientContract.js";
+import {
   rehomeSessionPane,
   rehomeSessionViewMode,
   sessionPaneId,
@@ -50,6 +56,7 @@ import {
   formatSessionRelativeTime,
   sessionModelProviderFallback,
 } from "./sessionsModel.js";
+import { viewportMenuPosition } from "./viewportMenuPosition.js";
 
 /* Main-pane surface for sessions — the Session Deck workspace.
 
@@ -258,44 +265,48 @@ export default function SessionSurface({
   const [draftError, setDraftError] = useState("");
   const submitBusyRef = useRef(false);
 
+  const refreshLibrary = useCallback(async () => {
+    try {
+      const snapshot = await invoke("haider_library_snapshot");
+      if (snapshot && typeof snapshot === "object") {
+        setLibrary(snapshot);
+        return snapshot;
+      }
+    } catch {
+      // The retry loop below keeps an unavailable startup self-healing.
+    }
+    return null;
+  }, []);
+
   /* Current provider/account context + model library from the harness. */
   useEffect(() => {
     let disposed = false;
+    let libraryRetry = null;
+    let libraryAttempt = 0;
+    const refreshLibraryUntilAuthoritative = async () => {
+      const snapshot = await refreshLibrary();
+      if (disposed || !librarySnapshotNeedsRetry(snapshot)) return;
+      const retryDelays = [500, 1_000, 2_000, 5_000, 10_000, 30_000];
+      const delay = retryDelays[Math.min(libraryAttempt, retryDelays.length - 1)];
+      libraryAttempt += 1;
+      libraryRetry = window.setTimeout(refreshLibraryUntilAuthoritative, delay);
+    };
     void invoke("haider_usage_snapshot").then((snapshot) => {
       if (!disposed && snapshot && typeof snapshot === "object") {
         setUsageMeta(snapshot);
       }
     }).catch(() => {});
-    void invoke("haider_library_snapshot").then((snapshot) => {
-      if (!disposed && snapshot && typeof snapshot === "object") {
-        setLibrary(snapshot);
-      }
-    }).catch(() => {});
+    void refreshLibraryUntilAuthoritative();
     void invoke("rpc_features").then((features) => {
       if (!disposed && Array.isArray(features)) setRpcFeatures(features);
     }).catch(() => {});
     return () => {
       disposed = true;
+      if (libraryRetry) window.clearTimeout(libraryRetry);
     };
-  }, []);
+  }, [refreshLibrary]);
 
-  const commandSlots = useMemo(() => {
-    const models = (Array.isArray(library?.models) ? library.models : [])
-      .map((entry) => {
-        if (typeof entry === "string") return entry;
-        if (!entry?.model) return "";
-        return entry.provider ? `${entry.provider}/${entry.model}` : entry.model;
-      })
-      .filter(Boolean);
-    const efforts = (Array.isArray(library?.efforts) ? library.efforts : [])
-      .filter((entry) => typeof entry === "string" && entry);
-    const customCommands = (Array.isArray(library?.custom_commands)
-      ? library.custom_commands
-      : [])
-      .map((entry) => (typeof entry === "string" ? entry : entry?.name))
-      .filter(Boolean);
-    return { models, efforts, custom_commands: customCommands };
-  }, [library]);
+  const commandSlots = useMemo(() => buildCommandSlots(library), [library]);
   const commandSlotsKey = useMemo(() => JSON.stringify(commandSlots), [commandSlots]);
   const commandContextId = draftOpen ? "draft" : activeSessionId;
   const commandInSession = Boolean(commandContextId && commandContextId !== "draft");
@@ -800,75 +811,48 @@ export default function SessionSurface({
      single coherent choice (a deepseek model can never ride an openai
      account). The menu groups the catalog by provider; selecting applies
      "provider/model" through the harness. */
-  /* Current summaries carry the model provider. Older/partial rows can leave
-     it unknown, so the library remains an unambiguous fallback rather than a
-     guessed provider. */
-  const libraryProviderFor = (model) => {
-    if (!model) return "";
-    const models = Array.isArray(library?.models) ? library.models : [];
-    /* The library allows the same model name under multiple providers —
-       infer only when the answer is unambiguous, never guess. */
-    const providers = new Set(
-      models.filter((entry) => entry?.model === model).map((entry) => entry.provider),
-    );
-    return providers.size === 1 ? [...providers][0] : "";
-  };
   const chipValuesFor = (session) => {
     const config = session ? sessionConfigs[session.id] : null;
-    const prefs = composerPrefs[session?.id || "draft"] || {};
-    const prefModel = (prefs.model || "").split("/").pop() || null;
-    const model = config?.model || prefModel || session?.model || "default";
+    const prefs = session ? {} : (composerPrefs.draft || {});
+    const prefModel = typeof prefs.model === "string" ? prefs.model.split("/").pop() : null;
+    const configHas = (key) => config && Object.hasOwn(config, key);
+    const sessionHas = (key) => session && Object.hasOwn(session, key);
+    const model = configHas("model") ? config.model
+      : prefModel || (sessionHas("model") ? session.model : null);
     return {
       model,
-      modelProvider: config?.provider
-        || (prefs.model || "").split("/")[0]
-        || sessionModelProviderFallback(session?.provider)
-        || libraryProviderFor(model),
-      /* 935 roster scalars: rows carry effort/speed once installed — the
-         summary becomes a complete chip source; null rows (934) fall back
-         exactly as before. */
-      effort: config?.effort || prefs.effort || session?.effort || "default",
-      speed: config?.speed === "fast" || prefs.speed === "fast" || session?.speed === "fast"
-        ? "fast"
-        : "default",
+      modelProvider: configHas("provider")
+        ? config.provider
+        : (prefs.model || "").split("/")[0]
+          || (sessionHas("provider") ? sessionModelProviderFallback(session.provider) : ""),
+      effort: configHas("effort")
+        ? (config.effort ?? "default")
+        : prefs.effort ?? (sessionHas("effort") ? (session.effort ?? "default") : null),
+      speed: configHas("speed")
+        ? config.speed
+        : prefs.speed ?? (sessionHas("speed") ? session.speed : null),
     };
   };
   const chipOptionsFor = (session) => {
-    const models = Array.isArray(library?.models) ? library.models : [];
-    const groups = [];
-    const byProvider = new Map();
-    for (const entry of models) {
-      if (!entry?.model || !entry?.provider) continue;
-      let group = byProvider.get(entry.provider);
-      if (!group) {
-        group = {
-          provider: entry.provider,
-          available: Boolean(entry.available),
-          auth_state: entry.auth_state || "",
-          models: [],
-        };
-        byProvider.set(entry.provider, group);
-        groups.push(group);
-      }
-      group.available = group.available || Boolean(entry.available);
-      if (!group.models.includes(entry.model)) group.models.push(entry.model);
-    }
-    groups.sort((a, b) => (b.available - a.available) || a.provider.localeCompare(b.provider));
     const config = session ? sessionConfigs[session.id] : null;
     return {
-      modelGroups: groups,
-      speedApplicable: config?.speed != null,
+      modelGroups: modelGroupsFromLibrary(library),
+      speedApplicable: Boolean(
+        (config && Object.hasOwn(config, "speed"))
+        || (session && Object.hasOwn(session, "speed")),
+      ),
     };
   };
   /* Bound sessions apply through the harness (session_config_set) so the
      TUI, the daemon, and the chips agree; the draft stashes prefs that ride
      the first `haider run` as flags. */
   const handleChipChange = useCallback((sessionId, key, option) => {
-    setComposerPrefs((current) => ({
-      ...current,
-      [sessionId]: { ...(current[sessionId] || {}), [key]: option },
-    }));
-    if (sessionId !== "draft") {
+    if (sessionId === "draft") {
+      setComposerPrefs((current) => ({
+        ...current,
+        draft: { ...(current.draft || {}), [key]: option },
+      }));
+    } else {
       const value = option === "default" ? null : option;
       const patch = { session_id: sessionId };
       if (key === "model") patch.model = value;
@@ -878,23 +862,9 @@ export default function SessionSurface({
       else return;
       void invoke("session_config_set", patch)
         .then(() => {
-          /* Replace the cache with the SET value immediately — the verify
-             GET (latest-wins) confirms; a slow earlier GET can't clobber.
-             Model options are "provider/model": split before caching, the
-             config shape holds them separately. */
-          setSessionConfigs((current) => {
-            const previous = current[sessionId] || {};
-            let updated;
-            if (key === "model" && option && option !== "default") {
-              const slash = option.indexOf("/");
-              updated = slash > 0
-                ? { ...previous, provider: option.slice(0, slash), model: option.slice(slash + 1) }
-                : { ...previous, model: option };
-            } else {
-              updated = { ...previous, [key]: option === "default" ? null : option };
-            }
-            return { ...current, [sessionId]: updated };
-          });
+          /* The mutation receipt proves acceptance but is not a config
+             snapshot. Keep showing the prior daemon value until the winning
+             config door supplies the current one. */
           refreshConfig(sessionId);
         })
         .catch(() => {});
@@ -1279,12 +1249,43 @@ export default function SessionSurface({
   const [titleRenamingId, setTitleRenamingId] = useState("");
   const [titleDraft, setTitleDraft] = useState("");
   const titleMenuRef = useRef(null);
+  const titleMenuButtonRef = useRef(null);
+  const titleMenuPanelRef = useRef(null);
+  const [titleMenuPosition, setTitleMenuPosition] = useState(null);
+  useLayoutEffect(() => {
+    if (!titleMenuFor) {
+      setTitleMenuPosition(null);
+      return undefined;
+    }
+    const place = () => {
+      const anchor = titleMenuButtonRef.current?.getBoundingClientRect();
+      const menu = titleMenuPanelRef.current?.getBoundingClientRect();
+      if (!anchor || !menu) return;
+      const viewport = window.visualViewport;
+      setTitleMenuPosition(viewportMenuPosition(anchor, menu, {
+        width: viewport?.width || window.innerWidth,
+        height: viewport?.height || window.innerHeight,
+      }));
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    window.visualViewport?.addEventListener("resize", place);
+    window.visualViewport?.addEventListener("scroll", place);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+      window.visualViewport?.removeEventListener("resize", place);
+      window.visualViewport?.removeEventListener("scroll", place);
+    };
+  }, [titleMenuFor]);
   useEffect(() => {
     if (!titleMenuFor) {
       return undefined;
     }
     const close = (event) => {
-      if (titleMenuRef.current && titleMenuRef.current.contains(event.target)) {
+      if (titleMenuRef.current?.contains(event.target)
+        || titleMenuPanelRef.current?.contains(event.target)) {
         return;
       }
       setTitleMenuFor("");
@@ -1368,6 +1369,7 @@ export default function SessionSurface({
         )}
         <TitleMenuWrap ref={titleMenuFor === session.id ? titleMenuRef : undefined}>
           <HeaderIconButton
+            ref={titleMenuFor === session.id ? titleMenuButtonRef : undefined}
             aria-expanded={titleMenuFor === session.id}
             aria-haspopup="menu"
             aria-label="Session menu"
@@ -1379,8 +1381,14 @@ export default function SessionSurface({
           >
             <MoreHoriz aria-hidden="true" size={15} />
           </HeaderIconButton>
-          {titleMenuFor === session.id && (
-            <TitleMenu role="menu">
+          {titleMenuFor === session.id && createPortal(
+            <TitleMenu
+              $left={titleMenuPosition?.left}
+              $positioned={Boolean(titleMenuPosition)}
+              $top={titleMenuPosition?.top}
+              ref={titleMenuPanelRef}
+              role="menu"
+            >
               <TitleMenuItem
                 onClick={() => void toggleSessionPin(session)}
                 role="menuitem"
@@ -1397,7 +1405,8 @@ export default function SessionSurface({
                 <Edit aria-hidden="true" />
                 <span>Rename</span>
               </TitleMenuItem>
-            </TitleMenu>
+            </TitleMenu>,
+            document.body,
           )}
         </TitleMenuWrap>
       </TitleRow>
@@ -1598,6 +1607,7 @@ export default function SessionSurface({
                 commandNotice={commandResults.draft || null}
                 onAttachmentsChange={(next) => handleAttachmentsChange({ id: "draft" }, next)}
                 onChipChange={(key, option) => handleChipChange("draft", key, option)}
+                onChipMenuOpen={() => { void refreshLibrary(); }}
                 onSubmit={submitDraft}
                 onPastedBlocksChange={(blocks) => setComposerPastesFor("draft", blocks)}
                 onValueChange={(text) => setComposerText("draft", text)}
@@ -1715,7 +1725,10 @@ export default function SessionSurface({
                       commandMenuRequest={commandMenuRequests[session.id] || null}
                       commandNotice={commandResults[session.id] || null}
                       onChipChange={(key, option) => handleChipChange(session.id, key, option)}
-                      onChipMenuOpen={() => refreshConfig(session.id)}
+                      onChipMenuOpen={() => {
+                        void refreshLibrary();
+                        refreshConfig(session.id);
+                      }}
                       attachments={composerAttachments[session.id] || []}
                       holdNotice={submitHold[session.id] || ""}
                       onCancelTurn={cancelTurnFor(session)}
@@ -2070,18 +2083,23 @@ const TitleMenuWrap = styled.div`
 `;
 
 const TitleMenu = styled.div`
-  position: absolute;
-  top: calc(100% + 4px);
-  right: 0;
+  position: fixed;
+  top: ${({ $top }) => `${$top ?? 0}px`};
+  left: ${({ $left }) => `${$left ?? 0}px`};
   z-index: 40;
   display: grid;
-  min-width: 148px;
+  width: 148px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
   gap: 1px;
   padding: 4px;
+  overflow-y: auto;
   border: 1px solid var(--forge-border-strong);
   border-radius: 9px;
   background: var(--forge-surface-raised, var(--forge-surface));
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
+  box-sizing: border-box;
+  visibility: ${({ $positioned }) => ($positioned ? "visible" : "hidden")};
 `;
 
 const TitleMenuItem = styled.button`
