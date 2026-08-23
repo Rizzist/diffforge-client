@@ -827,6 +827,17 @@ fn haider_tui_supports_session_flag() -> bool {
     })
 }
 
+/// Opaque, pane-scoped correlator for the harness resident-binding announce.
+/// Opaque by design: the daemon stores and echoes it without parsing, so the
+/// ADE's internal pane identity never becomes something the protocol models.
+fn terminal_binding_token(pane_id: &str, instance_id: u64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pane_id.hash(&mut hasher);
+    instance_id.hash(&mut hasher);
+    format!("ade-{:016x}", hasher.finish())
+}
+
 fn haider_tui_launch_args(provider_session_id: Option<&str>) -> Vec<String> {
     let mut args = vec!["tui".to_string()];
     if let Some(session_id) = terminal_clean_provider_session_id(provider_session_id) {
@@ -9611,6 +9622,29 @@ async fn terminal_open(
             activity_transport.as_ref(),
             Some(&launch_account_binding),
         )?;
+        /* A pane-scoped correlator for the harness binding announce.
+           `ResidentSessionBinding` is profile-global — the daemon keeps N
+           publishers keyed by connection and collapses them to one most-recent
+           winner, discarding the owner — so it cannot say WHICH pane a binding
+           belongs to. This token is minted here, carried by the TUI into its
+           publication, and echoed back untouched; the daemon never parses it,
+           so panes stay entirely the client's concept.
+
+           An ENV VAR rather than a flag on purpose: an unknown flag is a hard
+           launch failure (`haider tui: unknown flag`), which would force a
+           version gate gated on the harness's release boundary. An older TUI
+           ignores an unfamiliar variable and starts normally.
+
+           Stable for the pane's lifetime and therefore UNCHANGED ACROSS AN
+           IN-TUI HOP, which is the whole mechanism: same token with a new
+           session_id is what makes a hop attributable. instance_id is minted
+           per launch, so a recreated pane correctly gets a different token. */
+        if activity_provider_id == "haider" {
+            coordination_env_vars.push((
+                "HAIDER_BINDING_TOKEN".to_string(),
+                terminal_binding_token(&pane_id, instance_id),
+            ));
+        }
         if terminal_coordination.is_some() {
             coordination_env_vars
                 .extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
@@ -31799,6 +31833,30 @@ mod terminal_tests {
         assert_eq!(projected.execution_phase, "starting");
         assert_eq!(projected.native_rail_state, "starting");
         assert_eq!(projected.session_state, "session_starting");
+    }
+
+    /* The token's whole value is its STABILITY. A hop happens inside one TUI
+       process, so the variable is set once at spawn and never changes — same
+       token, new session_id, therefore attributable to this pane. If it varied
+       per hop it would be indistinguishable from a different pane binding, and
+       the correlator would be worse than nothing because it would look like it
+       worked. */
+    #[test]
+    fn a_binding_token_is_stable_for_a_pane_and_fresh_when_it_is_recreated() {
+        let first = terminal_binding_token("pane-a", 42);
+
+        // Same pane, same launch: identical every time it is asked for.
+        assert_eq!(first, terminal_binding_token("pane-a", 42));
+
+        // A recreated pane is a DIFFERENT pane and must not inherit identity.
+        assert_ne!(first, terminal_binding_token("pane-a", 43));
+
+        // Two panes never collide.
+        assert_ne!(first, terminal_binding_token("pane-b", 42));
+
+        // Opaque to the daemon: it must not carry our internal pane id.
+        assert!(!first.contains("pane-a"));
+        assert!(first.starts_with("ade-"));
     }
 
     #[test]

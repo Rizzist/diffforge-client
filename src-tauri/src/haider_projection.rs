@@ -7,7 +7,7 @@ const HAIDER_PROJECTION_MAX_EXPORT_BYTES: u64 = 32 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_WINDOW_ROWS: i64 = 1_000;
 const HAIDER_PROJECTION_WATCH_LIMIT: usize = 6;
-const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 5;
+const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 6;
 const HAIDER_PROJECTION_PIPE_BATCH_LINES: usize = 256;
 const HAIDER_PROJECTION_PIPE_SAFETY_POLL: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_PIPE_STOP_POLL: Duration = Duration::from_millis(100);
@@ -24,6 +24,7 @@ struct SessionProjectionRow {
     session_id: String,
     seq: i64,
     ordinal: i64,
+    projection_order: i64,
     branch_id: String,
     kind: String,
     role: String,
@@ -53,8 +54,8 @@ struct HaiderProjectionTail {
 struct HaiderProjectionFoldState {
     next_fallback_seq: i64,
     total_rows: i64,
-    persisted_max_key: Option<(i64, i64)>,
-    window_anchors: HashMap<i64, (i64, i64)>,
+    persisted_max_key: Option<(i64, i64, i64)>,
+    window_anchors: HashMap<i64, (i64, i64, i64)>,
     tail: Option<HaiderProjectionTail>,
     metadata: serde_json::Map<String, Value>,
     effect_summaries: HashMap<String, String>,
@@ -384,16 +385,17 @@ fn haider_projection_migrate_database(connection: &mut rusqlite::Connection) -> 
                 session_id TEXT NOT NULL,
                 seq INTEGER NOT NULL,
                 ordinal INTEGER NOT NULL DEFAULT 0,
+                projection_order INTEGER NOT NULL DEFAULT 0,
                 branch_id TEXT NOT NULL DEFAULT '',
                 kind TEXT NOT NULL,
                 role TEXT NOT NULL,
                 text TEXT NOT NULL,
                 meta TEXT NOT NULL,
                 at_ms INTEGER NOT NULL,
-                PRIMARY KEY (session_id, seq, ordinal)
+                PRIMARY KEY (session_id, seq, ordinal, projection_order)
              );
              CREATE INDEX IF NOT EXISTS idx_session_projection_rows_order
-                ON session_projection_rows(session_id, seq, ordinal);
+                ON session_projection_rows(session_id, seq, ordinal, projection_order);
              CREATE TABLE IF NOT EXISTS session_pipe_cursors (
                 session_id TEXT PRIMARY KEY,
                 segment_name TEXT NOT NULL DEFAULT '',
@@ -527,21 +529,24 @@ fn haider_projection_with_database<T>(
 fn haider_projection_database_stats_with_connection(
     connection: &mut rusqlite::Connection,
     session_id: &str,
-) -> Result<(i64, i64, i64), String> {
+) -> Result<(i64, i64, i64, i64), String> {
     connection
         .prepare_cached(
             "SELECT COUNT(*),
                         COALESCE((SELECT seq FROM session_projection_rows
                                   WHERE session_id = ?1
-                                  ORDER BY seq DESC, ordinal DESC LIMIT 1), 0),
+                                  ORDER BY seq DESC, ordinal DESC, projection_order DESC LIMIT 1), 0),
                         COALESCE((SELECT ordinal FROM session_projection_rows
                                   WHERE session_id = ?1
-                                  ORDER BY seq DESC, ordinal DESC LIMIT 1), 0)
+                                  ORDER BY seq DESC, ordinal DESC, projection_order DESC LIMIT 1), 0),
+                        COALESCE((SELECT projection_order FROM session_projection_rows
+                                  WHERE session_id = ?1
+                                  ORDER BY seq DESC, ordinal DESC, projection_order DESC LIMIT 1), 0)
                  FROM session_projection_rows WHERE session_id = ?1",
         )
         .and_then(|mut statement| {
             statement.query_row([session_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
         })
         .map_err(|error| format!("Unable to inspect session projection: {error}"))
@@ -550,7 +555,7 @@ fn haider_projection_database_stats_with_connection(
 fn haider_projection_database_stats(session_id: &str) -> Result<(i64, i64), String> {
     haider_projection_with_database(|connection| {
         haider_projection_database_stats_with_connection(connection, session_id)
-            .map(|(total_rows, max_seq, _)| (total_rows, max_seq))
+            .map(|(total_rows, max_seq, _, _)| (total_rows, max_seq))
     })
 }
 
@@ -565,7 +570,7 @@ fn haider_projection_initialize_state_with_connection(
     {
         return Ok(());
     }
-    let (total_rows, max_seq, max_ordinal) =
+    let (total_rows, max_seq, max_ordinal, max_projection_order) =
         haider_projection_database_stats_with_connection(connection, session_id)?;
     let mut states = haider_projection_states()
         .lock()
@@ -575,7 +580,11 @@ fn haider_projection_initialize_state_with_connection(
         .or_insert_with(|| HaiderProjectionFoldState {
             next_fallback_seq: max_seq.saturating_add(1).max(1),
             total_rows,
-            persisted_max_key: (total_rows > 0).then_some((max_seq, max_ordinal)),
+            persisted_max_key: (total_rows > 0).then_some((
+                max_seq,
+                max_ordinal,
+                max_projection_order,
+            )),
             ..HaiderProjectionFoldState::default()
         });
     Ok(())
@@ -758,6 +767,7 @@ fn haider_projection_row(
         session_id: session_id.to_string(),
         seq,
         ordinal,
+        projection_order: 0,
         branch_id,
         kind: kind.to_string(),
         role: role.to_string(),
@@ -1286,12 +1296,7 @@ fn haider_projection_fold_pipe_value_locked(
         .and_then(Value::as_str)
         .is_some_and(|role| matches!(role, "user" | "assistant" | "tool" | "error"));
     if !compat_role {
-        let mut step = haider_projection_fold_value_locked(state, session_id, value);
-        let ordinal = haider_projection_pipe_projection_ordinal(payload, 0);
-        for row in &mut step.rows {
-            row.ordinal = ordinal;
-        }
-        return step;
+        return haider_projection_fold_value_locked(state, session_id, value);
     }
 
     /* 0.0.937 native pipes contain only bare compat rows. An item envelope
@@ -1317,14 +1322,13 @@ fn haider_projection_fold_pipe_value_locked(
     if let Some(row) = reasoning {
         step.rows.push(row);
     }
-    /* Reasoning rides the row where the thinking HAPPENED — before the tool
-    calls — not the answer row, and 57% of those rows carry no text. Emitting
-    the message row anyway would put an empty assistant bubble under every
-    thinking fold. */
+    /* v4 carries reasoning and text on the SAME assistant row, and reasoning
+    happened before the text it produced. 57% of observed reasoning rows carry
+    no text, so emitting a message row anyway would put an empty assistant
+    bubble under every thinking fold. */
     if !carried_only_reasoning {
         if let Some(mut row) = haider_projection_export_row(state, session_id, payload) {
-            row.ordinal =
-                haider_projection_pipe_projection_ordinal(payload, i64::from(has_reasoning));
+            row.projection_order = i64::from(has_reasoning);
             step.rows.push(row);
         }
     }
@@ -1347,7 +1351,7 @@ fn haider_projection_pipe_kind_row(
     Some(haider_projection_row(
         session_id,
         haider_projection_seq(state, payload, payload),
-        haider_projection_pipe_projection_ordinal(payload, 0),
+        haider_projection_ordinal(payload, payload),
         String::new(),
         "compaction_boundary",
         "meta",
@@ -1375,7 +1379,7 @@ fn haider_projection_pipe_reasoning_row(
     Some(haider_projection_row(
         session_id,
         haider_projection_seq(state, payload, payload),
-        haider_projection_pipe_projection_ordinal(payload, 0),
+        haider_projection_ordinal(payload, payload),
         haider_projection_branch_id(payload, payload),
         "thinking",
         "assistant",
@@ -1383,16 +1387,6 @@ fn haider_projection_pipe_reasoning_row(
         payload.clone(),
         haider_projection_at_ms(payload, payload),
     ))
-}
-
-/* One wire row can project into a thinking row followed by assistant text.
-Reserve two adjacent projection ordinals per wire ordinal so both survive
-the `(session_id, seq, ordinal)` primary key without colliding with a later
-wire row at the same sequence. */
-fn haider_projection_pipe_projection_ordinal(payload: &Value, phase: i64) -> i64 {
-    haider_projection_ordinal(payload, payload)
-        .saturating_mul(2)
-        .saturating_add(phase.clamp(0, 1))
 }
 
 fn haider_projection_input_items(value: &Value) -> Vec<&Value> {
@@ -1428,14 +1422,14 @@ fn haider_projection_persist_batch(
             .map_err(|error| format!("Unable to begin session projection write: {error}"))?;
         let mut appended = 0usize;
         let mut persisted_rows = Vec::new();
-        let mut min_inserted = None::<(i64, i64)>;
-        let mut max_inserted = None::<(i64, i64)>;
+        let mut min_inserted = None::<(i64, i64, i64)>;
+        let mut max_inserted = None::<(i64, i64, i64)>;
         {
             let mut statement = transaction
                 .prepare_cached(
                     "INSERT OR IGNORE INTO session_projection_rows
-                     (session_id, seq, ordinal, branch_id, kind, role, text, meta, at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     (session_id, seq, ordinal, projection_order, branch_id, kind, role, text, meta, at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 )
                 .map_err(|error| format!("Unable to prepare session projection row: {error}"))?;
             for row in rows {
@@ -1444,6 +1438,7 @@ fn haider_projection_persist_batch(
                         row.session_id,
                         row.seq,
                         row.ordinal,
+                        row.projection_order,
                         row.branch_id,
                         row.kind,
                         row.role,
@@ -1455,7 +1450,7 @@ fn haider_projection_persist_batch(
                 appended = appended.saturating_add(inserted);
                 if inserted > 0 {
                     persisted_rows.push(row.clone());
-                    let key = (row.seq, row.ordinal);
+                    let key = (row.seq, row.ordinal, row.projection_order);
                     min_inserted = Some(min_inserted.map_or(key, |current| current.min(key)));
                     max_inserted = Some(max_inserted.map_or(key, |current| current.max(key)));
                 }
@@ -3590,17 +3585,18 @@ fn haider_projection_prefold_detach(ids: &[String]) {
 }
 
 fn haider_projection_decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionProjectionRow> {
-    let meta: String = row.get(7)?;
+    let meta: String = row.get(8)?;
     Ok(SessionProjectionRow {
         session_id: row.get(0)?,
         seq: row.get(1)?,
         ordinal: row.get(2)?,
-        branch_id: row.get(3)?,
-        kind: row.get(4)?,
-        role: row.get(5)?,
-        text: row.get(6)?,
+        projection_order: row.get(3)?,
+        branch_id: row.get(4)?,
+        kind: row.get(5)?,
+        role: row.get(6)?,
+        text: row.get(7)?,
         meta: serde_json::from_str(&meta).unwrap_or_else(|_| json!({"raw": meta})),
-        at_ms: row.get(8)?,
+        at_ms: row.get(9)?,
     })
 }
 
@@ -3627,7 +3623,7 @@ fn haider_projection_window_rows_keyset(
                     .max_by_key(|(index, _)| *index)
                     .map(|(index, anchor)| (*index, *anchor))
             })
-            .unwrap_or((0, (-1, -1)));
+            .unwrap_or((0, (-1, -1, -1)));
         let following = anchors.and_then(|anchors| {
             anchors
                 .iter()
@@ -3645,9 +3641,9 @@ fn haider_projection_window_rows_keyset(
         let skipped = if let Some((_, following_anchor)) = following {
             connection
                 .prepare_cached(
-                    "SELECT seq, ordinal FROM session_projection_rows
-                     WHERE session_id = ?1 AND (seq, ordinal) < (?2, ?3)
-                     ORDER BY seq DESC, ordinal DESC LIMIT ?4",
+                    "SELECT seq, ordinal, projection_order FROM session_projection_rows
+                     WHERE session_id = ?1 AND (seq, ordinal, projection_order) < (?2, ?3, ?4)
+                     ORDER BY seq DESC, ordinal DESC, projection_order DESC LIMIT ?5",
                 )
                 .and_then(|mut statement| {
                     statement
@@ -3656,23 +3652,34 @@ fn haider_projection_window_rows_keyset(
                                 session_id,
                                 following_anchor.0,
                                 following_anchor.1,
-                                reverse_distance
+                                following_anchor.2,
+                                reverse_distance,
                             ],
-                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                ))
+                            },
                         )?
                         .collect::<Result<Vec<_>, _>>()
                 })
         } else {
             connection
                 .prepare_cached(
-                    "SELECT seq, ordinal FROM session_projection_rows
+                    "SELECT seq, ordinal, projection_order FROM session_projection_rows
                      WHERE session_id = ?1
-                     ORDER BY seq DESC, ordinal DESC LIMIT ?2",
+                     ORDER BY seq DESC, ordinal DESC, projection_order DESC LIMIT ?2",
                 )
                 .and_then(|mut statement| {
                     statement
                         .query_map(rusqlite::params![session_id, reverse_distance], |row| {
-                            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
                         })?
                         .collect::<Result<Vec<_>, _>>()
                 })
@@ -3696,15 +3703,27 @@ fn haider_projection_window_rows_keyset(
     } else if base_index < start_index {
         let skipped = connection
             .prepare_cached(
-                "SELECT seq, ordinal FROM session_projection_rows
-                 WHERE session_id = ?1 AND (seq, ordinal) > (?2, ?3)
-                 ORDER BY seq, ordinal LIMIT ?4",
+                "SELECT seq, ordinal, projection_order FROM session_projection_rows
+                 WHERE session_id = ?1 AND (seq, ordinal, projection_order) > (?2, ?3, ?4)
+                 ORDER BY seq, ordinal, projection_order LIMIT ?5",
             )
             .and_then(|mut statement| {
                 statement
                     .query_map(
-                        rusqlite::params![session_id, anchor.0, anchor.1, start_index - base_index],
-                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                        rusqlite::params![
+                            session_id,
+                            anchor.0,
+                            anchor.1,
+                            anchor.2,
+                            start_index - base_index,
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
                     )?
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -3727,15 +3746,15 @@ fn haider_projection_window_rows_keyset(
     }
     let rows = connection
         .prepare_cached(
-            "SELECT session_id, seq, ordinal, branch_id, kind, role, text, meta, at_ms
+            "SELECT session_id, seq, ordinal, projection_order, branch_id, kind, role, text, meta, at_ms
              FROM session_projection_rows
-             WHERE session_id = ?1 AND (seq, ordinal) > (?2, ?3)
-             ORDER BY seq, ordinal LIMIT ?4",
+             WHERE session_id = ?1 AND (seq, ordinal, projection_order) > (?2, ?3, ?4)
+             ORDER BY seq, ordinal, projection_order LIMIT ?5",
         )
         .and_then(|mut statement| {
             statement
                 .query_map(
-                    rusqlite::params![session_id, anchor.0, anchor.1, count],
+                    rusqlite::params![session_id, anchor.0, anchor.1, anchor.2, count],
                     haider_projection_decode_row,
                 )?
                 .collect::<Result<Vec<_>, _>>()
@@ -3748,7 +3767,7 @@ fn haider_projection_window_rows_keyset(
         for (offset, row) in rows.iter().enumerate() {
             state.window_anchors.insert(
                 start_index + i64::try_from(offset).unwrap_or(i64::MAX) + 1,
-                (row.seq, row.ordinal),
+                (row.seq, row.ordinal, row.projection_order),
             );
         }
     }
@@ -4462,32 +4481,54 @@ async fn session_projection_trajectory(session_id: String) -> Result<Value, Stri
         haider_projection_with_database(|connection| {
             let mut statement = connection
                 .prepare_cached(
-                    "SELECT seq, ordinal, branch_id, kind, role, text, meta, at_ms
-                 FROM session_projection_rows WHERE session_id = ?1
-                 ORDER BY seq, ordinal",
+                    "SELECT seq, ordinal, projection_order, branch_id, kind, role, text, meta, at_ms
+                     FROM session_projection_rows WHERE session_id = ?1
+                 ORDER BY seq, ordinal, projection_order",
                 )
                 .map_err(|error| format!("Unable to prepare session trajectory read: {error}"))?;
             let points = statement
                 .query_map([&session_id], |row| {
                     let seq: i64 = row.get(0)?;
                     let ordinal: i64 = row.get(1)?;
-                    let branch_id: String = row.get(2)?;
-                    let kind: String = row.get(3)?;
-                    let role: String = row.get(4)?;
-                    let text: String = row.get(5)?;
-                    let meta_text: String = row.get(6)?;
-                    let at_ms: i64 = row.get(7)?;
-                    Ok((seq, ordinal, branch_id, kind, role, text, meta_text, at_ms))
+                    let projection_order: i64 = row.get(2)?;
+                    let branch_id: String = row.get(3)?;
+                    let kind: String = row.get(4)?;
+                    let role: String = row.get(5)?;
+                    let text: String = row.get(6)?;
+                    let meta_text: String = row.get(7)?;
+                    let at_ms: i64 = row.get(8)?;
+                    Ok((
+                        seq,
+                        ordinal,
+                        projection_order,
+                        branch_id,
+                        kind,
+                        role,
+                        text,
+                        meta_text,
+                        at_ms,
+                    ))
                 })
                 .map_err(|error| format!("Unable to read session trajectory rows: {error}"))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| format!("Unable to decode session trajectory row: {error}"))?
                 .into_iter()
                 .map(
-                    |(seq, ordinal, branch_id, kind, role, text, meta_text, at_ms)| {
+                    |(
+                        seq,
+                        ordinal,
+                        projection_order,
+                        branch_id,
+                        kind,
+                        role,
+                        text,
+                        meta_text,
+                        at_ms,
+                    )| {
                         let mut point = json!({
                             "seq": seq,
                             "ordinal": ordinal,
+                            "projection_order": projection_order,
                             "branch_id": branch_id,
                             "kind": kind,
                             "role": role,
@@ -5437,9 +5478,9 @@ mod haider_projection_tests {
             let (offset_rows, keyset_rows) = haider_projection_with_database(|connection| {
                 let offset_rows = connection
                     .prepare_cached(
-                        "SELECT session_id, seq, ordinal, branch_id, kind, role, text, meta, at_ms
+                        "SELECT session_id, seq, ordinal, projection_order, branch_id, kind, role, text, meta, at_ms
                              FROM session_projection_rows WHERE session_id = ?1
-                             ORDER BY seq, ordinal LIMIT ?2 OFFSET ?3",
+                             ORDER BY seq, ordinal, projection_order LIMIT ?2 OFFSET ?3",
                     )
                     .and_then(|mut statement| {
                         statement
@@ -5870,6 +5911,7 @@ mod haider_projection_tests {
             [
                 "seq",
                 "ordinal",
+                "projection_order",
                 "branch_id",
                 "kind",
                 "role",
@@ -6009,7 +6051,7 @@ mod haider_projection_tests {
     }
 
     #[test]
-    fn v4_reasoning_and_text_have_distinct_ordered_projection_keys() {
+    fn v4_reasoning_and_text_share_wire_position_with_thinking_ordered_first() {
         let mut state = HaiderProjectionFoldState::default();
         let step = haider_projection_fold_pipe_value_locked(
             &mut state,
@@ -6029,7 +6071,8 @@ mod haider_projection_tests {
         assert_eq!(step.rows[0].kind, "thinking");
         assert_eq!(step.rows[1].kind, "message");
         assert_eq!(step.rows[0].seq, step.rows[1].seq);
-        assert!(step.rows[0].ordinal < step.rows[1].ordinal);
+        assert_eq!(step.rows[0].ordinal, step.rows[1].ordinal);
+        assert!(step.rows[0].projection_order < step.rows[1].projection_order);
     }
 
     #[test]
@@ -6074,15 +6117,32 @@ mod haider_projection_tests {
         )
         .unwrap();
         assert_eq!(frame.appended, 2);
+        let window = haider_projection_with_database(|connection| {
+            haider_projection_window_rows_keyset(
+                connection,
+                &test_session.session_id,
+                0,
+                frame.total_rows,
+                frame.total_rows,
+            )
+        })
+        .unwrap();
         assert_eq!(
-            frame
-                .rows
+            window
                 .iter()
-                .map(|row| (row.kind.as_str(), row.ordinal, row.text.as_str()))
+                .map(|row| {
+                    (
+                        row.kind.as_str(),
+                        row.seq,
+                        row.ordinal,
+                        row.projection_order,
+                        row.text.as_str(),
+                    )
+                })
                 .collect::<Vec<_>>(),
             vec![
-                ("thinking", 6, "thinking first"),
-                ("message", 7, "the answer")
+                ("thinking", 25, 3, 0, "thinking first"),
+                ("message", 25, 3, 1, "the answer"),
             ]
         );
 
@@ -6702,13 +6762,14 @@ mod haider_projection_tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(columns.contains(&("ordinal".to_string(), 3)));
+        assert!(columns.contains(&("projection_order".to_string(), 4)));
         assert!(columns.contains(&("branch_id".to_string(), 0)));
         connection
             .execute(
                 "INSERT INTO session_projection_rows
-                 (session_id, seq, ordinal, branch_id, kind, role, text, meta, at_ms)
-                 VALUES ('local', 7, 0, '', 'message', 'user', 'main', '{}', 1),
-                        ('local', 7, 1, 'branch-a', 'message', 'assistant', 'branch', '{}', 2)",
+                 (session_id, seq, ordinal, projection_order, branch_id, kind, role, text, meta, at_ms)
+                 VALUES ('local', 7, 0, 0, '', 'message', 'user', 'main', '{}', 1),
+                        ('local', 7, 0, 1, 'branch-a', 'message', 'assistant', 'branch', '{}', 2)",
                 [],
             )
             .unwrap();

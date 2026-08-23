@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import styled from "styled-components";
 import NeedsInputCard from "./NeedsInputCard.jsx";
+import { buildTranscriptBlocks, projectionRowKey } from "./sessionTranscriptBlocks.js";
 
 /* Virtualized transcript for the session UI view, fed by the Rust
    projection store (haider_projection.rs):
@@ -12,9 +13,9 @@ import NeedsInputCard from "./NeedsInputCard.jsx";
      - session_projection_window(session_id, start_index, count)
      - session_projection_attach/detach       → live watch + coalesced
        "session-rows-appended" events
-   Rows are append-only and keyed by seq, so measured heights never
-   invalidate — the height cache is permanent per (session, seq). Only the
-   live tail row mutates until its item seals.
+   Rows are append-only and keyed by (seq, ordinal, projection_order), so
+   measured heights never invalidate. Only the live tail row mutates until its
+   item seals.
 
    Rendering groups the flat rows into turn blocks: a user bubble opens a
    turn; consecutive tool rows collapse into ONE cluster card (named,
@@ -184,103 +185,6 @@ function dayLabel(atMs) {
   });
 }
 
-/* Flat window rows → render blocks. Consecutive tool rows fuse into one
-   cluster; day dividers slot in where the calendar date changes. Cluster
-   keys pin to the FIRST row's identity — append-only rows keep them stable
-   so React state (expansion) survives live growth. */
-/* Graph bookkeeping only. Deliberately NOT hidden: model_selected (which
-   model answered is part of the story), context_compaction (the context was
-   rewritten — that explains later behaviour), and the session/run state
-   items (a turn's lifecycle). Those are events a reader can act on; a node
-   being committed to the graph is not. */
-const INTERNAL_ITEM_NAMES = new Set([
-  "node_committed",
-  "extension",
-]);
-
-function isInternalToolRow(row) {
-  const meta = row?.meta && typeof row.meta === "object" ? row.meta : {};
-  const name = String(meta.item || meta.type || meta.name || "").trim();
-  if (INTERNAL_ITEM_NAMES.has(name)) return true;
-  // Live-fold text leads with the name when meta is thin.
-  const lead = String(row?.text || "").split("·")[0].trim();
-  return INTERNAL_ITEM_NAMES.has(lead);
-}
-
-function buildBlocks(rows) {
-  const blocks = [];
-  /* Reasoning is committed when it SEALS, which is after the answer it
-     produced — but it happened before. Hold it and emit it above the reply
-     so the transcript reads in the order the work actually occurred. */
-  let pendingThinking = [];
-  const flushThinking = () => {
-    for (const thinking of pendingThinking) {
-      blocks.push({ type: "row", key: `${thinking.seq}:${thinking.ordinal || 0}`, row: thinking });
-    }
-    pendingThinking = [];
-  };
-  let lastDay = "";
-  let lastAssistantText = null;
-  for (let row of rows) {
-    if (row.kind === "usage") continue;
-    /* Historical projections hold streaming-fallback rows that leaked into
-       the chat column as prose: args/output deltas that arrived on a tail
-       classified as a message. The text prefix is proof of tool-ness —
-       re-home them into the cluster (new rows are re-kinded at ingest). */
-    if (row.kind === "message" && /^(tool arguments|command output) · /.test(row.text || "")) {
-      row = { ...row, kind: "tool", role: "tool" };
-    }
-    if (row.kind === "thinking" && !String(row.text || "").trim()) continue;
-    if (row.kind === "tool" && isInternalToolRow(row)) continue;
-    /* Daemon compat records leave empty assistant turn-markers and duplicate
-       final answers in older projections: an empty message row renders as a
-       blank spacer that also splits tool clusters, and an adjacent identical
-       assistant message is the same answer at a second seq. Skip both. */
-    if (row.kind === "message") {
-      const text = String(row.text || "").trim();
-      if (!text) continue;
-      if (row.role === "assistant") {
-        if (text === lastAssistantText) continue;
-        lastAssistantText = text;
-      } else {
-        lastAssistantText = null;
-      }
-    } else {
-      /* Strictly adjacent-only: any visible non-message row (tool, error)
-         between two identical assistant texts means both are legitimate. */
-      lastAssistantText = null;
-    }
-    if (Number.isFinite(row.at_ms) && row.at_ms > 0) {
-      const day = new Date(row.at_ms).toDateString();
-      if (day !== lastDay) {
-        if (lastDay) {
-          blocks.push({ type: "day", key: `day:${row.seq}:${row.ordinal || 0}`, at_ms: row.at_ms });
-        }
-        lastDay = day;
-      }
-    }
-    if (row.kind === "thinking") {
-      pendingThinking.push(row);
-      continue;
-    }
-    if (row.kind === "message" && row.role === "assistant") {
-      flushThinking();
-    }
-    if (row.kind === "tool") {
-      const last = blocks[blocks.length - 1];
-      if (last && last.type === "tools") {
-        last.rows.push(row);
-      } else {
-        blocks.push({ type: "tools", key: `tools:${row.seq}:${row.ordinal || 0}`, rows: [row] });
-      }
-    } else {
-      blocks.push({ type: "row", key: `${row.seq}:${row.ordinal || 0}`, row });
-    }
-  }
-  flushThinking();
-  return blocks;
-}
-
 /* ---- tool cluster card ------------------------------------------------ */
 
 function ToolCluster({ rows, sessionId }) {
@@ -346,7 +250,7 @@ function ToolCluster({ rows, sessionId }) {
       {open && (
         <ClusterRows>
           {rows.map((row) => {
-            const key = `${row.seq}:${row.ordinal || 0}`;
+            const key = projectionRowKey(row);
             const name = toolNameOf(row);
             const status = toolStatusOf(row);
             const detail = toolDetailOf(row, name);
@@ -519,8 +423,8 @@ export default function SessionTranscript({
              refetch raced this event; trim the front to the window size. */
           windowEndRef.current = startTotal + rows.length;
           setWindowState((current) => {
-            const have = new Set(current.rows.map((row) => `${row.seq}:${row.ordinal || 0}`));
-            const fresh = rows.filter((row) => !have.has(`${row.seq}:${row.ordinal || 0}`));
+            const have = new Set(current.rows.map(projectionRowKey));
+            const fresh = rows.filter((row) => !have.has(projectionRowKey(row)));
             const merged = [...current.rows, ...fresh];
             const overflow = Math.max(0, merged.length - WINDOW_FETCH_SIZE);
             return {
@@ -581,7 +485,10 @@ export default function SessionTranscript({
   const rowsBelow = Math.max(0, totalRows - windowState.start - windowState.rows.length);
   const bottomSpacer = rowsBelow * ROW_ESTIMATE_PX;
 
-  const blocks = useMemo(() => buildBlocks(windowState.rows), [windowState.rows]);
+  const blocks = useMemo(
+    () => buildTranscriptBlocks(windowState.rows),
+    [windowState.rows],
+  );
 
   if ((loadState === "error" || loadState === "empty") && !liveTail && !windowState.rows.length) {
     // A missing/empty projection is a normal state for young or unbound
