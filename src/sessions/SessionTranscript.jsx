@@ -6,7 +6,13 @@ import remarkGfm from "remark-gfm";
 import styled from "styled-components";
 import NeedsInputCard from "./NeedsInputCard.jsx";
 import { projectionCaughtUp } from "./sessionSync.js";
-import { buildTranscriptBlocks, projectionRowKey } from "./sessionTranscriptBlocks.js";
+import {
+  buildTranscriptBlocks,
+  projectionRowKey,
+  TOOL_STATUS_LABEL,
+  TOOL_STATUS_UNRESOLVED,
+  toolStatusOf,
+} from "./sessionTranscriptBlocks.js";
 
 /* Virtualized transcript for the session UI view, fed by the Rust
    projection store (haider_projection.rs):
@@ -45,35 +51,6 @@ function toolNameOf(row) {
   }
   return "tool";
 }
-
-function toolStatusOf(row) {
-  const meta = row?.meta && typeof row.meta === "object" ? row.meta : {};
-  let raw = "";
-  for (const key of ["status", "phase", "outcome"]) {
-    const value = meta[key];
-    if (typeof value === "string" && value.trim()) {
-      raw = value;
-      break;
-    }
-  }
-  if (!raw) {
-    const settled = /settled as ([a-z]+)/i.exec(String(row?.text || ""));
-    if (settled) raw = settled[1];
-  }
-  const status = raw.toLowerCase();
-  if (/^(completed?|success|succeeded|ok|done)$/.test(status)) return "ok";
-  if (/^(failed?|failure|error|errored)$/.test(status)) return "failed";
-  if (/^(cancell?ed|aborted)$/.test(status)) return "cancelled";
-  if (/^(running|in_progress|pending|started|active)$/.test(status)) return "running";
-  return "ok";
-}
-
-const TOOL_STATUS_LABEL = {
-  ok: "Completed",
-  failed: "Failed",
-  cancelled: "Cancelled",
-  running: "Running",
-};
 
 /* Secondary dim detail: what the call touched. Sidecar v3 (0.0.934) ships
    args_preview/result_preview on cold rows; live meta may carry the raw keys. */
@@ -190,7 +167,7 @@ function dayLabel(atMs) {
 
 function ToolCluster({ rows, sessionId }) {
   const failedCount = rows.reduce(
-    (count, row) => count + (toolStatusOf(row) === "failed" ? 1 : 0),
+    (count, row) => count + (TOOL_STATUS_UNRESOLVED.has(toolStatusOf(row)) ? 1 : 0),
     0,
   );
   const [open, setOpen] = useState(failedCount > 0 || rows.length === 1);
@@ -225,7 +202,15 @@ function ToolCluster({ rows, sessionId }) {
       });
   };
 
-  const counts = { ok: 0, failed: 0, cancelled: 0, running: 0 };
+  const counts = {
+    ok: 0,
+    failed: 0,
+    rejected: 0,
+    conflict: 0,
+    cancelled: 0,
+    running: 0,
+    unknown: 0,
+  };
   for (const row of rows) {
     counts[toolStatusOf(row)] += 1;
   }
@@ -242,10 +227,19 @@ function ToolCluster({ rows, sessionId }) {
           <span>{rows.length} tool calls</span>
           {counts.ok > 0 && <CountTag data-status="ok">{counts.ok} ok</CountTag>}
           {counts.failed > 0 && <CountTag data-status="failed">{counts.failed} failed</CountTag>}
+          {counts.rejected > 0 && (
+            <CountTag data-status="rejected">{counts.rejected} rejected</CountTag>
+          )}
+          {counts.conflict > 0 && (
+            <CountTag data-status="conflict">{counts.conflict} conflict</CountTag>
+          )}
           {counts.cancelled > 0 && (
             <CountTag data-status="cancelled">{counts.cancelled} cancelled</CountTag>
           )}
           {counts.running > 0 && <CountTag data-status="running">{counts.running} running</CountTag>}
+          {counts.unknown > 0 && (
+            <CountTag data-status="unknown">{counts.unknown} unknown</CountTag>
+          )}
         </ClusterHead>
       )}
       {open && (
@@ -888,8 +882,13 @@ const CountTag = styled.span`
 
   &[data-status="ok"] { color: var(--forge-green); }
   &[data-status="failed"] { color: var(--forge-red); }
+  &[data-status="rejected"] { color: var(--forge-red); }
+  &[data-status="conflict"] { color: var(--forge-amber); }
   &[data-status="cancelled"] { color: var(--forge-text-muted); }
   &[data-status="running"] { color: var(--forge-amber); }
+  /* Named as unread, not as fine: an unknown outcome must not wear the
+     success color. */
+  &[data-status="unknown"] { color: var(--forge-text-soft); }
 `;
 
 const ClusterRows = styled.div`
@@ -960,8 +959,13 @@ const StatusWord = styled.span`
 
   &[data-status="ok"] { color: var(--forge-green); }
   &[data-status="failed"] { color: var(--forge-red); }
+  &[data-status="rejected"] { color: var(--forge-red); }
+  &[data-status="conflict"] { color: var(--forge-amber); }
   &[data-status="cancelled"] { color: var(--forge-text-muted); }
   &[data-status="running"] { color: var(--forge-amber); }
+  /* Named as unread, not as fine: an unknown outcome must not wear the
+     success color. */
+  &[data-status="unknown"] { color: var(--forge-text-soft); }
 `;
 
 const ToolTime = styled.span`

@@ -21,6 +21,50 @@ function orderNumber(value) {
   return Number.isFinite(numeric) ? numeric : 0;
 }
 
+/* Outcomes that are not a success. A collapsed cluster must not hide one, so
+   these open it — an unnameable outcome included, because "we could not read
+   this" is exactly the case worth a human's eyes. */
+export const TOOL_STATUS_UNRESOLVED = new Set(["failed", "rejected", "conflict", "unknown"]);
+
+
+export function toolStatusOf(row) {
+  const meta = row?.meta && typeof row.meta === "object" ? row.meta : {};
+  let raw = "";
+  for (const key of ["status", "phase", "outcome"]) {
+    const value = meta[key];
+    if (typeof value === "string" && value.trim()) {
+      raw = value;
+      break;
+    }
+  }
+  if (!raw) {
+    const settled = /settled as ([a-z]+)/i.exec(String(row?.text || ""));
+    if (settled) raw = settled[1];
+  }
+  const status = raw.toLowerCase();
+  if (/^(completed?|success|succeeded|ok|done)$/.test(status)) return "ok";
+  if (/^(failed?|failure|error|errored)$/.test(status)) return "failed";
+  if (/^(rejected|denied|refused)$/.test(status)) return "rejected";
+  if (/^(conflict|conflicted)$/.test(status)) return "conflict";
+  if (/^(cancell?ed|aborted)$/.test(status)) return "cancelled";
+  if (/^(running|in_progress|pending|started|active)$/.test(status)) return "running";
+  // An outcome this build cannot name is NOT a success. Cold rows carry only
+  // the daemon's prose today, so a status added upstream arrives here as a
+  // word we've never seen — reporting that as "Completed" is how a rejected
+  // call reads as a finished one.
+  return "unknown";
+}
+
+export const TOOL_STATUS_LABEL = {
+  ok: "Completed",
+  failed: "Failed",
+  rejected: "Rejected",
+  conflict: "Conflict",
+  cancelled: "Cancelled",
+  running: "Running",
+  unknown: "Unknown",
+};
+
 export function projectionRowKey(row) {
   return `${orderNumber(row?.seq)}:${orderNumber(row?.ordinal)}:${orderNumber(row?.projection_order)}`;
 }

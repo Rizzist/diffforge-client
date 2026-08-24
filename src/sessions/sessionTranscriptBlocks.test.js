@@ -4,6 +4,9 @@ import test from "node:test";
 import {
   buildTranscriptBlocks,
   projectionRowKey,
+  TOOL_STATUS_LABEL,
+  TOOL_STATUS_UNRESOLVED,
+  toolStatusOf,
 } from "./sessionTranscriptBlocks.js";
 
 function row(overrides) {
@@ -109,4 +112,28 @@ test("sealed reasoning renders through the collapsed thinking fold", () => {
   assert.match(source, /row\.kind === "thinking"[\s\S]*?<ThinkingFold text=\{row\.text\} \/>/);
   assert.match(source, /function ThinkingFold\(\{ text, live = false \}\)/);
   assert.match(source, /const \[open, setOpen\] = useState\(live\)/);
+});
+
+test("an outcome this build cannot name never reads as a success", () => {
+  // The harness formats its typed status into prose, so cold rows only ever
+  // carry a word. A word we do not recognise — including one a newer daemon
+  // introduces — must not be reported as a finished, successful call.
+  assert.equal(toolStatusOf({ text: "tool call settled as Rejected" }), "rejected");
+  assert.equal(toolStatusOf({ text: "tool call settled as Conflict" }), "conflict");
+  assert.equal(toolStatusOf({ text: "tool call settled as Quarantined" }), "unknown");
+  assert.equal(toolStatusOf({ text: "" }), "unknown");
+  assert.equal(TOOL_STATUS_LABEL.unknown, "Unknown");
+
+  // Typed metadata outranks the prose wherever the row carries it.
+  assert.equal(
+    toolStatusOf({ meta: { status: "rejected" }, text: "tool call settled as Completed" }),
+    "rejected",
+  );
+
+  // Only a real success is a success; everything unresolved opens the cluster.
+  assert.equal(toolStatusOf({ text: "tool call settled as Completed" }), "ok");
+  for (const status of ["failed", "rejected", "conflict", "unknown"]) {
+    assert.ok(TOOL_STATUS_UNRESOLVED.has(status), `${status} must surface itself`);
+  }
+  assert.ok(!TOOL_STATUS_UNRESOLVED.has("ok"));
 });
