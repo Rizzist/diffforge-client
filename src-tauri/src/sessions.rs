@@ -137,12 +137,6 @@ impl SessionRow {
         }
         sessions_harness_value(self, "last_activity_ms")
             .and_then(Value::as_i64)
-            .or_else(|| {
-                sessions_harness_value(self, "metadata")
-                    .and_then(Value::as_object)
-                    .and_then(|metadata| metadata.get("created_at_ms"))
-                    .and_then(Value::as_i64)
-            })
     }
 
     fn needs_input(&self) -> Value {
@@ -1849,15 +1843,33 @@ mod sessions_tests {
     }
 
     #[test]
-    fn daemon_recency_uses_last_activity_presence_including_zero() {
+    fn harness_session_without_activity_serializes_null_recency() {
         let mut row = sessions_test_row("recency", Path::new(""), "pinned");
         row.created_at_ms = 999;
         row.harness = json!({"last_activity_ms": 0, "updated_at_ms": 888});
-        assert_eq!(row.latest_at_ms(), Some(0));
-        row.harness = json!({"updated_at_ms": 888});
-        assert_eq!(row.latest_at_ms(), None);
-        row.harness = json!({"metadata": {"created_at_ms": 0}});
-        assert_eq!(row.latest_at_ms(), Some(0));
+        assert_eq!(row.serialized_value()["latest_at_ms"], 0);
+
+        row.harness = json!({
+            "updated_at_ms": 888,
+            "metadata": {"created_at_ms": 777},
+        });
+        let serialized = row.serialized_value();
+        assert_eq!(serialized["latest_at_ms"], Value::Null);
+        assert_ne!(serialized["latest_at_ms"], row.created_at_ms);
+        assert_ne!(serialized["latest_at_ms"], 0);
+    }
+
+    #[test]
+    fn client_owned_session_serializes_its_local_coordinate() {
+        let mut row = sessions_test_row("local-recency", Path::new(""), "pinned");
+        row.provider_session_id.clear();
+        row.created_at_ms = 999;
+        row.harness = json!({
+            "updated_at_ms": 888,
+            "metadata": {"created_at_ms": 777},
+        });
+
+        assert_eq!(row.serialized_value()["latest_at_ms"], 999);
     }
 
     #[test]

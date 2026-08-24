@@ -16,12 +16,15 @@ import {
   RailSearchIcon,
   RailSearchField,
 } from "../app/appStyles.js";
-import { formatSessionRelativeTime } from "./sessionsModel.js";
+import {
+  formatSessionRelativeTime,
+  partitionSessionsForRail,
+} from "./sessionsModel.js";
 import { ModelBrandIcon } from "./modelBrand.jsx";
 
-/* Session Deck rail list: a prominent "New chat" compose row on top, then two
-   groups — Pinned (user-pinned rows) and Recent (everything else, newest
-   first). Rows lead with the brand mark of the session's current model.
+/* Session Deck rail list: a prominent "New chat" compose row on top, then
+   activity-ranked Pinned/Recent groups and quiet trailing groups for local or
+   activity-less rows. Rows lead with the brand mark of the current model.
    Right-click opens Pin/Unpin + Rename; renames set a title lock so daemon
    reconciles never clobber them. The collapsed rail keeps the rows as a
    brand-dot icon strip (compose stays as an icon square). New chat opens a
@@ -133,28 +136,22 @@ export default function SessionsRail({
     }
   }, [mediaSessions, onUpdateMedia, renameDraft, renamingId]);
 
-  /* AI sessions and media sessions (kind: "media", local demo rows) share
-     ONE recency ordering; media rows are visually distinct + DEV-badged. */
-  const measuredRecency = (session) => (
-    Object.hasOwn(session || {}, "latest_at_ms")
-      && session.latest_at_ms != null
-      && Number.isFinite(Number(session.latest_at_ms))
-      ? Number(session.latest_at_ms)
-      : Number.NEGATIVE_INFINITY
-  );
-  const sorted = [...sessions, ...mediaSessions].sort(
-    (a, b) => measuredRecency(b) - measuredRecency(a),
-  );
-  /* Rail search narrows both groups by title or the opening user message. */
+  /* Rail search narrows every coordinate domain by title or opening message. */
+  const allSessions = [...sessions, ...mediaSessions];
   const query = searchQuery.trim().toLowerCase();
   const matches = query
-    ? sorted.filter((session) => (
+    ? allSessions.filter((session) => (
       String(session.title || "").toLowerCase().includes(query)
       || String(session.first_user_message || "").toLowerCase().includes(query)
     ))
-    : sorted;
-  const pinned = matches.filter((session) => session.pinned);
-  const recent = matches.filter((session) => !session.pinned);
+    : allSessions;
+  const {
+    ranked,
+    local,
+    unordered,
+  } = partitionSessionsForRail(matches);
+  const pinned = ranked.filter((session) => session.pinned);
+  const recent = ranked.filter((session) => !session.pinned);
 
   /* Parked = the harness says a human is needed: 937's typed card, or 936's
      frozen waiting_why on an older daemon. */
@@ -393,13 +390,25 @@ export default function SessionsRail({
             {recent.map(renderRow)}
           </SessionGroup>
         )}
+        {local.length > 0 && (
+          <TrailingSessionGroup>
+            <SettingsNavGroupLabel>Local</SettingsNavGroupLabel>
+            {local.map(renderRow)}
+          </TrailingSessionGroup>
+        )}
+        {unordered.length > 0 && (
+          <TrailingSessionGroup>
+            <SettingsNavGroupLabel>No activity</SettingsNavGroupLabel>
+            {unordered.map(renderRow)}
+          </TrailingSessionGroup>
+        )}
 
-        {!sorted.length && (
+        {!allSessions.length && (
           <SessionsEmptyHint>
             No sessions yet. Start with New chat.
           </SessionsEmptyHint>
         )}
-        {sorted.length > 0 && !matches.length && (
+        {allSessions.length > 0 && !matches.length && (
           <SessionsEmptyHint>
             No sessions match “{searchQuery.trim()}”.
           </SessionsEmptyHint>
@@ -596,6 +605,12 @@ const SessionGroup = styled.div`
   [data-collapsed="true"] & ${SettingsNavGroupLabel} {
     display: none;
   }
+`;
+
+const TrailingSessionGroup = styled(SessionGroup)`
+  margin-top: 2px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(var(--forge-tint-rgb), 0.1);
 `;
 
 /* Dedicated row: shared rail buttons wrap a three-part row (mark · title ·

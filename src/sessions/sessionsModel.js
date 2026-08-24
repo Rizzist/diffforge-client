@@ -109,6 +109,42 @@ export function sessionWorkingDirectory(session) {
   return session.kind === "generated" ? `${session.dir}/work` : session.dir;
 }
 
+function sessionRailCoordinate(session) {
+  if (!Object.hasOwn(session || {}, "latest_at_ms")
+    || session.latest_at_ms == null
+    || !Number.isFinite(Number(session.latest_at_ms))) {
+    return null;
+  }
+  return Number(session.latest_at_ms);
+}
+
+/* The rail has three coordinate domains, and mixing them would make creation
+   or absence look like harness activity. Harness-ranked rows use only the
+   published activity coordinate. Client-owned rows may use their local
+   coordinate, but stay visibly separate. Bound rows without activity retain
+   input order in an explicitly unordered group. */
+export function partitionSessionsForRail(sessions) {
+  const ranked = [];
+  const local = [];
+  const unordered = [];
+  for (const session of Array.isArray(sessions) ? sessions : []) {
+    const coordinate = sessionRailCoordinate(session);
+    if (!String(session?.provider_session_id || "").trim() && coordinate != null) {
+      local.push(session);
+    } else if (coordinate == null) {
+      unordered.push(session);
+    } else {
+      ranked.push(session);
+    }
+  }
+  const newestFirst = (left, right) => (
+    sessionRailCoordinate(right) - sessionRailCoordinate(left)
+  );
+  ranked.sort(newestFirst);
+  local.sort(newestFirst);
+  return { ranked, local, unordered };
+}
+
 const SESSION_DAY_MS = 24 * 60 * 60 * 1000;
 
 function startOfLocalDay(ms) {
@@ -140,8 +176,9 @@ export function groupSessionsByDay(sessions, nowMs = Date.now()) {
   const groups = [];
   const byKey = new Map();
   for (const session of sessions) {
-    const hasPublishedRecency = Object.hasOwn(session, "latest_at_ms");
-    const stamp = hasPublishedRecency ? session.latest_at_ms : session.created_at_ms;
+    const stamp = Object.hasOwn(session, "latest_at_ms")
+      ? session.latest_at_ms
+      : null;
     const known = stamp != null && Number.isFinite(Number(stamp));
     const key = known ? String(startOfLocalDay(Number(stamp))) : "unknown";
     let group = byKey.get(key);

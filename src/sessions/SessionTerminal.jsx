@@ -133,10 +133,9 @@ export default function SessionTerminal({
       });
     };
 
-    // Recency is DAEMON-owned: reconcile syncs latest_at_ms from the
-    // harness's updated_at. Local touches on open/keystrokes made merely
-    // OPENING a session jump to the top of Recent — bad UX, and redundant
-    // because real activity bumps the daemon clock anyway.
+    // Harness recency is daemon-owned and comes only from last_activity_ms.
+    // Local touches on open/keystrokes must not make merely OPENING a session
+    // jump to the top of Recent; updated_at is row maintenance, not activity.
 
     const applyTerminalTheme = () => {
       if (disposed || !term) {

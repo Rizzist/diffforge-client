@@ -11,6 +11,7 @@ import {
   normalizeSessionRow,
   groupSessionsByDay,
   formatSessionRelativeTime,
+  partitionSessionsForRail,
   sessionWorkingDirectory,
   sessionModelProviderFallback,
 } from "./sessionsModel.js";
@@ -157,6 +158,28 @@ test("daemon recency preserves measured zero and keeps absence unknown", () => {
   assert.notEqual(formatSessionRelativeTime(0, 1_000), "");
   assert.equal(absent.latest_at_ms, null);
   assert.equal(groupSessionsByDay([absent], 3 * 24 * 60 * 60 * 1000)[0].label, "Unknown");
+  assert.equal(
+    groupSessionsByDay([{ created_at_ms: 99 }], 3 * 24 * 60 * 60 * 1000)[0].label,
+    "Unknown",
+  );
+});
+
+test("the rail separates unordered and local sessions from activity-ranked sessions", () => {
+  const groups = partitionSessionsForRail([
+    { id: "ranked-old", provider_session_id: "provider-old", latest_at_ms: 100 },
+    { id: "unordered-first", provider_session_id: "provider-a", created_at_ms: 1, latest_at_ms: null },
+    { id: "local-old", provider_session_id: "", latest_at_ms: 200 },
+    { id: "ranked-new", provider_session_id: "provider-new", latest_at_ms: 300 },
+    { id: "unordered-second", provider_session_id: "provider-b", created_at_ms: 999, latest_at_ms: null },
+    { id: "local-new", provider_session_id: "", latest_at_ms: 400 },
+  ]);
+
+  assert.deepEqual(groups.ranked.map(({ id }) => id), ["ranked-new", "ranked-old"]);
+  assert.deepEqual(groups.local.map(({ id }) => id), ["local-new", "local-old"]);
+  assert.deepEqual(
+    groups.unordered.map(({ id }) => id),
+    ["unordered-first", "unordered-second"],
+  );
 });
 
 test("bound sessions use only the published workspace cwd", () => {
