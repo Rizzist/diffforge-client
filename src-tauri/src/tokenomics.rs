@@ -9465,16 +9465,19 @@ fn tokenomics_upsert_scan_day(
 
 const TOKENOMICS_OPENCODE_SCANNER_VERSION: &str = "opencode-db-cost-v1";
 
+/// `None` when OpenCode did not publish the field at all — the caller decides
+/// what absence means rather than reading it as a measured zero.
+fn tokenomics_opencode_usage_value(value: Option<&Value>, key: &str) -> Option<i64> {
+    value.and_then(|object| object.get(key)).map(|number| {
+        number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|value| value.round() as i64))
+            .unwrap_or(0)
+    })
+}
+
 fn tokenomics_opencode_usage_number(value: Option<&Value>, key: &str) -> i64 {
-    value
-        .and_then(|object| object.get(key))
-        .map(|number| {
-            number
-                .as_i64()
-                .or_else(|| number.as_f64().map(|value| value.round() as i64))
-                .unwrap_or(0)
-        })
-        .unwrap_or(0)
+    tokenomics_opencode_usage_value(value, key).unwrap_or(0)
 }
 
 /// Builds a usage event from one OpenCode assistant message. Unlike the generic
@@ -9496,8 +9499,12 @@ fn tokenomics_opencode_event_from_message(
         + tokenomics_opencode_usage_number(tokens, "reasoning");
     let cache_read_tokens = tokenomics_opencode_usage_number(cache, "read");
     let cache_write_tokens = tokenomics_opencode_usage_number(cache, "write");
-    let total_tokens = tokenomics_opencode_usage_number(tokens, "total")
-        .max(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens);
+    // OpenCode publishes tokens.total and it is the authority. Summing the
+    // components double-counts what OpenCode already folded together, so the
+    // sum stands in only where no total was published — never as a maximum
+    // over one, which silently reports the larger of a fact and an estimate.
+    let total_tokens = tokenomics_opencode_usage_value(tokens, "total")
+        .unwrap_or(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens);
 
     let cost_usd = data.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
     let estimated_cost_microusd = (cost_usd * 1_000_000.0).round().max(0.0) as i64;
@@ -19510,6 +19517,54 @@ mod tokenomics_tests {
 
         tokenomics_rebuild_provider_rollups_from_events(&conn, "openai", "codex").unwrap();
         assert_eq!(scoped_snapshot, tokenomics_test_rollup_snapshot(&conn));
+    }
+
+    #[test]
+    fn opencode_published_total_outranks_the_component_sum() {
+        let account = TokenomicsProviderAccount {
+            key: "opencode-test".to_string(),
+            label: "OpenCode".to_string(),
+        };
+        let scope = tokenomics_unknown_billing_scope();
+
+        // OpenCode folds cache into its own total, so summing the parts counts
+        // it twice. Taking the larger of the two reports the estimate whenever
+        // the estimate is bigger — which is exactly when it is wrong.
+        let published = json!({
+            "tokens": {
+                "input": 40, "output": 10, "reasoning": 0,
+                "cache": {"read": 100, "write": 0}, "total": 100,
+            },
+            "cost": 0.25,
+            "modelID": "claude-sonnet",
+        });
+        let event = tokenomics_opencode_event_from_message(
+            "msg-published",
+            1_000,
+            &published,
+            &account,
+            scope.clone(),
+            "device".to_string(),
+        )
+        .expect("published message yields an event");
+        assert_eq!(event.total_tokens, 100, "the published total is the fact");
+
+        // No total published: the sum is an honest estimate, not a silent zero.
+        let absent = json!({
+            "tokens": {"input": 40, "output": 10, "cache": {"read": 100, "write": 0}},
+            "cost": 0.25,
+            "modelID": "claude-sonnet",
+        });
+        let event = tokenomics_opencode_event_from_message(
+            "msg-absent",
+            1_000,
+            &absent,
+            &account,
+            scope,
+            "device".to_string(),
+        )
+        .expect("estimated message yields an event");
+        assert_eq!(event.total_tokens, 150);
     }
 
     #[test]
