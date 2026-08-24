@@ -54,6 +54,7 @@ const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
 const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
 const FEATURE_ACCOUNT_OAUTH_DEVICE_V1: &str = "account_oauth_device_v1";
 const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
+const FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1: &str = "account_oauth_import_sources_v1";
 const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
 const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
@@ -744,6 +745,8 @@ enum RequestBody {
     },
     #[serde(rename = "account.oauth_import")]
     AccountOauthImport { command_id: String, source: String },
+    #[serde(rename = "account.oauth_import_sources")]
+    AccountOauthImportSources,
     #[serde(rename = "account.device_candidates")]
     AccountDeviceCandidates {},
     #[serde(rename = "account.import_device")]
@@ -937,6 +940,8 @@ enum ResponseBody {
     AccountAdd { descriptor: Value },
     #[serde(rename = "account.oauth_import")]
     AccountOauthImport { descriptor: Value, revision: u64 },
+    #[serde(rename = "account.oauth_import_sources")]
+    AccountOauthImportSources { sources: Vec<Value> },
     #[serde(rename = "account.device_candidates")]
     AccountDeviceCandidates {
         discovery_disabled: bool,
@@ -2403,9 +2408,60 @@ pub async fn account_oauth_add(
     }
 }
 
+/// The daemon owns the import catalog (`account_oauth_import_sources_v1`).
+/// Rows cross verbatim — source, provider, default_alias, available, and the
+/// daemon's own unavailable_reason prose — because re-modelling them here is
+/// how the hardcoded triple below drifted a whole source behind the harness.
+///
+/// `None` means this daemon does not publish a catalog, which is not the same
+/// answer as a catalog that lists nothing; only the caller can decide what to
+/// do about the first.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_oauth_import_sources() -> Result<Option<Vec<Value>>, String> {
+    #[cfg(unix)]
+    {
+        match rpc_request_with_feature_gate(
+            RequestBody::AccountOauthImportSources,
+            Capability::View,
+            account_feature_gate(&[FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1]),
+            true,
+        )
+        .await
+        {
+            Some(Ok(ResponseBody::AccountOauthImportSources { sources })) => Ok(Some(sources)),
+            Some(Ok(_)) => Err("account.oauth_import_sources response method mismatch".to_string()),
+            Some(Err(error)) => Err(account_error(error)),
+            None => Ok(None),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
+    }
+}
+
+/// Sources this client shipped knowing about, used only against a daemon that
+/// predates the published catalog. It is a floor for old daemons, never the
+/// answer when the daemon has one — grok-cli existed here for a release while
+/// this list said it did not.
+const HAIDER_LEGACY_IMPORT_SOURCES: &[&str] = &["codex", "claude-code", "kimi-code"];
+
+/// A published catalog is the whole answer: every source in it is importable
+/// and nothing outside it is. The shipped list applies only where no catalog
+/// was published at all.
+fn haider_import_source_is_known(published: Option<&[Value]>, source: &str) -> bool {
+    match published {
+        Some(sources) => sources
+            .iter()
+            .any(|entry| entry.get("source").and_then(Value::as_str) == Some(source)),
+        None => HAIDER_LEGACY_IMPORT_SOURCES.contains(&source),
+    }
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn account_oauth_import(source: String) -> Result<AccountImportResult, String> {
-    if !matches!(source.as_str(), "codex" | "claude-code" | "kimi-code") {
+    let published = account_oauth_import_sources().await.unwrap_or(None);
+    if !haider_import_source_is_known(published.as_deref(), source.as_str()) {
         return Err("invalid_argument".to_string());
     }
     #[cfg(unix)]
@@ -6068,6 +6124,14 @@ mod tests {
 
         assert_eq!(
             encoded(WireFrame::Request {
+                request_id: "req-import-sources".to_owned(),
+                body: RequestBody::AccountOauthImportSources,
+            }),
+            r#"{"v":1,"kind":"request","request_id":"req-import-sources","body":{"method":"account.oauth_import_sources"}}"#
+        );
+
+        assert_eq!(
+            encoded(WireFrame::Request {
                 request_id: "req-login-api".to_owned(),
                 body: RequestBody::AccountLoginApi {
                     command_id: "command-login-api".to_owned(),
@@ -7001,6 +7065,28 @@ mod tests {
             config_provider_feature_gate(),
             [FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1]
         );
+    }
+
+    #[test]
+    fn a_published_catalog_replaces_the_shipped_import_list() {
+        // The shipped list is a floor for daemons predating the catalog, and
+        // it is exactly how grok-cli stayed unimportable for a release.
+        let published = vec![
+            serde_json::json!({"source": "codex", "available": true}),
+            serde_json::json!({"source": "grok-cli", "available": false}),
+        ];
+        assert!(haider_import_source_is_known(
+            Some(&published),
+            "grok-cli"
+        ));
+        assert!(
+            !haider_import_source_is_known(Some(&published), "kimi-code"),
+            "a published catalog is the whole answer, not an addition to ours"
+        );
+
+        // No catalog published: fall back to what this build shipped knowing.
+        assert!(haider_import_source_is_known(None, "kimi-code"));
+        assert!(!haider_import_source_is_known(None, "grok-cli"));
     }
 
     #[tokio::test]

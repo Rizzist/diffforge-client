@@ -6277,6 +6277,7 @@ fn run_app(daemon: bool) {
             haider_rpc_ade::account_oauth_cancel,
             haider_rpc_ade::account_oauth_add,
             haider_rpc_ade::account_oauth_import,
+            haider_rpc_ade::account_oauth_import_sources,
             haider_rpc_ade::account_device_candidates,
             haider_rpc_ade::account_import_device,
             haider_rpc_ade::account_set_active,

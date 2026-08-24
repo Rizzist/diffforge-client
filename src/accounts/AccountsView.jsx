@@ -24,11 +24,40 @@ const LIST_POLL_MS = 5000;
 const LABEL_MAX = 64;
 const OAUTH_POLL_MS = 1500;
 
-const IMPORT_SOURCES = [
-  { source: "codex", label: "Codex CLI" },
-  { source: "claude-code", label: "Claude Code" },
-  { source: "kimi-code", label: "Kimi Code" },
+/* Sources this build shipped knowing about. The daemon owns the real catalog
+   (account_oauth_import_sources_v1); this list is the floor for daemons that
+   predate it, and it is exactly how grok-cli went a release with no import
+   path at all while these three looked complete. */
+const LEGACY_IMPORT_SOURCES = [
+  { source: "codex", available: true },
+  { source: "claude-code", available: true },
+  { source: "kimi-code", available: true },
 ];
+
+/* Display spelling only — the catalog decides what exists, this decides how a
+   known name is capitalized, and anything new still renders readably. */
+const IMPORT_SOURCE_LABELS = {
+  codex: "Codex CLI",
+  "claude-code": "Claude Code",
+  "kimi-code": "Kimi Code",
+  "grok-cli": "Grok CLI",
+};
+
+function importSourceLabel(source) {
+  const known = IMPORT_SOURCE_LABELS[source];
+  if (known) {
+    return known;
+  }
+  return String(source || "")
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((word) => (
+      word.toLowerCase() === "cli"
+        ? "CLI"
+        : word.charAt(0).toUpperCase() + word.slice(1)
+    ))
+    .join(" ");
+}
 
 const STATUS_LABELS = {
   ok: "ok",
@@ -291,6 +320,9 @@ export default function AccountsView({ active = false }) {
   const [confirmEpoch, setConfirmEpoch] = useState("");
   const [candidates, setCandidates] = useState(null); // {discovery_disabled, candidates}
   const [library, setLibrary] = useState(null);
+  /* null until asked. A daemon that publishes no catalog leaves the shipped
+     floor in place; one that publishes a catalog replaces it outright. */
+  const [importSources, setImportSources] = useState(null);
   const oauthFlowRef = useRef(null);
   oauthFlowRef.current = oauthFlow;
 
@@ -308,6 +340,9 @@ export default function AccountsView({ active = false }) {
     if (!active) return undefined;
     void refresh();
     void invoke("haider_library_snapshot").then(setLibrary).catch(() => {});
+    void invoke("account_oauth_import_sources")
+      .then((sources) => setImportSources(Array.isArray(sources) ? sources : null))
+      .catch(() => setImportSources(null));
     const timer = window.setInterval(() => void refresh(), LIST_POLL_MS);
     return () => window.clearInterval(timer);
   }, [active, refresh]);
@@ -708,17 +743,27 @@ export default function AccountsView({ active = false }) {
           <Add aria-hidden="true" />
           API key
         </GhostButton>
-        {IMPORT_SOURCES.map((entry) => (
-          <GhostButton
-            disabled={busy === `import:${entry.source}`}
-            key={entry.source}
-            onClick={() => importSource(entry.source)}
-            title={`Import the ${entry.label} login from this machine`}
-            type="button"
-          >
-            Import {entry.label}
-          </GhostButton>
-        ))}
+        {(importSources || LEGACY_IMPORT_SOURCES).map((entry) => {
+          const label = importSourceLabel(entry.source);
+          /* available is point-in-time, so an unavailable source is shown and
+             disabled rather than hidden — with the daemon's own sentence for
+             why, which is the whole reason it sends one. */
+          const available = entry.available !== false;
+          const reason = entry.unavailable_reason?.message;
+          return (
+            <GhostButton
+              disabled={busy === `import:${entry.source}` || !available}
+              key={entry.source}
+              onClick={() => importSource(entry.source)}
+              title={available
+                ? `Import the ${label} login from this machine`
+                : reason || `No ${label} login is available on this machine`}
+              type="button"
+            >
+              Import {label}
+            </GhostButton>
+          );
+        })}
         <GhostButton
           disabled={busy === "scan"}
           onClick={() => void scanDevice()}
