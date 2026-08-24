@@ -6820,7 +6820,7 @@ mod haider_projection_tests {
                 "CREATE TABLE session_projection_schema (
                     singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL
                  );
-                 INSERT INTO session_projection_schema VALUES (1, 1);
+                 INSERT INTO session_projection_schema VALUES (1, 7);
                  CREATE TABLE session_projection_rows (
                     session_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL,
                     role TEXT NOT NULL, text TEXT NOT NULL, meta TEXT NOT NULL,

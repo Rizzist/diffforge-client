@@ -30,6 +30,7 @@ import {
   mergeProviderLimitRowsForDisplay,
   mergeProviderLimits,
   mergeProviderLimitSamples,
+  parseLimitTimestamp,
   projectProviderLimitForDisplay,
   providerLimitKey,
   providerLimitSampleKey,
@@ -1208,26 +1209,6 @@ function limitNumberOrNull(...values) {
     if (Number.isFinite(number)) return number;
   }
   return null;
-}
-
-function parseLimitTimestamp(value) {
-  if (value == null || value === "") return null;
-  const text = String(value).trim();
-  if (/^resets\s+/i.test(text) && !/^resets\s+in\b/i.test(text)) {
-    return parseLimitTimestamp(text.replace(/^resets\s+/i, ""));
-  }
-  if (text.startsWith("unix:")) {
-    const unixSeconds = Number(text.slice(5));
-    if (Number.isFinite(unixSeconds) && unixSeconds > 0) {
-      return new Date(unixSeconds * 1000);
-    }
-  }
-  const number = Number(value);
-  if (Number.isFinite(number) && number > 0) {
-    return new Date(number < 1_000_000_000_000 ? number * 1000 : number);
-  }
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function limitTimestampMs(row = {}) {

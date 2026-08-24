@@ -9,7 +9,7 @@ function limitNumberOrNull(...values) {
   return null;
 }
 
-function parseLimitTimestamp(value) {
+export function parseLimitTimestamp(value) {
   if (value == null || value === "") return null;
   const text = String(value).trim();
   if (/^resets\s+/i.test(text) && !/^resets\s+in\b/i.test(text)) {
@@ -17,13 +17,15 @@ function parseLimitTimestamp(value) {
   }
   if (text.startsWith("unix:")) {
     const unixSeconds = Number(text.slice(5));
-    if (Number.isFinite(unixSeconds) && unixSeconds > 0) {
-      return new Date(unixSeconds * 1000);
-    }
+    return Number.isFinite(unixSeconds) && unixSeconds >= 0
+      ? new Date(unixSeconds * 1000)
+      : null;
   }
   const number = Number(value);
-  if (Number.isFinite(number) && number > 0) {
-    return new Date(number < 1_000_000_000_000 ? number * 1000 : number);
+  if (Number.isFinite(number)) {
+    return number >= 0
+      ? new Date(number < 1_000_000_000_000 ? number * 1000 : number)
+      : null;
   }
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;

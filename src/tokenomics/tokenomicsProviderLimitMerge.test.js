@@ -164,6 +164,25 @@ test("an expired Claude window stays unknown until the authority refreshes", () 
   assert.equal(projected.status_label, "Usage unknown until the provider publishes the next window");
 });
 
+test("a published Unix-epoch reset renders as an expired unknown window", () => {
+  const [projected] = mergeProviderLimitRowsForDisplay([{
+    ...knownClaudeSession,
+    used_percent: 0,
+    remaining_percent: 100,
+    display_percent: 100,
+    display_percent_kind: "remaining",
+    reset_at: "unix:0",
+  }]).map((row) => projectProviderLimitForDisplay(row, 1_100_000));
+
+  assert.equal(projected.used_percent, null);
+  assert.equal(projected.remaining_percent, null);
+  assert.equal(projected.display_percent, null);
+  assert.equal(projected.reset_after_seconds, 0);
+  assert.equal(projected.client_reset_pending, true);
+  assert.equal(projected.reset_label, "Provider window ended; awaiting daemon refresh");
+  assert.equal(projected.status_label, "Usage unknown until the provider publishes the next window");
+});
+
 test("an expired used-kind window does not fabricate zero used", () => {
   const projected = projectProviderLimitForDisplay({
     ...knownClaudeSession,

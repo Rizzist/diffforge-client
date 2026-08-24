@@ -1899,7 +1899,16 @@ fn tokenomics_ingest_daemon_counters(
             };
             for counter in counters {
                 let previous = tokenomics_counter_previous(transaction, &counter.counter_key)?;
-                let delta = tokenomics_counter_delta(counter, previous.as_ref());
+                // A missing per-counter baseline is absence, not a published
+                // zero. Once any daemon baseline or retained history exists,
+                // seed a newly observed account/model at its current lifetime
+                // value instead of importing that lifetime value as new usage.
+                let seed_counter = previous.is_none() && (baseline_exists || existing_history != 0);
+                let delta = if seed_counter {
+                    None
+                } else {
+                    tokenomics_counter_delta(counter, previous.as_ref())
+                };
                 if previous.is_some() && delta.is_none() {
                     result.counter_resets += 1;
                 }
@@ -13029,6 +13038,72 @@ mod tokenomics_tests {
         assert_eq!(ingest.inserted_events, 0);
         assert_eq!(after_events, before_events);
         assert_eq!(after_total, before_total);
+    }
+
+    #[test]
+    fn late_daemon_counter_seeds_without_importing_lifetime_usage() {
+        let _storage = process_test_storage_isolation(stringify!(
+            late_daemon_counter_seeds_without_importing_lifetime_usage
+        ));
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let existing = tokenomics_test_event(
+            "retained-history",
+            "legacy.jsonl",
+            1_700_000_000,
+            Some("anthropic:claude:retained"),
+            50,
+        );
+        assert!(tokenomics_insert_event(&conn, &existing).unwrap());
+        tokenomics_rebuild_provider_rollups_from_events(&conn, "anthropic", "claude").unwrap();
+
+        let first_counter = TokenomicsDaemonCounter {
+            counter_key: "daemon-first-baseline".to_string(),
+            device_id: "device-test".to_string(),
+            provider: "openai".to_string(),
+            agent_kind: "codex".to_string(),
+            provider_account_key: "openai:codex:haider:first".to_string(),
+            provider_account_label: Some("first".to_string()),
+            model: Some("gpt-5".to_string()),
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            generated_at_ms: 1_800_000,
+            ..TokenomicsDaemonCounter::default()
+        };
+        let first_ingest =
+            tokenomics_ingest_daemon_counters(&mut conn, &[first_counter]).unwrap();
+        assert_eq!(first_ingest.inserted_events, 0);
+
+        let late_counter = TokenomicsDaemonCounter {
+            counter_key: "daemon-late-baseline".to_string(),
+            device_id: "device-test".to_string(),
+            provider: "openai".to_string(),
+            agent_kind: "codex".to_string(),
+            provider_account_key: "openai:codex:haider:late".to_string(),
+            provider_account_label: Some("late".to_string()),
+            model: Some("gpt-5-new".to_string()),
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            generated_at_ms: 1_900_000,
+            ..TokenomicsDaemonCounter::default()
+        };
+        let late_ingest =
+            tokenomics_ingest_daemon_counters(&mut conn, &[late_counter]).unwrap();
+        let stored_total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(total_tokens), 0) FROM tokenomics_rollups",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            late_ingest.inserted_events, 0,
+            "a never-baselined counter must seed instead of importing its lifetime total"
+        );
+        assert_eq!(stored_total, 50, "late counter seeding must preserve retained history");
     }
 
     #[test]
