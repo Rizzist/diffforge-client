@@ -1370,6 +1370,14 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
 }
 
 fn cloud_mcp_background_sync_ensure_started(state: &CloudMcpState) {
+    #[cfg(test)]
+    if process_test_env_isolation_active() {
+        // Env-isolated tests own temporary cache/data roots only for their
+        // lexical guard lifetime. A detached drain could resolve those roots
+        // after restoration and write into another test's store, so isolated
+        // tests exercise durable enqueueing without starting the daemon loop.
+        return;
+    }
     if state.background_sync.started.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -1427,6 +1435,9 @@ fn cloud_mcp_home_dir() -> Option<PathBuf> {
 }
 
 fn cloud_mcp_native_cache_root() -> Option<PathBuf> {
+    #[cfg(test)]
+    assert_process_test_storage_isolation("cache");
+
     if let Some(path) = cloud_mcp_env_path(CLOUD_MCP_LOCAL_CACHE_DIR_ENV) {
         return Some(path);
     }
@@ -1461,6 +1472,9 @@ fn cloud_mcp_native_cache_root() -> Option<PathBuf> {
 }
 
 fn cloud_mcp_native_data_root() -> Option<PathBuf> {
+    #[cfg(test)]
+    assert_process_test_storage_isolation("data");
+
     if let Some(path) = cloud_mcp_env_path(CLOUD_MCP_LOCAL_DATA_DIR_ENV) {
         return Some(path);
     }
@@ -1503,6 +1517,11 @@ fn cloud_mcp_local_cache_file_path(filename: &str) -> Option<PathBuf> {
 }
 
 fn cloud_mcp_local_data_file_path(filename: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = process_test_protected_email_storage_path(filename) {
+        return Some(path);
+    }
+
     Some(cloud_mcp_native_data_root()?.join(filename))
 }
 
@@ -23147,11 +23166,9 @@ fn cloud_mcp_remote_workspace_catalog_with_configured_layout(
         let Some(workspace_id) = cloud_mcp_payload_text(workspace, &["workspace_id", "id"]) else {
             continue;
         };
-        let workspace_name = cloud_mcp_payload_text(
-            workspace,
-            &["name", "workspace_name", "workspaceName"],
-        )
-        .unwrap_or_else(|| workspace_id.clone());
+        let workspace_name =
+            cloud_mcp_payload_text(workspace, &["name", "workspace_name", "workspaceName"])
+                .unwrap_or_else(|| workspace_id.clone());
         let Some(settings) = workspace_settings
             .get(&workspace_id)
             .and_then(Value::as_object)
@@ -23361,8 +23378,7 @@ fn cloud_mcp_remote_workspace_mark_explicit_panel_clear(
     workspace_id: &str,
 ) {
     let Some(workspace) = workspaces.iter_mut().find(|workspace| {
-        cloud_mcp_payload_text(workspace, &["workspace_id", "id"]).as_deref()
-            == Some(workspace_id)
+        cloud_mcp_payload_text(workspace, &["workspace_id", "id"]).as_deref() == Some(workspace_id)
     }) else {
         return;
     };
@@ -24348,8 +24364,7 @@ fn cloud_mcp_remote_workspace_find_catalog_index(
     workspace_id: &str,
 ) -> Option<usize> {
     catalog.iter().position(|workspace| {
-        cloud_mcp_payload_text(workspace, &["workspace_id", "id"]).as_deref()
-            == Some(workspace_id)
+        cloud_mcp_payload_text(workspace, &["workspace_id", "id"]).as_deref() == Some(workspace_id)
     })
 }
 
@@ -26642,6 +26657,9 @@ mod cloud_mcp_agent_model_catalog_tests {
 
     #[test]
     fn list_agent_models_detector_accepts_cloud_event_wrapped_event_kind() {
+        let _storage = process_test_storage_isolation(
+            "list_agent_models_detector_accepts_cloud_event_wrapped_event_kind",
+        );
         let message = json!({
             "kind": "cloud_event",
             "event": {
@@ -26674,6 +26692,9 @@ mod cloud_mcp_agent_model_catalog_tests {
 
     #[test]
     fn list_agent_models_detector_accepts_cloud_event_wrapped_command_kind() {
+        let _storage = process_test_storage_isolation(
+            "list_agent_models_detector_accepts_cloud_event_wrapped_command_kind",
+        );
         let message = json!({
             "kind": "cloud_event",
             "event": {
@@ -26693,6 +26714,9 @@ mod cloud_mcp_agent_model_catalog_tests {
 
     #[test]
     fn list_agent_models_detector_ignores_unrelated_nested_lifecycle_kind() {
+        let _storage = process_test_storage_isolation(
+            "list_agent_models_detector_ignores_unrelated_nested_lifecycle_kind",
+        );
         let message = json!({
             "kind": "workspace_lifecycle",
             "payload": {
@@ -26710,6 +26734,9 @@ mod cloud_mcp_agent_model_catalog_tests {
 
     #[test]
     fn list_agent_models_detector_ignores_unrelated_nested_settings_kind() {
+        let _storage = process_test_storage_isolation(
+            "list_agent_models_detector_ignores_unrelated_nested_settings_kind",
+        );
         let message = json!({
             "kind": "workspace_settings_update",
             "request": {
@@ -26727,6 +26754,9 @@ mod cloud_mcp_agent_model_catalog_tests {
 
     #[test]
     fn list_agent_models_detector_ignores_unrelated_nested_terminal_kind() {
+        let _storage = process_test_storage_isolation(
+            "list_agent_models_detector_ignores_unrelated_nested_terminal_kind",
+        );
         let message = json!({
             "kind": "terminal_open",
             "payload": {
@@ -28199,7 +28229,6 @@ fn cloud_mcp_apply_remote_terminal_interrupt_lever(
     });
     true
 }
-
 
 /// Daemon-native terminal restart/relaunch. Closes the live instance (after
 /// Headless actuation for the surviving terminal-close levers. Workspace-
@@ -40248,7 +40277,6 @@ fn cloud_mcp_prompt_summary(prompt: &str) -> String {
         .collect()
 }
 
-
 fn cloud_mcp_work_title_from_brief(brief: &str) -> String {
     let mut title = brief.trim().to_string();
     for prefix in ["I'll ", "I’ll ", "I will ", "I'm ", "I’m ", "I am "] {
@@ -42319,7 +42347,6 @@ pub(crate) fn cloud_mcp_clean_terminal_state_text(text: &str) -> String {
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-
 pub(crate) fn cloud_mcp_agent_uses_activity_hooks(agent_id: &str) -> bool {
     // These providers publish structured lifecycle hooks. The predicate still
     // selects their initial runtime and hook-driven prompt/activity handling.
@@ -42328,7 +42355,6 @@ pub(crate) fn cloud_mcp_agent_uses_activity_hooks(agent_id: &str) -> bool {
         "claude" | "codex" | "opencode"
     )
 }
-
 
 async fn cloud_mcp_record_direct_prompt_todo_dispatch_status(
     state: &CloudMcpState,
@@ -47130,16 +47156,9 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         None
     } else {
         let snapshots = state.runtime_snapshots.lock().await;
-        snapshots
-            .workspace_terminals
-            .as_ref()
-            .and_then(|snapshot| {
-                cloud_mcp_terminal_snapshot_launch_epoch(
-                    snapshot,
-                    terminal_id,
-                    payload.instance_id,
-                )
-            })
+        snapshots.workspace_terminals.as_ref().and_then(|snapshot| {
+            cloud_mcp_terminal_snapshot_launch_epoch(snapshot, terminal_id, payload.instance_id)
+        })
     };
     let launch_epoch = context_entry
         .as_ref()
@@ -64086,7 +64105,9 @@ pub fn run_cloud_mcp_stdio_proxy(args: Vec<String>) -> Result<(), String> {
 mod cloud_mcp_tests {
     use super::*;
 
-    static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    fn isolated_cloud_mcp_test_storage(label: &str) -> ProcessTestStorageIsolationGuard {
+        process_test_storage_isolation(label)
+    }
 
     #[test]
     fn websocket_reconnect_parks_desktop_but_retries_daemon_indefinitely() {
@@ -64442,6 +64463,9 @@ mod cloud_mcp_tests {
     /// payload instead of re-seeding the freshly cleared snapshot.
     #[tokio::test]
     async fn stale_epoch_snapshot_commit_is_dropped_inside_the_critical_section() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "stale_epoch_snapshot_commit_is_dropped_inside_the_critical_section",
+        );
         let state = CloudMcpState::new();
         let captured_epoch = state.account_epoch.load(Ordering::SeqCst);
         let stale_snapshot = json!({
@@ -64505,10 +64529,7 @@ mod cloud_mcp_tests {
     /// token changed (account switch) or cleared (sign-out).
     #[test]
     fn stale_jwt_mint_never_commits_into_process_auth_cache() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = process_test_env_lock();
         let original = cloud_mcp_process_auth_cache()
             .lock()
             .map(|cache| {
@@ -64765,10 +64786,10 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn remote_command_listener_answers_headless_workspace_directory_browse() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "remote_command_listener_answers_headless_workspace_directory_browse",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-remote-workspace-browse-data");
         let cache_root = test_cloud_root("diffforge-remote-workspace-browse-cache");
         fs::create_dir_all(data_root.join("child-directory")).unwrap();
@@ -65086,6 +65107,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_journal_advances_headless_and_replay_offsets_together() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_journal_advances_headless_and_replay_offsets_together",
+        );
         let state = CloudMcpState::new();
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
         cloud_mcp_publish_terminal_output_delta(
@@ -65110,6 +65134,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_output_delta_emits_to_aliased_subscribed_stream_key() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_output_delta_emits_to_aliased_subscribed_stream_key",
+        );
         let state = CloudMcpState::new();
         let mut rx = termio_test_install_ws(&state);
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
@@ -65164,6 +65191,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_attach_dedupes_origin_across_alias_stream_keys_before_output() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_attach_dedupes_origin_across_alias_stream_keys_before_output",
+        );
         let state = CloudMcpState::new();
         let mut rx = termio_test_install_ws(&state);
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
@@ -65221,8 +65251,12 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_attach_retargets_stale_stream_key_to_newer_instance() {
-        let stale_stream_key =
-            cloud_mcp_terminal_output_stream_key("viewer-device", "workspace-rebind", "pane-rebind", 81);
+        let stale_stream_key = cloud_mcp_terminal_output_stream_key(
+            "viewer-device",
+            "workspace-rebind",
+            "pane-rebind",
+            81,
+        );
         let target = cloud_mcp_terminal_io_target(&stale_stream_key).expect("target parses");
 
         let rebound = cloud_mcp_terminal_io_retarget_newer_instance(&target, 82)
@@ -65360,7 +65394,11 @@ mod cloud_mcp_tests {
                 )
             );
 
-            let removed = terminals.write().await.remove("pane-current-target").unwrap();
+            let removed = terminals
+                .write()
+                .await
+                .remove("pane-current-target")
+                .unwrap();
             assert!(
                 cloud_mcp_terminal_io_current_attach_target(&terminal_state, &stale_target)
                     .await
@@ -65668,6 +65706,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_binary_publisher_gates_on_capability_and_interleaves_coherently() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_binary_publisher_gates_on_capability_and_interleaves_coherently",
+        );
         let state = CloudMcpState::new();
         let mut rx = termio_test_install_ws(&state);
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
@@ -65771,6 +65812,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_binary_flow_resume_and_skip_forward_emit_binary_frames() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_binary_flow_resume_and_skip_forward_emit_binary_frames",
+        );
         let state = CloudMcpState::new();
         let mut rx = termio_test_install_ws(&state);
         termio_test_set_binary(&state, true);
@@ -65884,6 +65928,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_output_ack_state_is_monotonic_gated_and_cleaned_up() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_output_ack_state_is_monotonic_gated_and_cleaned_up",
+        );
         let state = CloudMcpState::new();
         let stream_a = "device:workspace:pane:81";
         let stream_b = "device:workspace:pane:82";
@@ -66136,6 +66183,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_flow_publisher_pauses_then_ack_resume_replays_missing_range() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_flow_publisher_pauses_then_ack_resume_replays_missing_range",
+        );
         let state = CloudMcpState::new();
         let mut rx = termio_test_install_ws(&state);
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
@@ -66292,6 +66342,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_flow_resume_skips_forward_with_snapshot_when_tail_cannot_cover() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_flow_resume_skips_forward_with_snapshot_when_tail_cannot_cover",
+        );
         let state = CloudMcpState::new();
         let mut rx = termio_test_install_ws(&state);
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
@@ -66361,6 +66414,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_flow_resume_bounds_backlog_with_skip_forward_snapshot() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_flow_resume_bounds_backlog_with_skip_forward_snapshot",
+        );
         let state = CloudMcpState::new();
         let mut rx = termio_test_install_ws(&state);
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
@@ -66519,6 +66575,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn termio_flow_ack_is_invisible_until_the_send_lock_is_held() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_flow_ack_is_invisible_until_the_send_lock_is_held",
+        );
         let state = CloudMcpState::new();
         let (tx, mut rx) = mpsc::unbounded_channel::<CloudMcpTermioOutbound>();
         {
@@ -66628,6 +66687,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_flow_resume_does_not_advance_emitted_on_failed_enqueue() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_flow_resume_does_not_advance_emitted_on_failed_enqueue",
+        );
         let state = CloudMcpState::new();
         // A sender whose receiver is already gone: every enqueue fails, as
         // with a websocket torn down between reconnects.
@@ -66755,6 +66817,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_flow_resume_partial_replay_failure_never_advances_emitted() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_flow_resume_partial_replay_failure_never_advances_emitted",
+        );
         let state = CloudMcpState::new();
         let mut rx = termio_test_install_ws(&state);
         let output = Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::new(24, 80)));
@@ -66863,10 +66928,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_flow_ack_state_follows_lease_reap_and_terminal_close() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_flow_ack_state_follows_lease_reap_and_terminal_close",
+        );
+        let _guard = process_test_env_lock();
         let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
@@ -66999,6 +67064,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_control_is_terminal_wide_across_alias_stream_keys() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_control_is_terminal_wide_across_alias_stream_keys",
+        );
         let state = CloudMcpState::new();
         let workspace_id = "workspace-control-alias";
         let pane_id = "pane-control-alias";
@@ -67115,10 +67183,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn terminal_remote_presence_ignores_unknown_origin() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage =
+            isolated_cloud_mcp_test_storage("terminal_remote_presence_ignores_unknown_origin");
+        let _guard = process_test_env_lock();
         let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
@@ -67165,10 +67232,10 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn terminal_remote_presence_emits_normalized_workspace_key() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "terminal_remote_presence_emits_normalized_workspace_key",
+        );
+        let _guard = process_test_env_lock();
         let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
@@ -67208,10 +67275,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn terminal_remote_presence_reaper_drops_stale_origins() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage =
+            isolated_cloud_mcp_test_storage("terminal_remote_presence_reaper_drops_stale_origins");
+        let _guard = process_test_env_lock();
         let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
@@ -67273,10 +67339,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_stale_reap_collects_expired_stream_origin_pairs() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = process_test_env_lock();
         let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let now_ms = cloud_mcp_now_ms();
@@ -67357,10 +67420,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn terminal_remote_presence_reaper_tracks_earliest_deadline_not_double_ttl() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = process_test_env_lock();
         let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let stream_key = "device:workspace:pane:41".to_string();
@@ -67457,10 +67517,10 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn terminal_remote_presence_reaper_task_reaps_overdue_lease_promptly() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "terminal_remote_presence_reaper_task_reaps_overdue_lease_promptly",
+        );
+        let _guard = process_test_env_lock();
         let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let stream_key = "device:workspace:pane:61".to_string();
@@ -67833,10 +67893,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn terminal_remote_presence_close_cleanup_clears_pane_identity() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "terminal_remote_presence_close_cleanup_clears_pane_identity",
+        );
+        let _guard = process_test_env_lock();
         let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
@@ -68056,6 +68116,15 @@ mod cloud_mcp_tests {
     /// the new account context.
     #[tokio::test]
     async fn ready_frame_from_socket_born_under_older_account_epoch_is_rejected() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "ready_frame_from_socket_born_under_older_account_epoch_is_rejected",
+        );
+        // The current-epoch leg reaches the todo mirror, whose location is
+        // selected from process-global test environment variables.
+        let _guard = process_test_env_lock();
+        let cache_root = test_cloud_root("diffforge-stale-account-epoch-cache");
+        fs::create_dir_all(&cache_root).unwrap();
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
         let state = CloudMcpState::new();
         let termio_binary = Arc::new(AtomicBool::new(false));
         let ready_frame = json!({
@@ -68260,6 +68329,8 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn client_action_ack_emits_exact_app_ws_contract() {
+        let _storage =
+            isolated_cloud_mcp_test_storage("client_action_ack_emits_exact_app_ws_contract");
         let (state, mut rx) = workspace_consistency_connected_state().await;
         let send_state = state.clone();
         let send = tokio::spawn(async move {
@@ -68292,6 +68363,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn remote_todo_delete_emits_failed_ack_with_same_client_action_id() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "remote_todo_delete_emits_failed_ack_with_same_client_action_id",
+        );
         let (state, mut rx) = workspace_consistency_connected_state().await;
         let ack_state = state.clone();
         let ack = tokio::spawn(async move {
@@ -68609,6 +68683,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn termio_attach_with_cloud_routed_identity_reaches_runtime_gate() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "termio_attach_with_cloud_routed_identity_reaches_runtime_gate",
+        );
         let state = CloudMcpState::new();
         let mut rx = termio_test_install_ws(&state);
         let local_device_id = cloud_mcp_desktop_device_profile()["device_id"]
@@ -68642,6 +68719,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn remote_command_receive_gate_accepts_canonical_and_cloud_routed_device_aliases() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "remote_command_receive_gate_accepts_canonical_and_cloud_routed_device_aliases",
+        );
         let local_device_id = cloud_mcp_desktop_device_profile()["device_id"]
             .as_str()
             .expect("local desktop device id")
@@ -69277,6 +69357,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_git_deleted_sql_patch_ignores_hunk_comment_headers() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_turn_git_deleted_sql_patch_ignores_hunk_comment_headers",
+        );
         let patches = cloud_mcp_agent_chat_turn_git_patch_map(
             "diff --git a/db/schema.sql b/db/schema.sql\n\
              deleted file mode 100644\n\
@@ -69350,6 +69433,8 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn terminal_state_live_update_preserves_prompt_options() {
+        let _storage =
+            isolated_cloud_mcp_test_storage("terminal_state_live_update_preserves_prompt_options");
         let state = CloudMcpState::new();
         let payload = json!({
             "event_kind": "terminal_state_update",
@@ -69402,6 +69487,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn terminal_state_cache_rejects_late_lower_sequence_open_cohorts() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "terminal_state_cache_rejects_late_lower_sequence_open_cohorts",
+        );
         let state = CloudMcpState::new();
         let runtime = json!({
             "workspace_id": "workspace-a",
@@ -69825,6 +69913,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn late_terminal_close_is_exact_no_phantom_and_preserves_workspace_state() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "late_terminal_close_is_exact_no_phantom_and_preserves_workspace_state",
+        );
         let state = CloudMcpState::new();
         {
             let mut snapshots = state.runtime_snapshots.lock().await;
@@ -69939,6 +70030,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn device_live_cache_rejects_retired_instance_delta_after_reopen() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "device_live_cache_rejects_retired_instance_delta_after_reopen",
+        );
         let state = CloudMcpState::new();
         {
             let mut snapshots = state.runtime_snapshots.lock().await;
@@ -70043,6 +70137,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn terminal_state_live_update_projects_prompting_paused_and_idle_statuses() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "terminal_state_live_update_projects_prompting_paused_and_idle_statuses",
+        );
         let state = CloudMcpState::new();
 
         for payload in [
@@ -70124,6 +70221,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn terminal_orchestrator_is_included_losslessly_in_full_device_snapshot() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "terminal_orchestrator_is_included_losslessly_in_full_device_snapshot",
+        );
         let state = CloudMcpState::new();
         let payload = json!({
             "event_kind": "device_terminal_orchestrator_update",
@@ -70164,6 +70264,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn terminal_orchestrator_full_snapshot_uses_stable_pane_terminal_id() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "terminal_orchestrator_full_snapshot_uses_stable_pane_terminal_id",
+        );
         let state = CloudMcpState::new();
         {
             let mut snapshots = state.runtime_snapshots.lock().await;
@@ -70205,10 +70308,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_permission_config_record_enqueues_session_sync_delta() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_permission_config_record_enqueues_session_sync_delta",
+        );
+        let _guard = process_test_env_lock();
         let cache_root = test_cloud_root("diffforge-permission-config-cache");
         let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
 
@@ -70267,10 +70370,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_git_capture_maps_fixture_changes_without_real_index_mutation() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_turn_git_capture_maps_fixture_changes_without_real_index_mutation",
+        );
+        let _guard = process_test_env_lock();
         cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
         let root = cloud_mcp_test_dir("diffforge-turn-git");
         if !cloud_mcp_init_test_repo(&root) {
@@ -70337,10 +70440,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_git_capture_builds_turn_diff_patches() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage =
+            isolated_cloud_mcp_test_storage("agent_chat_turn_git_capture_builds_turn_diff_patches");
+        let _guard = process_test_env_lock();
         cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
         let root = cloud_mcp_test_dir("diffforge-turn-diff");
         if !cloud_mcp_init_test_repo(&root) {
@@ -70427,10 +70529,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_git_capture_matches_non_ascii_numstat_and_patch_paths() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_turn_git_capture_matches_non_ascii_numstat_and_patch_paths",
+        );
+        let _guard = process_test_env_lock();
         cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
         let root = cloud_mcp_test_dir("diffforge-turn-nonascii");
         if !cloud_mcp_init_test_repo(&root) {
@@ -70479,10 +70581,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_git_no_changes_has_no_turn_diff() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage =
+            isolated_cloud_mcp_test_storage("agent_chat_turn_git_no_changes_has_no_turn_diff");
+        let _guard = process_test_env_lock();
         cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
         let root = cloud_mcp_test_dir("diffforge-turn-no-diff");
         if !cloud_mcp_init_test_repo(&root) {
@@ -70509,10 +70610,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_git_patch_timeout_emits_counts_only_turn_diff() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_turn_git_patch_timeout_emits_counts_only_turn_diff",
+        );
+        let _guard = process_test_env_lock();
         cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
         let root = cloud_mcp_test_dir("diffforge-turn-diff-timeout");
         if !cloud_mcp_init_test_repo(&root) {
@@ -70646,10 +70747,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_git_capture_non_git_cwd_noops() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
         let root = cloud_mcp_test_dir("diffforge-turn-non-git");
         fs::create_dir_all(&root).unwrap();
@@ -70673,10 +70771,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_summary_aliases_prompt_start_snapshot_to_native_turn_id() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_turn_summary_aliases_prompt_start_snapshot_to_native_turn_id",
+        );
+        let _guard = process_test_env_lock();
         cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
         let root = cloud_mcp_test_dir("diffforge-turn-alias");
         if !cloud_mcp_init_test_repo(&root) {
@@ -70737,10 +70835,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_summary_does_not_use_latest_session_snapshot_fallback() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_turn_summary_does_not_use_latest_session_snapshot_fallback",
+        );
+        let _guard = process_test_env_lock();
         cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
         let root = cloud_mcp_test_dir("diffforge-turn-no-latest");
         if !cloud_mcp_init_test_repo(&root) {
@@ -70791,10 +70889,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_git_snapshot_map_prunes_ttl_and_oldest_entries() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
         let now = cloud_mcp_now_ms();
         for index in 0..(CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_MAX + 1) {
@@ -70847,10 +70942,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_hook_workspace_root_prefers_payload_cwd_over_context_root() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_hook_workspace_root_prefers_payload_cwd_over_context_root",
+        );
+        let _guard = process_test_env_lock();
         cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
         let payload_root = cloud_mcp_test_dir("diffforge-turn-payload-cwd");
         let context_root = cloud_mcp_test_dir("diffforge-turn-context-root");
@@ -70982,6 +71077,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_summary_missing_start_snapshot_has_no_file_change() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_turn_summary_missing_start_snapshot_has_no_file_change",
+        );
         let mut payload = agent_chat_status_hook_test_payload("provider-turn-completed");
         payload.turn_status = "completed".to_string();
         payload.provider_session_id = Some("session-missing-start".to_string());
@@ -71007,6 +71105,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_turn_summary_app_restart_mid_turn_noops_without_snapshot() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_turn_summary_app_restart_mid_turn_noops_without_snapshot",
+        );
         let mut payload = agent_chat_status_hook_test_payload("provider-turn-completed");
         payload.turn_status = "completed".to_string();
         payload.provider_session_id = Some("session-after-restart".to_string());
@@ -71552,7 +71653,6 @@ mod cloud_mcp_tests {
         ));
     }
 
-
     fn assert_account_document_snake_only(value: &Value) {
         fn visit(value: &Value, path: &str) {
             match value {
@@ -71584,10 +71684,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_cache_writes_canonical_file_and_keeps_metadata_only() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_cache_writes_canonical_file_and_keeps_metadata_only",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-data");
         let cache_root = test_cloud_root("diffforge-account-document-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -71655,10 +71755,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_remote_metadata_does_not_read_local_path_as_content() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_remote_metadata_does_not_read_local_path_as_content",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-remote-meta-data");
         let cache_root = test_cloud_root("diffforge-account-document-remote-meta-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -71718,10 +71818,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_metadata_apply_materializes_current_local_file() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_metadata_apply_materializes_current_local_file",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-local-current-data");
         let cache_root = test_cloud_root("diffforge-account-document-local-current-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -71780,10 +71880,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_prepare_draft_writes_overlay_without_touching_canonical() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_prepare_draft_writes_overlay_without_touching_canonical",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-draft-data");
         let cache_root = test_cloud_root("diffforge-account-document-draft-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -71835,10 +71935,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_prepare_draft_preserves_nested_document_id_without_file_path() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_prepare_draft_preserves_nested_document_id_without_file_path",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-draft-nested-id-data");
         let cache_root = test_cloud_root("diffforge-account-document-draft-nested-id-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -71886,10 +71986,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_draft_file_event_payload_preserves_canonical_cache_identity() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_draft_file_event_payload_preserves_canonical_cache_identity",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-draft-event-data");
         let cache_root = test_cloud_root("diffforge-account-document-draft-event-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -71981,10 +72081,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_draft_file_event_payload_preserves_nested_fallback_identity() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_draft_file_event_payload_preserves_nested_fallback_identity",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-draft-event-fallback-data");
         let cache_root = test_cloud_root("diffforge-account-document-draft-event-fallback-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72018,10 +72118,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_empty_overwrite_guard_checks_canonical_file_without_cache() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_empty_overwrite_guard_checks_canonical_file_without_cache",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-empty-overwrite-file-data");
         let cache_root = test_cloud_root("diffforge-account-document-empty-overwrite-file-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72090,10 +72190,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_folder_tombstone_blocks_stale_child_recovery() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_folder_tombstone_blocks_stale_child_recovery",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-folder-tombstone-data");
         let cache_root = test_cloud_root("diffforge-account-document-folder-tombstone-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72179,6 +72279,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_camel_only_input_is_rejected_and_not_replayed() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_camel_only_input_is_rejected_and_not_replayed",
+        );
         let row = cloud_mcp_account_document_metadata_row(
             &json!({
                 "scopeKey": "Personal Account",
@@ -72218,10 +72321,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_cached_asset_file_must_match_expected_hash() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-file-hash-data");
         let path = data_root.join("candidate.md");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -72254,10 +72354,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_hydration_stage_dir_is_hidden_from_collection_recovery() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_hydration_stage_dir_is_hidden_from_collection_recovery",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-stage-data");
         let cache_root = test_cloud_root("diffforge-account-document-stage-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72291,10 +72391,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_metadata_maps_kind_to_document_kind() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage =
+            isolated_cloud_mcp_test_storage("account_document_metadata_maps_kind_to_document_kind");
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-kind-metadata-data");
         let cache_root = test_cloud_root("diffforge-account-document-kind-metadata-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72327,10 +72426,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_recovery_preserves_cached_document_kind() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_recovery_preserves_cached_document_kind",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-preserve-kind-data");
         let cache_root = test_cloud_root("diffforge-account-document-preserve-kind-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72389,10 +72488,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_recovery_reuses_cached_identity_for_sanitized_path() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_recovery_reuses_cached_identity_for_sanitized_path",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-reuse-id-data");
         let cache_root = test_cloud_root("diffforge-account-document-reuse-id-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72458,10 +72557,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_recovery_scans_nested_folders_and_emits_folder_rows() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_recovery_scans_nested_folders_and_emits_folder_rows",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-nested-data");
         let cache_root = test_cloud_root("diffforge-account-document-nested-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72518,10 +72617,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_recovery_consolidates_numbered_hydration_siblings() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_recovery_consolidates_numbered_hydration_siblings",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-numbered-data");
         let cache_root = test_cloud_root("diffforge-account-document-numbered-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72589,10 +72688,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_recovery_removes_orphaned_numbered_hydration_siblings() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_recovery_removes_orphaned_numbered_hydration_siblings",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-orphan-numbered-data");
         let cache_root = test_cloud_root("diffforge-account-document-orphan-numbered-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72662,10 +72761,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_implicit_empty_inline_content_defers_to_local_file() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-empty-inline-local-data");
         let path = data_root.join("cloudflare_dns.md");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -72693,10 +72789,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_delete_removes_cached_literal_numbered_path() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_delete_removes_cached_literal_numbered_path",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-delete-numbered-data");
         let cache_root = test_cloud_root("diffforge-account-document-delete-numbered-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72754,10 +72850,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_removed_payload_deletes_path_key_local_file() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_removed_payload_deletes_path_key_local_file",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-delete-data");
         let cache_root = test_cloud_root("diffforge-account-document-delete-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -72830,10 +72926,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_document_cloud_compact_op_uses_doc_id_not_meta_hash() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_document_cloud_compact_op_uses_doc_id_not_meta_hash",
+        );
+        let _guard = process_test_env_lock();
         let data_root = test_cloud_root("diffforge-account-document-compact-data");
         let cache_root = test_cloud_root("diffforge-account-document-compact-cache");
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
@@ -73039,6 +73135,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn asset_http_headers_move_appwrite_jwt_out_of_authorization_for_direct_routes() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "asset_http_headers_move_appwrite_jwt_out_of_authorization_for_direct_routes",
+        );
         let headers = cloud_mcp_asset_http_headers(
             Some("appwrite.jwt.token"),
             Some("route.payload.signature"),
@@ -73415,10 +73514,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn configured_cloud_base_url_honors_env() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = process_test_env_lock();
         let _mcp_base_env = ScopedCloudMcpEnv::remove(CLOUD_MCP_BASE_URL_ENV);
         let _base_env =
             ScopedCloudMcpEnv::set_str(CLOUD_DIFFFORGE_BASE_URL_ENV, "http://127.0.0.1:9090/");
@@ -73432,10 +73528,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn local_cloud_probe_default_matches_build_mode() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = process_test_env_lock();
         let _use_local_env = ScopedCloudMcpEnv::remove("RUST_DIFFFORGE_USE_LOCAL_DOCKER_CLOUD");
         let _allow_local_env = ScopedCloudMcpEnv::remove(CLOUD_MCP_ALLOW_LOCAL_CLOUD_ENV);
         let _mcp_base_env = ScopedCloudMcpEnv::remove(CLOUD_MCP_BASE_URL_ENV);
@@ -73449,10 +73542,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn local_cloud_probe_can_be_disabled_by_env() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = process_test_env_lock();
         let _use_local_env = ScopedCloudMcpEnv::remove("RUST_DIFFFORGE_USE_LOCAL_DOCKER_CLOUD");
         let _allow_local_env = ScopedCloudMcpEnv::set_str(CLOUD_MCP_ALLOW_LOCAL_CLOUD_ENV, "0");
         let _mcp_base_env = ScopedCloudMcpEnv::remove(CLOUD_MCP_BASE_URL_ENV);
@@ -74041,40 +74131,7 @@ mod cloud_mcp_tests {
         );
     }
 
-    struct ScopedCloudMcpEnv {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl ScopedCloudMcpEnv {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let previous = env::var_os(key);
-            env::set_var(key, value);
-            Self { key, previous }
-        }
-
-        fn set_str(key: &'static str, value: &str) -> Self {
-            let previous = env::var_os(key);
-            env::set_var(key, value);
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = env::var_os(key);
-            env::remove_var(key);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for ScopedCloudMcpEnv {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                env::set_var(self.key, previous);
-            } else {
-                env::remove_var(self.key);
-            }
-        }
-    }
+    type ScopedCloudMcpEnv = ProcessTestEnvVarGuard;
 
     fn test_cloud_root(prefix: &str) -> PathBuf {
         let suffix = SystemTime::now()
@@ -74103,10 +74160,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn diffforge_credit_ledger_dedupes_entities_and_meters_transfer_bytes() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "diffforge_credit_ledger_dedupes_entities_and_meters_transfer_bytes",
+        );
+        let _guard = process_test_env_lock();
         let root = test_cloud_root("diffforge-credit-ledger");
         fs::create_dir_all(&root).unwrap();
         let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &root);
@@ -74252,10 +74309,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn generated_asset_promotion_copies_and_registers_local_asset() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "generated_asset_promotion_copies_and_registers_local_asset",
+        );
+        let _guard = process_test_env_lock();
         let root = test_cloud_root("generated-asset-promotion");
         let data_root = root.join("data");
         let cache_root = root.join("cache");
@@ -74339,6 +74396,8 @@ mod cloud_mcp_tests {
 
     #[test]
     fn asset_items_extraction_skips_non_asset_objects() {
+        let _storage =
+            isolated_cloud_mcp_test_storage("asset_items_extraction_skips_non_asset_objects");
         let clouds_list = json!({
             "kind": "asset_library_clouds",
             "items": [
@@ -74411,10 +74470,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn deleting_local_account_asset_stays_account_scoped() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage =
+            isolated_cloud_mcp_test_storage("deleting_local_account_asset_stays_account_scoped");
+        let _guard = process_test_env_lock();
         let root = test_cloud_root("asset-delete-local-account-scope");
         let data_root = root.join("data");
         let cache_root = root.join("cache");
@@ -74465,10 +74523,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn deleting_local_only_account_asset_removes_tracked_row() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "deleting_local_only_account_asset_removes_tracked_row",
+        );
+        let _guard = process_test_env_lock();
         let root = test_cloud_root("asset-delete-local-only-row");
         let data_root = root.join("data");
         let cache_root = root.join("cache");
@@ -74518,6 +74576,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn local_deleted_registration_payload_clears_device_copy() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "local_deleted_registration_payload_clears_device_copy",
+        );
         let payload = cloud_mcp_asset_local_deleted_registration_payload(
             "asset_untracked",
             &json!({
@@ -74552,6 +74613,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn local_deleted_registration_payload_preserves_cloud_metadata_for_device_delete() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "local_deleted_registration_payload_preserves_cloud_metadata_for_device_delete",
+        );
         let payload = cloud_mcp_asset_local_deleted_registration_payload(
             "asset_local_deleted",
             &json!({
@@ -74709,6 +74773,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn todo_mirror_status_filters_cached_workspace_dispatches() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "todo_mirror_status_filters_cached_workspace_dispatches",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let response = json!({
@@ -74757,6 +74824,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn workspace_device_consistency_todo_status_query_reaches_mixed_case_recipient() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "workspace_device_consistency_todo_status_query_reaches_mixed_case_recipient",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let response = json!({
@@ -74854,6 +74924,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn todo_mirror_cancel_replaces_repo_scoped_queued_duplicate() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "todo_mirror_cancel_replaces_repo_scoped_queued_duplicate",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let queued = json!({
@@ -74930,6 +75003,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn todo_mirror_key_uses_row_workspace_when_payload_context_is_missing() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "todo_mirror_key_uses_row_workspace_when_payload_context_is_missing",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let response = json!({
@@ -75017,6 +75093,8 @@ mod cloud_mcp_tests {
 
     #[test]
     fn todo_mirror_rejects_rows_without_required_identity() {
+        let _storage =
+            isolated_cloud_mcp_test_storage("todo_mirror_rejects_rows_without_required_identity");
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let response = json!({
@@ -75073,6 +75151,8 @@ mod cloud_mcp_tests {
 
     #[test]
     fn todo_mirror_workspace_todos_excludes_terminal_rows() {
+        let _storage =
+            isolated_cloud_mcp_test_storage("todo_mirror_workspace_todos_excludes_terminal_rows");
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let response = json!({
@@ -75140,6 +75220,8 @@ mod cloud_mcp_tests {
 
     #[test]
     fn todo_mirror_applies_removed_todo_ids_from_payloads() {
+        let _storage =
+            isolated_cloud_mcp_test_storage("todo_mirror_applies_removed_todo_ids_from_payloads");
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let listed = json!({
@@ -75226,6 +75308,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn todo_mirror_upsert_keeps_terminal_status_over_late_running_row() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "todo_mirror_upsert_keeps_terminal_status_over_late_running_row",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let completed = json!({
@@ -75291,6 +75376,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_todo_delta_applies_peer_rows_idempotently_and_purges_deletes() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_todo_delta_applies_peer_rows_idempotently_and_purges_deletes",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let delta = json!({
@@ -75403,6 +75491,8 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_todo_delta_ignores_local_device_echo() {
+        let _storage =
+            isolated_cloud_mcp_test_storage("account_todo_delta_ignores_local_device_echo");
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let delta = json!({
@@ -75451,6 +75541,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_todo_delta_applies_dashboard_origin_for_local_device() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_todo_delta_applies_dashboard_origin_for_local_device",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let delta = json!({
@@ -75504,6 +75597,8 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_todo_delta_preserves_compact_inputs() {
+        let _storage =
+            isolated_cloud_mcp_test_storage("account_todo_delta_preserves_compact_inputs");
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let delta = json!({
@@ -75562,6 +75657,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_todo_delta_skips_stale_sequence_without_downgrading_mirror() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_todo_delta_skips_stale_sequence_without_downgrading_mirror",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let newer = json!({
@@ -75630,6 +75728,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn account_todo_delta_does_not_advance_cursor_without_applied_entries() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "account_todo_delta_does_not_advance_cursor_without_applied_entries",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let malformed = json!({
@@ -75774,10 +75875,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn remote_command_status_outbox_persists_and_claims_all_statuses_in_order() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "remote_command_status_outbox_persists_and_claims_all_statuses_in_order",
+        );
+        let _guard = process_test_env_lock();
         let cache_root = test_cloud_root("diffforge-remote-command-status-outbox-cache");
         let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
         let events = [
@@ -76582,10 +76683,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn day_packet_outbox_keeps_claimed_seq_payload_immutable() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "day_packet_outbox_keeps_claimed_seq_payload_immutable",
+        );
+        let _guard = process_test_env_lock();
         let cache_root = test_cloud_root("diffforge-tokenomics-immutable-seq-cache");
         let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
         let day_start_ms = cloud_mcp_tokenomics_timestamp_ms("2026-06-16T00:00:00Z").unwrap();
@@ -76717,10 +76818,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn tokenomics_force_full_requeues_acked_day_packet() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage =
+            isolated_cloud_mcp_test_storage("tokenomics_force_full_requeues_acked_day_packet");
+        let _guard = process_test_env_lock();
         let cache_root = test_cloud_root("diffforge-tokenomics-force-full-cache");
         let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
         let day_start_ms = cloud_mcp_tokenomics_timestamp_ms("2026-06-16T00:00:00Z").unwrap();
@@ -76780,10 +76880,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn tokenomics_current_acked_decision_seeds_prune_ack_meta() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "tokenomics_current_acked_decision_seeds_prune_ack_meta",
+        );
+        let _guard = process_test_env_lock();
         let cache_root = test_cloud_root("diffforge-tokenomics-current-acked-prune-cache");
         let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
         let day_start_ms = cloud_mcp_tokenomics_timestamp_ms("2026-06-16T00:00:00Z").unwrap();
@@ -77003,6 +77103,8 @@ mod cloud_mcp_tests {
 
     #[test]
     fn tokenomics_transport_ack_does_not_advance_sync_state() {
+        let _storage =
+            isolated_cloud_mcp_test_storage("tokenomics_transport_ack_does_not_advance_sync_state");
         let response = json!({
             "ok": true,
             "data": {
@@ -77076,10 +77178,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn production_workspace_purges_dual_read_legacy_posix_and_windows_ids() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "production_workspace_purges_dual_read_legacy_posix_and_windows_ids",
+        );
+        let _guard = process_test_env_lock();
         let root = test_cloud_root("workspace-legacy-delete-purge");
         let data_root = root.join("data");
         let cache_root = root.join("cache");
@@ -77207,10 +77309,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_metadata_ack_with_nested_zero_count_clears_stale_sync_state() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_metadata_ack_with_nested_zero_count_clears_stale_sync_state",
+        );
+        let _guard = process_test_env_lock();
         let root = test_cloud_root("agent-chat-stale-sync-repair");
         let data_root = root.join("data");
         let cache_root = root.join("cache");
@@ -77298,10 +77400,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn agent_chat_metadata_only_ack_with_nested_zero_count_preserves_sync_state() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "agent_chat_metadata_only_ack_with_nested_zero_count_preserves_sync_state",
+        );
+        let _guard = process_test_env_lock();
         let root = test_cloud_root("agent-chat-metadata-only-stale-ack");
         let data_root = root.join("data");
         let cache_root = root.join("cache");
@@ -77405,10 +77507,10 @@ mod cloud_mcp_tests {
 
     #[test]
     fn expedited_claim_selects_first_attempt_agent_chat_and_todo_rows() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage = isolated_cloud_mcp_test_storage(
+            "expedited_claim_selects_first_attempt_agent_chat_and_todo_rows",
+        );
+        let _guard = process_test_env_lock();
         let root = test_cloud_root("agent-chat-expedited-claim");
         let data_root = root.join("data");
         let cache_root = root.join("cache");
@@ -77494,6 +77596,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn asset_library_init_migrates_legacy_asset_cache_primary_keys() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "asset_library_init_migrates_legacy_asset_cache_primary_keys",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             r#"
@@ -77763,6 +77868,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn asset_snapshot_preserves_local_overlay_and_atomically_reconciles_cloud_rows() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "asset_snapshot_preserves_local_overlay_and_atomically_reconciles_cloud_rows",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let root = test_cloud_root("asset-snapshot-local-overlay");
         fs::create_dir_all(&root).unwrap();
@@ -77839,10 +77947,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn compact_asset_snapshot_recovers_managed_local_path() {
-        let _guard = CLOUD_MCP_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
+        let _storage =
+            isolated_cloud_mcp_test_storage("compact_asset_snapshot_recovers_managed_local_path");
+        let _guard = process_test_env_lock();
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let root = test_cloud_root("asset-compact-managed-recovery");
         let data_root = root.join("data");
@@ -77890,6 +77997,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn generic_asset_projection_prefers_full_local_rows_over_compact_state() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "generic_asset_projection_prefers_full_local_rows_over_compact_state",
+        );
         let root = test_cloud_root("asset-generic-projection-direct-first");
         fs::create_dir_all(&root).unwrap();
         let local_path = root.join("image.png");
@@ -77928,6 +78038,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn document_backed_asset_rows_do_not_render_as_generic_assets() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "document_backed_asset_rows_do_not_render_as_generic_assets",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let root = test_cloud_root("asset-doc-backed-hidden");
         fs::create_dir_all(&root).unwrap();
@@ -77981,6 +78094,9 @@ mod cloud_mcp_tests {
 
     #[test]
     fn missing_local_asset_rows_are_pruned_or_returned_cloud_only() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "missing_local_asset_rows_are_pruned_or_returned_cloud_only",
+        );
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let root = test_cloud_root("asset-missing-local-cleanup");
         fs::create_dir_all(&root).unwrap();
@@ -78070,6 +78186,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn todo_targets_read_sqlite_snapshot_locally() {
+        let _storage = isolated_cloud_mcp_test_storage("todo_targets_read_sqlite_snapshot_locally");
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let response = json!({
@@ -78113,6 +78230,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn todo_history_reads_sqlite_rows_locally() {
+        let _storage = isolated_cloud_mcp_test_storage("todo_history_reads_sqlite_rows_locally");
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let response = json!({
@@ -78157,6 +78275,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn create_plan_is_plan_only_without_task() {
+        let _storage = isolated_cloud_mcp_test_storage("create_plan_is_plan_only_without_task");
         let input = json!({
             "task_id": "ignored-task-id",
             "plan_id": "plan-1",
@@ -78471,6 +78590,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn remote_command_cancel_marks_unclaimed_command_cancelled() {
+        let storage = isolated_cloud_mcp_test_storage(
+            "remote_command_cancel_marks_unclaimed_command_cancelled",
+        );
         let state = CloudMcpState::new();
         let cancel = json!({
             "command_kind": "remote_command_cancel",
@@ -78490,10 +78612,34 @@ mod cloud_mcp_tests {
 
         assert!(cloud_mcp_handle_remote_command_cancel(&state, &cancel).await);
         assert!(cloud_mcp_remote_command_cancelled_before_receipt(&state, &original).await);
+        assert_eq!(
+            cloud_mcp_outbox_db_path(),
+            Some(storage.cache_root.join(CLOUD_MCP_OUTBOX_DB_FILE)),
+            "cancel status writes must stay inside this test's cache root",
+        );
+        assert!(
+            !state.background_sync.started.load(Ordering::SeqCst),
+            "an env-isolated test must not leave a detached outbox worker alive",
+        );
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        let rows: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {CLOUD_MCP_OUTBOX_TABLE} WHERE status = 'queued'"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 2,
+            "the isolated outbox contains only target-cancelled and request-completed",
+        );
     }
 
     #[tokio::test]
     async fn remote_command_cancel_does_not_cancel_claimed_command() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "remote_command_cancel_does_not_cancel_claimed_command",
+        );
         let state = CloudMcpState::new();
         let original = json!({
             "client_id": "client-1",
@@ -78515,6 +78661,26 @@ mod cloud_mcp_tests {
         );
         assert!(cloud_mcp_handle_remote_command_cancel(&state, &cancel).await);
         assert!(!cloud_mcp_remote_command_cancelled_before_receipt(&state, &original).await);
+    }
+
+    #[test]
+    fn remote_command_cancel_storage_writers_keep_the_process_isolation_guard() {
+        let source = include_str!("cloud_mcp.rs");
+        for test_name in [
+            "remote_command_cancel_marks_unclaimed_command_cancelled",
+            "remote_command_cancel_does_not_cancel_claimed_command",
+        ] {
+            let marker = format!("fn {test_name}(");
+            let body = source
+                .split(&marker)
+                .nth(1)
+                .and_then(|tail| tail.split("\n    #[").next())
+                .unwrap_or_else(|| panic!("missing cloud test {test_name}"));
+            assert!(
+                body.contains("isolated_cloud_mcp_test_storage("),
+                "env-derived storage test {test_name} must acquire isolated cache/data roots",
+            );
+        }
     }
 
     #[test]
@@ -78573,6 +78739,9 @@ mod cloud_mcp_tests {
 
     #[tokio::test]
     async fn device_live_provider_accounts_exposes_stale_terminal_inventory_field() {
+        let _storage = isolated_cloud_mcp_test_storage(
+            "device_live_provider_accounts_exposes_stale_terminal_inventory_field",
+        );
         let state = CloudMcpState::new();
         let payload = cloud_mcp_device_live_state_snapshot_payload(
             &state,

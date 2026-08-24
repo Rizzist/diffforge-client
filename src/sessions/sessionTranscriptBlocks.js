@@ -55,6 +55,18 @@ export function toolStatusOf(row) {
   return "unknown";
 }
 
+/* One transition serves both ToolCluster entry points: undefined means React
+   is initializing the cluster; a boolean means an existing cluster is being
+   reconsidered after its rows changed. Unresolved outcomes always surface,
+   while a settled cluster otherwise preserves the user's open/closed choice. */
+export function toolClusterOpenState(currentOpen, rows) {
+  const clusterRows = Array.isArray(rows) ? rows : [];
+  if (clusterRows.some((row) => TOOL_STATUS_UNRESOLVED.has(toolStatusOf(row)))) {
+    return true;
+  }
+  return currentOpen === undefined ? clusterRows.length === 1 : currentOpen;
+}
+
 export const TOOL_STATUS_LABEL = {
   ok: "Completed",
   failed: "Failed",
@@ -94,7 +106,12 @@ export function buildTranscriptBlocks(rows) {
     pendingThinking = [];
   };
   let lastDay = "";
-  let lastAssistantText = null;
+  /* Identity, not wording. Two assistant turns are allowed to say the same
+     thing — "Done." twice is two answers, not one delivered twice — so only a
+     repeated (seq, ordinal, projection_order) is a repeat. The compat records
+     this once guarded against are already dropped in the Rust fold once the
+     item stream is live. */
+  const emitted = new Set();
   for (let row of orderedProjectionRows(Array.isArray(rows) ? rows : [])) {
     if (row.kind === "usage") continue;
     if (row.kind === "message" && /^(tool arguments|command output) · /.test(row.text || "")) {
@@ -102,18 +119,10 @@ export function buildTranscriptBlocks(rows) {
     }
     if (row.kind === "thinking" && !String(row.text || "").trim()) continue;
     if (row.kind === "tool" && isInternalToolRow(row)) continue;
-    if (row.kind === "message") {
-      const text = String(row.text || "").trim();
-      if (!text) continue;
-      if (row.role === "assistant") {
-        if (text === lastAssistantText) continue;
-        lastAssistantText = text;
-      } else {
-        lastAssistantText = null;
-      }
-    } else {
-      lastAssistantText = null;
-    }
+    if (row.kind === "message" && !String(row.text || "").trim()) continue;
+    const identity = projectionRowKey(row);
+    if (emitted.has(identity)) continue;
+    emitted.add(identity);
     if (Number.isFinite(row.at_ms) && row.at_ms > 0) {
       const day = new Date(row.at_ms).toDateString();
       if (day !== lastDay) {

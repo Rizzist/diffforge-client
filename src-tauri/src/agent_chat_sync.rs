@@ -4091,26 +4091,10 @@ mod agent_chat_session_sync_tests {
         let _ = fs::remove_dir_all(root);
         source
     }
-
-
-    struct TestEnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for TestEnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.as_ref() {
-                Some(value) => env::set_var(self.key, value),
-                None => env::remove_var(self.key),
-            }
-        }
-    }
+    type TestEnvVarGuard = ProcessTestEnvVarGuard;
 
     fn set_test_env_var(key: &'static str, value: &Path) -> TestEnvVarGuard {
-        let previous = env::var_os(key);
-        env::set_var(key, value);
-        TestEnvVarGuard { key, previous }
+        TestEnvVarGuard::set(key, value)
     }
 
     #[test]

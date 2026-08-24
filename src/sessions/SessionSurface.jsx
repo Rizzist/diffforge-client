@@ -58,6 +58,16 @@ import {
   formatSessionRelativeTime,
   sessionModelProviderFallback,
 } from "./sessionsModel.js";
+import {
+  sessionActivityVisualState,
+  sessionRunCanCancel,
+  sessionRunIsActive,
+} from "./sessionActivity.js";
+import {
+  activeSessionSyncReport,
+  createSessionSyncLifecycleReporter,
+  sessionSyncTransportState,
+} from "./sessionSync.js";
 import { viewportMenuPosition } from "./viewportMenuPosition.js";
 
 /* Main-pane surface for sessions — the Session Deck workspace.
@@ -891,18 +901,31 @@ export default function SessionSurface({
      surfaces. */
   const [transcriptSyncing, setTranscriptSyncing] = useState({});
   const handleTranscriptSyncing = useCallback((sessionId, syncing) => {
+    /* Carried as reported: true | false | null. Collapsing null to false here
+       is what let the rail claim "Synced" for a projection nobody had
+       observed. */
+    const reported = sessionSyncTransportState(syncing);
     setTranscriptSyncing((current) => (
-      Boolean(current[sessionId]) === Boolean(syncing)
+      (current[sessionId] ?? null) === reported
         ? current
-        : { ...current, [sessionId]: Boolean(syncing) }
+        : { ...current, [sessionId]: reported }
     ));
   }, []);
-  const activeTranscriptSyncing = Boolean(
-    !draftOpen && activeSessionId && transcriptSyncing[activeSessionId],
+  const activeTranscriptSyncing = activeSessionSyncReport(
+    draftOpen,
+    activeSessionId,
+    transcriptSyncing,
+  );
+  const syncLifecycle = useMemo(
+    () => createSessionSyncLifecycleReporter(onSyncingChange),
+    [onSyncingChange],
   );
   useEffect(() => {
-    onSyncingChange?.(activeTranscriptSyncing);
-  }, [activeTranscriptSyncing, onSyncingChange]);
+    syncLifecycle.report(activeTranscriptSyncing);
+  }, [activeTranscriptSyncing, syncLifecycle]);
+  useEffect(() => () => {
+    syncLifecycle.unmount();
+  }, [syncLifecycle]);
 
   const tabsStateFor = (sessionId) => sessionTabs[sessionId] || {
     tabs: [{ id: "chat", kind: "chat" }],
@@ -1114,16 +1137,17 @@ export default function SessionSurface({
     submitCommand,
   ]);
 
-  /* A stop button exists only when the harness has named the run to stop.
-     run_id and worker_generation are ONE observation and ride verbatim: the
+  /* A stop button exists only when the harness has published an active state
+     and named the run to stop. run_id and worker_generation are ONE
+     observation and ride verbatim: the
      generation fences a resurrected worker and the run id fences the specific
      run, so a cancel that raced a turn boundary cannot kill the next turn.
-     Absent run_id means no active run — never a guess, never a stop button. */
+     An absent run_id supplies no cancel coordinate, so it never creates a
+     stop button; activity caution is resolved separately from run_state. */
   const cancelTurnFor = useCallback((session) => {
-    if (session?.status !== "running") return null;
     const runId = session?.run_id;
     const generation = session?.worker_generation;
-    if (typeof runId !== "string" || !runId) return null;
+    if (!sessionRunCanCancel(session)) return null;
     if (typeof generation !== "number" || !Number.isFinite(generation)) return null;
     return async () => {
       try {
@@ -1620,7 +1644,10 @@ export default function SessionSurface({
                     onClick={() => onOpenSession?.(session)}
                     type="button"
                   >
-                    <HomeContinueDot aria-hidden="true" data-status={session.status} />
+                    <HomeContinueDot
+                      aria-hidden="true"
+                      data-status={sessionActivityVisualState(session)}
+                    />
                     <span>{session.title}</span>
                     <em>{formatSessionRelativeTime(session.latest_at_ms)}</em>
                   </HomeContinueRow>
@@ -1669,7 +1696,8 @@ export default function SessionSurface({
                            calls. The TUI's own strip outranks the bridge's
                            coarse status — if it says idle (settle lag), no
                            dot, ever. */
-                        if (session.status !== "running") return "";
+                        if (sessionActivityVisualState(session) !== "running"
+                          || !sessionRunIsActive(session)) return "";
                         const entry = surfaceStatus[session.id] || null;
                         if ((entry?.state || "").toLowerCase() === "idle") return "";
                         const structured = (entry?.detail || entry?.state || "").trim();
@@ -2166,6 +2194,11 @@ const HomeContinueDot = styled.i`
 
   &[data-status="error"] {
     background: var(--forge-red);
+    animation: none;
+  }
+
+  &[data-status="unknown"] {
+    background: var(--forge-text-disabled);
     animation: none;
   }
 

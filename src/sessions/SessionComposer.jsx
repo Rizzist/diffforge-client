@@ -7,6 +7,8 @@ import { Close } from "@styled-icons/material-rounded/Close";
 import { KeyboardVoice } from "@styled-icons/material-rounded/KeyboardVoice";
 import { Send } from "@styled-icons/material-rounded/Send";
 
+import { modelGroupSelectionState } from "./haiderClientContract.js";
+
 /* Composer for the session UI view, in the dashboard's visual language:
    a chips row (MODEL / EFFORT / SPEED / PROVIDER / ACCOUNT) above a pill
    input with mic + circular send. Enter submits, Shift+Enter newlines.
@@ -315,30 +317,40 @@ export default function SessionComposer({
         </Chip>
         {openMenu === "model" && (
           <ChipMenu role="menu">
-            {groups.length ? groups.map((group) => (
-              <ChipGroup key={group.provider} data-unavailable={group.available ? undefined : "true"}>
-                <ChipGroupHead>
-                  <span>{group.provider}</span>
-                  <em>{group.status || (group.available ? "ready" : "unavailable")}</em>
-                </ChipGroupHead>
-                {group.models.map((model) => (
-                  <ChipMenuItem
-                    data-active={model === current && group.provider === provider ? "true" : undefined}
-                    data-readonly={switchable && group.available ? undefined : "true"}
-                    key={`${group.provider}/${model}`}
-                    onClick={() => {
-                      if (!switchable || !group.available) return;
-                      setOpenMenu("");
-                      onChipChange?.("model", `${group.provider}/${model}`);
-                    }}
-                    role="menuitem"
-                    type="button"
-                  >
-                    {model}
-                  </ChipMenuItem>
-                ))}
-              </ChipGroup>
-            )) : (
+            {groups.length ? groups.map((group) => {
+              const selection = modelGroupSelectionState(group, switchable);
+              return (
+                <ChipGroup
+                  data-availability={group.availability}
+                  data-disabled={group.enabled === false ? "true" : undefined}
+                  key={group.provider}
+                >
+                  <ChipGroupHead>
+                    <span>{group.provider}</span>
+                    <em>{group.status || "availability unknown"}</em>
+                  </ChipGroupHead>
+                  {group.models.map((model) => (
+                    <ChipMenuItem
+                      aria-disabled={selection.selectable ? undefined : "true"}
+                      data-active={model === current && group.provider === provider ? "true" : undefined}
+                      data-readonly={selection.selectable ? undefined : "true"}
+                      data-readonly-reason={selection.reason || undefined}
+                      key={`${group.provider}/${model}`}
+                      onClick={() => {
+                        if (!selection.selectable) return;
+                        setOpenMenu("");
+                        onChipChange?.("model", `${group.provider}/${model}`);
+                      }}
+                      role="menuitem"
+                      title={selection.label || undefined}
+                      type="button"
+                    >
+                      {model}
+                    </ChipMenuItem>
+                  ))}
+                </ChipGroup>
+              );
+            }) : (
               <ChipMenuEmpty>Model catalog unavailable — is the harness running?</ChipMenuEmpty>
             )}
             {!switchable && groups.length > 0 && (
@@ -624,7 +636,8 @@ const ChipDim = styled.span`
 `;
 
 const ChipGroup = styled.div`
-  &[data-unavailable="true"] {
+  &[data-availability="unavailable"],
+  &[data-disabled="true"] {
     opacity: 0.55;
   }
 

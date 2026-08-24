@@ -3870,6 +3870,9 @@ mod desktop_auth_tests {
 
     #[test]
     fn desktop_auth_login_url_uses_snake_case_query_keys() {
+        let _storage = process_test_storage_isolation(stringify!(
+            desktop_auth_login_url_uses_snake_case_query_keys
+        ));
         let url =
             reqwest::Url::parse(&desktop_auth_login_url("state-123", None)).expect("desktop login URL");
         let query = url
@@ -3909,6 +3912,9 @@ mod desktop_auth_tests {
 
     #[test]
     fn desktop_auth_login_url_carries_only_opaque_device_binding_token() {
+        let _storage = process_test_storage_isolation(stringify!(
+            desktop_auth_login_url_carries_only_opaque_device_binding_token
+        ));
         let token = "dbt1.c2lnbmVkLWRldmljZS1iaW5kaW5nLXRva2Vu.signature01234567890123456789012345678901";
         let url = reqwest::Url::parse(&desktop_auth_login_url("state-123", Some(token)))
             .expect("desktop login URL");

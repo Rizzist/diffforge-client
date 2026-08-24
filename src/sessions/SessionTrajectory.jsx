@@ -6,6 +6,7 @@ import styled from "styled-components";
 import { cacheRereadMetric } from "./cacheMetric.js";
 import {
   exactTrajectoryUsagePoints,
+  trajectoryDurationLabel,
   trajectorySummaryMetrics,
 } from "./trajectoryMetrics.js";
 
@@ -35,18 +36,6 @@ const STRIP_H = LANE_TOP + LANE_H * 3 + TOKEN_LANE_H + 8;
 const LIST_ROW_PX = 26;
 const CACHE_MISS_MIN_INPUT = 1000;
 const TOOLTIP_CLAMP_PX = 150;
-
-function formatDuration(ms) {
-  if (!ms || ms < 1000) {
-    return "<1s";
-  }
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${s % 60}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
-}
 
 function formatTokens(n) {
   if (n == null) return "";
@@ -99,6 +88,7 @@ export default function SessionTrajectory({ session }) {
   const [paintTick, setPaintTick] = useState(0);
   const [listScrollTop, setListScrollTop] = useState(0);
   const [listHeight, setListHeight] = useState(300);
+  const [durationNowMs, setDurationNowMs] = useState(() => Date.now());
   const canvasRef = useRef(null);
   const stripScrollRef = useRef(null);
   const listRef = useRef(null);
@@ -172,6 +162,18 @@ export default function SessionTrajectory({ session }) {
     };
   }, [sessionId, fetchTrajectory]);
 
+  /* Keep the harness-defined live elapsed coordinate moving. A terminal
+     snapshot is fixed, and an absent terminal on a non-live snapshot remains
+     unknown rather than borrowing the event stream's timestamps. */
+  const durationIsLive = session?.agent_metrics?.live === true
+    && session?.agent_metrics?.terminal_at_ms == null;
+  useEffect(() => {
+    setDurationNowMs(Date.now());
+    if (!durationIsLive) return undefined;
+    const timer = window.setInterval(() => setDurationNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [durationIsLive, sessionId]);
+
   /* Repaint when the app theme flips (canvas reads CSS variables) and when
      the window moves to a display with a different pixel ratio. */
   useEffect(() => {
@@ -238,17 +240,13 @@ export default function SessionTrajectory({ session }) {
         };
       }
     }
-    const stamps = events
-      .map((event) => event.at_ms)
-      .filter((stamp) => stamp != null && Number.isFinite(Number(stamp)))
-      .map(Number);
     return {
       events,
-      durationMs: stamps.length ? Math.max(...stamps) - Math.min(...stamps) : 0,
       cacheKnown,
     };
   }, [points]);
   const summaryMetrics = useMemo(() => trajectorySummaryMetrics(session), [session]);
+  const durationLabel = trajectoryDurationLabel(session, durationNowMs);
 
   /* Layout geometry is pure data — the draw effect and hit-testing share it. */
   const geometry = useMemo(() => {
@@ -513,9 +511,9 @@ export default function SessionTrajectory({ session }) {
   return (
     <TrajectoryRoot>
       <TrajectoryHeader>
-        <Metric title="Wall-clock span of this session's events">
+        <Metric title="Elapsed time from the harness-published session lifecycle">
           <em>Duration</em>
-          <span>{formatDuration(derived.durationMs)}</span>
+          <span>{durationLabel}</span>
         </Metric>
         <Metric title="User turns">
           <em>Turns</em>

@@ -29277,6 +29277,7 @@ mod terminal_tests {
 
     #[test]
     fn missing_local_claude_resume_fails_before_launch_with_a_clear_message() {
+        let _storage = process_test_storage_isolation(stringify!(missing_local_claude_resume_fails_before_launch_with_a_clear_message));
         let session_id = uuid::Uuid::new_v4().to_string();
         let cwd = env::temp_dir()
             .join(format!("diffforge-missing-claude-resume-{session_id}"))
@@ -29299,6 +29300,7 @@ mod terminal_tests {
 
     #[test]
     fn terminal_open_launch_resolution_falls_back_fresh_for_every_provider() {
+        let _storage = process_test_storage_isolation(stringify!(terminal_open_launch_resolution_falls_back_fresh_for_every_provider));
         let nonce = uuid::Uuid::new_v4();
         let cwd = env::temp_dir()
             .join(format!("diffforge-missing-provider-resume-{nonce}"))

@@ -6,6 +6,7 @@ import {
   buildCommandSlots,
   credentialStatus,
   librarySnapshotNeedsRetry,
+  modelGroupSelectionState,
   modelGroupsFromLibrary,
   modelOptionCatalog,
   providerAuthOptions,
@@ -63,23 +64,70 @@ test("model groups retain unavailable providers even when they publish no models
   }), [
     {
       provider: "available-provider",
-      available: true,
+      availability: "available",
+      enabled: true,
+      selectable: true,
       status: "ready",
       models: ["model-a"],
     },
     {
       provider: "disabled-provider",
-      available: false,
-      status: "unavailable",
+      availability: "available",
+      enabled: false,
+      selectable: false,
+      status: "disabled",
       models: ["model-b"],
     },
     {
       provider: "empty-unavailable-provider",
-      available: false,
+      availability: "unavailable",
+      enabled: true,
+      selectable: false,
       status: "unavailable",
       models: [],
     },
   ]);
+});
+
+test("unknown provider availability stays unknown and does not disable its models", () => {
+  const [group] = modelGroupsFromLibrary({
+    providers: [{
+      provider: "future-provider",
+      availability: "future_probe_state",
+      enabled: true,
+      models: ["future-model"],
+    }],
+  });
+
+  assert.deepEqual(group, {
+    provider: "future-provider",
+    availability: "unknown",
+    enabled: true,
+    selectable: true,
+    status: "availability unknown",
+    models: ["future-model"],
+  });
+  assert.deepEqual(modelGroupSelectionState(group, true), {
+    selectable: true,
+    reason: null,
+    label: null,
+  });
+  assert.deepEqual(modelGroupSelectionState({
+    availability: "available",
+    enabled: false,
+  }, true), {
+    selectable: false,
+    reason: "provider_disabled",
+    label: "Provider disabled",
+  });
+  assert.deepEqual(modelGroupSelectionState({
+    availability: "unavailable",
+    enabled: true,
+  }, true), {
+    selectable: false,
+    reason: "provider_unavailable",
+    label: "Provider unavailable",
+  });
 });
 
 test("account availability distinguishes empty from unavailable and legacy unknown", () => {

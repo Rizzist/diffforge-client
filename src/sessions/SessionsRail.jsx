@@ -20,6 +20,10 @@ import {
   formatSessionRelativeTime,
   partitionSessionsForRail,
 } from "./sessionsModel.js";
+import {
+  sessionActivityVisualState,
+  sessionRunIsActive,
+} from "./sessionActivity.js";
 import { ModelBrandIcon } from "./modelBrand.jsx";
 
 /* Session Deck rail list: a prominent "New chat" compose row on top, then
@@ -158,7 +162,7 @@ export default function SessionsRail({
   const parkOf = (session) => Boolean(session.needs_input?.kind)
     || session.status === "waiting";
   const statusSlot = (session) => {
-    const status = session.status || "";
+    const status = sessionActivityVisualState(session);
     /* 937 needs_input carries the park's own typed kind and can name kinds
        this build predates — prefer it, humanise anything unrecognised, and
        keep 936's waiting_why (frozen at three kinds) as the fallback. */
@@ -231,7 +235,7 @@ export default function SessionsRail({
           <ModelBrandIcon
             model={session.model}
             provider={session.provider}
-            status={session.status}
+            status={sessionActivityVisualState(session)}
           />
           <SessionRenameInput
             autoFocus
@@ -264,7 +268,7 @@ export default function SessionsRail({
           model={session.model}
           park={parkOf(session)}
           provider={session.provider}
-          status={session.status}
+          status={sessionActivityVisualState(session)}
         />
         <SessionRowTitle data-shell={shellPrefs[session.id] === true ? "on" : undefined}>
           {session.title}
@@ -298,7 +302,7 @@ export default function SessionsRail({
               only offered once it settles. */}
           {(() => {
             const shellOn = shellPrefs[session.id] === true;
-            const locked = shellOn && session.status === "running";
+            const locked = shellOn && sessionRunIsActive(session);
             const toggle = (event) => {
               event.stopPropagation();
               if (locked) return;

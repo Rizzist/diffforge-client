@@ -232,12 +232,7 @@ impl SessionRow {
         object.insert("state_raw".to_string(), Value::String(state_raw));
         object.insert("latest_at_ms".to_string(), json!(self.latest_at_ms()));
         object.insert("speed".to_string(), speed);
-        for key in [
-            "seen_at_ms",
-            "last_activity_ms",
-            "run_id",
-            "worker_generation",
-        ] {
+        for key in ["seen_at_ms", "last_activity_ms", "worker_generation"] {
             object.entry(key.to_string()).or_insert(Value::Null);
         }
         object.insert("waiting_kind".to_string(), waiting_kind);
@@ -603,12 +598,11 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
                 ] {
                     harness.insert(key.to_string(), json!(row.get::<_, Option<i64>>(index)?));
                 }
-                for (key, index) in [
-                    ("waiting_kind", 11),
-                    ("waiting_menu_id", 12),
-                    ("run_id", 13),
-                ] {
+                for (key, index) in [("waiting_kind", 11), ("waiting_menu_id", 12)] {
                     harness.insert(key.to_string(), json!(row.get::<_, Option<String>>(index)?));
+                }
+                if let Some(run_id) = row.get::<_, Option<String>>(13)? {
+                    harness.insert("run_id".to_string(), Value::String(run_id));
                 }
                 harness.insert("needs_input".to_string(), needs_input);
                 Ok((row.get::<_, String>(0)?, Value::Object(harness)))
@@ -1043,26 +1037,10 @@ async fn sessions_home_dir() -> String {
 mod sessions_tests {
     use super::*;
 
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
-
-    struct SessionsEnvGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for SessionsEnvGuard {
-        fn drop(&mut self) {
-            match self.previous.as_ref() {
-                Some(value) => env::set_var(self.key, value),
-                None => env::remove_var(self.key),
-            }
-        }
-    }
+    type SessionsEnvGuard = ProcessTestEnvVarGuard;
 
     fn set_sessions_env(key: &'static str, path: &Path) -> SessionsEnvGuard {
-        let previous = env::var_os(key);
-        env::set_var(key, path);
-        SessionsEnvGuard { key, previous }
+        SessionsEnvGuard::set(key, path)
     }
 
     fn set_sessions_home(path: &Path) -> SessionsEnvGuard {
@@ -1189,7 +1167,7 @@ mod sessions_tests {
 
     #[test]
     fn sessions_home_honors_test_override() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("home");
         fs::create_dir_all(&directory).unwrap();
         let _guard = set_sessions_home(&directory);
@@ -1270,7 +1248,9 @@ mod sessions_tests {
         assert_eq!(row_json["waiting_kind"], Value::Null);
         assert_eq!(row_json["waiting_menu_id"], Value::Null);
         assert_eq!(row_json["needs_input"], Value::Null);
-        assert_eq!(row_json["run_id"], Value::Null);
+        assert!(!row_json
+            .as_object()
+            .is_some_and(|object| object.contains_key("run_id")));
         assert_eq!(row_json["worker_generation"], Value::Null);
         assert!(!row.pinned);
         assert!(row.title_override.is_none());
@@ -1311,7 +1291,7 @@ mod sessions_tests {
 
     #[test]
     fn sessions_migration_preserves_a_locked_legacy_title() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("migration-locked");
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("sessions.sqlite");
@@ -1367,7 +1347,8 @@ mod sessions_tests {
 
     #[test]
     fn session_rename_locks_title_against_reconcile() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(session_rename_locks_title_against_reconcile));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("rename");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -1415,7 +1396,8 @@ mod sessions_tests {
 
     #[test]
     fn session_pinned_toggle_round_trips() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(session_pinned_toggle_round_trips));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("pinned");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -1443,7 +1425,8 @@ mod sessions_tests {
 
     #[test]
     fn first_user_message_reslug_skips_locked_rows() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(first_user_message_reslug_skips_locked_rows));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("locked-reslug");
         let session_directory = directory.join("home").join("original-title");
         fs::create_dir_all(session_directory.join("work")).unwrap();
@@ -1531,7 +1514,8 @@ mod sessions_tests {
 
     #[test]
     fn haider_bridge_cli_payload_cannot_downgrade_stored_rpc_payload() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_cli_payload_cannot_downgrade_stored_rpc_payload));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("rpc-precedence");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -1567,7 +1551,8 @@ mod sessions_tests {
 
     #[test]
     fn haider_bridge_live_cli_sync_preserves_idle_rpc_payload() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_live_cli_sync_preserves_idle_rpc_payload));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("live-cli-cycle");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -1609,7 +1594,8 @@ mod sessions_tests {
 
     #[test]
     fn haider_bridge_cli_fallback_reconciles_without_rpc() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_cli_fallback_reconciles_without_rpc));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("cli-fallback");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -1684,7 +1670,8 @@ mod sessions_tests {
 
     #[test]
     fn haider_bridge_live_cli_sync_still_prunes_ghosts() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_live_cli_sync_still_prunes_ghosts));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("live-cli-prune");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -1719,7 +1706,8 @@ mod sessions_tests {
 
     #[test]
     fn haider_bridge_empty_roster_does_not_prune() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_empty_roster_does_not_prune));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("empty-roster");
         let session_directory = directory.join("kept-session");
         fs::create_dir_all(&session_directory).unwrap();
@@ -1740,7 +1728,8 @@ mod sessions_tests {
 
     #[test]
     fn haider_bridge_store_serialize_round_trip_preserves_full_and_unknown_harness_payload() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_store_serialize_round_trip_preserves_full_and_unknown_harness_payload));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("opaque-harness");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -1815,7 +1804,8 @@ mod sessions_tests {
 
     #[test]
     fn imported_session_repairs_empty_dir_from_published_workspace() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(imported_session_repairs_empty_dir_from_published_workspace));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("published-workspace");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -1874,7 +1864,8 @@ mod sessions_tests {
 
     #[test]
     fn haider_bridge_summary_needs_input_round_trips_and_clears_sql_null() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_summary_needs_input_round_trips_and_clears_sql_null));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("needs-input-state");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -1966,7 +1957,8 @@ mod sessions_tests {
 
     #[test]
     fn command_parked_card_is_stored_verbatim_on_the_existing_needs_input_path() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(command_parked_card_is_stored_verbatim_on_the_existing_needs_input_path));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("command-parked");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -1999,7 +1991,8 @@ mod sessions_tests {
 
     #[test]
     fn haider_bridge_ghost_prune_observes_age_guard() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_ghost_prune_observes_age_guard));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("ghost-age");
         fs::create_dir_all(&directory).unwrap();
         let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
@@ -2025,7 +2018,8 @@ mod sessions_tests {
 
     #[test]
     fn haider_bridge_absent_id_prune_keeps_directory() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_absent_id_prune_keeps_directory));
+        let _lock = process_test_env_lock();
         let directory = sessions_test_directory("absent-id");
         let session_directory = directory.join("generated-session");
         fs::create_dir_all(&session_directory).unwrap();

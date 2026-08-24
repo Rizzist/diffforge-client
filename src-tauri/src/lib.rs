@@ -2913,6 +2913,8 @@ struct PreparedPromptImages {
 }
 
 include!("validation.rs");
+#[cfg(test)]
+include!("test_env_lock.rs");
 include!("platform.rs");
 include!("process.rs");
 include!("backend_cpu.rs");

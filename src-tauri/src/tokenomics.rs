@@ -18618,6 +18618,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_usage_event_prune_chunk_preserves_rollup_and_tombstone() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_usage_event_prune_chunk_preserves_rollup_and_tombstone));
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         conn.execute(
@@ -18735,6 +18736,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_fold_preserves_event_when_live_rollup_is_missing() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_fold_preserves_event_when_live_rollup_is_missing));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let event = tokenomics_test_event(
@@ -18782,6 +18784,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_all_rollup_day_starts_includes_acked_days_and_filters_scope() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_all_rollup_day_starts_includes_acked_days_and_filters_scope));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         // 2026-06-01 and 2026-06-03 for the personal scope; 2026-06-02 for a
@@ -18859,6 +18862,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_insert_waiting_on_fold_rechecks_source_hour_tombstone() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_insert_waiting_on_fold_rechecks_source_hour_tombstone));
         let db_path = tokenomics_test_temp_path("insert-fold-race", "sqlite");
         let _ = fs::remove_file(&db_path);
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -18910,6 +18914,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_fold_freezes_only_the_contributing_source_hour() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_fold_freezes_only_the_contributing_source_hour));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let source_a = tokenomics_test_event(
@@ -18955,6 +18960,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_settlement_horizon_ignores_one_day_clock_skew() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_settlement_horizon_ignores_one_day_clock_skew));
         let active_unix = 1_800_000_000;
         let active_day = tokenomics_utc_hour_bucket_from_unix(active_unix).0;
         let skewed_latest = active_unix + 86_400;
@@ -19002,6 +19008,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_accountless_pruned_history_uses_import_identity() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_accountless_pruned_history_uses_import_identity));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let (_, bucket_hour) = tokenomics_utc_hour_bucket_from_unix(1_600_000_000);
@@ -19066,6 +19073,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_accountless_live_history_is_owned_per_profile_source() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_accountless_live_history_is_owned_per_profile_source));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let event_a = tokenomics_test_event(
@@ -19178,6 +19186,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_persisted_retirement_survives_registry_absence() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_persisted_retirement_survives_registry_absence));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let retired = "anthropic:claude:profile:deleted-profile";
@@ -19196,6 +19205,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_retirement_migration_preserves_and_merges_totals() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_retirement_migration_preserves_and_merges_totals));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let old_key = "anthropic:claude:profile:synthetic";
@@ -19406,6 +19416,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_scoped_rollup_rebuild_matches_full_with_pruned_contributions() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_scoped_rollup_rebuild_matches_full_with_pruned_contributions));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let event_unix = tokenomics_unix_now().saturating_sub(2 * 86_400);
@@ -19569,6 +19580,7 @@ mod tokenomics_tests {
 
     #[test]
     fn opencode_db_scanner_ingests_cost_and_is_idempotent() {
+        let _storage = process_test_storage_isolation(stringify!(opencode_db_scanner_ingests_cost_and_is_idempotent));
         let _guard = TOKENOMICS_OPENCODE_TEST_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
@@ -19627,15 +19639,13 @@ mod tokenomics_tests {
             .unwrap();
         }
 
-        let previous = env::var_os("XDG_DATA_HOME");
-        env::set_var("XDG_DATA_HOME", &dir);
+        let _xdg_env = ProcessTestEnvVarGuard::set("XDG_DATA_HOME", &dir);
         // Isolate the agent-accounts registry too: on a dev machine a real
         // captured OpenCode profile would otherwise outrank the test's XDG
         // store (ingestion resolves the LAUNCH profile authority first).
         // Model production shape: an active profile whose root IS this test
         // store, so the profile-authority path resolves the fixture db.
-        let previous_data_dir = env::var_os("RUST_DIFFFORGE_DATA_DIR");
-        env::set_var("RUST_DIFFFORGE_DATA_DIR", &dir);
+        let _data_env = ProcessTestEnvVarGuard::set("RUST_DIFFFORGE_DATA_DIR", &dir);
         fs::write(
             dir.join("agent-accounts.json"),
             serde_json::to_string(&serde_json::json!({
@@ -19692,19 +19702,12 @@ mod tokenomics_tests {
             .unwrap();
         assert_eq!(count_after, 3);
 
-        match previous {
-            Some(value) => env::set_var("XDG_DATA_HOME", value),
-            None => env::remove_var("XDG_DATA_HOME"),
-        }
-        match previous_data_dir {
-            Some(value) => env::set_var("RUST_DIFFFORGE_DATA_DIR", value),
-            None => env::remove_var("RUST_DIFFFORGE_DATA_DIR"),
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn opencode_account_label_uses_short_key_fingerprint_tag() {
+        let _storage = process_test_storage_isolation(stringify!(opencode_account_label_uses_short_key_fingerprint_tag));
         let _guard = TOKENOMICS_OPENCODE_TEST_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
@@ -19720,8 +19723,7 @@ mod tokenomics_tests {
         )
         .unwrap();
 
-        let previous = env::var_os("XDG_DATA_HOME");
-        env::set_var("XDG_DATA_HOME", &dir);
+        let _data_env = ProcessTestEnvVarGuard::set("XDG_DATA_HOME", &dir);
 
         // The account's display label is a short tag of the key fingerprint
         // (same hash the accounts panel shows) so the usage filter chip and the
@@ -19733,10 +19735,6 @@ mod tokenomics_tests {
         assert_eq!(account.label, format!("OpenCode {expected_tag}"));
         assert_ne!(account.label, "OpenCode account");
 
-        match previous {
-            Some(value) => env::set_var("XDG_DATA_HOME", value),
-            None => env::remove_var("XDG_DATA_HOME"),
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -19872,6 +19870,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_rollup_rebuild_normalizes_legacy_event_buckets() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_rollup_rebuild_normalizes_legacy_event_buckets));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         conn.execute(
@@ -19911,6 +19910,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_rollup_rebuild_coalesces_legacy_identity_duplicates() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_rollup_rebuild_coalesces_legacy_identity_duplicates));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         conn.execute_batch(
@@ -19949,6 +19949,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_prepare_db_migrates_legacy_cloud_rollups_before_indexes() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_prepare_db_migrates_legacy_cloud_rollups_before_indexes));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE tokenomics_cloud_rollups(
@@ -20029,6 +20030,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_reconcile_preserves_completed_codex_state_scan() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_reconcile_preserves_completed_codex_state_scan));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         tokenomics_upsert_scan_state(
@@ -20053,6 +20055,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_reconcile_preserves_pruned_and_unrebuildable_codex_history() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_reconcile_preserves_pruned_and_unrebuildable_codex_history));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         tokenomics_upsert_scan_state(
@@ -20186,6 +20189,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_codex_usage_cache_reuses_fresh_weekly_snapshot() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_codex_usage_cache_reuses_fresh_weekly_snapshot));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let usage = json!({
@@ -20292,6 +20296,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_repair_deletes_mislabeled_codex_session_windows() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_repair_deletes_mislabeled_codex_session_windows));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         conn.execute(
@@ -20348,6 +20353,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_codex_usage_cache_expires_after_stale_window() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_codex_usage_cache_expires_after_stale_window));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         tokenomics_store_codex_usage_cache_at(
@@ -20399,6 +20405,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_latest_windows_use_v2_session_replacement_rows() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_latest_windows_use_v2_session_replacement_rows));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let scope = tokenomics_unknown_billing_scope();
@@ -20432,6 +20439,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_compaction_keeps_accounts_referenced_only_by_pruned_rollups() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_compaction_keeps_accounts_referenced_only_by_pruned_rollups));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let account_key = "openai:codex:pruned-only";
@@ -20481,6 +20489,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_account_sync_rollups_collapse_workspace_metadata() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_account_sync_rollups_collapse_workspace_metadata));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let bucket_start = tokenomics_test_current_hour_bucket();
@@ -20539,6 +20548,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_account_sync_rollups_fall_back_to_component_totals() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_account_sync_rollups_fall_back_to_component_totals));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let bucket_start = tokenomics_test_current_hour_bucket();
@@ -20568,6 +20578,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_account_sync_rollups_skip_legacy_unix_hour_buckets() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_account_sync_rollups_skip_legacy_unix_hour_buckets));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let bucket_start = tokenomics_test_current_hour_bucket();
@@ -20599,6 +20610,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_summary_separates_same_provider_accounts() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_summary_separates_same_provider_accounts));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let created_at = tokenomics_test_current_hour_bucket();
@@ -20669,6 +20681,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_existing_source_identity_reuses_historical_codex_provider() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_existing_source_identity_reuses_historical_codex_provider));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
 
@@ -20722,6 +20735,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_local_json_scan_ignores_embedded_device_ids() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_local_json_scan_ignores_embedded_device_ids));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let provider_account = TokenomicsProviderAccount {
@@ -20760,6 +20774,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_summary_uses_hourly_replacements_without_day_double_counting() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_summary_uses_hourly_replacements_without_day_double_counting));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let bucket_start = tokenomics_test_current_hour_bucket();
@@ -20810,6 +20825,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_codex_import_ledger_repair_tombstones_orphaned_event_rows() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_codex_import_ledger_repair_tombstones_orphaned_event_rows));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let (_, bucket_start) =
@@ -20925,6 +20941,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_scan_day_summary_delta_returns_completed_provider_day() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_scan_day_summary_delta_returns_completed_provider_day));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let bucket_start = tokenomics_test_current_hour_bucket();
@@ -20979,6 +20996,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_summary_v2_includes_rolling_daily_rows_without_legacy_monthly() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_summary_v2_includes_rolling_daily_rows_without_legacy_monthly));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
 
@@ -21024,6 +21042,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_account_sync_rollups_preserve_provider_accounts() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_account_sync_rollups_preserve_provider_accounts));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let bucket_start = tokenomics_test_current_hour_bucket();
@@ -21072,6 +21091,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_account_sync_rollups_preserve_scope_and_include_unknown() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_account_sync_rollups_preserve_scope_and_include_unknown));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let created_at = tokenomics_test_current_hour_bucket();
@@ -21144,6 +21164,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_account_sync_rollups_preserve_models_for_same_account() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_account_sync_rollups_preserve_models_for_same_account));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let bucket_start = tokenomics_test_current_hour_bucket();
@@ -21185,6 +21206,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_account_sync_rollups_preserve_device_ids() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_account_sync_rollups_preserve_device_ids));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let bucket_start = tokenomics_test_current_hour_bucket();
@@ -21222,6 +21244,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_cloud_cache_is_display_only_and_device_aware() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_cloud_cache_is_display_only_and_device_aware));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let bucket_start = tokenomics_test_current_hour_bucket();
@@ -21307,6 +21330,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_cloud_cache_rejects_local_and_account_level_limit_facts() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_cloud_cache_rejects_local_and_account_level_limit_facts));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let local_device_id = tokenomics_local_device_id();
@@ -21410,6 +21434,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_cloud_relay_summary_flattens_hourly_groups_and_windows() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_cloud_relay_summary_flattens_hourly_groups_and_windows));
         let bucket_start = tokenomics_test_current_hour_bucket();
         let bucket_ms = tokenomics_timestamp_unix(&bucket_start)
             .unwrap()
@@ -21478,6 +21503,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_cloud_status_summary_devices_flatten_to_remote_facts_and_preserve_cursor() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_cloud_status_summary_devices_flatten_to_remote_facts_and_preserve_cursor));
         let bucket_start = tokenomics_test_current_hour_bucket();
         let bucket_ms = tokenomics_timestamp_unix(&bucket_start)
             .unwrap()
@@ -21553,6 +21579,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_resync_reset_clears_scan_caches() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_resync_reset_clears_scan_caches));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         tokenomics_upsert_scan_state(
@@ -21624,6 +21651,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_source_import_offset_survives_forced_resync_cache_reset() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_source_import_offset_survives_forced_resync_cache_reset));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let path = tokenomics_test_temp_path("import-offset-cache", "jsonl");
@@ -21694,6 +21722,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_duplicate_generic_scan_preserves_observed_import_timestamps() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_duplicate_generic_scan_preserves_observed_import_timestamps));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let path = tokenomics_test_temp_path("duplicate-observed", "jsonl");
@@ -21750,6 +21779,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_source_offsets_require_matching_coverage_range() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_source_offsets_require_matching_coverage_range));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let path = tokenomics_test_temp_path("session-coverage", "jsonl");
@@ -21794,6 +21824,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_codex_import_ledger_survives_raw_session_deletion() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_codex_import_ledger_survives_raw_session_deletion));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let path = tokenomics_test_temp_path("codex-ledger", "jsonl");
@@ -21960,6 +21991,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_claude_jsonl_scan_resumes_from_byte_offset() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_claude_jsonl_scan_resumes_from_byte_offset));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let path = tokenomics_test_temp_path("claude-ledger", "jsonl");
@@ -22091,6 +22123,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_claude_jsonl_scan_dedupes_repeated_request_chunks() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_claude_jsonl_scan_dedupes_repeated_request_chunks));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let path = tokenomics_test_temp_path("claude-request-dedupe", "jsonl");
@@ -22153,6 +22186,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_claude_jsonl_scan_does_not_advance_past_partial_tail() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_claude_jsonl_scan_does_not_advance_past_partial_tail));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let path = tokenomics_test_temp_path("claude-partial-tail", "jsonl");
@@ -22209,6 +22243,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_source_offset_resume_rejects_rewritten_prefix() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_source_offset_resume_rejects_rewritten_prefix));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let path = tokenomics_test_temp_path("claude-rewrite", "jsonl");
@@ -22307,6 +22342,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_account_sync_rollups_include_rolling_30_day_boundary() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_account_sync_rollups_include_rolling_30_day_boundary));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let window_start: String = conn
@@ -22412,6 +22448,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_reconcile_provider_account_label_updates_existing_rows() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_reconcile_provider_account_label_updates_existing_rows));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let account = TokenomicsProviderAccount {
@@ -22471,6 +22508,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_reconcile_duplicate_provider_account_identities_preserves_badge_windows() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_reconcile_duplicate_provider_account_identities_preserves_badge_windows));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let canonical_key = "openai:codex:canonical-agency";
@@ -22555,6 +22593,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_reconcile_duplicate_provider_account_identities_preserves_claude_usage_keys() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_reconcile_duplicate_provider_account_identities_preserves_claude_usage_keys));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let canonical_key = "anthropic:claude:support-splutter";
@@ -22645,6 +22684,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_provider_account_uses_claude_oauth_account_identity() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_provider_account_uses_claude_oauth_account_identity));
         let auth_a = json!({
             "credentials": {
                 "claudeAiOauth": {
@@ -22688,6 +22728,7 @@ mod tokenomics_tests {
 
     #[test]
     fn claude_profile_provider_account_resolves_profile_dir_identity() {
+        let _storage = process_test_storage_isolation(stringify!(claude_profile_provider_account_resolves_profile_dir_identity));
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
@@ -22879,6 +22920,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_migrate_provider_account_key_rebuilds_claude_rollups() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_migrate_provider_account_key_rebuilds_claude_rollups));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         let old_credentials = json!({
@@ -22973,6 +23015,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_codex_usage_account_id_canonicalizes_auth_alias_rows() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_codex_usage_account_id_canonicalizes_auth_alias_rows));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
 
@@ -23150,6 +23193,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_cached_codex_usage_rewrites_alias_cache_key() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_cached_codex_usage_rewrites_alias_cache_key));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
 
@@ -23218,6 +23262,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_record_usage_value_prices_claude_fable_5() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_record_usage_value_prices_claude_fable_5));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
 
@@ -23262,6 +23307,7 @@ mod tokenomics_tests {
 
     #[test]
     fn tokenomics_repair_provider_api_costs_rebuilds_claude_rollups() {
+        let _storage = process_test_storage_isolation(stringify!(tokenomics_repair_provider_api_costs_rebuilds_claude_rollups));
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
         conn.execute(

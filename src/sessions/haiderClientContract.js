@@ -69,7 +69,14 @@ export function modelGroupsFromLibrary(library) {
     if (!id) return null;
     let group = byProvider.get(id);
     if (!group) {
-      group = { provider: id, available: false, status: "unavailable", models: [] };
+      group = {
+        provider: id,
+        availability: "unknown",
+        enabled: null,
+        selectable: true,
+        status: "availability unknown",
+        models: [],
+      };
       byProvider.set(id, group);
       groups.push(group);
     }
@@ -78,11 +85,24 @@ export function modelGroupsFromLibrary(library) {
   };
 
   for (const entry of providers) {
-    const availability = text(entry?.availability);
-    const available = availability === "available" && entry?.enabled === true;
+    const rawAvailability = text(entry?.availability);
+    const availability = ["available", "unavailable", "unknown"].includes(rawAvailability)
+      ? rawAvailability
+      : "unknown";
+    const enabled = typeof entry?.enabled === "boolean" ? entry.enabled : null;
+    const selectable = enabled !== false && availability !== "unavailable";
+    const status = enabled === false
+      ? "disabled"
+      : availability === "unavailable"
+        ? "unavailable"
+        : availability === "unknown"
+          ? "availability unknown"
+          : text(entry?.auth_state) || "ready";
     const group = ensureGroup(entry?.provider, {
-      available,
-      status: available ? (text(entry?.auth_state) || "ready") : "unavailable",
+      availability,
+      enabled,
+      selectable,
+      status,
     });
     if (!group) continue;
     for (const model of Array.isArray(entry?.models) ? entry.models : []) {
@@ -95,8 +115,12 @@ export function modelGroupsFromLibrary(library) {
     if (!entry || typeof entry !== "object") continue;
     const group = ensureGroup(entry.provider, {
       ...(byProvider.has(text(entry.provider)) ? {} : {
-        available: Boolean(entry.available),
-        status: entry.available ? (text(entry.auth_state) || "ready") : "unavailable",
+        availability: entry.available === true ? "available" : "unknown",
+        enabled: entry.available === true ? true : null,
+        selectable: true,
+        status: entry.available === true
+          ? (text(entry.auth_state) || "ready")
+          : "availability unknown",
       }),
     });
     const model = text(entry.model);
@@ -104,10 +128,40 @@ export function modelGroupsFromLibrary(library) {
   }
 
   groups.sort((left, right) => (
-    Number(right.available) - Number(left.available)
+    Number(right.selectable) - Number(left.selectable)
+    || Number(right.availability === "available") - Number(left.availability === "available")
     || left.provider.localeCompare(right.provider)
   ));
   return groups;
+}
+
+/* Availability and administrative enablement are independent provider facts.
+   Only a known unavailable provider or a known disabled provider blocks model
+   selection. Unknown availability remains selectable, and the reason for any
+   actual block is carried separately for the composer to render. */
+export function modelGroupSelectionState(group, switchable) {
+  if (switchable !== true) {
+    return {
+      selectable: false,
+      reason: "switching_unavailable",
+      label: "Model switching is read-only",
+    };
+  }
+  if (group?.enabled === false) {
+    return {
+      selectable: false,
+      reason: "provider_disabled",
+      label: "Provider disabled",
+    };
+  }
+  if (group?.availability === "unavailable") {
+    return {
+      selectable: false,
+      reason: "provider_unavailable",
+      label: "Provider unavailable",
+    };
+  }
+  return { selectable: true, reason: null, label: null };
 }
 
 /* Testable seam for the composer menus. This initially preserves the legacy

@@ -35,6 +35,11 @@ import SessionsRail from "../sessions/SessionsRail.jsx";
 import SessionSurface from "../sessions/SessionSurface.jsx";
 import MediaDeck from "../media/MediaDeck.jsx";
 import { listSessions, sessionWorkingDirectory } from "../sessions/sessionsModel.js";
+import { sessionCloseCautionSummary } from "../sessions/sessionActivity.js";
+import {
+  railSyncPillState,
+  sessionSyncTransportState,
+} from "../sessions/sessionSync.js";
 import { listenShared, waitSharedListenerReady } from "./sharedTauriEvents.js";
 import { resolveLoopspaceTodoTerminalSelectors } from "./loopspaceTodoDispatchTargets.js";
 import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
@@ -18565,7 +18570,14 @@ export default function App() {
   /* Session-history sync for the rail's syncing pill: lifted from
      SessionTranscript (projection caught_up) through SessionSurface's
      additive onSyncingChange callback. */
-  const [sessionHistorySyncing, setSessionHistorySyncing] = useState(false);
+  /* true | false | null — null means no transcript has observed a projection
+     head yet (startup, draft/home, after unmount). "Synced" is a claim, so an
+     unobserved projection must not make it. */
+  const [sessionHistorySyncing, setSessionHistorySyncing] = useState(null);
+  const handleSessionHistorySyncing = useCallback((syncing) => {
+    setSessionHistorySyncing(sessionSyncTransportState(syncing));
+  }, []);
+  const sessionHistorySyncState = railSyncPillState(sessionHistorySyncing);
   /* Rail session search: a persistent input under the New chat row (rendered
      by SessionsRail) narrows the Pinned/Recent lists by title. */
   const [railSearchQuery, setRailSearchQuery] = useState("");
@@ -20337,10 +20349,11 @@ export default function App() {
 
 
 
-  /* Close contract (v0.9.38, session-native): closing with non-idle
-     sessions raises the Close / Background / Go back modal — the count is
-     sessions the harness reports as running or waiting. Idle app closes
-     directly; "force" (a modal's Close, or a repeat close request) skips. */
+  /* Close contract (v0.9.38, session-native): closing with an active run or
+     a summary whose activity is unknown raises the Close / Background / Go
+     back modal. run_id is the active-run coordinate; its documented absence
+     ambiguity is resolved only by run_state from that same summary. "force"
+     (the modal's Close, or a repeat request) skips. */
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
   useEffect(() => {
     if (!closeConfirmOpen) return undefined;
@@ -20358,12 +20371,11 @@ export default function App() {
       setNativeWebviewsSuppressed("close-confirm", false);
     };
   }, [closeConfirmOpen]);
-  const nonIdleSessionCount = useMemo(
-    () => sessions.filter(
-      (row) => row.status === "running" || row.status === "waiting",
-    ).length,
+  const closeCaution = useMemo(
+    () => sessionCloseCautionSummary(sessions),
     [sessions],
   );
+  const nonIdleSessionCount = closeCaution.total;
   const closeWindow = useCallback((eventOrOptions = null) => {
     const event = eventOrOptions && typeof eventOrOptions.stopPropagation === "function"
       ? eventOrOptions
@@ -24343,21 +24355,21 @@ export default function App() {
                             caught_up signal, lifted through SessionSurface.
                             Informational, never faked. */}
                         <RailSyncPill
-                          aria-label={sessionHistorySyncing
-                            ? "Syncing session history — open sync activity"
-                            : "Session history synced — open sync activity"}
-                          data-state={sessionHistorySyncing ? "syncing" : undefined}
+                          aria-label={sessionHistorySyncState.ariaLabel}
+                          data-state={sessionHistorySyncState.state === "syncing"
+                            ? "syncing"
+                            : undefined}
                           onClick={openNetworkingOverlay}
-                          title={sessionHistorySyncing
-                            ? "Syncing this session's history — click for the sync inbox/outbox"
-                            : "Synced — click for the sync inbox/outbox"}
+                          title={sessionHistorySyncState.title}
                           type="button"
                         >
                           <WindowSyncPillIndicator
                             aria-hidden="true"
-                            data-variant={sessionHistorySyncing ? "spinner" : "dot"}
+                            data-variant={sessionHistorySyncState.state === "syncing"
+                              ? "spinner"
+                              : "dot"}
                           />
-                          <span>{sessionHistorySyncing ? "Syncing" : "Synced"}</span>
+                          <span>{sessionHistorySyncState.label}</span>
                         </RailSyncPill>
                       </RailUtilityRow>
                     </RailTrafficRow>
@@ -25051,7 +25063,7 @@ export default function App() {
                       onResetToDraft={startNewSessionChat}
                       onSessionsRefresh={refreshSessions}
                       onShellWarm={markShellWarm}
-                      onSyncingChange={setSessionHistorySyncing}
+                      onSyncingChange={handleSessionHistorySyncing}
                       shellPrefs={shellPrefs}
                       onToggleTheme={() => updateAppTheme(
                         activeAppTheme === APP_THEME_LIGHT ? APP_THEME_DARK : APP_THEME_LIGHT,
@@ -26458,9 +26470,13 @@ export default function App() {
                   <CloseConfirmCard>
                     <h2>Close Diff Forge?</h2>
                     <p>
-                      {nonIdleSessionCount === 1
-                        ? "1 session is still working."
-                        : `${nonIdleSessionCount} sessions are still working.`}
+                      {closeCaution.active > 0 && (closeCaution.active === 1
+                        ? "1 session has an active run."
+                        : `${closeCaution.active} sessions have active runs.`)}
+                      {closeCaution.active > 0 && closeCaution.unknown > 0 ? " " : null}
+                      {closeCaution.unknown > 0 && (closeCaution.unknown === 1
+                        ? "1 session's activity state has not been observed."
+                        : `${closeCaution.unknown} sessions' activity states have not been observed.`)}
                       {" "}Background keeps the agents running with the window
                       folded away.
                     </p>

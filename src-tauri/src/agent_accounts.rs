@@ -8445,8 +8445,6 @@ async fn agent_accounts_pane_profiles(state: State<'_, TerminalState>) -> Result
 mod agent_accounts_tests {
     use super::*;
 
-    static AGENT_ACCOUNTS_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-
     // Regression (v0.9.25 startup crash): profile_identity computed the
     // fossil policy, whose helpers called profile_identity back — unbounded
     // mutual recursion that stack-overflowed the agent-accounts-capture
@@ -8493,10 +8491,7 @@ mod agent_accounts_tests {
 
     #[test]
     fn registry_parse_rejects_torn_writes_and_last_good_survives() {
-        let _env_guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_guard = process_test_env_lock();
         assert!(agent_accounts_registry_parse("{\"agents\": {\"codex\"").is_none());
         assert!(agent_accounts_registry_parse("[1, 2]").is_none());
         // Structurally invalid shapes must not become "last known good".
@@ -8583,28 +8578,7 @@ trust_level = "trusted"
         );
     }
 
-    struct ScopedAgentAccountsEnv {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl ScopedAgentAccountsEnv {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let previous = env::var_os(key);
-            env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for ScopedAgentAccountsEnv {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                env::set_var(self.key, previous);
-            } else {
-                env::remove_var(self.key);
-            }
-        }
-    }
+    type ScopedAgentAccountsEnv = ProcessTestEnvVarGuard;
 
     fn test_codex_auth_for_email(email: &str) -> String {
         test_codex_auth_for_account(email, &format!("acct-{email}"), "refresh-a")
@@ -8668,6 +8642,7 @@ trust_level = "trusted"
     /// replace HOME/local-data between the three provider captures.
     #[test]
     fn userprofile_without_home_capture_child() {
+        let _storage = process_test_storage_isolation("userprofile_without_home_capture_child");
         let Some(root) = env::var_os("DIFFFORGE_USERPROFILE_CAPTURE_CHILD").map(PathBuf::from)
         else {
             return;
@@ -8959,6 +8934,9 @@ trust_level = "trusted"
 
     #[test]
     fn login_transaction_generation_cas_rejects_stale_cancelled_and_exited_watchers() {
+        let _storage = process_test_storage_isolation(
+            "login_transaction_generation_cas_rejects_stale_cancelled_and_exited_watchers",
+        );
         agent_accounts_login_transaction_invalidate("codex", None, None);
         let old = agent_accounts_login_transaction_begin("codex", "profile-a", None);
         let current = agent_accounts_login_transaction_begin("codex", "profile-b", None);
@@ -9026,6 +9004,8 @@ trust_level = "trusted"
 
     #[test]
     fn login_pane_binding_is_atomic_and_instance_scoped() {
+        let _storage =
+            process_test_storage_isolation("login_pane_binding_is_atomic_and_instance_scoped");
         let kind = "opencode";
         let profile = format!("atomic-bind-{}", uuid::Uuid::new_v4());
         let baseline = AgentAccountsLoginCompletionBaseline {
@@ -9523,6 +9503,9 @@ trust_level = "trusted"
 
     #[test]
     fn stale_inventory_spans_workspaces_and_preserves_busy_state() {
+        let _storage = process_test_storage_isolation(
+            "stale_inventory_spans_workspaces_and_preserves_busy_state",
+        );
         let panes = json!({
             "pane-a": { "kind": "codex", "profile_id": "old", "profile_label": "Old", "auth_revision": "r1", "refresh_token": "inventory-must-not-leak" },
             "pane-b": { "kind": "codex", "profile_id": "old", "profile_label": "Old", "auth_revision": "r1" },
@@ -10064,10 +10047,8 @@ trust_level = "trusted"
 
     #[test]
     fn captured_label_collisions_disambiguate_newer_profile_by_domain() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(captured_label_collisions_disambiguate_newer_profile_by_domain));
+        let _guard = process_test_env_lock();
         let data = env::temp_dir().join(format!(
             "agent_accounts_label_dedupe_{}",
             uuid::Uuid::new_v4()
@@ -10124,10 +10105,7 @@ trust_level = "trusted"
 
     #[test]
     fn claude_snapshot_refresh_rejects_mismatched_default_identity() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_identity_gate_{}",
             uuid::Uuid::new_v4()
@@ -10232,10 +10210,7 @@ trust_level = "trusted"
 
     #[test]
     fn claude_snapshot_refresh_defers_credentials_newer_than_matching_state() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_credentials_first_{}",
             uuid::Uuid::new_v4()
@@ -10307,10 +10282,8 @@ trust_level = "trusted"
 
     #[test]
     fn deferred_claude_repair_refreshes_captured_profile_after_manual_duplicate() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(deferred_claude_repair_refreshes_captured_profile_after_manual_duplicate));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_deferred_duplicate_{}",
             uuid::Uuid::new_v4()
@@ -10387,10 +10360,7 @@ trust_level = "trusted"
 
     #[test]
     fn captured_claude_identity_self_heals_without_touching_manual_profiles() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_self_heal_{}",
             uuid::Uuid::new_v4()
@@ -10503,10 +10473,7 @@ trust_level = "trusted"
 
     #[test]
     fn marked_claude_profile_login_rebinds_email_and_collision_safe_label() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_profile_rebind_{}",
             uuid::Uuid::new_v4()
@@ -10601,10 +10568,8 @@ trust_level = "trusted"
 
     #[test]
     fn profile_login_preparation_neutralizes_a_preexisting_mismatch() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(profile_login_preparation_neutralizes_a_preexisting_mismatch));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_profile_prepare_{}",
             uuid::Uuid::new_v4()
@@ -10676,10 +10641,7 @@ trust_level = "trusted"
 
     #[test]
     fn matching_email_profile_login_detects_completion_material_change() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         let profile_dir = env::temp_dir().join(format!(
             "agent_accounts_claude_same_email_login_{}",
             uuid::Uuid::new_v4()
@@ -10729,10 +10691,7 @@ trust_level = "trusted"
 
     #[test]
     fn profile_login_completion_rejects_stale_email_for_new_state() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         let profile_dir = env::temp_dir().join(format!(
             "agent_accounts_claude_stale_login_poll_{}",
             uuid::Uuid::new_v4()
@@ -10766,10 +10725,8 @@ trust_level = "trusted"
 
     #[test]
     fn rebind_reserves_old_capture_id_and_dir_when_old_default_is_recaptured() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(rebind_reserves_old_capture_id_and_dir_when_old_default_is_recaptured));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_rebind_recapture_{}",
             uuid::Uuid::new_v4()
@@ -10911,10 +10868,9 @@ trust_level = "trusted"
 
     #[test]
     fn active_duplicate_email_stays_on_selected_profile() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(
+            active_duplicate_email_stays_on_selected_profile
+        ));
         let root = env::temp_dir().join(format!(
             "agent_accounts_duplicate_email_{}",
             uuid::Uuid::new_v4()
@@ -11009,10 +10965,8 @@ trust_level = "trusted"
 
     #[test]
     fn default_active_resolves_to_current_device_codex_profile() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(default_active_resolves_to_current_device_codex_profile));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_default_device_active_{}",
             uuid::Uuid::new_v4()
@@ -11218,10 +11172,8 @@ trust_level = "trusted"
 
     #[test]
     fn codex_launch_home_pins_default_account_to_captured_snapshot() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(codex_launch_home_pins_default_account_to_captured_snapshot));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!("agent_accounts_launch_{}", uuid::Uuid::new_v4()));
         let home = root.join("home");
         let data = root.join("data");
@@ -11249,10 +11201,8 @@ trust_level = "trusted"
 
     #[test]
     fn claude_spawn_env_pins_default_account_to_captured_config_dir() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(claude_spawn_env_pins_default_account_to_captured_config_dir));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_launch_{}",
             uuid::Uuid::new_v4()
@@ -11322,10 +11272,8 @@ trust_level = "trusted"
 
     #[test]
     fn claude_frozen_launch_keeps_env_trust_stamp_and_inventory_on_account_a() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(claude_frozen_launch_keeps_env_trust_stamp_and_inventory_on_account_a));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_frozen_launch_{}",
             uuid::Uuid::new_v4()
@@ -11554,10 +11502,8 @@ trust_level = "trusted"
 
     #[test]
     fn opencode_effective_default_launch_uses_captured_xdg_after_native_auth_changes() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(opencode_effective_default_launch_uses_captured_xdg_after_native_auth_changes));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_opencode_effective_default_{}",
             uuid::Uuid::new_v4()
@@ -11609,10 +11555,8 @@ trust_level = "trusted"
 
     #[test]
     fn codex_workspace_trust_uses_frozen_home_after_active_account_switch() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(codex_workspace_trust_uses_frozen_home_after_active_account_switch));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_codex_frozen_trust_{}",
             uuid::Uuid::new_v4()
@@ -11702,15 +11646,16 @@ trust_level = "trusted"
 
     #[test]
     fn launch_account_capture_rejects_unsupported_providers() {
+        let _storage = process_test_storage_isolation(
+            "launch_account_capture_rejects_unsupported_providers",
+        );
         assert!(agent_accounts_capture_launch_account_binding("generic").is_none());
     }
 
     #[test]
     fn captured_resume_account_survives_switch_before_spawn_everywhere() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(captured_resume_account_survives_switch_before_spawn_everywhere));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_captured_resume_{}",
             uuid::Uuid::new_v4()
@@ -11906,10 +11851,8 @@ trust_level = "trusted"
 
     #[test]
     fn codex_captured_resume_account_survives_switch_before_spawn_everywhere() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(codex_captured_resume_account_survives_switch_before_spawn_everywhere));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_codex_captured_resume_{}",
             uuid::Uuid::new_v4()
@@ -12121,10 +12064,7 @@ trust_level = "trusted"
 
     #[test]
     fn codex_managed_home_is_not_clobbered() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         // Even if an active codex profile existed, a coordination-managed
         // CODEX_HOME must win; this asserts the guard path compiles and the
         // managed entry survives untouched.
@@ -12160,10 +12100,8 @@ trust_level = "trusted"
 
     #[test]
     fn push_seal_open_round_trip_and_tamper_fails() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(push_seal_open_round_trip_and_tamper_fails));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_push_crypto_{}",
             uuid::Uuid::new_v4()
@@ -12185,10 +12123,8 @@ trust_level = "trusted"
 
     #[test]
     fn claude_push_bundle_contains_only_account_scoped_state() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(claude_push_bundle_contains_only_account_scoped_state));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_bundle_{}",
             uuid::Uuid::new_v4()
@@ -12245,10 +12181,8 @@ trust_level = "trusted"
 
     #[test]
     fn codex_push_bundle_excludes_config_toml_global_settings() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(codex_push_bundle_excludes_config_toml_global_settings));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_codex_bundle_{}",
             uuid::Uuid::new_v4()
@@ -12280,10 +12214,8 @@ trust_level = "trusted"
 
     #[test]
     fn claude_default_wipe_splices_oauth_and_preserves_global_state() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(claude_default_wipe_splices_oauth_and_preserves_global_state));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_claude_default_wipe_{}",
             uuid::Uuid::new_v4()
@@ -12336,10 +12268,8 @@ trust_level = "trusted"
 
     #[test]
     fn wipe_isolation_parent_escape_profile_dir_refused() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(wipe_isolation_parent_escape_profile_dir_refused));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_wipe_escape_{}",
             uuid::Uuid::new_v4()
@@ -12380,6 +12310,9 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_accepts_legacy_camel_case_device_and_status_payloads() {
+        let _storage = process_test_storage_isolation(
+            "agent_account_push_accepts_legacy_camel_case_device_and_status_payloads",
+        );
         let device = json!({
             "nativeDeviceId": "Device-B",
             "clientType": "desktop",
@@ -12440,10 +12373,8 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_completed_from_wrong_device_does_not_wipe() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_completed_from_wrong_device_does_not_wipe));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_wrong_device_complete_{}",
             uuid::Uuid::new_v4()
@@ -12512,12 +12443,10 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_stale_completion_is_rejected_and_removed() {
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_stale_completion_is_rejected_and_removed));
         use hmac::Mac as _;
 
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_stale_completion_{}",
             uuid::Uuid::new_v4()
@@ -12592,10 +12521,8 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_target_key_pin_allows_same_key_and_rejects_changed_key() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_target_key_pin_allows_same_key_and_rejects_changed_key));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_target_pin_{}",
             uuid::Uuid::new_v4()
@@ -12646,12 +12573,10 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_completed_requires_recipient_key_proof() {
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_completed_requires_recipient_key_proof));
         use hmac::Mac as _;
 
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         let root =
             env::temp_dir().join(format!("agent_accounts_ack_proof_{}", uuid::Uuid::new_v4()));
         let data = root.join("data");
@@ -12725,10 +12650,8 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_received_blob_rejects_wrong_target_expiry_and_replay() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_received_blob_rejects_wrong_target_expiry_and_replay));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!("agent_accounts_replay_{}", uuid::Uuid::new_v4()));
         let data = root.join("data");
         let _data_env = ScopedAgentAccountsEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data);
@@ -12754,10 +12677,8 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_requires_trusted_authenticated_sender() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_requires_trusted_authenticated_sender));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_sender_auth_{}",
             uuid::Uuid::new_v4()
@@ -12822,10 +12743,8 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_materialize_is_private_and_never_overwrites() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_materialize_is_private_and_never_overwrites));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_materialize_{}",
             uuid::Uuid::new_v4()
@@ -12859,10 +12778,8 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_registry_failure_never_reports_materialized() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_registry_failure_never_reports_materialized));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_registry_failure_{}",
             uuid::Uuid::new_v4()
@@ -12892,10 +12809,8 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_existing_corrupt_key_is_not_rotated() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_existing_corrupt_key_is_not_rotated));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_corrupt_key_{}",
             uuid::Uuid::new_v4()
@@ -12916,10 +12831,8 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_existing_mismatched_keypair_is_rejected() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_existing_mismatched_keypair_is_rejected));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_mismatched_key_{}",
             uuid::Uuid::new_v4()
@@ -12948,10 +12861,8 @@ trust_level = "trusted"
 
     #[test]
     fn agent_account_push_uses_loaded_key_after_file_changes_in_same_run() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(agent_account_push_uses_loaded_key_after_file_changes_in_same_run));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_cached_key_{}",
             uuid::Uuid::new_v4()
@@ -12979,10 +12890,8 @@ trust_level = "trusted"
 
     #[test]
     fn wipe_reprobes_non_default_identity_before_deleting() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(wipe_reprobes_non_default_identity_before_deleting));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_wipe_reprobe_{}",
             uuid::Uuid::new_v4()
@@ -13027,12 +12936,10 @@ trust_level = "trusted"
     #[cfg(unix)]
     #[test]
     fn wipe_rejects_symlinked_claude_global_state_without_touching_target() {
+        let _storage = process_test_storage_isolation(stringify!(wipe_rejects_symlinked_claude_global_state_without_touching_target));
         use std::os::unix::fs::symlink;
 
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_wipe_claude_symlink_{}",
             uuid::Uuid::new_v4()
@@ -13071,10 +12978,8 @@ trust_level = "trusted"
 
     #[test]
     fn wipe_isolation_other_profile_dirs_untouched() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(wipe_isolation_other_profile_dirs_untouched));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_wipe_other_profiles_{}",
             uuid::Uuid::new_v4()
@@ -13147,10 +13052,8 @@ trust_level = "trusted"
 
     #[test]
     fn wipe_isolation_default_home_different_identity_untouched() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(wipe_isolation_default_home_different_identity_untouched));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_wipe_default_other_{}",
             uuid::Uuid::new_v4()
@@ -13202,10 +13105,8 @@ trust_level = "trusted"
 
     #[test]
     fn wipe_isolation_only_pushed_identity_material_removed() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(wipe_isolation_only_pushed_identity_material_removed));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_wipe_only_pushed_{}",
             uuid::Uuid::new_v4()
@@ -13262,10 +13163,8 @@ trust_level = "trusted"
 
     #[test]
     fn wipe_isolation_apply_failed_does_not_wipe() {
-        let _guard = AGENT_ACCOUNTS_TEST_ENV_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _storage = process_test_storage_isolation(stringify!(wipe_isolation_apply_failed_does_not_wipe));
+        let _guard = process_test_env_lock();
         let root = env::temp_dir().join(format!(
             "agent_accounts_wipe_failed_apply_{}",
             uuid::Uuid::new_v4()

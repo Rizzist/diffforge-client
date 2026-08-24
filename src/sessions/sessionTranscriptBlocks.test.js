@@ -6,6 +6,7 @@ import {
   projectionRowKey,
   TOOL_STATUS_LABEL,
   TOOL_STATUS_UNRESOLVED,
+  toolClusterOpenState,
   toolStatusOf,
 } from "./sessionTranscriptBlocks.js";
 
@@ -136,4 +137,60 @@ test("an outcome this build cannot name never reads as a success", () => {
     assert.ok(TOOL_STATUS_UNRESOLVED.has(status), `${status} must surface itself`);
   }
   assert.ok(!TOOL_STATUS_UNRESOLVED.has("ok"));
+});
+
+test("a multi-row cluster that is unresolved on arrival initializes open", () => {
+  const rows = [
+    row({ kind: "tool", role: "tool", meta: { status: "completed" } }),
+    row({ seq: 2, kind: "tool", role: "tool", meta: { status: "quarantined" } }),
+  ];
+
+  assert.equal(toolClusterOpenState(undefined, rows), true);
+
+  const source = readFileSync(new URL("./SessionTranscript.jsx", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /useState\(\(\) => toolClusterOpenState\(undefined, rows\)\)/,
+    "ToolCluster must initialize from the tested open-state transition",
+  );
+});
+
+test("a row becoming unresolved later reopens a closed multi-row cluster", () => {
+  const settledRows = [
+    row({ kind: "tool", role: "tool", meta: { status: "completed" } }),
+    row({ seq: 2, kind: "tool", role: "tool", meta: { status: "completed" } }),
+  ];
+  const unresolvedRows = [
+    settledRows[0],
+    { ...settledRows[1], meta: { status: "conflict" } },
+  ];
+
+  const closed = toolClusterOpenState(undefined, settledRows);
+  assert.equal(closed, false);
+  assert.equal(toolClusterOpenState(closed, unresolvedRows), true);
+
+  const source = readFileSync(new URL("./SessionTranscript.jsx", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /setOpen\(\(current\) => toolClusterOpenState\(current, rows\)\)/,
+    "ToolCluster must reopen from the tested open-state transition",
+  );
+});
+
+test("two assistant turns saying the same thing are two turns", () => {
+  // Identical wording is not identical identity. Collapsing on text silently
+  // removed part of the transcript; only a repeated row identity is a repeat.
+  const blocks = buildTranscriptBlocks([
+    { seq: 1, ordinal: 0, projection_order: 0, kind: "message", role: "assistant", text: "Done." },
+    { seq: 2, ordinal: 0, projection_order: 0, kind: "message", role: "assistant", text: "Done." },
+  ]);
+  const said = blocks.filter((block) => block.type === "row").map((block) => block.row.text);
+  assert.deepEqual(said, ["Done.", "Done."]);
+
+  // The same row delivered twice still collapses.
+  const repeated = buildTranscriptBlocks([
+    { seq: 5, ordinal: 0, projection_order: 0, kind: "message", role: "assistant", text: "Once." },
+    { seq: 5, ordinal: 0, projection_order: 0, kind: "message", role: "assistant", text: "Once." },
+  ]);
+  assert.equal(repeated.filter((block) => block.type === "row").length, 1);
 });

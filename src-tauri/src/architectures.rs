@@ -2484,6 +2484,9 @@ mod architecture_folder_list_tests {
 
     #[test]
     fn folder_list_includes_all_subfolders_and_labels_git() {
+        let _storage = process_test_storage_isolation(
+            "architecture_folder_list_includes_all_subfolders_and_labels_git",
+        );
         let root = temp_workspace("mixed");
         let git_repo = root.join("repo-a");
         fs::create_dir_all(git_repo.join(".git")).unwrap();

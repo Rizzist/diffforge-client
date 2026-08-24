@@ -5,12 +5,17 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import styled from "styled-components";
 import NeedsInputCard from "./NeedsInputCard.jsx";
-import { projectionCaughtUp } from "./sessionSync.js";
+import {
+  projectionCaughtUp,
+  sessionSyncUnmountReport,
+  transcriptSyncReport,
+} from "./sessionSync.js";
 import {
   buildTranscriptBlocks,
   projectionRowKey,
   TOOL_STATUS_LABEL,
   TOOL_STATUS_UNRESOLVED,
+  toolClusterOpenState,
   toolStatusOf,
 } from "./sessionTranscriptBlocks.js";
 
@@ -170,13 +175,13 @@ function ToolCluster({ rows, sessionId }) {
     (count, row) => count + (TOOL_STATUS_UNRESOLVED.has(toolStatusOf(row)) ? 1 : 0),
     0,
   );
-  const [open, setOpen] = useState(failedCount > 0 || rows.length === 1);
+  const [open, setOpen] = useState(() => toolClusterOpenState(undefined, rows));
   const [detailKey, setDetailKey] = useState("");
   const [detailDocs, setDetailDocs] = useState({}); // key -> {state, doc}
   useEffect(() => {
     // A failure arriving in a live cluster must surface itself.
-    if (failedCount > 0) setOpen(true);
-  }, [failedCount]);
+    setOpen((current) => toolClusterOpenState(current, rows));
+  }, [failedCount, rows]);
 
   /* Thin rows fetch the full item through the 0.0.934 detail door on first
      open (haider session <id> item <seq> --json); pre-934 harnesses fall
@@ -314,19 +319,21 @@ export default function SessionTranscript({
   const [windowState, setWindowState] = useState({ start: 0, rows: [] });
   const [loadState, setLoadState] = useState("loading"); // loading | ready | empty | error
   const [caughtUp, setCaughtUp] = useState(null);
-  /* Additive sync lift (Session Deck): report whether this projection is
-     still catching up — cold load or a live fold gap — so the shell's rail
-     pill can show it. Read through a ref so an inline callback prop can't
-     retrigger the effect; unmount reports false (a hidden transcript is not
-     syncing anything the shell should show). Nothing else here changes. */
+  /* Additive sync lift (Session Deck): report this projection's sync state so
+     the shell's rail pill can show it. THREE states, because the projection
+     genuinely has three: true (catching up), false (observed caught up), and
+     null (no observed head — cold load hasn't answered, or the daemon sent no
+     caught_up at all). Read through a ref so an inline callback prop can't
+     retrigger the effect. Unmount reports null, not false: a transcript that
+     is gone knows nothing, and "synced" is a claim. */
   const onSyncingChangeRef = useRef(onSyncingChange);
   onSyncingChangeRef.current = onSyncingChange;
-  const syncing = loadState === "loading" || !caughtUp;
+  const syncing = transcriptSyncReport(loadState, caughtUp);
   useEffect(() => {
     onSyncingChangeRef.current?.(syncing);
   }, [syncing]);
   useEffect(() => () => {
-    onSyncingChangeRef.current?.(false);
+    onSyncingChangeRef.current?.(sessionSyncUnmountReport());
   }, []);
   const heightsRef = useRef(new Map()); // seq -> measured px
   const stickBottomRef = useRef(true);
@@ -510,7 +517,7 @@ export default function SessionTranscript({
 
   return (
     <TranscriptScroller onScroll={onScroll} ref={scrollerRef}>
-      {!caughtUp && (
+      {syncing === true && (
         <SyncHint aria-live="polite">syncing history…</SyncHint>
       )}
       {topSpacer > 0 && <div aria-hidden="true" style={{ height: topSpacer }} />}

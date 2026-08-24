@@ -1095,30 +1095,6 @@ fn haider_projection_fold_value_locked(
     let payload = haider_projection_payload(value);
     let payload_object = payload.as_object();
 
-    if haider_projection_pipe_usage_value(value)
-        && payload_object.is_some_and(|object| {
-            object.get("type").and_then(Value::as_str) != Some("usage")
-                && object.get("role").and_then(Value::as_str) != Some("usage")
-        })
-    {
-        let Some(seq) = haider_projection_seq(state, value, payload) else {
-            return step;
-        };
-        state.metadata.insert("usage".to_string(), payload.clone());
-        step.rows.push(haider_projection_row(
-            session_id,
-            seq,
-            haider_projection_ordinal(value, payload),
-            haider_projection_branch_id(value, payload),
-            "usage",
-            "meta",
-            String::new(),
-            payload.clone(),
-            haider_projection_at_ms(value, payload),
-        ));
-        return step;
-    }
-
     if payload_object.is_some_and(|object| object.contains_key("role")) {
         /* Once the enveloped item stream is live it is canonical: bare
         role-shaped compat records would duplicate its content at fresh
@@ -1211,12 +1187,13 @@ fn haider_projection_fold_value_locked(
                     state.effect_summaries.insert(effect_id, summary);
                 }
             } else if phase == "outcome" {
-                let summary = state
-                    .effect_summaries
-                    .remove(&effect_id)
-                    .unwrap_or_else(|| "effect completed".to_string());
                 let outcome = haider_projection_kind(payload, "outcome")
                     .unwrap_or_else(|| "unknown".to_string());
+                let text = state
+                    .effect_summaries
+                    .remove(&effect_id)
+                    .map(|summary| format!("{summary} · {outcome}"))
+                    .unwrap_or(outcome);
                 let Some(seq) = haider_projection_seq(state, value, payload) else {
                     return step;
                 };
@@ -1227,7 +1204,7 @@ fn haider_projection_fold_value_locked(
                     haider_projection_branch_id(value, payload),
                     "tool",
                     "tool",
-                    haider_projection_compact(&format!("{summary} · {outcome}"), 240),
+                    haider_projection_compact(&text, 240),
                     payload.clone(),
                     haider_projection_at_ms(value, payload),
                 ));
@@ -1345,7 +1322,7 @@ fn haider_projection_pipe_kind_row(
         session_id,
         haider_projection_seq(state, payload, payload)?,
         haider_projection_ordinal(payload, payload),
-        String::new(),
+        haider_projection_branch_id(payload, payload),
         "compaction_boundary",
         "meta",
         String::new(),
@@ -2242,35 +2219,6 @@ fn haider_projection_pipe_feature(value: &Value) -> bool {
             .is_some_and(haider_projection_pipe_feature),
         _ => false,
     }
-}
-
-fn haider_projection_pipe_usage_value(value: &Value) -> bool {
-    let payload = haider_projection_payload(value);
-    let Some(object) = payload.as_object() else {
-        return false;
-    };
-    if object.get("type").and_then(Value::as_str) == Some("usage")
-        || object.get("role").and_then(Value::as_str) == Some("usage")
-    {
-        return true;
-    }
-    if object.contains_key("role") {
-        return false;
-    }
-    object.get("usage").is_some_and(Value::is_object)
-        || object.keys().any(|key| {
-            matches!(
-                key.as_str(),
-                "input_tokens"
-                    | "output_tokens"
-                    | "prompt_tokens"
-                    | "completion_tokens"
-                    | "cached_tokens"
-                    | "cache_read"
-                    | "cache_read_input_tokens"
-                    | "cached_input_tokens"
-            )
-        })
 }
 
 fn haider_projection_daemon_endpoint() -> Result<PathBuf, String> {
@@ -5786,21 +5734,73 @@ mod haider_projection_tests {
     }
 
     #[test]
-    fn haider_projection_pipe_does_not_claim_usage_authority() {
-        assert!(haider_projection_pipe_usage_value(&json!({
-            "payload": {"type":"usage", "input":10, "output":3, "cached":2}
-        })));
-        assert!(!haider_projection_pipe_usage_value(&json!({
-            "role":"assistant", "text":"done", "seq":4, "ordinal":0
-        })));
-        let pipe_usage = json!({
+    fn typed_non_usage_event_with_token_field_is_not_admitted_as_usage() {
+        let mut state = HaiderProjectionFoldState::default();
+        let step = haider_projection_fold_value_locked(
+            &mut state,
+            "local",
+            &json!({
+                "seq": 62,
+                "payload": {
+                    "type": "run_state",
+                    "state": "streaming",
+                    "input_tokens": 10
+                }
+            }),
+        );
+
+        assert!(
+            step.rows.is_empty(),
+            "the published run_state discriminator must not be relabelled as usage"
+        );
+        assert!(state.metadata.contains_key("run_state"));
+        assert!(!state.metadata.contains_key("usage"));
+    }
+
+    #[test]
+    fn usage_requires_a_published_type_or_export_role_discriminator() {
+        let mut state = HaiderProjectionFoldState::default();
+        let export_usage = haider_projection_fold_pipe_value_locked(
+            &mut state,
+            "local",
+            &json!({"role":"usage", "seq":4, "ordinal":0, "input_tokens":10}),
+        );
+        assert_eq!(export_usage.rows.len(), 1);
+        assert_eq!(export_usage.rows[0].kind, "usage");
+
+        let undiscriminated = json!({
             "seq":5, "ordinal":0,
             "usage":{"input_tokens":10, "output_tokens":3, "cached_tokens":2}
         });
         assert_eq!(
-            haider_projection_pipe_row_identity(&pipe_usage).unwrap(),
+            haider_projection_pipe_row_identity(&undiscriminated).unwrap(),
             None
         );
+        let folded =
+            haider_projection_fold_pipe_value_locked(&mut state, "local", &undiscriminated);
+        assert!(folded.rows.is_empty());
+    }
+
+    #[test]
+    fn effect_outcome_without_seen_intent_keeps_summary_absent() {
+        let mut state = HaiderProjectionFoldState::default();
+        let step = haider_projection_fold_value_locked(
+            &mut state,
+            "local",
+            &json!({
+                "seq": 63,
+                "payload": {
+                    "type": "effect",
+                    "phase": "outcome",
+                    "effect": "effect-from-before-attach",
+                    "outcome": {"status": "failed"}
+                }
+            }),
+        );
+
+        assert_eq!(step.rows.len(), 1);
+        assert_eq!(step.rows[0].text, "failed");
+        assert!(step.rows[0].meta.get("summary").is_none());
     }
 
     #[test]
@@ -5968,10 +5968,8 @@ mod haider_projection_tests {
 
         assert_eq!(step.rows.len(), 1);
         assert_eq!(step.rows[0].kind, "compaction_boundary");
-        // The daemon owns this vocabulary; it rides in meta rather than being
-        // lifted into named fields we would then have to keep in step.
         assert_eq!(step.rows[0].meta, value);
-        assert_eq!(step.rows[0].branch_id, "");
+        assert_eq!(step.rows[0].branch_id, "branch-a");
         assert_eq!(
             haider_projection_pipe_row_identity(&step.rows[0].meta).unwrap(),
             Some((300, 0))

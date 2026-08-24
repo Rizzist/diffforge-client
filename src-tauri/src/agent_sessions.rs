@@ -4800,6 +4800,7 @@ mod agent_sessions_tests {
 
     #[test]
     fn opencode_session_last_model_prefers_latest_assistant_then_session_column() {
+        let _storage = process_test_storage_isolation(stringify!(opencode_session_last_model_prefers_latest_assistant_then_session_column));
         let _guard = OPENCODE_DB_TEST_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
@@ -4852,8 +4853,7 @@ mod agent_sessions_tests {
                 .unwrap();
         }
 
-        let previous = env::var_os("XDG_DATA_HOME");
-        env::set_var("XDG_DATA_HOME", &dir);
+        let _data_env = ProcessTestEnvVarGuard::set("XDG_DATA_HOME", &dir);
 
         assert_eq!(
             opencode_session_last_model("ses_1"),
@@ -4871,15 +4871,12 @@ mod agent_sessions_tests {
             Some("fireworks-ai/kimi-k2".to_string())
         );
 
-        match previous {
-            Some(value) => env::set_var("XDG_DATA_HOME", value),
-            None => env::remove_var("XDG_DATA_HOME"),
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn opencode_resume_resolution_requires_existing_workspace_session() {
+        let _storage = process_test_storage_isolation(stringify!(opencode_resume_resolution_requires_existing_workspace_session));
         let _guard = OPENCODE_DB_TEST_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
@@ -4929,8 +4926,7 @@ mod agent_sessions_tests {
                 .unwrap();
         }
 
-        let previous = env::var_os("XDG_DATA_HOME");
-        env::set_var("XDG_DATA_HOME", &dir);
+        let _data_env = ProcessTestEnvVarGuard::set("XDG_DATA_HOME", &dir);
 
         assert_eq!(
             resolve_opencode_resume_session(
@@ -4957,10 +4953,6 @@ mod agent_sessions_tests {
             "session history for a different workspace must not be resumed in this cwd"
         );
 
-        match previous {
-            Some(value) => env::set_var("XDG_DATA_HOME", value),
-            None => env::remove_var("XDG_DATA_HOME"),
-        }
         let _ = fs::remove_dir_all(&dir);
     }
 
