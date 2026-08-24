@@ -95,3 +95,11 @@ test("trajectory duration uses published lifecycle coordinates and preserves unk
   assert.match(source, /const durationLabel = trajectoryDurationLabel\(session, durationNowMs\)/);
   assert.match(source, /<span>\{durationLabel\}<\/span>/);
 });
+
+test("absent trajectory duration renders an em dash", () => {
+  assert.equal(
+    trajectoryDurationLabel({ agent_metrics: { live: false } }, 71_500),
+    "—",
+    "absent published lifecycle coordinates must render —, never a fabricated duration",
+  );
+});

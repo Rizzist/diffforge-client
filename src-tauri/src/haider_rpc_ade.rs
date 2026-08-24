@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         OnceLock,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,7 @@ const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
 const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
 const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
+const FEATURE_HAIDER_CODE_PLAN_STATUS_V1: &str = "haider_code_plan_status_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
 const HAIDER_NEEDS_INPUT_NO_CONNECTION: &str = "haider_needs_input_no_connection";
@@ -82,6 +83,7 @@ const MAX_ACCOUNT_RESTAGE_RETRIES: usize = 3;
 const ACCOUNT_RETRY_BACKOFF: Duration = Duration::from_millis(120);
 const SURFACE_EVENT: &str = "session-surface";
 const RESIDENT_SESSION_BINDING_EVENT: &str = "resident-session-binding";
+const TOKENOMICS_UPDATED_EVENT: &str = "diffforge://tokenomics-updated";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const FEATURE_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
@@ -179,6 +181,48 @@ pub struct UsageReportResult {
     pub report: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub availability: Option<SnapshotAvailabilityWire>,
+}
+
+/// Last provider-authored Haider Code plan frame observed on the shared ADE
+/// connection. `known=false` is deliberately distinct from a frame whose
+/// snapshot omits `weekly_allowance.percent_remaining`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct HaiderCodePlanStatusSnapshot {
+    /// `None` before a Welcome, `Some(false)` for an older daemon, and
+    /// `Some(true)` once the publishing feature is advertised.
+    pub supported: Option<bool>,
+    pub known: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at_ms: Option<u64>,
+}
+
+impl HaiderCodePlanStatusSnapshot {
+    fn for_features(features: &BTreeSet<String>, previous: &Self) -> Self {
+        if features.contains(FEATURE_HAIDER_CODE_PLAN_STATUS_V1) {
+            let mut snapshot = previous.clone();
+            snapshot.supported = Some(true);
+            snapshot
+        } else {
+            Self {
+                supported: Some(false),
+                ..Self::default()
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn unsupported() -> Self {
+        Self {
+            supported: Some(false),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -1024,6 +1068,11 @@ enum WireFrame {
         #[serde(default)]
         status: Option<SurfaceStatusWire>,
     },
+    HaiderCodePlanStatus {
+        provider: String,
+        account_alias: String,
+        outcome: Value,
+    },
     ResidentSessionBinding {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
@@ -1480,6 +1529,7 @@ struct ActorHandle {
     commands: mpsc::UnboundedSender<ActorCommand>,
     connection: watch::Sender<ConnectionSnapshot>,
     resident_binding: watch::Sender<ResidentSessionBindingSnapshot>,
+    haider_code_plan_status: watch::Sender<HaiderCodePlanStatusSnapshot>,
 }
 
 #[cfg(unix)]
@@ -1507,15 +1557,19 @@ fn actor_handle() -> &'static ActorHandle {
         let (commands, receiver) = mpsc::unbounded_channel();
         let (connection, _) = watch::channel(ConnectionSnapshot::default());
         let (resident_binding, _) = watch::channel(ResidentSessionBindingSnapshot::default());
+        let (haider_code_plan_status, _) =
+            watch::channel(HaiderCodePlanStatusSnapshot::default());
         tauri::async_runtime::spawn(run_actor(
             receiver,
             connection.clone(),
             resident_binding.clone(),
+            haider_code_plan_status.clone(),
         ));
         ActorHandle {
             commands,
             connection,
             resident_binding,
+            haider_code_plan_status,
         }
     })
 }
@@ -1555,6 +1609,17 @@ pub async fn resident_session_binding_snapshot() -> ResidentSessionBindingSnapsh
     }
     #[cfg(not(unix))]
     ResidentSessionBindingSnapshot::legacy()
+}
+
+/// Returns the last typed plan frame without treating a missing frame, a
+/// disconnected transport, or an absent percentage field as a numeric value.
+pub(crate) fn haider_code_plan_status_snapshot() -> HaiderCodePlanStatusSnapshot {
+    #[cfg(unix)]
+    {
+        return actor_handle().haider_code_plan_status.borrow().clone();
+    }
+    #[cfg(not(unix))]
+    HaiderCodePlanStatusSnapshot::unsupported()
 }
 
 /// Starts (or refreshes) a local subscription for one provider session.
@@ -4293,6 +4358,7 @@ async fn run_actor(
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
     connection_tx: watch::Sender<ConnectionSnapshot>,
     resident_binding_tx: watch::Sender<ResidentSessionBindingSnapshot>,
+    haider_code_plan_status_tx: watch::Sender<HaiderCodePlanStatusSnapshot>,
 ) {
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
     let mut last_published_revision: HashMap<String, u64> = HashMap::new();
@@ -4380,6 +4446,11 @@ async fn run_actor(
             roster_app.as_ref(),
             ResidentSessionBindingSnapshot::for_features(&snapshot.features),
         );
+        let plan_status = HaiderCodePlanStatusSnapshot::for_features(
+            &snapshot.features,
+            &haider_code_plan_status_tx.borrow(),
+        );
+        haider_code_plan_status_tx.send_replace(plan_status);
         let mut next_request = 1_u64;
         let mut setup_failed = false;
         if roster_app.is_some() && snapshot.can_watch_roster() {
@@ -4431,6 +4502,7 @@ async fn run_actor(
                 &mut roster_app,
                 &mut next_request,
                 &resident_binding_tx,
+                &haider_code_plan_status_tx,
             )
             .await;
         }
@@ -4538,6 +4610,7 @@ async fn run_connected(
     roster_app: &mut Option<AppHandle>,
     next_request: &mut u64,
     resident_binding_tx: &watch::Sender<ResidentSessionBindingSnapshot>,
+    haider_code_plan_status_tx: &watch::Sender<HaiderCodePlanStatusSnapshot>,
 ) {
     let mut heartbeat = tokio::time::interval(PING_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -4633,6 +4706,36 @@ async fn run_connected(
                 status,
             } => {
                 emit_surface(subscriptions, &connection, session_id, input, status);
+            }
+            WireFrame::HaiderCodePlanStatus {
+                provider,
+                account_alias,
+                outcome,
+            } => {
+                if connection
+                    .features
+                    .contains(FEATURE_HAIDER_CODE_PLAN_STATUS_V1)
+                {
+                    haider_code_plan_status_tx.send_replace(HaiderCodePlanStatusSnapshot {
+                        supported: Some(true),
+                        known: true,
+                        provider: Some(provider),
+                        account_alias: Some(account_alias),
+                        outcome: Some(outcome),
+                        received_at_ms: Some(
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+                            .unwrap_or(0),
+                        ),
+                    });
+                    if let Some(app) = roster_app.as_ref() {
+                        let _ = app.emit(
+                            TOKENOMICS_UPDATED_EVENT,
+                            serde_json::json!({ "source": "haider_code_plan_status" }),
+                        );
+                    }
+                }
             }
             WireFrame::ResidentSessionBinding {
                 session_id,
@@ -5073,6 +5176,7 @@ fn wire_frame_kind(frame: &WireFrame) -> &'static str {
         WireFrame::Response { .. } => "response",
         WireFrame::SessionRosterDelta { .. } => "session_roster_delta",
         WireFrame::SessionSurfaceDelta { .. } => "session_surface_delta",
+        WireFrame::HaiderCodePlanStatus { .. } => "haider_code_plan_status",
         WireFrame::ResidentSessionBinding { .. } => "resident_session_binding",
         WireFrame::MenuAnswer { .. } => "menu_answer",
         WireFrame::Ping { .. } => "ping",
@@ -5411,6 +5515,82 @@ fn blake3_g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn haider_code_plan_status_frame_preserves_optional_allowance_fields() {
+        let frame: WireFrame = serde_json::from_value(serde_json::json!({
+            "kind": "haider_code_plan_status",
+            "provider": "haider-code",
+            "account_alias": "work",
+            "outcome": {
+                "state": "available",
+                "snapshot": {
+                    "weekly_allowance": {
+                        "percent_remaining": null,
+                        "state": "grace",
+                        "resets_at_ms": null,
+                        "grace_until_ms": 1_800_000_000_000_u64
+                    }
+                }
+            }
+        }))
+        .expect("decode provider-authored plan status frame");
+
+        let WireFrame::HaiderCodePlanStatus {
+            provider,
+            account_alias,
+            outcome,
+        } = frame
+        else {
+            panic!("expected haider_code_plan_status frame");
+        };
+        assert_eq!(provider, "haider-code");
+        assert_eq!(account_alias, "work");
+        assert!(outcome["snapshot"]["weekly_allowance"]["percent_remaining"].is_null());
+        assert_eq!(
+            outcome["snapshot"]["weekly_allowance"]["state"],
+            serde_json::json!("grace")
+        );
+        assert_eq!(
+            outcome["snapshot"]["weekly_allowance"]["grace_until_ms"],
+            serde_json::json!(1_800_000_000_000_u64)
+        );
+    }
+
+    #[test]
+    fn haider_code_plan_status_support_does_not_fabricate_a_snapshot() {
+        let supported = BTreeSet::from([FEATURE_HAIDER_CODE_PLAN_STATUS_V1.to_string()]);
+        let first = HaiderCodePlanStatusSnapshot::for_features(
+            &supported,
+            &HaiderCodePlanStatusSnapshot::default(),
+        );
+        assert_eq!(first.supported, Some(true));
+        assert!(!first.known);
+        assert_eq!(first.outcome, None);
+
+        let published = HaiderCodePlanStatusSnapshot {
+            supported: Some(true),
+            known: true,
+            provider: Some("haider-code".to_string()),
+            account_alias: Some("work".to_string()),
+            outcome: Some(serde_json::json!({
+                "state": "available",
+                "snapshot": { "weekly_allowance": { "percent_remaining": 37.5 } }
+            })),
+            received_at_ms: Some(123),
+        };
+        assert_eq!(
+            HaiderCodePlanStatusSnapshot::for_features(&supported, &published),
+            published,
+            "a reconnect that still advertises the feature must retain the last provider frame"
+        );
+
+        let unsupported =
+            HaiderCodePlanStatusSnapshot::for_features(&BTreeSet::new(), &published);
+        assert_eq!(unsupported.supported, Some(false));
+        assert!(!unsupported.known);
+        assert_eq!(unsupported.outcome, None);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -7117,6 +7297,8 @@ mod tests {
             FEATURE_SESSION_EFFORT_SELECT_V1,
             FEATURE_SESSION_FAST_SELECT_V1,
             FEATURE_COMMAND_DOOR_V1,
+            FEATURE_USAGE_REPORT_V1,
+            FEATURE_HAIDER_CODE_PLAN_STATUS_V1,
         ] {
             assert!(
                 welcome.features.contains(feature),

@@ -115,10 +115,7 @@ test("sealed reasoning renders through the collapsed thinking fold", () => {
   assert.match(source, /const \[open, setOpen\] = useState\(live\)/);
 });
 
-test("an outcome this build cannot name never reads as a success", () => {
-  // The harness formats its typed status into prose, so cold rows only ever
-  // carry a word. A word we do not recognise — including one a newer daemon
-  // introduces — must not be reported as a finished, successful call.
+test("legacy pre-v6 outcomes retain inference without fabricating success", () => {
   assert.equal(toolStatusOf({ text: "tool call settled as Rejected" }), "rejected");
   assert.equal(toolStatusOf({ text: "tool call settled as Conflict" }), "conflict");
   assert.equal(toolStatusOf({ text: "tool call settled as Quarantined" }), "unknown");
@@ -137,6 +134,39 @@ test("an outcome this build cannot name never reads as a success", () => {
     assert.ok(TOOL_STATUS_UNRESOLVED.has(status), `${status} must surface itself`);
   }
   assert.ok(!TOOL_STATUS_UNRESOLVED.has("ok"));
+});
+
+function v6ToolRow(status, text = "tool call settled as Completed") {
+  const meta = {
+    _diffforge_pipe: { version: 6, pipe_tool_status_v1: true },
+  };
+  if (status !== undefined) meta.status = status;
+  return row({ kind: "tool", role: "tool", meta, text });
+}
+
+test("published rejected status outranks presentation prose", () => {
+  assert.equal(
+    toolStatusOf(v6ToolRow("rejected")),
+    "rejected",
+    "typed rejected must win over prose that says Completed",
+  );
+});
+
+test("an unnameable published status is unknown and forces its cluster open", () => {
+  const future = v6ToolRow("quarantined");
+  assert.deepEqual(
+    { status: toolStatusOf(future), open: toolClusterOpenState(false, [future]) },
+    { status: "unknown", open: true },
+    "a future typed status must stay unknown and surface its cluster",
+  );
+});
+
+test("a v6-capable row without status is unknown rather than prose-derived", () => {
+  assert.equal(
+    toolStatusOf(v6ToolRow(undefined, "tool call settled as Completed")),
+    "unknown",
+    "missing typed status must not borrow an outcome from presentation prose",
+  );
 });
 
 test("a multi-row cluster that is unresolved on arrival initializes open", () => {

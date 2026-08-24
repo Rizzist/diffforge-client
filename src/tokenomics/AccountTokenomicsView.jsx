@@ -62,11 +62,13 @@ import {
   TERMINAL_SESSION_RESTART_RESULT_EVENT,
   createTerminalSessionRestartCoordinatorId,
 } from "../terminals/terminalSessionRestart.js";
+import {
+  tokenomicsAuthorityLimit,
+  tokenomicsUsageAuthorityPresentation,
+} from "./tokenomicsUsageAuthority.js";
 
-const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_UPDATED_EVENT = "diffforge://tokenomics-updated";
 const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 60_000;
-const TOKENOMICS_HOT_TAIL_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TOKENOMICS_LIVE_LIMIT_REFRESH_INTERVAL_MS = 60_000;
 const TOKENOMICS_SUMMARY_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TOKENOMICS_HIDDEN_NOTIFY_DELAY_MS = 250;
@@ -94,6 +96,7 @@ const PROVIDER_LABELS = {
   openai: "Codex",
   codex: "Codex",
   opencode: "OpenCode",
+  "haider-code": "Haider Code",
 };
 
 const PROVIDER_MODELS = {
@@ -107,6 +110,7 @@ const PROVIDER_ACCENTS = {
   codex: "#60a5fa",
   claude: "#fb923c",
   opencode: "#34d399",
+  "haider-code": "#a78bfa",
 };
 
 const TOKENOMICS_PROVIDER_ACCOUNT_FILTER_NONE = "__none__";
@@ -238,7 +242,6 @@ function createTokenomicsStoreState() {
     selectedProvider: "all",
     selectedProviderAccountKeys: createDefaultProviderAccountKeys(),
     selectedDeviceId: "all",
-    scanProgress: null,
   };
 }
 
@@ -517,6 +520,7 @@ function providerLabel(row) {
 function providerDisplayName(providerId) {
   if (providerId === "codex") return "Codex";
   if (providerId === "claude") return "Claude Code";
+  if (providerId === "haider-code") return "Haider Code";
   return PROVIDERS.find((provider) => provider.id === providerId)?.label || providerId || "Provider";
 }
 
@@ -1413,8 +1417,10 @@ function limitDisplayAccountRows(rows) {
   return kept;
 }
 
-function mergeLimits(limits, windowKind) {
+function mergeLimits(limits, windowKind, authorityPresentation = null) {
   const normalizedWindowKind = normalizedLimitWindowKind(windowKind);
+  const authorityLimit = tokenomicsAuthorityLimit(authorityPresentation, normalizedWindowKind);
+  if (authorityLimit) return authorityLimit;
   const rows = limitDisplayAccountRows(
     limits
       .map(normalizeLimitRowForDisplay)
@@ -1492,7 +1498,7 @@ function mergeLimits(limits, windowKind) {
     // usage: "Safe at current pace" would be a claim about a pace nobody
     // measured yet.
     status_label: rows.every((row) => row?.client_reset_pending)
-      ? "Fresh window; awaiting live usage"
+      ? "Window ended; usage unknown"
       : limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
     reset_label: limitResetLabel(rows, normalizedWindowKind, claudeUnavailable, resetReference),
     rate_points: ratePoints,
@@ -1698,6 +1704,9 @@ function usageRateWindowSeconds(limit, windowKind) {
 }
 
 function limitSourceText(limit) {
+  if (limit?.authority_state === "unavailable") return limit.reset_label || "The daemon could not publish usage";
+  if (limit?.authority_state === "local_only") return limit.reset_label || "Only daemon journal counters are available";
+  if (limit?.authority_state === "unknown") return limit.reset_label || "No authoritative reading has been published";
   const source = limit?.limit_source || "";
   const isClaude = Array.isArray(limit?.providerKeys) && limit.providerKeys.includes("claude");
   if (source === "claude_statusline_unavailable") return "Live Claude Code limits unavailable";
@@ -1712,6 +1721,7 @@ function limitSourceText(limit) {
 }
 
 function planStatusTitle(limit, selectedProvider) {
+  if (limit?.authority_state) return limit.plan_name || limit.status_label || "Usage unknown";
   if (!limit?.plan_detected) {
     return selectedProvider === "claude" ? "No Claude account detected" : "No provider plan detected";
   }
@@ -2067,19 +2077,13 @@ const tokenomicsStore = {
   loadedOnce: false,
   loadPromise: null,
   liveLimitsPromise: null,
-  liveLimitsForcedRefreshQueued: false,
   liveLimitsLastAt: 0,
-  hotTailPromise: null,
-  hotTailLastAt: 0,
   summaryRefreshLastAt: 0,
   pollInterval: null,
   pollSubscriberCount: 0,
-  warmScanEpoch: -1,
   limitPercentSignature: "",
   limitSyncInFlight: false,
   limitSyncPending: false,
-  progressListenerPromise: null,
-  progressUnlisten: null,
   updatedListenerPromise: null,
   updatedUnlisten: null,
   notifyFrame: 0,
@@ -2116,28 +2120,6 @@ function tokenomicsHashNotifyValue(hash, value) {
   return tokenomicsHashNotifyText(hash, value);
 }
 
-function tokenomicsProgressNotifySignature(progress) {
-  if (!progress || typeof progress !== "object") return progress ? String(progress) : "";
-  return [
-    progress.phase,
-    progress.provider,
-    progress.agent_kind,
-    progress.provider_account_key,
-    progress.provider_account_label,
-    progress.day_index,
-    progress.day_total,
-    progress.day_label,
-    progress.files_scanned,
-    progress.inserted_events,
-    progress.day_files_scanned,
-    progress.day_inserted_events,
-    progress.candidate_count,
-    progress.day_candidate_count,
-    progress.cached,
-    progress.mode,
-  ].map((value) => String(value ?? "")).join("\u001f");
-}
-
 function tokenomicsSummaryNotifySignature(summary) {
   if (!summary || typeof summary !== "object") return "";
   const cached = tokenomicsSummaryNotifySignatureCache.get(summary);
@@ -2156,7 +2138,6 @@ function tokenomicsSubscriberStateSignature(state = {}) {
     PROVIDER_ACCOUNT_FILTER_PROVIDERS
       .map((providerId) => `${providerId}:${accountKeyForProvider(state.selectedProviderAccountKeys, providerId)}`)
       .join("\u001e"),
-    tokenomicsProgressNotifySignature(state.scanProgress),
     tokenomicsSummaryNotifySignature(state.summary),
   ].map((value) => String(value ?? "")).join("\u001f");
 }
@@ -2365,47 +2346,18 @@ function resetTokenomicsStoreForAccount(accountKey) {
   tokenomicsStore.loadedAccountKey = "";
   tokenomicsStore.loadPromise = null;
   tokenomicsStore.liveLimitsPromise = null;
-  tokenomicsStore.liveLimitsForcedRefreshQueued = false;
   tokenomicsStore.liveLimitsLastAt = 0;
-  tokenomicsStore.hotTailPromise = null;
-  tokenomicsStore.hotTailLastAt = 0;
   tokenomicsStore.summaryRefreshLastAt = 0;
   tokenomicsStore.limitPercentSignature = "";
   tokenomicsStore.limitSyncPending = false;
-  tokenomicsStore.warmScanEpoch = -1;
   tokenomicsStore.state = createTokenomicsStoreState();
   notifyTokenomicsSubscribers();
 }
 
-function ensureTokenomicsProgressListener() {
-  if (!tokenomicsStore.progressUnlisten && !tokenomicsStore.progressListenerPromise) {
-    tokenomicsStore.progressListenerPromise = listen(TOKENOMICS_SCAN_PROGRESS_EVENT, (event) => {
-      const payload = event.payload || null;
-      updateTokenomicsStore({ scanProgress: payload });
-      if (payload?.summary) {
-        mergeSummaryIntoTokenomicsStore(payload.summary);
-      }
-      const summaryDelta = payload?.summary_delta;
-      if (summaryDelta) {
-        mergeSummaryDeltaIntoTokenomicsStore(summaryDelta);
-      }
-    })
-      .then((handler) => {
-        if (tokenomicsStore.pollSubscriberCount <= 0) {
-          handler();
-          return;
-        }
-        tokenomicsStore.progressUnlisten = handler;
-      })
-      .catch(() => {})
-      .finally(() => {
-        tokenomicsStore.progressListenerPromise = null;
-      });
-  }
-
+function ensureTokenomicsUpdatedListener() {
   if (!tokenomicsStore.updatedUnlisten && !tokenomicsStore.updatedListenerPromise) {
     tokenomicsStore.updatedListenerPromise = listen(TOKENOMICS_UPDATED_EVENT, () => {
-      void refreshTokenomicsSummaryIfStale({ force: true });
+      void refreshVisibleTokenomicsLimits({ force: true });
     })
       .then((handler) => {
         if (tokenomicsStore.pollSubscriberCount <= 0) {
@@ -2421,15 +2373,7 @@ function ensureTokenomicsProgressListener() {
   }
 }
 
-function stopTokenomicsProgressListener() {
-  if (tokenomicsStore.progressUnlisten) {
-    try {
-      tokenomicsStore.progressUnlisten();
-    } catch {
-      // ignore
-    }
-    tokenomicsStore.progressUnlisten = null;
-  }
+function stopTokenomicsUpdatedListener() {
   if (tokenomicsStore.updatedUnlisten) {
     try {
       tokenomicsStore.updatedUnlisten();
@@ -2440,24 +2384,10 @@ function stopTokenomicsProgressListener() {
   }
 }
 
-function refreshTokenomicsLiveLimits({ force = false, force_provider_refresh: forceProviderRefresh = false, syncLimitChanges = false } = {}) {
+function refreshTokenomicsLiveLimits({ force = false, syncLimitChanges = false } = {}) {
   const now = Date.now();
   const requestEpoch = tokenomicsStore.requestEpoch;
   if (tokenomicsStore.liveLimitsPromise) {
-    if (forceProviderRefresh) {
-      tokenomicsStore.liveLimitsForcedRefreshQueued = true;
-      return tokenomicsStore.liveLimitsPromise.finally(() => {
-        if (tokenomicsStore.requestEpoch !== requestEpoch || !tokenomicsStore.liveLimitsForcedRefreshQueued) {
-          return tokenomicsStore.state.summary;
-        }
-        tokenomicsStore.liveLimitsForcedRefreshQueued = false;
-        return refreshTokenomicsLiveLimits({
-          force: true,
-          force_provider_refresh: true,
-          syncLimitChanges,
-        });
-      });
-    }
     return tokenomicsStore.liveLimitsPromise;
   }
   if (!force && now - tokenomicsStore.liveLimitsLastAt < TOKENOMICS_LIVE_LIMIT_REFRESH_INTERVAL_MS) {
@@ -2465,16 +2395,19 @@ function refreshTokenomicsLiveLimits({ force = false, force_provider_refresh: fo
   }
 
   tokenomicsStore.liveLimitsLastAt = now;
-  tokenomicsStore.liveLimitsPromise = invoke("tokenomics_get_live_limits", {
-    force_provider_refresh: forceProviderRefresh,
-  })
+  tokenomicsStore.liveLimitsPromise = invoke("tokenomics_get_live_limits")
     .then((limitsSummary) => {
       if (tokenomicsStore.requestEpoch === requestEpoch) {
         mergeSummaryIntoTokenomicsStore(limitsSummary || {}, { syncLimitChanges });
       }
       return tokenomicsStore.state.summary;
     })
-    .catch(() => tokenomicsStore.state.summary)
+    .catch((caught) => {
+      if (tokenomicsStore.requestEpoch === requestEpoch) {
+        updateTokenomicsStore({ error: tokenomicsErrorMessage(caught) });
+      }
+      return tokenomicsStore.state.summary;
+    })
     .finally(() => {
       if (tokenomicsStore.requestEpoch === requestEpoch) {
         tokenomicsStore.liveLimitsPromise = null;
@@ -2492,102 +2425,34 @@ function refreshTokenomicsSummaryIfStale({ force = false } = {}) {
   return loadTokenomicsStore({ force: true, summaryOnly: true });
 }
 
-function refreshVisibleTokenomicsLimits({ force = false, force_provider_refresh: forceProviderRefresh = true } = {}) {
-  return refreshTokenomicsLiveLimits({ force, force_provider_refresh: forceProviderRefresh, syncLimitChanges: true })
+function refreshVisibleTokenomicsLimits({ force = false } = {}) {
+  return refreshTokenomicsLiveLimits({ force, syncLimitChanges: true })
     .finally(() => {
       void refreshTokenomicsSummaryIfStale();
     });
 }
 
-function refreshTokenomicsHotTail({ force = false } = {}) {
-  const now = Date.now();
-  const requestEpoch = tokenomicsStore.requestEpoch;
-  if (tokenomicsStore.hotTailPromise) {
-    return tokenomicsStore.hotTailPromise;
-  }
-  if (!force && now - tokenomicsStore.hotTailLastAt < TOKENOMICS_HOT_TAIL_REFRESH_INTERVAL_MS) {
-    return Promise.resolve(tokenomicsStore.state.summary);
-  }
-
-  tokenomicsStore.hotTailLastAt = now;
-  tokenomicsStore.hotTailPromise = invoke("tokenomics_scan_realtime_usage")
-    .then((next) => {
-      if (tokenomicsStore.requestEpoch === requestEpoch) {
-        mergeSummaryIntoTokenomicsStore(next || {});
-      }
-      return tokenomicsStore.state.summary;
-    })
-    .catch(() => tokenomicsStore.state.summary)
-    .finally(() => {
-      if (tokenomicsStore.requestEpoch === requestEpoch) {
-        tokenomicsStore.hotTailPromise = null;
-      }
-    });
-  return tokenomicsStore.hotTailPromise;
-}
-
-function loadTokenomicsStore({
-  background = false,
-  force = false,
-  resync = false,
-  scan = false,
-  summaryOnly = false,
-} = {}) {
-  const forceResync = Boolean(resync);
-  if (forceResync) {
-    tokenomicsStore.requestEpoch += 1;
-    tokenomicsStore.loadPromise = null;
-    tokenomicsStore.liveLimitsPromise = null;
-  }
+function loadTokenomicsStore({ background = false, force = false } = {}) {
   const hasSummary = Boolean(tokenomicsStore.state.summary);
-  const shouldScan = !summaryOnly && Boolean(scan || forceResync || !tokenomicsStore.loadedOnce);
   const requestEpoch = tokenomicsStore.requestEpoch;
-
-  if (tokenomicsStore.loadPromise) {
-    return tokenomicsStore.loadPromise;
-  }
-  if (!force && summaryOnly && hasSummary) {
-    return Promise.resolve(tokenomicsStore.state.summary);
-  }
-  if (!force && !shouldScan && tokenomicsStore.loadedOnce && hasSummary) {
+  if (tokenomicsStore.loadPromise) return tokenomicsStore.loadPromise;
+  if (!force && tokenomicsStore.loadedOnce && hasSummary) {
     return Promise.resolve(tokenomicsStore.state.summary);
   }
 
   updateTokenomicsStore((previous) => ({
     error: "",
-    scanProgress: shouldScan ? null : previous.scanProgress,
-    status: background && previous.summary
-      ? "ready"
-      : shouldScan
-        ? "scanning"
-        : (previous.summary ? "ready" : "loading"),
+    status: background && previous.summary ? "ready" : "loading",
   }));
 
-  tokenomicsStore.loadPromise = (async () => {
-    try {
-      if (shouldScan) {
-        void refreshTokenomicsLiveLimits({
-          force: true,
-          force_provider_refresh: true,
-          syncLimitChanges: true,
-        });
-      }
-
-      const next = forceResync
-        ? await invoke("tokenomics_resync_last_30_days")
-        : summaryOnly
-          ? await invoke("tokenomics_get_summary")
-          : shouldScan
-            ? await invoke("tokenomics_scan_usage")
-            : await invoke("tokenomics_get_summary");
+  tokenomicsStore.loadPromise = invoke("tokenomics_get_summary")
+    .then((next) => {
       if (tokenomicsStore.requestEpoch !== requestEpoch) {
         return tokenomicsStore.state.summary;
       }
       tokenomicsStore.loadedOnce = true;
       tokenomicsStore.loadedAccountKey = tokenomicsStore.account_key;
-      if (summaryOnly) {
-        tokenomicsStore.summaryRefreshLastAt = Date.now();
-      }
+      tokenomicsStore.summaryRefreshLastAt = Date.now();
       updateTokenomicsStore((previous) => ({
         error: "",
         status: "ready",
@@ -2595,70 +2460,41 @@ function loadTokenomicsStore({
       }));
       rememberTokenomicsLimitSignature(tokenomicsStore.state.summary);
       return tokenomicsStore.state.summary;
-    } catch (caught) {
-      if (tokenomicsStore.requestEpoch !== requestEpoch) {
-        return tokenomicsStore.state.summary;
+    })
+    .catch((caught) => {
+      if (tokenomicsStore.requestEpoch === requestEpoch) {
+        updateTokenomicsStore((previous) => ({
+          error: tokenomicsErrorMessage(caught),
+          status: previous.summary ? "ready" : "error",
+        }));
       }
-      updateTokenomicsStore((previous) => ({
-        error: tokenomicsErrorMessage(caught),
-        status: previous.summary ? "ready" : "error",
-      }));
       return tokenomicsStore.state.summary;
-    }
-  })();
-
-  tokenomicsStore.loadPromise.finally(() => {
-    if (tokenomicsStore.requestEpoch === requestEpoch) {
-      tokenomicsStore.loadPromise = null;
-    }
-  });
-
+    })
+    .finally(() => {
+      if (tokenomicsStore.requestEpoch === requestEpoch) {
+        tokenomicsStore.loadPromise = null;
+      }
+    });
   return tokenomicsStore.loadPromise;
 }
 
-export function warmAccountTokenomics({ account_key: accountKey = "", scan = false } = {}) {
+export function warmAccountTokenomics({ account_key: accountKey = "" } = {}) {
   resetTokenomicsStoreForAccount(accountKey);
-  const requestEpoch = tokenomicsStore.requestEpoch;
-  const summaryPromise = loadTokenomicsStore({
-    background: true,
-    force: false,
-    summaryOnly: true,
+  const summaryPromise = loadTokenomicsStore({ background: true });
+  summaryPromise.finally(() => {
+    scheduleTokenomicsIdleTask(() => {
+      void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
+    }, { delay_ms: 120, timeout: 1500 });
   });
-
-  if (scan && tokenomicsStore.warmScanEpoch !== requestEpoch) {
-    tokenomicsStore.warmScanEpoch = requestEpoch;
-    summaryPromise.finally(() => {
-      scheduleTokenomicsIdleTask(() => {
-        if (tokenomicsStore.requestEpoch !== requestEpoch) {
-          return;
-        }
-        void loadTokenomicsStore({
-          background: true,
-          force: true,
-          scan: true,
-        }).finally(() => {
-          if (tokenomicsStore.requestEpoch === requestEpoch) {
-            void refreshTokenomicsLiveLimits({
-              force: true,
-              force_provider_refresh: true,
-              syncLimitChanges: true,
-            });
-          }
-        });
-      }, { delay_ms: 120, timeout: 1500 });
-    });
-  }
-
   return summaryPromise;
 }
-
 function startTokenomicsViewPolling() {
-  ensureTokenomicsProgressListener();
+  ensureTokenomicsUpdatedListener();
   tokenomicsStore.pollSubscriberCount += 1;
   let disposed = false;
-  const refreshVisibleTokenomics = ({ force = false, force_provider_refresh: forceProviderRefresh = false } = {}) => {
+  const refreshVisibleTokenomics = ({ force = false } = {}) => {
     if (disposed) return;
-    void refreshVisibleTokenomicsLimits({ force, force_provider_refresh: forceProviderRefresh });
+    void refreshVisibleTokenomicsLimits({ force });
   };
   // Tokenomics is DEVICE-level state: view activation (workspace switches
   // re-activate the keep-alive Tokens tab) must only subscribe and render the
@@ -2698,7 +2534,7 @@ function startTokenomicsViewPolling() {
     // no-op interval behind for the survivors. Its lifetime is already gated
     // by pollSubscriberCount below.
     tokenomicsStore.pollInterval = window.setInterval(() => {
-      void refreshVisibleTokenomicsLimits({ force: false, force_provider_refresh: false });
+      void refreshVisibleTokenomicsLimits({ force: false });
     }, TOKENOMICS_VIEW_POLL_INTERVAL_MS);
   }
 
@@ -2712,34 +2548,13 @@ function startTokenomicsViewPolling() {
       tokenomicsStore.pollInterval = null;
     }
     if (tokenomicsStore.pollSubscriberCount === 0) {
-      stopTokenomicsProgressListener();
+      stopTokenomicsUpdatedListener();
     }
   };
 }
 
-function tokenomicsLoadingLabel(status, summary, progress) {
-  const phase = String(progress?.phase || "");
-  if (phase === "limits_ready") return "Updating live limits";
-  if (phase === "realtime_current_day") return "Updating today";
-  if (phase === "day_complete") return "Updated usage day";
-  if (phase === "complete") return "Finalizing usage";
-  if (phase === "catch_up") return "Catching up usage";
-  if (phase === "day_start" || phase === "backfill_start") return "Scanning usage by day";
-  return status === "scanning" ? "Scanning usage" : "Loading usage";
-}
-
-function tokenomicsLoadingDetail(progress) {
-  const dayIndex = numeric(progress?.day_index);
-  const dayTotal = numeric(progress?.day_total);
-  const dayLabel = String(progress?.day_label || "").trim();
-  const files = numeric(progress?.files_scanned);
-  const events = numeric(progress?.inserted_events);
-  const parts = [];
-  if (dayLabel) parts.push(dayLabel);
-  if (dayIndex > 0 && dayTotal > 0) parts.push(`${dayIndex}/${dayTotal}`);
-  parts.push(`${files} files`);
-  parts.push(`${events} events`);
-  return parts.join(" · ");
+function tokenomicsLoadingLabel(status) {
+  return status === "refreshing" ? "Refreshing daemon usage" : "Loading usage history";
 }
 
 function TokenCell({ value }) {
@@ -2797,14 +2612,15 @@ function LimitMetricCard({ icon: Icon, limit, title }) {
 }
 
 function ProviderLimitGroup({ five_hour: fiveHour, provider_id: providerId, weekly }) {
+  const statusLimit = providerId === "haider-code" ? weekly : fiveHour;
   return (
     <ProviderLimitColumn>
       <ProviderLimitHeading $provider={providerId}>
         <strong>{providerDisplayName(providerId)}</strong>
       </ProviderLimitHeading>
       <PlanStatusLine>
-        <strong>{planStatusTitle(fiveHour, providerId)}</strong>
-        <span>{limitSourceText(fiveHour)}</span>
+        <strong>{planStatusTitle(statusLimit, providerId)}</strong>
+        <span>{limitSourceText(statusLimit)}</span>
       </PlanStatusLine>
       <LimitMetricCard icon={ClockIcon} limit={fiveHour} title="5-Hour Session" />
       <LimitMetricCard icon={CalendarIcon} limit={weekly} title="Weekly Limit" />
@@ -2825,7 +2641,6 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
     selectedProvider,
     selectedProviderAccountKeys,
     selectedAccountKey: legacySelectedAccountKey,
-    scanProgress,
   }, setTokenomicsState] = useState(() => tokenomicsStore.state);
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
   const [usageRateWindowKind, setUsageRateWindowKind] = useState("5_hour");
@@ -2836,10 +2651,13 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   );
   const lastAgentCredentialSignatureRef = useRef("");
 
-  const refresh = useCallback(async ({ scan = false, resync = false } = {}) => {
-    await loadTokenomicsStore({ scan, force: true, resync });
+  const refresh = useCallback(async () => {
+    updateTokenomicsStore({ error: "", status: "refreshing" });
+    await refreshTokenomicsLiveLimits({ force: true, syncLimitChanges: true });
+    await loadTokenomicsStore({ force: true });
+    updateTokenomicsStore({ status: "ready" });
   }, []);
-  const isScanning = status === "scanning";
+  const isRefreshing = status === "refreshing";
 
   const setSelectedProvider = useCallback((provider) => {
     updateTokenomicsStore({ selectedProvider: provider });
@@ -2869,8 +2687,8 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
       return;
     }
     resetTokenomicsStoreForAccount(accountKey);
-    void refreshVisibleTokenomicsLimits({ force: true, force_provider_refresh: true });
-    void loadTokenomicsStore({ background: true, force: false, summaryOnly: true });
+    void refreshVisibleTokenomicsLimits({ force: true });
+    void loadTokenomicsStore({ background: true, force: false });
   }, [accountKey, active]);
 
   useLayoutEffect(() => {
@@ -2900,7 +2718,6 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
     if (!previousSignature || previousSignature === agentCredentialSignature) return;
     void refreshTokenomicsLiveLimits({
       force: true,
-      force_provider_refresh: true,
       syncLimitChanges: true,
     }).finally(() => {
       void refreshTokenomicsSummaryIfStale({ force: true });
@@ -3011,8 +2828,20 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
     () => filterLimits(limitRowsRaw, selectedProvider, selectedLimitAccountFilter, selectedScopeKey, selectedDeviceId),
     [limitRowsRaw, selectedDeviceId, selectedLimitAccountFilter, selectedProvider, selectedScopeKey],
   );
-  const fiveHour = useMemo(() => mergeLimits(limits, "5_hour"), [limits]);
-  const weekly = useMemo(() => mergeLimits(limits, "weekly"), [limits]);
+  const fiveHour = useMemo(() => mergeLimits(
+    limits,
+    "5_hour",
+    selectedProvider === "all"
+      ? null
+      : tokenomicsUsageAuthorityPresentation(visibleSummary, selectedProvider, "5_hour"),
+  ), [limits, selectedProvider, visibleSummary]);
+  const weekly = useMemo(() => mergeLimits(
+    limits,
+    "weekly",
+    selectedProvider === "all"
+      ? null
+      : tokenomicsUsageAuthorityPresentation(visibleSummary, selectedProvider, "weekly"),
+  ), [limits, selectedProvider, visibleSummary]);
   const usageRateLimit = usageRateWindowKind === "weekly" ? weekly : fiveHour;
   const sessionUsageRows = useMemo(
     () => usageRateRowsFromLimit(usageRateLimit, hourlyRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey, usageRateWindowKind),
@@ -3054,8 +2883,12 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   // OpenCode is intentionally excluded from live limit gauges — OpenCode Go has
   // no usage API, and users track spend via their own plugins. OpenCode usage is
   // surfaced through the token-usage charts/account cards below, not estimates.
-  const providerLimitGroups = useMemo(() => (
-    ["codex", "claude"].map((providerId) => {
+  const providerLimitGroups = useMemo(() => {
+    const providerIds = ["codex", "claude"];
+    if (visibleSummary?.haider_code_plan_status?.supported === true) {
+      providerIds.push("haider-code");
+    }
+    return providerIds.map((providerId) => {
       const providerAccountKey = limitAccountKeyForDisplay(
         limitRowsRaw,
         providerId,
@@ -3066,11 +2899,19 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
       const providerLimits = filterLimits(limitRowsRaw, providerId, providerAccountKey, selectedScopeKey, selectedDeviceId);
       return {
         provider_id: providerId,
-        five_hour: mergeLimits(providerLimits, "5_hour"),
-        weekly: mergeLimits(providerLimits, "weekly"),
+        five_hour: mergeLimits(
+          providerLimits,
+          "5_hour",
+          tokenomicsUsageAuthorityPresentation(visibleSummary, providerId, "5_hour"),
+        ),
+        weekly: mergeLimits(
+          providerLimits,
+          "weekly",
+          tokenomicsUsageAuthorityPresentation(visibleSummary, providerId, "weekly"),
+        ),
       };
-    })
-  ), [limitRowsRaw, providerAccountKeys, selectedDeviceId, selectedScopeKey]);
+    });
+  }, [limitRowsRaw, providerAccountKeys, selectedDeviceId, selectedScopeKey, visibleSummary]);
   const storage = useMemo(
     () => storageUsageModel(billingStatus, storageUsage),
     [billingStatus, storageUsage],
@@ -3117,8 +2958,7 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
         {status !== "ready" && !visibleSummary ? (
           <TokenomicsLoading role="status" aria-live="polite">
             <span />
-            <strong>{tokenomicsLoadingLabel(status, summary, scanProgress)}</strong>
-            {scanProgress ? <small>{tokenomicsLoadingDetail(scanProgress)}</small> : null}
+            <strong>{tokenomicsLoadingLabel(status)}</strong>
           </TokenomicsLoading>
         ) : null}
 
@@ -3326,15 +3166,15 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
         <TokenomicsFooter>
           <span>{lastUpdatedText(summary?.updated_at)}</span>
           <TokenomicsRescanButton
-            disabled={isScanning}
+            disabled={isRefreshing}
             onClick={() => {
-              void refresh({ resync: true });
+              void refresh();
             }}
-            title="Rescan token usage"
+            title="Refresh daemon usage"
             type="button"
           >
-            <TokenomicsRescanIcon aria-hidden="true" data-spinning={isScanning ? "true" : undefined} />
-            <span>{isScanning ? "Scanning" : "Rescan"}</span>
+            <TokenomicsRescanIcon aria-hidden="true" data-spinning={isRefreshing ? "true" : undefined} />
+            <span>{isRefreshing ? "Refreshing" : "Refresh"}</span>
           </TokenomicsRescanButton>
         </TokenomicsFooter>
       </TokenomicsPanel>

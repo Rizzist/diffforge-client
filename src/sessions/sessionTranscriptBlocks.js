@@ -26,9 +26,33 @@ function orderNumber(value) {
    this" is exactly the case worth a human's eyes. */
 export const TOOL_STATUS_UNRESOLVED = new Set(["failed", "rejected", "conflict", "unknown"]);
 
+function publishedToolStatus(meta) {
+  const raw = typeof meta.status === "string" ? meta.status.trim().toLowerCase() : "";
+  if (raw === "completed") return "ok";
+  if (raw === "failed") return "failed";
+  if (raw === "rejected") return "rejected";
+  if (raw === "conflict") return "conflict";
+  if (raw === "cancelled") return "cancelled";
+  // The daemon's status enum is unknown-tolerant. Missing status and future
+  // wire names carry the same client meaning: this build cannot name them.
+  return "unknown";
+}
+
+function hasPublishedToolStatusAuthority(meta) {
+  const authority = meta?._diffforge_pipe;
+  return authority && typeof authority === "object"
+    && Number(authority.version) >= 6
+    && authority.pipe_tool_status_v1 === true;
+}
 
 export function toolStatusOf(row) {
   const meta = row?.meta && typeof row.meta === "object" ? row.meta : {};
+  if (hasPublishedToolStatusAuthority(meta)) {
+    return publishedToolStatus(meta);
+  }
+
+  // Legacy-only inference for pre-v6 rows. Prose is not consulted once the
+  // projection marker says the daemon publishes typed tool status.
   let raw = "";
   for (const key of ["status", "phase", "outcome"]) {
     const value = meta[key];
@@ -48,10 +72,8 @@ export function toolStatusOf(row) {
   if (/^(conflict|conflicted)$/.test(status)) return "conflict";
   if (/^(cancell?ed|aborted)$/.test(status)) return "cancelled";
   if (/^(running|in_progress|pending|started|active)$/.test(status)) return "running";
-  // An outcome this build cannot name is NOT a success. Cold rows carry only
-  // the daemon's prose today, so a status added upstream arrives here as a
-  // word we've never seen — reporting that as "Completed" is how a rejected
-  // call reads as a finished one.
+  // An outcome this build cannot name is NOT a success. A legacy cold row may
+  // carry only daemon prose, so an unfamiliar word still remains unknown.
   return "unknown";
 }
 

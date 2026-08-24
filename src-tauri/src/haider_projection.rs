@@ -7,7 +7,9 @@ const HAIDER_PROJECTION_MAX_EXPORT_BYTES: u64 = 32 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_WINDOW_ROWS: i64 = 1_000;
 const HAIDER_PROJECTION_WATCH_LIMIT: usize = 6;
-const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 7;
+// v8 refolds cached pipe rows so v6 tool-status authority reaches metadata
+// persisted by clients that first read those sidecars before this adoption.
+const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 8;
 const HAIDER_PROJECTION_PIPE_BATCH_LINES: usize = 256;
 const HAIDER_PROJECTION_PIPE_SAFETY_POLL: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_PIPE_STOP_POLL: Duration = Duration::from_millis(100);
@@ -17,6 +19,7 @@ const HAIDER_PROJECTION_IMMEDIATE_IDLE: Duration = Duration::from_millis(300);
 const HAIDER_PROJECTION_EVENT_ROWS_LIMIT: usize = 32;
 const HAIDER_PROJECTION_ROWS_EVENT: &str = "session-rows-appended";
 const HAIDER_PROJECTION_PREFOLD_QUEUE_LIMIT: usize = 32;
+const HAIDER_PROJECTION_PIPE_AUTHORITY_META_KEY: &str = "_diffforge_pipe";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct SessionProjectionRow {
@@ -252,6 +255,7 @@ enum HaiderProjectionJournalIngest {
 struct HaiderProjectionPipeRoute {
     path: PathBuf,
     head_seq: Option<i64>,
+    tool_status_v1: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1305,6 +1309,33 @@ fn haider_projection_fold_pipe_value_locked(
     step
 }
 
+/* The JSONL header and Welcome feature set are authorities for whether a
+tool row's `status` field exists by contract. They are not part of the row
+itself, so carry that negotiated context beside the verbatim daemon payload
+through persistence and into the frontend. This marker never supplies a
+status; an authoritative row that omitted it must remain unknown. */
+fn haider_projection_pipe_value_with_authority(
+    value: &Value,
+    pipe_version: i64,
+    tool_status_v1: bool,
+) -> Value {
+    let mut value = value.clone();
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    if object.get("role").and_then(Value::as_str) != Some("tool") {
+        return value;
+    }
+    object.insert(
+        HAIDER_PROJECTION_PIPE_AUTHORITY_META_KEY.to_string(),
+        json!({
+            "version": pipe_version,
+            "pipe_tool_status_v1": tool_status_v1,
+        }),
+    );
+    value
+}
+
 /* A v4 row named by `kind` rather than `role`. Kept open-vocabulary on purpose:
 an unfamiliar kind is passed to the generic fold rather than recognised here,
 so this function only claims the kinds it can actually render. */
@@ -2210,13 +2241,15 @@ fn haider_projection_read_capped_line(
     }
 }
 
-fn haider_projection_pipe_feature(value: &Value) -> bool {
+fn haider_projection_pipe_feature(value: &Value, expected: &str) -> bool {
     match value {
-        Value::String(feature) => feature == "pipe_native_v2",
-        Value::Array(values) => values.iter().any(haider_projection_pipe_feature),
+        Value::String(feature) => feature == expected,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| haider_projection_pipe_feature(value, expected)),
         Value::Object(object) => object
             .get("features")
-            .is_some_and(haider_projection_pipe_feature),
+            .is_some_and(|value| haider_projection_pipe_feature(value, expected)),
         _ => false,
     }
 }
@@ -2320,10 +2353,12 @@ fn haider_projection_resolve_pipe_route_rpc(
     )?;
     let welcome = haider_projection_rpc_read(&mut stream)?;
     if welcome.get("kind").and_then(Value::as_str) != Some("welcome")
-        || !haider_projection_pipe_feature(&welcome)
+        || !haider_projection_pipe_feature(&welcome, "pipe_native_v2")
     {
         return Err("Haider daemon does not advertise pipe_native_v2.".to_string());
     }
+    let tool_status_v1 =
+        haider_projection_pipe_feature(&welcome, "pipe_tool_status_v1");
     if let (Some(expected), Some(actual)) = (
         haider_rpc_ade::expected_profile_id(),
         welcome.get("profile_id").and_then(Value::as_str),
@@ -2358,6 +2393,7 @@ fn haider_projection_resolve_pipe_route_rpc(
     Ok(HaiderProjectionPipeRoute {
         path,
         head_seq: haider_bridge_head_seq(provider_session_id),
+        tool_status_v1,
     })
 }
 
@@ -2423,7 +2459,7 @@ fn haider_projection_refresh_pipe_route_with(
 const HAIDER_PROJECTION_PIPE_VERSION_FLOOR: i64 = 2;
 /// The newest version whose additions this reader actually understands. Reading
 /// above it is allowed and reported, never refused — see the header parser.
-const HAIDER_PROJECTION_PIPE_VERSION_KNOWN: i64 = 5;
+const HAIDER_PROJECTION_PIPE_VERSION_KNOWN: i64 = 6;
 
 static HAIDER_PROJECTION_PIPE_VERSION_AHEAD: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
@@ -2465,8 +2501,9 @@ fn haider_projection_parse_pipe_header(
         .ok_or_else(|| "Haider pipe header version was missing.".to_string())?;
     // v2 = 0.0.932 baseline; v3 (0.0.934) adds args_preview/result_preview on
     // tool rows; v4 (0.0.939) adds sealed `reasoning`, a `compaction_boundary`
-    // row kind carrying no role, and a `segment_end` terminator. Every bump so
-    // far has been ADDITIVE.
+    // row kind carrying no role, and a `segment_end` terminator; v5 rewrites
+    // v4 rows without changing their shape; v6 adds typed tool `status`. Every
+    // bump so far has been ADDITIVE.
     //
     // A version bump rebuilds every sidecar at once, so a closed upper bound is
     // not graceful degradation — it takes every session's transcript offline
@@ -2970,6 +3007,11 @@ fn haider_projection_ingest_pipe_owned(
                     let state = states.get_mut(session_id).ok_or_else(|| {
                         "Session projection state was not initialized.".to_string()
                     })?;
+                    let value = haider_projection_pipe_value_with_authority(
+                        &value,
+                        header.version,
+                        route.tool_status_v1,
+                    );
                     haider_projection_fold_pipe_value_locked(state, session_id, &value)
                 };
                 rows.extend(step.rows);
@@ -4754,6 +4796,7 @@ mod haider_projection_tests {
                     second_path.clone()
                 },
                 head_seq: Some(calls.get() as i64),
+                tool_status_v1: false,
             })
         };
 
@@ -4772,6 +4815,85 @@ mod haider_projection_tests {
                 .unwrap();
         assert_eq!(refreshed.path, second_path);
         assert_eq!(calls.get(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pipe_feature_sniff_names_typed_tool_status_independently() {
+        let welcome = json!({
+            "kind": "welcome",
+            "features": ["pipe_native_v2", "pipe_tool_status_v1"]
+        });
+        assert!(haider_projection_pipe_feature(&welcome, "pipe_native_v2"));
+        assert!(haider_projection_pipe_feature(
+            &welcome,
+            "pipe_tool_status_v1"
+        ));
+        assert!(!haider_projection_pipe_feature(
+            &json!({"features":["pipe_native_v2"]}),
+            "pipe_tool_status_v1"
+        ));
+    }
+
+    #[test]
+    fn v6_pipe_rows_carry_status_authority_without_inventing_status() {
+        let test_session = haider_projection_test_session();
+        let root = std::env::temp_dir().join(format!(
+            "haider-tool-status-v6-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.pipe");
+        let header = json!({
+            "pipe":"haider.session.jsonl",
+            "version":6,
+            "session_id":test_session.provider_session_id,
+            "generation":1,
+            "segment":0,
+            "starts_after":0
+        });
+        let rejected = json!({
+            "role":"tool",
+            "name":"apply_patch",
+            "summary":"presentation says completed",
+            "status":"rejected",
+            "at_ms":10,
+            "seq":1,
+            "ordinal":0
+        });
+        let absent = json!({
+            "role":"tool",
+            "name":"future_tool",
+            "summary":"tool call settled as Completed",
+            "at_ms":20,
+            "seq":2,
+            "ordinal":0
+        });
+        fs::write(&path, format!("{header}\n{rejected}\n{absent}\n")).unwrap();
+
+        let frame = haider_projection_ingest_pipe(
+            &test_session.session_id,
+            &test_session.provider_session_id,
+            &HaiderProjectionPipeRoute {
+                path: path.clone(),
+                head_seq: Some(2),
+                tool_status_v1: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(frame.rows.len(), 2);
+        assert_eq!(frame.rows[0].meta["status"], "rejected");
+        for row in &frame.rows {
+            assert_eq!(
+                row.meta[HAIDER_PROJECTION_PIPE_AUTHORITY_META_KEY],
+                json!({"version":6,"pipe_tool_status_v1":true})
+            );
+        }
+        assert!(
+            frame.rows[1].meta.get("status").is_none(),
+            "projection context must not synthesize an absent daemon status"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4808,6 +4930,7 @@ mod haider_projection_tests {
         let route = HaiderProjectionPipeRoute {
             path: path.clone(),
             head_seq: Some(257),
+            tool_status_v1: false,
         };
         let checks = Arc::new(AtomicUsize::new(0));
         let foreground_started = Arc::new(AtomicBool::new(false));
@@ -4907,6 +5030,7 @@ mod haider_projection_tests {
             &HaiderProjectionPipeRoute {
                 path: next_path,
                 head_seq: Some(3),
+                tool_status_v1: false,
             },
         )
         .unwrap();
@@ -4925,6 +5049,7 @@ mod haider_projection_tests {
             &HaiderProjectionPipeRoute {
                 path: truncated_path,
                 head_seq: Some(3),
+                tool_status_v1: false,
             },
         )
         .unwrap_err()
@@ -5001,6 +5126,7 @@ mod haider_projection_tests {
         let old_route = HaiderProjectionPipeRoute {
             path: old_path.clone(),
             head_seq: Some(1),
+            tool_status_v1: false,
         };
         haider_projection_ingest_pipe(
             &test_session.session_id,
@@ -5015,6 +5141,7 @@ mod haider_projection_tests {
         let stale_route = HaiderProjectionPipeRoute {
             path: old_path.clone(),
             head_seq: Some(2),
+            tool_status_v1: false,
         };
 
         let routes = StdMutex::new(HashMap::from([(
@@ -5038,6 +5165,7 @@ mod haider_projection_tests {
                         Ok(HaiderProjectionPipeRoute {
                             path: new_path.clone(),
                             head_seq: Some(2),
+                            tool_status_v1: false,
                         })
                     },
                 )
@@ -6041,6 +6169,7 @@ mod haider_projection_tests {
             &HaiderProjectionPipeRoute {
                 path: path.clone(),
                 head_seq: Some(25),
+                tool_status_v1: false,
             },
         )
         .unwrap();
@@ -6086,7 +6215,7 @@ mod haider_projection_tests {
        passing when the daemon ships a version this build has never heard of. */
     #[test]
     fn a_pipe_version_newer_than_this_build_is_read_and_reported_not_refused() {
-        for (version, generation) in [(2, 7), (3, 8), (4, 9), (5, 10)] {
+        for (version, generation) in [(2, 7), (3, 8), (4, 9), (5, 10), (6, 11)] {
             let header = haider_projection_parse_pipe_header(
                 &json!({
                     "pipe":"haider.session.jsonl",
@@ -6272,6 +6401,7 @@ mod haider_projection_tests {
             &HaiderProjectionPipeRoute {
                 path: path.clone(),
                 head_seq: Some(1),
+                tool_status_v1: false,
             },
         )
         .unwrap();
@@ -6308,6 +6438,7 @@ mod haider_projection_tests {
         let route = HaiderProjectionPipeRoute {
             path: path.clone(),
             head_seq: None,
+            tool_status_v1: false,
         };
         let first = haider_projection_ingest_pipe(
             &test_session.session_id,
@@ -6415,6 +6546,7 @@ mod haider_projection_tests {
         let route = HaiderProjectionPipeRoute {
             path: path.clone(),
             head_seq: Some(2),
+            tool_status_v1: false,
         };
         let initial = haider_projection_ingest_pipe(
             &test_session.session_id,
@@ -6549,6 +6681,7 @@ mod haider_projection_tests {
         let route = HaiderProjectionPipeRoute {
             path: path.clone(),
             head_seq: Some(9),
+            tool_status_v1: false,
         };
 
         // First ingest reaches EOF of an unterminated segment: at-head is real.
@@ -6645,6 +6778,7 @@ mod haider_projection_tests {
         let route = HaiderProjectionPipeRoute {
             path: path.clone(),
             head_seq: Some(9),
+            tool_status_v1: false,
         };
 
         let sealed = haider_projection_ingest_pipe(

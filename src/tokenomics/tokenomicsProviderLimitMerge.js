@@ -126,30 +126,21 @@ export function projectProviderLimitForDisplay(row = {}, nowMs = Date.now()) {
       reset_label: `Resets in ${formatLimitResetDuration(secondsUntilReset)}`,
     };
   }
-  // The provider window has ended: until the next live sample proves
-  // otherwise, assume the window rolled over fresh (visual only — raw
-  // counters stay untouched). Keeping the stale mid-window percentage reads
-  // as "still capped", which is the wrong default for an expired window.
-  // Pace belongs to the window it was measured in: the dead window's
-  // over-pace verdict ("▲549% — will exhaust before reset") next to an
-  // assumed-fresh 100% is a contradiction, so every pace field resets with
-  // the percents. The fresh window has no observed usage yet — its pace is
-  // unknown, not red.
-  const displayKind = String(row.display_percent_kind || "").toLowerCase();
+  // The published window ended. Until the authority sends its successor,
+  // both usage and remaining allowance are unknown; a client-side 0/100
+  // projection would fabricate a healthy reading.
   return {
     ...row,
-    remaining_percent: 100,
-    used_percent: 0,
-    limit_used_percent: 0,
-    ...(row.display_percent != null
-      ? { display_percent: displayKind === "used" ? 0 : 100 }
-      : {}),
+    remaining_percent: null,
+    used_percent: null,
+    limit_used_percent: null,
+    display_percent: null,
     reset_after_seconds: 0,
-    reset_label: "Provider window ended; assuming 100% until live refresh",
+    reset_label: "Provider window ended; awaiting daemon refresh",
     pace_status: "unknown",
     pace_delta_percent: null,
     pace_exhausts_before_reset: false,
-    status_label: "",
+    status_label: "Usage unknown until the provider publishes the next window",
     client_reset_pending: true,
   };
 }

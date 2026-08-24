@@ -957,20 +957,9 @@ const CLOUD_MCP_TOKENOMICS_WINDOW_REPUBLISH_REASON: &str = "tokenomics_window_re
 /// buckets are 15 minutes, so this preserves history without minute polling.
 const CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS: u64 = 15 * 60;
 /// Coalescing window for transcript file events. Streaming agents append
-/// continuously, so this bounds the cycle rate while active — one stamp per
-/// window — instead of re-running the gate every few seconds.
-/// 90s: each expiry runs the full sync cluster (summary_worker +
-/// periodic_sample_cycle + provider limits, ~3-4s CPU at 200-300%) — at 30s
-/// that was an Energy Impact spike >1k every ~95s during agent streaming.
-/// Cross-device usage freshness lags at most ~90s; live limit sampling has
-/// its own cadence and is unaffected.
-const CLOUD_MCP_TOKENOMICS_WATCH_DEBOUNCE_MS: u64 = 90_000;
 /// Settle delay before the first cycle so app startup and first paint aren't contended.
 const CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS: u64 = 45;
 const CLOUD_MCP_BACKGROUND_SCHEDULER_SHUTDOWN_POLL_SECS: u64 = 30;
-
-static CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER: OnceLock<StdMutex<Option<notify::RecommendedWatcher>>> =
-    OnceLock::new();
 
 fn cloud_mcp_run_periodic_local_temp_cleanups() -> usize {
     sweep_stale_chat_attachments()
@@ -1158,81 +1147,8 @@ async fn cloud_mcp_wait_for_background_scheduler_delay(delay: Duration) -> bool 
     cloud_mcp_wait_for_background_scheduler_wake(&notify, delay).await
 }
 
-fn cloud_mcp_tokenomics_source_watcher_slot(
-) -> &'static StdMutex<Option<notify::RecommendedWatcher>> {
-    CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER.get_or_init(|| StdMutex::new(None))
-}
-
-fn cloud_mcp_start_tokenomics_source_watcher(notify: Arc<tokio::sync::Notify>) -> bool {
-    use notify::Watcher as _;
-
-    let slot = cloud_mcp_tokenomics_source_watcher_slot();
-    let Ok(mut guard) = slot.lock() else {
-        return false;
-    };
-    if guard.is_some() {
-        return true;
-    }
-
-    let roots = tokenomics_periodic_watch_roots();
-    if roots.is_empty() {
-        log_terminal_status_event(
-            "backend.cloud_mcp.tokenomics_scheduler.watch_roots_empty",
-            json!({}),
-        );
-        return false;
-    }
-
-    let (sender, receiver) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher = match notify::recommended_watcher(sender) {
-        Ok(watcher) => watcher,
-        Err(error) => {
-            log_terminal_status_event(
-                "backend.cloud_mcp.tokenomics_scheduler.watch_create_error",
-                json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
-            );
-            return false;
-        }
-    };
-
-    let mut watched_roots = Vec::new();
-    for root in roots {
-        match watcher.watch(&root, notify::RecursiveMode::Recursive) {
-            Ok(()) => watched_roots.push(root.display().to_string()),
-            Err(error) => {
-                log_terminal_status_event(
-                    "backend.cloud_mcp.tokenomics_scheduler.watch_root_error",
-                    json!({
-                        "root": root.display().to_string(),
-                        "error": clean_terminal_telemetry_text(&error.to_string()),
-                    }),
-                );
-            }
-        }
-    }
-    if watched_roots.is_empty() {
-        return false;
-    }
-
-    cloud_mcp_spawn_fs_event_debounce_forwarder(
-        "tokenomics",
-        receiver,
-        notify,
-        Duration::from_millis(CLOUD_MCP_TOKENOMICS_WATCH_DEBOUNCE_MS),
-        Some(tokenomics_periodic_note_changed_paths),
-    );
-    *guard = Some(watcher);
-    log_terminal_status_event(
-        "backend.cloud_mcp.tokenomics_scheduler.watch_started",
-        json!({ "roots": watched_roots }),
-    );
-    true
-}
-
-/// Drives the always-on Tokenomics refresh while the app is running: filesystem
-/// changes wake it quickly, and a slow fallback stamps provider history if an
-/// event is missed. Inbound server tokenomics is ignored for now. The database
-/// is only opened for the duration of each cycle.
+/// Drives the always-on Tokenomics refresh from the daemon-published usage
+/// authority. No legacy agent-data directories are watched or scanned.
 pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudMcpState) {
     if state
         .background_sync
@@ -1244,8 +1160,6 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
 
     tauri::async_runtime::spawn(async move {
         let tokenomics_wake = Arc::new(tokio::sync::Notify::new());
-        let _watching_tokenomics =
-            cloud_mcp_start_tokenomics_source_watcher(tokenomics_wake.clone());
         cloud_mcp_run_periodic_local_temp_cleanups();
 
         sleep(Duration::from_secs(
@@ -1265,7 +1179,6 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
         }
 
         let mut tokenomics_sync_pending_after_offline = false;
-        let paced_realtime_wake_scheduled = Arc::new(AtomicBool::new(false));
         loop {
             if app_shutdown_requested() {
                 break;
@@ -1283,27 +1196,12 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
             }
             cloud_mcp_run_periodic_local_temp_cleanups();
 
-            // Stamp/scan runs off the async runtime: it opens SQLite and may
-            // issue blocking HTTP for the live provider limits.
-            let cycle_app = app.clone();
-            let cycle_status = match tauri::async_runtime::spawn_blocking(move || {
-                let _qos_guard = CloudMcpMacosThreadQosGuard::utility();
-                tokenomics_run_periodic_sample_cycle(&cycle_app)
-            })
-            .await
-            {
-                Ok(Ok(status)) => Some(status),
-                Ok(Err(error)) => {
+            let cycle_status = match tokenomics_run_periodic_sample_cycle(&app).await {
+                Ok(status) => Some(status),
+                Err(error) => {
                     log_terminal_status_event(
                         "backend.cloud_mcp.tokenomics_scheduler.cycle_error",
                         json!({ "error": clean_terminal_telemetry_text(&error) }),
-                    );
-                    None
-                }
-                Err(error) => {
-                    log_terminal_status_event(
-                        "backend.cloud_mcp.tokenomics_scheduler.join_error",
-                        json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
                     );
                     None
                 }
@@ -1313,25 +1211,6 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
                 break;
             }
 
-            if let Some(retry_after_ms) = cycle_status
-                .as_ref()
-                .and_then(|status| status.get("realtime_scan_retry_after_ms"))
-                .and_then(Value::as_u64)
-                .filter(|value| *value > 0)
-            {
-                if !paced_realtime_wake_scheduled.swap(true, Ordering::SeqCst) {
-                    let wake = tokenomics_wake.clone();
-                    let scheduled = paced_realtime_wake_scheduled.clone();
-                    tauri::async_runtime::spawn(async move {
-                        sleep(Duration::from_millis(retry_after_ms.saturating_add(250))).await;
-                        scheduled.store(false, Ordering::SeqCst);
-                        if !app_shutdown_requested() {
-                            wake.notify_one();
-                        }
-                    });
-                }
-            }
-
             // Best-effort outbound sync. Only attempt while a live connection
             // exists; offline cycles keep stamping locally and the next online
             // cycle flushes the accumulated delta since the sync cursor.
@@ -1339,7 +1218,7 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
                 [
                     "recorded_samples",
                     "recorded_windows",
-                    "token_scan_inserted_events",
+                    "inserted_events",
                 ]
                 .iter()
                 .any(|key| status.get(*key).and_then(Value::as_u64).unwrap_or(0) > 0)
@@ -11330,11 +11209,6 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     let summary_task = tauri::async_runtime::spawn_blocking(move || {
         let _heavy_permit = backend_heavy_job_acquire("cloud_mcp.tokenomics_sync.summary_worker");
         let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_sync.summary_worker");
-        if force_resync {
-            tokenomics_scan_usage_for(&summary_app, false, true)?;
-        } else if force_full {
-            tokenomics_scan_usage_for(&summary_app, false, false)?;
-        }
         let conn = tokenomics_open_db(&summary_app)?;
         tokenomics_reconcile_current_provider_accounts(&conn)?;
         if limits_only {

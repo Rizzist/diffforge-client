@@ -147,7 +147,7 @@ test("Claude display drops expired unknown-scope aliases once a canonical row ex
   assert.equal(projected[0].reset_label, "Resets in 8m");
 });
 
-test("an expired Claude window assumes a fresh window until refresh", () => {
+test("an expired Claude window stays unknown until the authority refreshes", () => {
   const projected = projectProviderLimitForDisplay({
     ...knownClaudeSession,
     display_percent: 16,
@@ -155,17 +155,16 @@ test("an expired Claude window assumes a fresh window until refresh", () => {
     reset_at: "unix:1000",
   }, 1_100_000);
 
-  /* Visual-only assumption: an ended window is shown as fully reset until
-     the next live sample lands (client_reset_pending marks the guess). */
-  assert.equal(projected.used_percent, 0);
-  assert.equal(projected.remaining_percent, 100);
-  assert.equal(projected.display_percent, 100);
+  assert.equal(projected.used_percent, null);
+  assert.equal(projected.remaining_percent, null);
+  assert.equal(projected.display_percent, null);
   assert.equal(projected.reset_after_seconds, 0);
   assert.equal(projected.client_reset_pending, true);
-  assert.equal(projected.reset_label, "Provider window ended; assuming 100% until live refresh");
+  assert.equal(projected.reset_label, "Provider window ended; awaiting daemon refresh");
+  assert.equal(projected.status_label, "Usage unknown until the provider publishes the next window");
 });
 
-test("an expired used-kind window assumes zero used until refresh", () => {
+test("an expired used-kind window does not fabricate zero used", () => {
   const projected = projectProviderLimitForDisplay({
     ...knownClaudeSession,
     display_percent: 84,
@@ -173,9 +172,9 @@ test("an expired used-kind window assumes zero used until refresh", () => {
     reset_at: "unix:1000",
   }, 1_100_000);
 
-  assert.equal(projected.used_percent, 0);
-  assert.equal(projected.remaining_percent, 100);
-  assert.equal(projected.display_percent, 0);
+  assert.equal(projected.used_percent, null);
+  assert.equal(projected.remaining_percent, null);
+  assert.equal(projected.display_percent, null);
   assert.equal(projected.client_reset_pending, true);
 });
 
@@ -191,13 +190,11 @@ test("an expired window drops the dead window's pace verdict with the percents",
     status_label: "Pace will exhaust before reset",
   }, 1_100_000);
 
-  /* Pace belongs to the window it was measured in: an assumed-fresh 100%
-     window has no observed usage, so its pace is unknown — never red. */
-  assert.equal(projected.remaining_percent, 100);
+  assert.equal(projected.remaining_percent, null);
   assert.equal(projected.pace_status, "unknown");
   assert.equal(projected.pace_delta_percent, null);
   assert.equal(projected.pace_exhausts_before_reset, false);
-  assert.equal(projected.status_label, "");
+  assert.equal(projected.status_label, "Usage unknown until the provider publishes the next window");
 });
 
 test("a live mid-window sample keeps its pace verdict", () => {

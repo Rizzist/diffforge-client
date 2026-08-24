@@ -83,7 +83,7 @@ function toolDetailOf(row, name) {
    recorded the full call item. Thin rows go through the item detail door. */
 const THIN_META_KEYS = new Set([
   "role", "name", "summary", "at_ms", "seq", "ordinal", "branch_id",
-  "kind", "type", "status", "item", "args_preview", "result_preview",
+  "kind", "type", "status", "item", "args_preview", "result_preview", "_diffforge_pipe",
 ]);
 
 function toolMetaIsRich(row) {

@@ -1082,13 +1082,29 @@ async fn haider_library_snapshot() -> Value {
 }
 
 #[tauri::command]
-async fn haider_usage_snapshot() -> Value {
-    serde_json::to_value(haider_rpc_ade::usage_report_rpc().await.ok()).unwrap_or(Value::Null)
+async fn haider_usage_snapshot() -> Result<Value, String> {
+    haider_usage_snapshot_value(haider_rpc_ade::usage_report_rpc().await)
+}
+
+fn haider_usage_snapshot_value(
+    result: Result<haider_rpc_ade::UsageReportResult, String>,
+) -> Result<Value, String> {
+    let snapshot = result?;
+    serde_json::to_value(snapshot)
+        .map_err(|error| format!("Unable to serialize Haider usage snapshot: {error}"))
 }
 
 #[cfg(test)]
 mod haider_bridge_tests {
     use super::*;
+
+    #[test]
+    fn haider_usage_snapshot_preserves_rpc_failure_reason() {
+        assert_eq!(
+            haider_usage_snapshot_value(Err("daemon could not read usage".to_string())),
+            Err("daemon could not read usage".to_string())
+        );
+    }
 
     #[test]
     fn haider_bridge_maps_run_states_defensively() {
