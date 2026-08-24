@@ -1,4 +1,14 @@
+# Test binaries in this crate redirect process-global environment variables —
+# HOME, XDG_DATA_HOME, APPDATA and friends — to aim the app's directory
+# resolution at a temp root. Environment is per-PROCESS, but libtest runs tests
+# as parallel THREADS, so two tests redirecting HOME at the same moment read
+# each other's fixtures. Eight modules each define their own unsynchronized
+# env guard, and the result was 48 failures in the whole-suite run where every
+# one of those tests passed in isolation — a gate that reported red for a
+# reason no single test could explain.
+#
+# Serial tests cost ~23s here and make a green result mean what it says. The
+# deeper fix is one process-wide lock every env guard holds for its lifetime;
+# until that lands, do not remove this.
 [env]
-LANG = { value = "C", force = true }
-LC_ALL = { value = "C", force = true }
-LC_CTYPE = { value = "C", force = true }
+RUST_TEST_THREADS = "1"
