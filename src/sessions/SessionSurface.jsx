@@ -69,6 +69,22 @@ import {
   sessionSyncTransportState,
 } from "./sessionSync.js";
 import { viewportMenuPosition } from "./viewportMenuPosition.js";
+import SessionQueuePanel from "./SessionQueuePanel.jsx";
+import {
+  applyQueueDelta,
+  createQueueInvokeBoundary,
+  FEATURE_QUEUE_CONTROL_V1,
+  mutateQueueRowWithRetry,
+  queueListFailed,
+  queueListStarted,
+  queueListSucceeded,
+  queueStateForFeatures,
+} from "./queueViewModel.js";
+import {
+  normalizeDeliveryMode,
+  ownSubmissionConfirmation,
+  submitSessionPrompt,
+} from "./sessionSubmit.js";
 
 /* Main-pane surface for sessions — the Session Deck workspace.
 
@@ -94,6 +110,9 @@ import { viewportMenuPosition } from "./viewportMenuPosition.js";
 const SUBMIT_WAKE_ATTEMPTS = 6;
 const SUBMIT_WAKE_BACKOFF_MS = 700;
 const SUBMIT_HOLD_CLEAR_MS = 6000;
+const SUBMIT_CONFIRMATION_MS = 5000;
+
+const queueInvokeBoundary = createQueueInvokeBoundary(invoke);
 
 
 const PANEL_KINDS = {
@@ -250,6 +269,17 @@ export default function SessionSurface({
   const [usageMeta, setUsageMeta] = useState(null);
   const [library, setLibrary] = useState(null);
   const [rpcFeatures, setRpcFeatures] = useState([]);
+  const [queueState, setQueueState] = useState(() => queueStateForFeatures([]));
+  const queueStateRef = useRef(queueState);
+  const commitQueueState = useCallback((next) => {
+    const resolved = typeof next === "function" ? next(queueStateRef.current) : next;
+    queueStateRef.current = resolved;
+    setQueueState(resolved);
+    return resolved;
+  }, []);
+  const [queueActionBusy, setQueueActionBusy] = useState("");
+  const [queueActionError, setQueueActionError] = useState("");
+  const [queueRefreshGeneration, setQueueRefreshGeneration] = useState(0);
   const [commandCatalogState, setCommandCatalogState] = useState({ key: "", items: [] });
   const [commandResults, setCommandResults] = useState({});
   const [commandMenuRequests, setCommandMenuRequests] = useState({});
@@ -305,6 +335,10 @@ export default function SessionSurface({
   const commandText = composerTexts[commandContextId] || "";
   const slashInputActive = commandText.startsWith("/") && !commandText.includes("\n");
   const commandDoorAvailable = rpcFeatures.includes(COMMAND_DOOR_FEATURE);
+  const queueDoorAvailable = rpcFeatures.includes(FEATURE_QUEUE_CONTROL_V1);
+  const activeQueueSession = sessions.find((row) => row.id === activeSessionId) || null;
+  const activeQueueSessionId = activeQueueSession?.id || "";
+  const activeQueueProviderId = activeQueueSession?.provider_session_id || "";
 
   /* Re-sniff when a slash interaction begins so a daemon upgraded or started
      after the surface mounted can expose its door. Until the bit is present,
@@ -356,6 +390,160 @@ export default function SessionSurface({
   const slashCommands = commandCatalogState.key === commandContextKey
     ? catalogToSlashCommands(commandCatalogState.items)
     : [];
+
+  /* queue_control_v1: install the event listener before asking for the list.
+     QueueChanged frames that beat the response are buffered by the pure
+     model and replayed above the snapshot revision. The Rust lane owns how
+     the ordinary session attach is forwarded to this Tauri event. */
+  useEffect(() => {
+    setQueueActionBusy("");
+    setQueueActionError("");
+    if (!queueDoorAvailable || !activeQueueSessionId) {
+      commitQueueState(queueStateForFeatures(rpcFeatures));
+      return undefined;
+    }
+
+    let disposed = false;
+    let unlisten = null;
+    let listSequence = 0;
+    commitQueueState(queueStateForFeatures([FEATURE_QUEUE_CONTROL_V1]));
+
+    const relist = async () => {
+      const sequence = listSequence + 1;
+      listSequence = sequence;
+      commitQueueState((current) => queueListStarted(current));
+      try {
+        const snapshot = await queueInvokeBoundary.list({ sessionId: activeQueueSessionId });
+        if (disposed || sequence !== listSequence) return;
+        const responseSession = typeof snapshot?.session_id === "string"
+          ? snapshot.session_id
+          : "";
+        if (responseSession
+          && responseSession !== activeQueueSessionId
+          && responseSession !== activeQueueProviderId) {
+          commitQueueState((current) => queueListFailed(
+            current,
+            "queue.list returned a different session.",
+          ));
+          return;
+        }
+        commitQueueState((current) => queueListSucceeded(current, snapshot).state);
+      } catch (error) {
+        if (!disposed && sequence === listSequence) {
+          commitQueueState((current) => queueListFailed(current, error));
+        }
+      }
+    };
+
+    const receiveDelta = (event) => {
+      if (disposed) return;
+      const payload = event?.payload;
+      if (!payload || typeof payload !== "object") {
+        commitQueueState((current) => queueListFailed(current, "Malformed queue watch payload."));
+        return;
+      }
+      const eventSession = typeof payload.session_id === "string" ? payload.session_id : "";
+      if (!eventSession) {
+        commitQueueState((current) => queueListFailed(current, "Queue watch payload omitted its session."));
+        void relist();
+        return;
+      }
+      if (eventSession !== activeQueueSessionId && eventSession !== activeQueueProviderId) return;
+      if (payload.watch_failed === true || payload.watch_state === "failed") {
+        commitQueueState((current) => queueListFailed(
+          current,
+          payload.reason || "The session queue watch failed.",
+        ));
+        return;
+      }
+      const envelope = payload.envelope && typeof payload.envelope === "object"
+        ? payload.envelope
+        : payload;
+      const delta = payload.delta
+        || payload.queue_delta
+        || envelope.payload
+        || payload.payload
+        || payload;
+      const envelopeSeq = Number.isSafeInteger(envelope.seq)
+        ? envelope.seq
+        : Number.isSafeInteger(payload.seq)
+          ? payload.seq
+          : null;
+      const applied = applyQueueDelta(queueStateRef.current, delta, {
+        envelopeSeq,
+        streamGap: payload.gap === true
+          || payload.kind === "lagged"
+          || payload.type === "lagged",
+      });
+      commitQueueState(applied.state);
+      if (applied.relist) void relist();
+    };
+
+    void listen("session-queue-changed", receiveDelta).then((stop) => {
+      if (disposed) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+      void relist();
+    }).catch((error) => {
+      if (!disposed) commitQueueState((current) => queueListFailed(current, error));
+    });
+
+    return () => {
+      disposed = true;
+      listSequence += 1;
+      if (unlisten) unlisten();
+    };
+  }, [
+    activeQueueProviderId,
+    activeQueueSessionId,
+    commitQueueState,
+    queueDoorAvailable,
+    queueRefreshGeneration,
+    rpcFeatures,
+  ]);
+
+  const activeSessionIdRef = useRef(activeSessionId);
+  activeSessionIdRef.current = activeSessionId;
+  const mutateQueuedRow = useCallback(async (action, id) => {
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId || queueActionBusy) return;
+    const busyKey = `${action}:${id}`;
+    setQueueActionBusy(busyKey);
+    setQueueActionError("");
+    try {
+      const result = await mutateQueueRowWithRetry({
+        boundary: queueInvokeBoundary,
+        sessionId,
+        id,
+        action,
+        state: queueStateRef.current,
+      });
+      if (activeSessionIdRef.current !== sessionId) return;
+      commitQueueState((current) => {
+        if (result.state?.kind === "unknown") return result.state;
+        const currentRevision = Number.isSafeInteger(current?.revision) ? current.revision : -1;
+        const resultRevision = Number.isSafeInteger(result.state?.revision)
+          ? result.state.revision
+          : -1;
+        return currentRevision >= resultRevision ? current : result.state;
+      });
+      if (result.status === "conflict") {
+        setQueueActionError("The queue changed again. Review the refreshed list and retry.");
+      } else if (result.status === "unknown") {
+        setQueueActionError("The queue could not be refreshed after it changed.");
+      }
+    } catch (error) {
+      if (activeSessionIdRef.current === sessionId) {
+        setQueueActionError(String(error?.message || error || "Queue action failed."));
+      }
+    } finally {
+      if (activeSessionIdRef.current === sessionId) {
+        setQueueActionBusy((current) => (current === busyKey ? "" : current));
+      }
+    }
+  }, [commitQueueState, queueActionBusy]);
 
   /* Chips show REALITY (the session's actual model/provider, the harness's
      actual account), never an unapplied local preference — switching stays
@@ -969,6 +1157,32 @@ export default function SessionSurface({
   /* A submit into a session whose shell is closed holds the typed text in
      place while the session comes up, rather than failing silently. */
   const [submitHold, setSubmitHold] = useState({});
+  const [composerDeliveryModes, setComposerDeliveryModes] = useState({});
+  const [submissionConfirmations, setSubmissionConfirmations] = useState({});
+  const submissionConfirmationTimersRef = useRef({});
+  useEffect(() => () => {
+    for (const timer of Object.values(submissionConfirmationTimersRef.current)) {
+      window.clearTimeout(timer);
+    }
+  }, []);
+  const recordSubmissionConfirmation = useCallback((sessionId, result, prompt) => {
+    const confirmation = ownSubmissionConfirmation(result, prompt);
+    setSubmissionConfirmations((current) => ({
+      ...current,
+      [sessionId]: confirmation,
+    }));
+    const existing = submissionConfirmationTimersRef.current[sessionId];
+    if (existing) window.clearTimeout(existing);
+    submissionConfirmationTimersRef.current[sessionId] = window.setTimeout(() => {
+      delete submissionConfirmationTimersRef.current[sessionId];
+      setSubmissionConfirmations((current) => {
+        if (current[sessionId]?.id !== confirmation.id) return current;
+        const next = { ...current };
+        delete next[sessionId];
+        return next;
+      });
+    }, SUBMIT_CONFIRMATION_MS);
+  }, []);
 
   const submitCommand = useCallback(async (session, prompt) => {
     const contextId = session?.id || "draft";
@@ -1164,7 +1378,7 @@ export default function SessionSurface({
     };
   }, [onSessionsRefresh]);
 
-  const submitIntoSession = useCallback(async (session, prompt, attachments) => {
+  const submitIntoSession = useCallback(async (session, prompt, attachments, requestedMode) => {
     if (/^\/\S/.test(prompt.trim())) {
       return submitCommand(session, prompt);
     }
@@ -1173,12 +1387,23 @@ export default function SessionSurface({
        nothing. The empty mirror publish rides the same history-recording
        door, so its echo can never resurrect the prompt. */
     const gen = editGenRef.current[session.id] || 0;
-    const send = () => invoke("session_submit_prompt", {
-      session_id: session.id,
+    /* Offer and forward a delivery mode only when the daemon advertises
+       queue_control_v1. The Rust submit boundary silently ignores an
+       unknown `mode` argument (serde drops it), so sending one to a daemon
+       that cannot honour it would render "Steer" while performing a plain
+       queued send — a fabricated affordance. Absent the bit, the mode is
+       not merely hidden: it is not sent. */
+    const deliveryMode = queueDoorAvailable
+      ? normalizeDeliveryMode(requestedMode)
+      : "queue";
+    const send = () => submitSessionPrompt(invoke, {
+      sessionId: session.id,
       prompt,
-      attachments: attachments?.length ? attachments : null,
+      attachments: attachments || [],
+      mode: deliveryMode,
     });
-    const accept = () => {
+    const accept = (result) => {
+      recordSubmissionConfirmation(session.id, result, prompt);
       if ((editGenRef.current[session.id] || 0) === gen) {
         setComposerText(session.id, "");
         setComposerPastesFor(session.id, []);
@@ -1187,8 +1412,8 @@ export default function SessionSurface({
       return true;
     };
     try {
-      await send();
-      return accept();
+      const result = await send();
+      return accept(result);
     } catch (error) {
       const message = String(error?.message || error || "");
       if (message.includes("haider_run_session_unsupported")) {
@@ -1208,8 +1433,8 @@ export default function SessionSurface({
         for (let attempt = 0; attempt < SUBMIT_WAKE_ATTEMPTS; attempt += 1) {
           await new Promise((resolve) => { window.setTimeout(resolve, SUBMIT_WAKE_BACKOFF_MS); });
           try {
-            await send();
-            return accept();
+            const result = await send();
+            return accept(result);
           } catch (retryError) {
             if (String(retryError?.message || retryError || "")
               .includes("haider_run_session_unsupported")) {
@@ -1239,6 +1464,7 @@ export default function SessionSurface({
   }, [
     onShellWarm,
     publishMirror,
+    recordSubmissionConfirmation,
     setComposerPastesFor,
     setComposerText,
     setModeFor,
@@ -1708,12 +1934,22 @@ export default function SessionSurface({
                       })()}
                       session={session}
                     />
+                    <SessionQueuePanel
+                      actionBusy={queueActionBusy}
+                      actionError={queueActionError}
+                      confirmation={submissionConfirmations[session.id] || null}
+                      onPromoteSteer={(id) => { void mutateQueuedRow("promoteSteer", id); }}
+                      onRefresh={() => setQueueRefreshGeneration((value) => value + 1)}
+                      onRemove={(id) => { void mutateQueuedRow("remove", id); }}
+                      state={queueState}
+                    />
                     <SessionComposer
                       chipCapabilities={library?.capabilities || {}}
                       chipOptions={chipOptionsFor(session)}
                       chipValues={chipValuesFor(session)}
                       commandMenuRequest={commandMenuRequests[session.id] || null}
                       commandNotice={commandResults[session.id] || null}
+                      deliveryMode={composerDeliveryModes[session.id] || "queue"}
                       onChipChange={(key, option) => handleChipChange(session.id, key, option)}
                       onChipMenuOpen={() => {
                         void refreshLibrary();
@@ -1725,7 +1961,15 @@ export default function SessionSurface({
                       mirrorAttachments={mirrorAttachments[session.id] || []}
                       onAttachmentsChange={(next) => handleAttachmentsChange(session, next)}
                       onMirrorType={(text) => publishMirror(session, text)}
-                      onSubmit={(prompt, attachments) => submitIntoSession(session, prompt, attachments)}
+                      onDeliveryModeChange={queueDoorAvailable
+                        ? (deliveryMode) => setComposerDeliveryModes((current) => ({
+                          ...current,
+                          [session.id]: normalizeDeliveryMode(deliveryMode),
+                        }))
+                        : undefined}
+                      onSubmit={(prompt, attachments, deliveryMode) => (
+                        submitIntoSession(session, prompt, attachments, deliveryMode)
+                      )}
                       onPastedBlocksChange={(blocks) => setComposerPastesFor(session.id, blocks)}
                       onValueChange={(text) => setComposerText(session.id, text)}
                       pastedBlocks={composerPastes[session.id] || []}

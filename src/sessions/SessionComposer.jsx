@@ -8,6 +8,7 @@ import { KeyboardVoice } from "@styled-icons/material-rounded/KeyboardVoice";
 import { Send } from "@styled-icons/material-rounded/Send";
 
 import { modelGroupSelectionState } from "./haiderClientContract.js";
+import { DELIVERY_MODES, normalizeDeliveryMode } from "./sessionSubmit.js";
 
 /* Composer for the session UI view, in the dashboard's visual language:
    a chips row (MODEL / EFFORT / SPEED / PROVIDER / ACCOUNT) above a pill
@@ -56,6 +57,11 @@ export default function SessionComposer({
   /* Present only while a turn is running AND the harness has told us which
      run it is. Absent means no stop button — never a guess. */
   onCancelTurn = null,
+  /* DeliveryMode is independent of queue visibility. The selected value
+     rides the submit request; only queue_control_v1 unlocks the persistent
+     queue panel elsewhere. */
+  deliveryMode = "queue",
+  onDeliveryModeChange = null,
 }) {
   /* The draft text is SURFACE-owned (value/onValueChange): the composer
      unmounts on every view/session switch, so component-local text would be
@@ -153,7 +159,11 @@ export default function SessionComposer({
       /* Text/blocks/mirror clearing is SURFACE-owned (generation-guarded in
          submitIntoSession) — a stale completion after a session switch must
          never wipe fresh edits. Attachments are ours; clear locally. */
-      const accepted = await onSubmit(prompt, attachments);
+      const accepted = await onSubmit(
+        prompt,
+        attachments,
+        normalizeDeliveryMode(deliveryMode),
+      );
       if (accepted !== false) {
         setAttachments([]);
       }
@@ -161,7 +171,7 @@ export default function SessionComposer({
       setBusy(false);
       textareaRef.current?.focus();
     }
-  }, [attachments, busy, compositeText, disabled, onSubmit, pastedBlocks, value]);
+  }, [attachments, busy, compositeText, deliveryMode, disabled, onSubmit, pastedBlocks, value]);
 
   /* Paste routing: image clipboard items stage to temp files and join the
      attachments; oversized text pastes become blocks above the input. Both
@@ -362,12 +372,53 @@ export default function SessionComposer({
     );
   };
 
+  const deliveryModeChip = () => {
+    if (!onDeliveryModeChange) return null;
+    const selected = normalizeDeliveryMode(deliveryMode);
+    const current = DELIVERY_MODES.find((mode) => mode.value === selected) || DELIVERY_MODES[0];
+    return (
+      <ChipWrap key="delivery-mode">
+        <Chip
+          data-open={openMenu === "delivery-mode" ? "true" : undefined}
+          onClick={() => setOpenMenu((open) => (
+            open === "delivery-mode" ? "" : "delivery-mode"
+          ))}
+          type="button"
+        >
+          <em>Send</em>
+          <span>{current.label}</span>
+          <ChipCaret aria-hidden="true">▾</ChipCaret>
+        </Chip>
+        {openMenu === "delivery-mode" && (
+          <ChipMenu role="menu">
+            {DELIVERY_MODES.map((mode) => (
+              <DeliveryModeItem
+                data-active={mode.value === selected ? "true" : undefined}
+                key={mode.value}
+                onClick={() => {
+                  setOpenMenu("");
+                  onDeliveryModeChange(mode.value);
+                }}
+                role="menuitem"
+                type="button"
+              >
+                <strong>{mode.label}</strong>
+                <span>{mode.detail}</span>
+              </DeliveryModeItem>
+            ))}
+          </ChipMenu>
+        )}
+      </ChipWrap>
+    );
+  };
+
   return (
     <ComposerRoot ref={rootRef}>
       <ChipsRow>
         {modelChip()}
         {chip("effort", "Effort")}
         {chipOptions.speedApplicable ? chip("speed", "Speed") : null}
+        {deliveryModeChip()}
       </ChipsRow>
 
       <ComposerBarWrap>
@@ -456,6 +507,7 @@ export default function SessionComposer({
             <Add aria-hidden="true" />
           </ComposerRoundButton>
           <ComposerInput
+            $hasStop={Boolean(onCancelTurn)}
             autoFocus={autoFocus}
             disabled={disabled || busy || Boolean(holdNotice)}
             onChange={(event) => {
@@ -488,6 +540,7 @@ export default function SessionComposer({
           />
           <ComposerRoundButton
             aria-label="Voice input"
+            data-shifted={onCancelTurn ? "true" : undefined}
             data-variant="mic"
             disabled={!onVoice}
             onClick={() => onVoice?.()}
@@ -496,12 +549,11 @@ export default function SessionComposer({
           >
             <KeyboardVoice aria-hidden="true" />
           </ComposerRoundButton>
-          {/* While a turn is streaming the send button becomes a stop: the
-              useful action mid-turn is to end it, and hiding that behind the
-              TUI made the chat the weaker surface. Only offered when the
-              harness told us WHICH run to stop — cancelling by guess could
-              kill the next turn instead. */}
-          {onCancelTurn ? (
+          {/* Stop is additive to Send. Mid-turn Send is how Queue, Steer, and
+              Subturn are submitted; replacing it with Stop would make those
+              modes keyboard-only exactly when they matter. Stop still exists
+              only when the harness names the exact cancellable run. */}
+          {onCancelTurn && (
             <ComposerRoundButton
               aria-label="Stop"
               data-variant="stop"
@@ -512,7 +564,7 @@ export default function SessionComposer({
             >
               {cancelling ? "…" : <StopGlyph aria-hidden="true" />}
             </ComposerRoundButton>
-          ) : (
+          )}
           <ComposerRoundButton
             aria-label="Send"
             data-variant="send"
@@ -522,7 +574,6 @@ export default function SessionComposer({
           >
             {busy ? "…" : <Send aria-hidden="true" />}
           </ComposerRoundButton>
-          )}
         </ComposerField>
       </ComposerBarWrap>
     </ComposerRoot>
@@ -627,6 +678,24 @@ const ChipMenuItem = styled.button`
   &[data-readonly="true"] {
     opacity: 0.55;
     cursor: default;
+  }
+`;
+
+const DeliveryModeItem = styled(ChipMenuItem)`
+  display: grid;
+  gap: 2px;
+
+  strong {
+    font-size: 11px;
+  }
+
+  span {
+    max-width: 190px;
+    color: var(--forge-text-muted);
+    font-size: 9.5px;
+    font-weight: 500;
+    line-height: 1.35;
+    white-space: normal;
   }
 `;
 
@@ -841,7 +910,7 @@ const ComposerInput = styled.textarea`
   min-height: 46px;
   max-height: min(150px, 32vh);
   resize: none;
-  padding: 13px 86px 13px 48px;
+  padding: 13px ${({ $hasStop }) => ($hasStop ? "122px" : "86px")} 13px 48px;
   border: 1px solid var(--forge-border);
   border-radius: 24px;
   color: var(--forge-text);
@@ -902,9 +971,26 @@ const ComposerRoundButton = styled.button`
     background: transparent;
   }
 
+  &[data-variant="mic"][data-shifted="true"] {
+    right: 80px;
+  }
+
   &[data-variant="mic"]:hover:not(:disabled) {
     color: var(--forge-text);
     border-color: var(--forge-border-strong);
+  }
+
+  &[data-variant="stop"] {
+    right: 44px;
+    border: 1px solid rgba(255, 108, 108, 0.42);
+    color: var(--forge-red);
+    background: rgba(255, 78, 78, 0.1);
+  }
+
+  &[data-variant="stop"]:hover:not(:disabled) {
+    color: #fff;
+    border-color: var(--forge-red);
+    background: var(--forge-red);
   }
 
   &[data-variant="send"] {
