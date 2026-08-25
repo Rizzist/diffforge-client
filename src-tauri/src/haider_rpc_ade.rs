@@ -51,6 +51,7 @@ const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
 const FEATURE_SESSION_NEEDS_INPUT_V1: &str = "session_needs_input_v1";
 const FEATURE_COMMAND_DOOR_V1: &str = "command_door_v1";
 const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
+const FEATURE_ACCOUNT_LIST_WATCH_V1: &str = "account_list_watch_v1";
 const FEATURE_ACCOUNT_LOGIN_API_V1: &str = "account_login_api_v1";
 const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
 const FEATURE_ACCOUNT_OAUTH_DEVICE_V1: &str = "account_oauth_device_v1";
@@ -85,6 +86,7 @@ const MAX_ACCOUNT_RESTAGE_RETRIES: usize = 3;
 const ACCOUNT_RETRY_BACKOFF: Duration = Duration::from_millis(120);
 const SURFACE_EVENT: &str = "session-surface";
 const SESSION_QUEUE_CHANGED_EVENT: &str = "session-queue-changed";
+const ACCOUNT_ROSTER_CHANGED_EVENT: &str = "account-roster-changed";
 const RESIDENT_SESSION_BINDING_EVENT: &str = "resident-session-binding";
 const TOKENOMICS_UPDATED_EVENT: &str = "diffforge://tokenomics-updated";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
@@ -206,6 +208,38 @@ pub struct AccountListResult {
     pub provider_defaults: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub availability: Option<SnapshotAvailabilityWire>,
+    /// A successful point-in-time list is not evidence that its change feed
+    /// is live. Surfaces retain the snapshot but must present it as possibly
+    /// stale whenever this state is unavailable.
+    pub watch: AccountRosterWatchState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AccountRosterWatchState {
+    Live,
+    Unavailable { reason: String },
+}
+
+impl AccountRosterWatchState {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl Default for AccountRosterWatchState {
+    fn default() -> Self {
+        Self::unavailable("The account roster watch has not been started for this window.")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct AccountRosterChangedPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<u64>,
+    watch: AccountRosterWatchState,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -983,6 +1017,9 @@ enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    /// Wire authority: `crates/haider-rpc/src/frame.rs:2281-2286`.
+    #[serde(rename = "account.list_watch")]
+    AccountListWatch {},
     #[serde(rename = "vault.stage")]
     VaultStage {
         stage_id: String,
@@ -1222,6 +1259,14 @@ enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         availability: Option<SnapshotAvailabilityWire>,
     },
+    /// Wire authority: `crates/haider-rpc/src/frame.rs:2877-2878`.
+    /// Kept raw until the correlated response is handled so malformed
+    /// readiness cannot deserialize into a guessed success.
+    #[serde(rename = "account.list_watch")]
+    AccountListWatch {
+        #[serde(default)]
+        accepted: Value,
+    },
     #[serde(rename = "vault.stage")]
     VaultStage {
         stage_id: String,
@@ -1330,6 +1375,13 @@ enum WireFrame {
     SessionRosterDelta {
         #[serde(default)]
         summaries: Vec<Value>,
+    },
+    /// Wire authority: `crates/haider-rpc/src/frame.rs:3284-3287`.
+    /// The signal is revision-only. Raw validation lets one malformed signal
+    /// be logged and dropped without poisoning the rest of the stream.
+    AccountsChanged {
+        #[serde(default)]
+        revision: Value,
     },
     SessionSurfaceDelta {
         session_id: String,
@@ -1839,6 +1891,9 @@ type RpcReply = oneshot::Sender<Option<Result<ResponseBody, String>>>;
 type QueueWatchReply = oneshot::Sender<Result<(), QueueCommandError>>;
 
 #[cfg(unix)]
+type AccountRosterWatchReply = oneshot::Sender<AccountRosterWatchState>;
+
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 enum RpcErrorStyle {
     Detailed,
@@ -1857,6 +1912,10 @@ enum ActorCommand {
     ReconnectNow,
     RosterAttach {
         app: AppHandle,
+    },
+    AccountRosterAttach {
+        window: tauri::WebviewWindow,
+        reply: AccountRosterWatchReply,
     },
     QueueAttach {
         app: AppHandle,
@@ -1905,6 +1964,7 @@ struct ActorHandle {
     connection: watch::Sender<ConnectionSnapshot>,
     resident_binding: watch::Sender<ResidentSessionBindingSnapshot>,
     haider_code_plan_status: watch::Sender<HaiderCodePlanStatusSnapshot>,
+    account_roster_watch: watch::Sender<AccountRosterWatchState>,
 }
 
 #[cfg(unix)]
@@ -1934,17 +1994,20 @@ fn actor_handle() -> &'static ActorHandle {
         let (resident_binding, _) = watch::channel(ResidentSessionBindingSnapshot::default());
         let (haider_code_plan_status, _) =
             watch::channel(HaiderCodePlanStatusSnapshot::default());
+        let (account_roster_watch, _) = watch::channel(AccountRosterWatchState::default());
         tauri::async_runtime::spawn(run_actor(
             receiver,
             connection.clone(),
             resident_binding.clone(),
             haider_code_plan_status.clone(),
+            account_roster_watch.clone(),
         ));
         ActorHandle {
             commands,
             connection,
             resident_binding,
             haider_code_plan_status,
+            account_roster_watch,
         }
     })
 }
@@ -1995,6 +2058,112 @@ pub(crate) fn haider_code_plan_status_snapshot() -> HaiderCodePlanStatusSnapshot
     }
     #[cfg(not(unix))]
     HaiderCodePlanStatusSnapshot::unsupported()
+}
+
+#[cfg(unix)]
+fn account_roster_watch_preflight(
+    connection: &ConnectionSnapshot,
+) -> Result<(), AccountRosterWatchState> {
+    if !connection.connected {
+        return Err(AccountRosterWatchState::unavailable(
+            "The Haider RPC connection is unavailable for a live account roster watch.",
+        ));
+    }
+    if !connection
+        .features
+        .contains(FEATURE_ACCOUNT_LIST_WATCH_V1)
+    {
+        return Err(AccountRosterWatchState::unavailable(format!(
+            "unsupported: the daemon does not advertise {FEATURE_ACCOUNT_LIST_WATCH_V1}"
+        )));
+    }
+    // Harness authority: session_hub/rpc.rs:2029-2039 authorizes this watch
+    // with View, exactly like account.list. Unlike queue watch, it does not
+    // acquire Control; the separate feature bit is the only asymmetry.
+    if !connection.grants(Capability::View) {
+        return Err(AccountRosterWatchState::unavailable(
+            "capability_denied: the current Haider RPC connection cannot watch accounts",
+        ));
+    }
+    Ok(())
+}
+
+fn account_watch_state_from_response(
+    body: ResponseBody,
+) -> Result<AccountRosterWatchState, String> {
+    match body {
+        ResponseBody::AccountListWatch { accepted: Value::Bool(true) } => {
+            Ok(AccountRosterWatchState::Live)
+        }
+        ResponseBody::AccountListWatch { accepted: Value::Bool(false) } => {
+            Ok(AccountRosterWatchState::unavailable(
+                "The daemon did not accept account.list_watch.",
+            ))
+        }
+        ResponseBody::AccountListWatch { .. } => {
+            Err("account.list_watch returned a malformed accepted flag".to_string())
+        }
+        ResponseBody::Error { message, .. } => {
+            // The daemon's reason is public protocol data. Preserve it
+            // verbatim instead of collapsing distinct failures into stale.
+            Ok(AccountRosterWatchState::unavailable(message))
+        }
+        _ => Err("account.list_watch response method mismatch".to_string()),
+    }
+}
+
+fn forward_account_roster_change(
+    revision: Value,
+    mut emit: impl FnMut(AccountRosterChangedPayload),
+) -> Result<(), String> {
+    let revision = revision
+        .as_u64()
+        .ok_or_else(|| "AccountsChanged revision was not an unsigned integer".to_string())?;
+    emit(AccountRosterChangedPayload {
+        revision: Some(revision),
+        watch: AccountRosterWatchState::Live,
+    });
+    Ok(())
+}
+
+/// Starts the connection-scoped account watch for the invoking webview, or
+/// returns its current readiness when already live. The point-in-time
+/// `account_list` result carries the same state so snapshot presence never
+/// silently implies live authority.
+#[tauri::command]
+pub async fn account_list_watch(
+    window: tauri::WebviewWindow,
+) -> AccountRosterWatchState {
+    #[cfg(unix)]
+    {
+        let handle = actor_handle();
+        let (reply, answer) = oneshot::channel();
+        if handle
+            .commands
+            .send(ActorCommand::AccountRosterAttach { window, reply })
+            .is_err()
+        {
+            return AccountRosterWatchState::unavailable(
+                "The account roster watch actor is unavailable.",
+            );
+        }
+        return match tokio::time::timeout(COMMAND_REPLY_TIMEOUT, answer).await {
+            Ok(Ok(state)) => state,
+            Ok(Err(_)) => AccountRosterWatchState::unavailable(
+                "The account roster watch actor dropped its readiness confirmation.",
+            ),
+            Err(_) => AccountRosterWatchState::unavailable(
+                "The account roster watch did not confirm readiness in time.",
+            ),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = window;
+        AccountRosterWatchState::unavailable(
+            "account.list_watch is unavailable on this platform.",
+        )
+    }
 }
 
 /// Starts (or refreshes) a local subscription for one provider session.
@@ -2824,6 +2993,29 @@ async fn account_request(
     }
 }
 
+fn account_list_response(
+    body: ResponseBody,
+    watch: AccountRosterWatchState,
+) -> Result<AccountListResult, String> {
+    match body {
+        ResponseBody::AccountList {
+            descriptors,
+            revision,
+            provider_active,
+            provider_defaults,
+            availability,
+        } => Ok(AccountListResult {
+            descriptors,
+            revision,
+            provider_active,
+            provider_defaults,
+            availability,
+            watch,
+        }),
+        _ => Err("account.list response method mismatch".to_string()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApiKeyRetryDecision {
     Restage,
@@ -2894,20 +3086,10 @@ pub async fn account_list(provider: Option<String>) -> Result<AccountListResult,
         )
         .await
         {
-            Some(Ok(ResponseBody::AccountList {
-                descriptors,
-                revision,
-                provider_active,
-                provider_defaults,
-                availability,
-            })) => Ok(AccountListResult {
-                descriptors,
-                revision,
-                provider_active,
-                provider_defaults,
-                availability,
-            }),
-            Some(Ok(_)) => Err("account.list response method mismatch".to_string()),
+            Some(Ok(body)) => account_list_response(
+                body,
+                actor_handle().account_roster_watch.borrow().clone(),
+            ),
             Some(Err(error)) if error.starts_with("missing_feature:") => {
                 Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
             }
@@ -5272,15 +5454,45 @@ async fn command_answer(
 }
 
 #[cfg(unix)]
+fn publish_account_roster_watch_state(
+    watch_tx: &watch::Sender<AccountRosterWatchState>,
+    window: Option<&tauri::WebviewWindow>,
+    state: AccountRosterWatchState,
+) {
+    let changed = *watch_tx.borrow() != state;
+    watch_tx.send_replace(state.clone());
+    if changed {
+        if let Some(window) = window {
+            let _ = window.emit(
+                ACCOUNT_ROSTER_CHANGED_EVENT,
+                AccountRosterChangedPayload {
+                    revision: None,
+                    watch: state,
+                },
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn account_roster_transport_unavailable() -> AccountRosterWatchState {
+    AccountRosterWatchState::unavailable(
+        "The Haider RPC connection is unavailable for a live account roster watch.",
+    )
+}
+
+#[cfg(unix)]
 async fn run_actor(
     mut commands: mpsc::UnboundedReceiver<ActorCommand>,
     connection_tx: watch::Sender<ConnectionSnapshot>,
     resident_binding_tx: watch::Sender<ResidentSessionBindingSnapshot>,
     haider_code_plan_status_tx: watch::Sender<HaiderCodePlanStatusSnapshot>,
+    account_roster_watch_tx: watch::Sender<AccountRosterWatchState>,
 ) {
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
     let mut last_published_revision: HashMap<String, u64> = HashMap::new();
     let mut roster_app = None;
+    let mut account_roster_window = None;
     let mut reconnect_delay = Duration::from_millis(100);
 
     loop {
@@ -5290,6 +5502,8 @@ async fn run_actor(
                 &mut subscriptions,
                 &mut last_published_revision,
                 &mut roster_app,
+                &mut account_roster_window,
+                &account_roster_watch_tx,
             );
         }
 
@@ -5298,11 +5512,18 @@ async fn run_actor(
         eprintln!("[ade-rpc] resolve -> {resolved:?}");
         let Some(socket_path) = resolved else {
             publish_disconnected(&connection_tx);
+            publish_account_roster_watch_state(
+                &account_roster_watch_tx,
+                account_roster_window.as_ref(),
+                account_roster_transport_unavailable(),
+            );
             if !wait_disconnected(
                 &mut commands,
                 &mut subscriptions,
                 &mut last_published_revision,
                 &mut roster_app,
+                &mut account_roster_window,
+                &account_roster_watch_tx,
                 reconnect_delay,
             )
             .await
@@ -5328,11 +5549,18 @@ async fn run_actor(
         let connected = attempt.ok().and_then(Result::ok);
         let Some((mut stream, welcome)) = connected else {
             publish_disconnected(&connection_tx);
+            publish_account_roster_watch_state(
+                &account_roster_watch_tx,
+                account_roster_window.as_ref(),
+                account_roster_transport_unavailable(),
+            );
             if !wait_disconnected(
                 &mut commands,
                 &mut subscriptions,
                 &mut last_published_revision,
                 &mut roster_app,
+                &mut account_roster_window,
+                &account_roster_watch_tx,
                 reconnect_delay,
             )
             .await
@@ -5418,15 +5646,22 @@ async fn run_actor(
                 &mut subscriptions,
                 &mut last_published_revision,
                 &mut roster_app,
+                &mut account_roster_window,
                 &mut next_request,
                 &resident_binding_tx,
                 &haider_code_plan_status_tx,
+                &account_roster_watch_tx,
             )
             .await;
         }
         let binding = resident_binding_tx.borrow().without_binding();
         publish_resident_binding(&resident_binding_tx, roster_app.as_ref(), binding);
         publish_disconnected(&connection_tx);
+        publish_account_roster_watch_state(
+            &account_roster_watch_tx,
+            account_roster_window.as_ref(),
+            account_roster_transport_unavailable(),
+        );
     }
 }
 
@@ -5465,12 +5700,21 @@ async fn wait_disconnected(
     subscriptions: &mut HashMap<String, Subscription>,
     last_published_revision: &mut HashMap<String, u64>,
     roster_app: &mut Option<AppHandle>,
+    account_roster_window: &mut Option<tauri::WebviewWindow>,
+    account_roster_watch_tx: &watch::Sender<AccountRosterWatchState>,
     delay: Duration,
 ) -> bool {
     tokio::select! {
         command = commands.recv() => {
             let Some(command) = command else { return false; };
-            apply_disconnected_command(command, subscriptions, last_published_revision, roster_app);
+            apply_disconnected_command(
+                command,
+                subscriptions,
+                last_published_revision,
+                roster_app,
+                account_roster_window,
+                account_roster_watch_tx,
+            );
         }
         _ = tokio::time::sleep(delay) => {}
     }
@@ -5483,10 +5727,22 @@ fn apply_disconnected_command(
     subscriptions: &mut HashMap<String, Subscription>,
     _last_published_revision: &mut HashMap<String, u64>,
     roster_app: &mut Option<AppHandle>,
+    account_roster_window: &mut Option<tauri::WebviewWindow>,
+    account_roster_watch_tx: &watch::Sender<AccountRosterWatchState>,
 ) {
     match command {
         ActorCommand::ReconnectNow => {}
         ActorCommand::RosterAttach { app } => *roster_app = Some(app),
+        ActorCommand::AccountRosterAttach { window, reply } => {
+            *account_roster_window = Some(window);
+            let state = account_roster_transport_unavailable();
+            publish_account_roster_watch_state(
+                account_roster_watch_tx,
+                account_roster_window.as_ref(),
+                state.clone(),
+            );
+            let _ = reply.send(state);
+        }
         ActorCommand::QueueAttach {
             app,
             session_id,
@@ -5536,9 +5792,11 @@ async fn run_connected(
     subscriptions: &mut HashMap<String, Subscription>,
     last_published_revision: &mut HashMap<String, u64>,
     roster_app: &mut Option<AppHandle>,
+    account_roster_window: &mut Option<tauri::WebviewWindow>,
     next_request: &mut u64,
     resident_binding_tx: &watch::Sender<ResidentSessionBindingSnapshot>,
     haider_code_plan_status_tx: &watch::Sender<HaiderCodePlanStatusSnapshot>,
+    account_roster_watch_tx: &watch::Sender<AccountRosterWatchState>,
 ) {
     let mut heartbeat = tokio::time::interval(PING_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -5546,8 +5804,51 @@ async fn run_connected(
     let mut unacked_pings: VecDeque<(u64, Instant)> = VecDeque::new();
     let mut pending_requests: HashMap<String, PendingRpcRequest> = HashMap::new();
     let mut pending_queue_attaches: HashMap<String, String> = HashMap::new();
+    let mut pending_account_roster_watch = None;
+    let mut account_roster_watch_waiters = Vec::new();
     let mut decoder = StreamingFrameDecoder::default();
     let mut scratch = [0_u8; 16 * 1024];
+
+    if account_roster_window.is_some() {
+        match account_roster_watch_preflight(&connection) {
+            Ok(()) => {
+                let pending = AccountRosterWatchState::unavailable(
+                    "The account roster watch is awaiting daemon readiness.",
+                );
+                publish_account_roster_watch_state(
+                    account_roster_watch_tx,
+                    account_roster_window.as_ref(),
+                    pending,
+                );
+                match send_account_roster_watch(
+                    stream,
+                    connection.frame_limit,
+                    encoding,
+                    next_request,
+                )
+                .await
+                {
+                    Ok(request_id) => pending_account_roster_watch = Some(request_id),
+                    Err(error) => {
+                        let state = AccountRosterWatchState::unavailable(format!(
+                            "Unable to write account.list_watch: {error}"
+                        ));
+                        publish_account_roster_watch_state(
+                            account_roster_watch_tx,
+                            account_roster_window.as_ref(),
+                            state,
+                        );
+                        return;
+                    }
+                }
+            }
+            Err(state) => publish_account_roster_watch_state(
+                account_roster_watch_tx,
+                account_roster_window.as_ref(),
+                state,
+            ),
+        }
+    }
 
     for subscription in subscriptions.values_mut() {
         subscription.queue_attachment_id = None;
@@ -5587,9 +5888,13 @@ async fn run_connected(
                             subscriptions,
                             last_published_revision,
                             roster_app,
+                            account_roster_window,
                             &mut pending_requests,
                             &mut pending_queue_attaches,
+                            &mut pending_account_roster_watch,
+                            &mut account_roster_watch_waiters,
                             next_request,
+                            account_roster_watch_tx,
                         ).await;
                         if !keep_connection {
                             return;
@@ -5632,6 +5937,25 @@ async fn run_connected(
         // timers; it was already read from the socket and must be kept.
         match frame {
             WireFrame::Response { request_id, body } => {
+                if pending_account_roster_watch.as_deref() == Some(request_id.as_str()) {
+                    pending_account_roster_watch = None;
+                    let state = match account_watch_state_from_response(body) {
+                        Ok(state) => state,
+                        Err(reason) => {
+                            eprintln!("[ade-rpc] dropping malformed account.list_watch response: {reason}");
+                            AccountRosterWatchState::unavailable(reason)
+                        }
+                    };
+                    publish_account_roster_watch_state(
+                        account_roster_watch_tx,
+                        account_roster_window.as_ref(),
+                        state.clone(),
+                    );
+                    for reply in account_roster_watch_waiters.drain(..) {
+                        let _ = reply.send(state.clone());
+                    }
+                    continue;
+                }
                 if let Some(session_id) = pending_queue_attaches.remove(&request_id) {
                     finish_queue_watch(subscriptions, session_id, body);
                     continue;
@@ -5654,6 +5978,25 @@ async fn run_connected(
                     super::haider_bridge_reconcile_from_summaries(app.clone(), summaries);
                     if first_delta {
                         super::haider_bridge_seed_from_rpc(app.clone());
+                    }
+                }
+            }
+            WireFrame::AccountsChanged { revision } => {
+                let watch_live = matches!(
+                    &*account_roster_watch_tx.borrow(),
+                    AccountRosterWatchState::Live
+                );
+                if !watch_live {
+                    eprintln!(
+                        "[ade-rpc] dropping AccountsChanged before account.list_watch was live"
+                    );
+                    continue;
+                }
+                if let Some(window) = account_roster_window.as_ref() {
+                    if let Err(error) = forward_account_roster_change(revision, |payload| {
+                        let _ = window.emit(ACCOUNT_ROSTER_CHANGED_EVENT, payload);
+                    }) {
+                        eprintln!("[ade-rpc] dropping malformed AccountsChanged: {error}");
                     }
                 }
             }
@@ -5766,9 +6109,13 @@ async fn apply_connected_command(
     subscriptions: &mut HashMap<String, Subscription>,
     last_published_revision: &mut HashMap<String, u64>,
     roster_app: &mut Option<AppHandle>,
+    account_roster_window: &mut Option<tauri::WebviewWindow>,
     pending_requests: &mut HashMap<String, PendingRpcRequest>,
     pending_queue_attaches: &mut HashMap<String, String>,
+    pending_account_roster_watch: &mut Option<String>,
+    account_roster_watch_waiters: &mut Vec<AccountRosterWatchReply>,
     next_request: &mut u64,
+    account_roster_watch_tx: &watch::Sender<AccountRosterWatchState>,
 ) -> bool {
     match command {
         ActorCommand::ReconnectNow => true,
@@ -5782,6 +6129,66 @@ async fn apply_connected_command(
             // Health stays pending until the first SessionRosterDelta lands.
             ROSTER_WATCH_ACTIVE.store(false, Ordering::Release);
             written
+        }
+        ActorCommand::AccountRosterAttach { window, reply } => {
+            *account_roster_window = Some(window);
+            if let Err(state) = account_roster_watch_preflight(connection) {
+                publish_account_roster_watch_state(
+                    account_roster_watch_tx,
+                    account_roster_window.as_ref(),
+                    state.clone(),
+                );
+                let _ = reply.send(state);
+                return true;
+            }
+            let watch_live = matches!(
+                &*account_roster_watch_tx.borrow(),
+                AccountRosterWatchState::Live
+            );
+            if watch_live {
+                let _ = reply.send(AccountRosterWatchState::Live);
+                return true;
+            }
+            account_roster_watch_waiters.push(reply);
+            if pending_account_roster_watch.is_some() {
+                return true;
+            }
+
+            let pending = AccountRosterWatchState::unavailable(
+                "The account roster watch is awaiting daemon readiness.",
+            );
+            publish_account_roster_watch_state(
+                account_roster_watch_tx,
+                account_roster_window.as_ref(),
+                pending,
+            );
+            match send_account_roster_watch(
+                stream,
+                connection.frame_limit,
+                encoding,
+                next_request,
+            )
+            .await
+            {
+                Ok(request_id) => {
+                    *pending_account_roster_watch = Some(request_id);
+                    true
+                }
+                Err(error) => {
+                    let state = AccountRosterWatchState::unavailable(format!(
+                        "Unable to write account.list_watch: {error}"
+                    ));
+                    publish_account_roster_watch_state(
+                        account_roster_watch_tx,
+                        account_roster_window.as_ref(),
+                        state.clone(),
+                    );
+                    for reply in account_roster_watch_waiters.drain(..) {
+                        let _ = reply.send(state.clone());
+                    }
+                    false
+                }
+            }
         }
         ActorCommand::QueueAttach {
             app,
@@ -6359,6 +6766,22 @@ async fn send_roster_watch(
 }
 
 #[cfg(unix)]
+async fn send_account_roster_watch(
+    stream: &mut UnixStream,
+    frame_limit: usize,
+    encoding: WireEncoding,
+    next_request: &mut u64,
+) -> std::io::Result<String> {
+    let request_id = request_id(next_request);
+    let request = WireFrame::Request {
+        request_id: request_id.clone(),
+        body: RequestBody::AccountListWatch {},
+    };
+    write_frame(stream, &request, frame_limit, encoding).await?;
+    Ok(request_id)
+}
+
+#[cfg(unix)]
 async fn send_queue_watch(
     stream: &mut UnixStream,
     frame_limit: usize,
@@ -6476,6 +6899,7 @@ fn wire_frame_kind(frame: &WireFrame) -> &'static str {
         WireFrame::Event { .. } => "event",
         WireFrame::AttachCaughtUp { .. } => "attach_caught_up",
         WireFrame::SessionRosterDelta { .. } => "session_roster_delta",
+        WireFrame::AccountsChanged { .. } => "accounts_changed",
         WireFrame::SessionSurfaceDelta { .. } => "session_surface_delta",
         WireFrame::HaiderCodePlanStatus { .. } => "haider_code_plan_status",
         WireFrame::ResidentSessionBinding { .. } => "resident_session_binding",
@@ -8066,6 +8490,167 @@ mod tests {
     }
 
     #[test]
+    fn account_list_watch_frames_match_reference_json_bytes() {
+        // Harness wire authority (haider-run/b2b-tui): feature bit at
+        // crates/haider-rpc/src/frame.rs:279-282; request at 2281-2286;
+        // response at 2877-2878; AccountsChanged at 3284-3287.
+        let request_json = br#"{"v":1,"kind":"request","request_id":"req-account-watch","body":{"method":"account.list_watch"}}"#;
+        let request = WireFrame::Request {
+            request_id: "req-account-watch".to_string(),
+            body: RequestBody::AccountListWatch {},
+        };
+        assert_eq!(
+            &encode_framed(&request, DEFAULT_FRAME_LIMIT)
+                .expect("encode account.list_watch request")[4..],
+            request_json
+        );
+        assert_eq!(
+            decode_body(request_json, DEFAULT_FRAME_LIMIT)
+                .expect("decode account.list_watch request"),
+            request
+        );
+
+        let response_json = br#"{"v":1,"kind":"response","request_id":"req-account-watch","body":{"method":"account.list_watch","accepted":true}}"#;
+        let response = WireFrame::Response {
+            request_id: "req-account-watch".to_string(),
+            body: ResponseBody::AccountListWatch {
+                accepted: Value::Bool(true),
+            },
+        };
+        assert_eq!(
+            &encode_framed(&response, DEFAULT_FRAME_LIMIT)
+                .expect("encode account.list_watch response")[4..],
+            response_json
+        );
+        assert_eq!(
+            decode_body(response_json, DEFAULT_FRAME_LIMIT)
+                .expect("decode account.list_watch response"),
+            response
+        );
+
+        let changed_json = br#"{"v":1,"kind":"accounts_changed","revision":42}"#;
+        let changed = WireFrame::AccountsChanged {
+            revision: serde_json::json!(42),
+        };
+        assert_eq!(
+            &encode_framed(&changed, DEFAULT_FRAME_LIMIT)
+                .expect("encode AccountsChanged")[4..],
+            changed_json
+        );
+        assert_eq!(
+            decode_body(changed_json, DEFAULT_FRAME_LIMIT).expect("decode AccountsChanged"),
+            changed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn account_watch_feature_absence_is_unsupported_not_an_empty_roster() {
+        // MUTATION CHECK (executed): bypassing the feature-bit branch fails
+        // with `the separate watch bit is required: ()`.
+        let mut connection = ConnectionSnapshot {
+            connected: true,
+            capabilities_granted: BTreeSet::from([Capability::View]),
+            features: BTreeSet::from([FEATURE_ACCOUNT_MANAGEMENT_V1.to_string()]),
+            ..ConnectionSnapshot::default()
+        };
+        let watch = account_roster_watch_preflight(&connection)
+            .expect_err("the separate watch bit is required");
+        let snapshot = account_list_response(
+            ResponseBody::AccountList {
+                descriptors: vec![serde_json::json!({"alias":"work"})],
+                revision: Some(42),
+                provider_active: Vec::new(),
+                provider_defaults: Vec::new(),
+                availability: Some(SnapshotAvailabilityWire::Available),
+            },
+            watch,
+        )
+        .expect("account.list remains a present point-in-time snapshot");
+
+        assert_eq!(snapshot.descriptors.len(), 1, "the roster was not erased");
+        let AccountRosterWatchState::Unavailable { reason } = snapshot.watch else {
+            panic!("an unsupported watch must not be reported live");
+        };
+        assert_eq!(
+            reason,
+            "unsupported: the daemon does not advertise account_list_watch_v1"
+        );
+
+        connection
+            .features
+            .insert(FEATURE_ACCOUNT_LIST_WATCH_V1.to_string());
+        account_roster_watch_preflight(&connection)
+            .expect("View is sufficient for account.list_watch just as it is for account.list");
+    }
+
+    #[test]
+    fn malformed_accounts_changed_signal_is_dropped_not_forwarded() {
+        // MUTATION CHECK (executed): defaulting a missing revision to zero
+        // fails with `a missing revision is malformed: ()`.
+        let mut forwarded = Vec::new();
+        let error = forward_account_roster_change(Value::Null, |payload| {
+            forwarded.push(payload)
+        })
+        .expect_err("a missing revision is malformed");
+        assert_eq!(
+            error,
+            "AccountsChanged revision was not an unsigned integer"
+        );
+        assert!(
+            forwarded.is_empty(),
+            "a malformed AccountsChanged signal must not reach the webview"
+        );
+    }
+
+    #[test]
+    fn account_watch_failure_preserves_daemon_reason() {
+        // MUTATION CHECK (executed): replacing daemon prose with a generic
+        // reason fails with unequal `Unavailable { reason: ... }` values.
+        let state = account_watch_state_from_response(ResponseBody::Error {
+            code: "store_unavailable".to_string(),
+            message: "credential registry publication failed".to_string(),
+            retryable: true,
+            data: None,
+        })
+        .expect("a daemon failure is a typed unavailable watch state");
+        assert_eq!(
+            state,
+            AccountRosterWatchState::Unavailable {
+                reason: "credential registry publication failed".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn account_snapshot_keeps_unavailable_watch_state() {
+        // MUTATION CHECK (executed): forcing `watch: Live` fails with
+        // `left: Live`, `right: Unavailable { reason: "watch transport closed" }`.
+        let snapshot = account_list_response(
+            ResponseBody::AccountList {
+                descriptors: vec![serde_json::json!({"alias":"personal"})],
+                revision: Some(7),
+                provider_active: Vec::new(),
+                provider_defaults: Vec::new(),
+                availability: Some(SnapshotAvailabilityWire::Available),
+            },
+            AccountRosterWatchState::Unavailable {
+                reason: "watch transport closed".to_string(),
+            },
+        )
+        .expect("the stale snapshot is still presentable");
+        assert_eq!(snapshot.revision, Some(7));
+        assert_eq!(snapshot.descriptors.len(), 1);
+        assert_eq!(
+            snapshot.watch,
+            AccountRosterWatchState::Unavailable {
+                reason: "watch transport closed".to_string(),
+            },
+            "snapshot presence and live-watch authority are independent"
+        );
+    }
+
+    #[test]
     fn account_management_frames_match_reference_json_bytes() {
         let encoded = |frame: WireFrame| {
             let framed = encode_framed(&frame, DEFAULT_FRAME_LIMIT).expect("encode account frame");
@@ -8702,6 +9287,9 @@ mod tests {
         let mut subscriptions = HashMap::new();
         let mut revisions = HashMap::new();
         let mut roster_app = None;
+        let mut account_roster_window = None;
+        let (account_roster_watch_tx, _) =
+            watch::channel(AccountRosterWatchState::default());
         apply_disconnected_command(
             ActorCommand::RpcRequest {
                 body: RequestBody::SessionList {
@@ -8716,6 +9304,8 @@ mod tests {
             &mut subscriptions,
             &mut revisions,
             &mut roster_app,
+            &mut account_roster_window,
+            &account_roster_watch_tx,
         );
         assert!(answer.try_recv().expect("fallback reply").is_none());
     }
@@ -8727,6 +9317,9 @@ mod tests {
         let mut subscriptions = HashMap::new();
         let mut revisions = HashMap::new();
         let mut roster_app = None;
+        let mut account_roster_window = None;
+        let (account_roster_watch_tx, _) =
+            watch::channel(AccountRosterWatchState::default());
         commands
             .send(ActorCommand::ReconnectNow)
             .expect("queue reconnect nudge");
@@ -8738,6 +9331,8 @@ mod tests {
                 &mut subscriptions,
                 &mut revisions,
                 &mut roster_app,
+                &mut account_roster_window,
+                &account_roster_watch_tx,
                 Duration::from_secs(5),
             ),
         )

@@ -6276,6 +6276,7 @@ fn run_app(daemon: bool) {
             haider_rpc_ade::session_cancel_turn,
             haider_rpc_ade::computer_permission_open_settings,
             haider_rpc_ade::account_list,
+            haider_rpc_ade::account_list_watch,
             haider_rpc_ade::account_add_api_key,
             haider_rpc_ade::account_oauth_start,
             haider_rpc_ade::account_oauth_status,

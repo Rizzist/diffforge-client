@@ -1,11 +1,22 @@
 import { rowProviderAccountKey } from "./tokenomicsFormat.js";
 
-// Pure roster logic for the tokenomics provider-account pills, extracted from
-// AccountTokenomicsView.jsx so the "known accounts can never vanish"
-// guarantees stay unit-testable outside the React tree.
+// HISTORICAL account filtering ONLY. This module classifies STORED usage
+// rows (pre-ledger archive + recorded rollups) so the history filter chips
+// and archive groupings keep working for accounts that no longer exist as
+// live accounts — its "known accounts never vanish" merge guarantee protects
+// exactly that history. It is NOT a roster of real accounts: the LIVE
+// harness roster comes from `account_list` + the account-roster-changed
+// watch in harnessAccountRoster.js, and nothing here may feed that surface.
 
-export const PROVIDER_ACCOUNT_FILTER_PROVIDERS = ["codex", "claude", "opencode"];
+/* The agent lanes present in stored history rows. These are the excised
+   standalone-CLI harness lanes plus the lanes the ledger's rollup views
+   still classify rows into — a taxonomy of the ARCHIVE, never of the live
+   daemon roster. */
+export const HISTORICAL_ACCOUNT_FILTER_PROVIDERS = ["codex", "claude", "opencode"];
 
+/* Classifies one STORED row into a historical lane for filter grouping.
+   Only ever applied to rows read back from storage — live account identity
+   comes verbatim from account_list descriptors instead. */
 export function providerKey(row) {
   const agent = String(row?.agent_kind || "").toLowerCase();
   const provider = String(row?.provider || "").toLowerCase();
@@ -50,7 +61,7 @@ export function tokenomicsRowAgentProfileId(row = {}) {
 
 export function tokenomicsCurrentProfileIdsByProvider(agentAccounts) {
   if (!agentAccounts || typeof agentAccounts !== "object") return null;
-  return PROVIDER_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
+  return HISTORICAL_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
     const profiles = Array.isArray(agentAccounts?.[providerId]?.profiles)
       ? agentAccounts[providerId].profiles
       : [];

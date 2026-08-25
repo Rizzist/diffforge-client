@@ -42,7 +42,7 @@ import {
   uniqueTokenomicsAliasesByOwner,
 } from "./tokenomicsAccountIdentity.js";
 import {
-  PROVIDER_ACCOUNT_FILTER_PROVIDERS,
+  HISTORICAL_ACCOUNT_FILTER_PROVIDERS,
   mergeTokenomicsProviderAccounts,
   providerKey,
   rowDeviceId,
@@ -57,6 +57,36 @@ import {
   reconcileProviderTerminalStaleRows,
   recordRestartedProviderTerminalClaim,
 } from "./providerTerminalRestart.js";
+import {
+  createHarnessRosterState,
+  createHarnessRosterWatchUnavailable,
+  driveHarnessRosterStartup,
+  harnessAccountAlias,
+  harnessAccountChipPresentation,
+  harnessRosterApplySignal,
+  harnessRosterErrorCode,
+  harnessRosterOnListError,
+  harnessRosterOnListResult,
+  harnessRosterOnWatchState,
+  harnessRosterPresentation,
+  harnessSwapAllowed,
+  harnessSwapBegin,
+  harnessSwapConfirm,
+  harnessSwapDismissFailure,
+  harnessSwapFail,
+} from "./harnessAccountRoster.js";
+import {
+  harnessAccountMeterPresentation,
+  harnessAccountUsagePresentation,
+  harnessMeterLine,
+  harnessProviderAccent,
+} from "./harnessAccountUsage.js";
+import {
+  tokenomicsDailyBucketPresentation,
+  tokenomicsDailyBucketTitle,
+  tokenomicsLedgerAuthority,
+  tokenomicsPeriodCellValue,
+} from "./tokenomicsLedgerHonesty.js";
 import {
   TERMINAL_SESSION_RESTART_MODES,
   TERMINAL_SESSION_RESTART_REQUEST_EVENT,
@@ -117,6 +147,109 @@ const PROVIDER_ACCENTS = {
 const TOKENOMICS_PROVIDER_ACCOUNT_FILTER_NONE = "__none__";
 
 const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
+
+/* Rust boundary event for the live account roster watch (haider_rpc_ade.rs,
+   account_list_watch_v1). Payloads are revision-only change signals or watch
+   readiness transitions — never roster data. */
+const HARNESS_ROSTER_CHANGED_EVENT = "account-roster-changed";
+
+/* Live harness roster wiring. Every decision lives in harnessAccountRoster.js;
+   this hook only performs the invokes/listens those decisions call for. */
+function useHarnessAccountRoster(active) {
+  const [rosterState, setRosterState] = useState(createHarnessRosterState);
+  const rosterStateRef = useRef(rosterState);
+  rosterStateRef.current = rosterState;
+
+  const relist = useCallback(() => {
+    invoke("account_list", { provider: null }).then((result) => {
+      setRosterState((prev) => harnessRosterOnListResult(prev, result));
+    }).catch((error) => {
+      setRosterState((prev) => harnessRosterOnListError(prev, error));
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!active) return undefined;
+    let cancelled = false;
+    let unlisten = null;
+    /* Register the event listener first. Only after registration resolves may
+       the watch be attached, and only after that settles may the baseline be
+       listed. This closes the revision-loss gap and keeps listener failures
+       visible as Snapshot with their real reason. */
+    void driveHarnessRosterStartup({
+      registerListener: () => listen(HARNESS_ROSTER_CHANGED_EVENT, (event) => {
+        if (cancelled) return;
+        /* relist depends only on the payload (never on state), so deciding it
+           outside the updater cannot drift from what the updater applies. */
+        const { relist: relistNow } = harnessRosterApplySignal(rosterStateRef.current, event?.payload);
+        setRosterState((prev) => harnessRosterApplySignal(prev, event?.payload).state);
+        /* A roster-changed signal carries no roster data: re-list is the only
+           way its change reaches pixels. */
+        if (relistNow) relist();
+      }),
+      attachWatch: () => invoke("account_list_watch"),
+      takeBaseline: () => invoke("account_list", { provider: null }),
+      onListenerFailure: (error) => {
+        setRosterState((prev) => harnessRosterOnWatchState(
+          prev,
+          createHarnessRosterWatchUnavailable(harnessRosterErrorCode(error)),
+        ));
+      },
+      onWatchResult: (watch) => {
+        setRosterState((prev) => harnessRosterOnWatchState(prev, watch));
+      },
+      onWatchFailure: (error) => {
+        setRosterState((prev) => harnessRosterOnWatchState(
+          prev,
+          createHarnessRosterWatchUnavailable(harnessRosterErrorCode(error)),
+        ));
+      },
+      onBaselineResult: (result) => {
+        setRosterState((prev) => harnessRosterOnListResult(prev, result));
+      },
+      onBaselineFailure: (error) => {
+        setRosterState((prev) => harnessRosterOnListError(prev, error));
+      },
+      isCancelled: () => cancelled,
+    }).then(({ unlisten: next }) => {
+      if (cancelled) {
+        if (next) next();
+        return;
+      }
+      unlisten = next;
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [active, relist]);
+
+  const swapAccount = useCallback(async (descriptor, confirmNewEpoch = false) => {
+    const alias = harnessAccountAlias(descriptor);
+    const gate = harnessSwapAllowed(rosterStateRef.current, descriptor);
+    if (!confirmNewEpoch && !gate.allowed) return;
+    if (confirmNewEpoch && !alias) return;
+    setRosterState((prev) => harnessSwapBegin(prev, alias));
+    try {
+      const result = await invoke("account_set_active", {
+        alias,
+        confirm_new_epoch: Boolean(confirmNewEpoch),
+      });
+      /* The daemon confirmed: only now does the displayed active account
+         move, and only to what the daemon returned. */
+      setRosterState((prev) => harnessSwapConfirm(prev, alias, result));
+      relist();
+    } catch (error) {
+      setRosterState((prev) => harnessSwapFail(prev, alias, error));
+    }
+  }, [relist]);
+
+  const dismissSwapFailure = useCallback(() => {
+    setRosterState((prev) => harnessSwapDismissFailure(prev));
+  }, []);
+
+  return { rosterState, swapAccount, dismissSwapFailure };
+}
 
 function scheduleTokenomicsIdleTask(callback, { delay_ms: delayMs = 0, timeout = 1200 } = {}) {
   if (typeof window === "undefined") {
@@ -220,7 +353,7 @@ function tokenomicsAgentCredentialProfileSignature(profile = {}) {
 
 function tokenomicsAgentCredentialSignature(agentAccounts) {
   if (!agentAccounts || typeof agentAccounts !== "object") return "";
-  return PROVIDER_ACCOUNT_FILTER_PROVIDERS.map((providerId) => {
+  return HISTORICAL_ACCOUNT_FILTER_PROVIDERS.map((providerId) => {
     const entry = agentAccounts?.[providerId] || {};
     const profiles = Array.isArray(entry?.profiles) ? entry.profiles : [];
     const profileParts = profiles
@@ -247,7 +380,7 @@ function createTokenomicsStoreState() {
 }
 
 function createDefaultProviderAccountKeys() {
-  return PROVIDER_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
+  return HISTORICAL_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
     acc[providerId] = "all";
     return acc;
   }, {});
@@ -345,7 +478,7 @@ function preferredTokenomicsAccountLabel(nextLabel, currentLabel, providerId = "
 function normalizeProviderAccountKeys(value, fallbackKey = "all") {
   const fallback = normalizeProviderAccountKey(fallbackKey);
   const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  return PROVIDER_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
+  return HISTORICAL_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
     acc[providerId] = normalizeProviderAccountKey(source[providerId] || fallback);
     return acc;
   }, {});
@@ -360,7 +493,7 @@ function accountKeyForProvider(accountKeys, providerId) {
 
 function accountFilterIsAll(selectedProvider, accountKeys) {
   if (selectedProvider === "all") {
-    return PROVIDER_ACCOUNT_FILTER_PROVIDERS.every((providerId) => accountKeyForProvider(accountKeys, providerId) === "all");
+    return HISTORICAL_ACCOUNT_FILTER_PROVIDERS.every((providerId) => accountKeyForProvider(accountKeys, providerId) === "all");
   }
   return accountKeyForProvider(accountKeys, selectedProvider) === "all";
 }
@@ -635,7 +768,7 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
     activeByProvider: new Map(),
     providerGroupCount: new Map(),
   };
-  for (const providerId of PROVIDER_ACCOUNT_FILTER_PROVIDERS) {
+  for (const providerId of HISTORICAL_ACCOUNT_FILTER_PROVIDERS) {
     const entry = agentAccounts?.[providerId];
     const profiles = Array.isArray(entry?.profiles) ? entry.profiles : [];
     const uniqueProfileLabels = uniqueTokenomicsAliasesByOwner(
@@ -710,7 +843,7 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
 function tokenomicsResolveAccountGroup(row, index) {
   if (!index) return null;
   const providerId = providerKey(row);
-  if (!PROVIDER_ACCOUNT_FILTER_PROVIDERS.includes(providerId)) return null;
+  if (!HISTORICAL_ACCOUNT_FILTER_PROVIDERS.includes(providerId)) return null;
   const key = rowProviderAccountKey(row);
   const byKey = index.byKey.get(tokenomicsIndexKey(providerId, key));
   if (byKey) return byKey;
@@ -1173,6 +1306,10 @@ function buildDailyRows(dailyRows, limitSamples, limits, selectedProvider, selec
     buckets.push({
       key,
       ...aggregate,
+      /* Kept for the tri-state daily presentation: a bucket with no rows is
+         "no usage recorded", never a measured zero, and a bucket whose rows
+         are all pre-ledger archive is labelled as archive. */
+      rows: match?.rows || [],
     });
   }
   const rows = buckets.map((row) => ({
@@ -1192,14 +1329,14 @@ function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKeys
       const key = bucketDayKey(row);
       return key >= startKey && key <= endKey;
     });
-  return aggregateRows(rows);
+  return { ...aggregateRows(rows), rowCount: rows.length };
 }
 
 function todayAggregate(dailyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all") {
   const today = dayKeyUtc(new Date());
   const rows = filterRows(dailyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey)
     .filter((row) => bucketDayKey(row) === today);
-  return aggregateRows(rows);
+  return { ...aggregateRows(rows), rowCount: rows.length };
 }
 
 function limitNumberOrNull(...values) {
@@ -1839,7 +1976,7 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
 }
 
 function providerAccountOptionsByProvider(summary, selectedDeviceId = "all", selectedScopeKey = "all", agentAccounts = null) {
-  return PROVIDER_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
+  return HISTORICAL_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
     acc[providerId] = providerAccountOptions(summary, providerId, selectedDeviceId, selectedScopeKey, agentAccounts);
     return acc;
   }, {});
@@ -1847,8 +1984,8 @@ function providerAccountOptionsByProvider(summary, selectedDeviceId = "all", sel
 
 function providerAccountOptionGroups(optionsByProvider, selectedProvider) {
   const providerIds = selectedProvider === "all"
-    ? PROVIDER_ACCOUNT_FILTER_PROVIDERS
-    : PROVIDER_ACCOUNT_FILTER_PROVIDERS.filter((providerId) => providerId === selectedProvider);
+    ? HISTORICAL_ACCOUNT_FILTER_PROVIDERS
+    : HISTORICAL_ACCOUNT_FILTER_PROVIDERS.filter((providerId) => providerId === selectedProvider);
 
   return providerIds
     .map((providerId) => {
@@ -2116,7 +2253,7 @@ function tokenomicsSubscriberStateSignature(state = {}) {
     state.error,
     state.selectedProvider,
     state.selectedAccountKey,
-    PROVIDER_ACCOUNT_FILTER_PROVIDERS
+    HISTORICAL_ACCOUNT_FILTER_PROVIDERS
       .map((providerId) => `${providerId}:${accountKeyForProvider(state.selectedProviderAccountKeys, providerId)}`)
       .join("\u001e"),
     tokenomicsSummaryNotifySignature(state.summary),
@@ -2538,12 +2675,38 @@ function tokenomicsLoadingLabel(status) {
   return status === "refreshing" ? "Refreshing daemon usage" : "Loading usage history";
 }
 
-function TokenCell({ value }) {
+/* null means UNKNOWN (the ledger authority could not vouch for the period),
+   which renders as an em dash — never as a fabricated 0. */
+function TokenCell({ value, unknown_reason: unknownReason = "" }) {
+  if (value == null) {
+    return <td title={unknownReason || "Usage history is not available"}>—</td>;
+  }
   return <td title={formatTokenTitle(value)}>{formatTokens(value)}</td>;
 }
 
-function CostCell({ value }) {
+function CostCell({ value, unknown_reason: unknownReason = "" }) {
+  if (value == null) {
+    return <td title={unknownReason || "Usage history is not available"}>—</td>;
+  }
   return <td title={formatCostTitle(value)}>{formatCost(value)}</td>;
+}
+
+/* Resolves one Today/Last-30-Days row of cells through the pinned tri-state
+   decision: recorded rows render their sums; an empty period renders 0 only
+   while the ledger authority is available, and otherwise renders unknown. */
+function periodRowCells(aggregate, ledgerAuthority) {
+  const cell = tokenomicsPeriodCellValue(aggregate?.input ?? 0, aggregate?.rowCount ?? 0, ledgerAuthority);
+  if (cell.known) {
+    return {
+      input: aggregate.input,
+      output: aggregate.output,
+      cache: aggregate.cache,
+      cost: aggregate.cost,
+      reason: "",
+    };
+  }
+  const reason = `Usage history unknown — ${cell.reason}`;
+  return { input: null, output: null, cache: null, cost: null, reason };
 }
 
 function LimitMetricCard({ icon: Icon, limit, title }) {
@@ -2609,6 +2772,83 @@ function ProviderLimitGroup({ five_hour: fiveHour, provider_id: providerId, week
   );
 }
 
+function HarnessAccountChipView({
+  descriptor,
+  swap,
+  usage,
+  meter,
+  on_swap: onSwap,
+}) {
+  const usageKnown = usage.state === "known";
+  const meterLine = harnessMeterLine(meter);
+  const {
+    confirmEpoch,
+    disabled,
+    inFlight,
+    isActive,
+    label,
+    provider,
+    title,
+  } = harnessAccountChipPresentation(descriptor, swap, {
+    meterTitle: meterLine.title,
+    usageKnown,
+    usageTitle: usageKnown
+      ? `${formatTokenTitle(usage.totalTokens)} recorded in the harness ledger`
+      : "",
+  });
+  const accent = harnessProviderAccent(provider);
+  return (
+    <HarnessAccountChip
+      $accent={accent}
+      $active={isActive}
+      $inFlight={inFlight}
+      aria-pressed={isActive}
+      disabled={disabled}
+      onClick={isActive ? undefined : () => onSwap(descriptor, confirmEpoch)}
+      title={title}
+      type="button"
+    >
+      <HarnessChipTop>
+        <HarnessChipName>{label}</HarnessChipName>
+        {isActive ? <HarnessChipBadge $accent={accent}>Active</HarnessChipBadge> : null}
+        {inFlight ? <HarnessChipBadge $accent={accent} $busy>Switching…</HarnessChipBadge> : null}
+        {confirmEpoch ? <HarnessChipBadge $accent={accent} $confirm>Click again to confirm</HarnessChipBadge> : null}
+      </HarnessChipTop>
+      <HarnessChipMeta>
+        <span data-role="provider">{provider}</span>
+        <span data-role="usage" data-known={usageKnown ? "true" : "false"}>
+          {usageKnown ? formatTokens(usage.totalTokens) : "—"}
+        </span>
+        {meterLine.text ? (
+          <span data-role="meter" data-tone={meterLine.tone}>{meterLine.text}</span>
+        ) : null}
+      </HarnessChipMeta>
+    </HarnessAccountChip>
+  );
+}
+
+/* The parent has many unrelated tokenomics controls. This memo boundary keeps
+   lane scans and meter selection off chip renders until their raw inputs, the
+   descriptor, or swap state actually change. The pinned pure seams remain the
+   only source of usage/meter facts. */
+const HarnessAccountChipRow = memo(function HarnessAccountChipRow({
+  descriptor,
+  harness_hourly_rows: harnessHourlyRows,
+  on_swap: onSwap,
+  summary,
+  swap,
+}) {
+  return (
+    <HarnessAccountChipView
+      descriptor={descriptor}
+      meter={harnessAccountMeterPresentation(summary, descriptor)}
+      on_swap={onSwap}
+      swap={swap}
+      usage={harnessAccountUsagePresentation(harnessHourlyRows, descriptor?.alias)}
+    />
+  );
+});
+
 const AccountTokenomicsView = memo(function AccountTokenomicsView({
   account_key: accountKey = "",
   active = true,
@@ -2626,6 +2866,12 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
   const [usageRateWindowKind, setUsageRateWindowKind] = useState("5_hour");
   const { accounts: agentAccounts } = useAgentAccountsState(active);
+  const { rosterState, swapAccount, dismissSwapFailure } = useHarnessAccountRoster(active);
+  const harnessRoster = useMemo(() => harnessRosterPresentation(rosterState), [rosterState]);
+  /* Per-account ledger lanes match on the VERBATIM lane account key, so they
+     read the raw summary rows — canonicalization rewrites keys for the
+     historical filters and must not touch live-account matching. */
+  const harnessHourlyRows = useMemo(() => hourlyRowsForDisplay(summary), [summary]);
   const agentCredentialSignature = useMemo(
     () => tokenomicsAgentCredentialSignature(agentAccounts),
     [agentAccounts],
@@ -2742,7 +2988,7 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   );
   useEffect(() => {
     let nextKeys = null;
-    for (const providerId of PROVIDER_ACCOUNT_FILTER_PROVIDERS) {
+    for (const providerId of HISTORICAL_ACCOUNT_FILTER_PROVIDERS) {
       const selectedKey = accountKeyForProvider(providerAccountKeys, providerId);
       if (selectedProvider === "all" && selectedKey === TOKENOMICS_PROVIDER_ACCOUNT_FILTER_NONE) {
         continue;
@@ -2775,6 +3021,9 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
     () => rollingWindowAggregate(dailyRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey),
     [dailyRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
+  const ledgerAuthority = useMemo(() => tokenomicsLedgerAuthority(summary), [summary]);
+  const todayCells = useMemo(() => periodRowCells(today, ledgerAuthority), [ledgerAuthority, today]);
+  const last30DayCells = useMemo(() => periodRowCells(last30Days, ledgerAuthority), [last30Days, ledgerAuthority]);
   const deviceAccountRows = accountRowsForDisplay(visibleSummary);
   const totalRows = accountFilterIsAll(selectedProvider, selectedAccountFilter) ? providerRows : deviceAccountRows;
   const total = useMemo(
@@ -2784,7 +3033,7 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   const selectedLimitAccountFilter = useMemo(
     () => {
       if (selectedProvider === "all") {
-        return PROVIDER_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
+        return HISTORICAL_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
           acc[providerId] = limitAccountKeyForDisplay(
             limitRowsRaw,
             providerId,
@@ -2901,8 +3150,13 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   return (
     <TokenomicsShell>
       <TokenomicsPanel>
+        {/* HISTORY filters: chips derived from STORED usage rows so archive
+            data referencing retired accounts stays filterable. This is not
+            the account roster — live harness accounts render in the
+            Accounts card at the bottom. */}
         {accountOptionGroups.length > 0 ? (
-          <ProviderAccountRows aria-label="Provider account filters">
+          <ProviderAccountRows aria-label="Usage history account filters"
+            title="Filters over recorded usage history — live accounts are in the Accounts card below">
             {accountOptionGroups.map((group) => (
               <ProviderAccountRow key={group.provider_id}>
                 <AccountTabs role="tablist" aria-label={`${group.label} filter`}>
@@ -3039,16 +3293,29 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
               </RangeToggle>
             </PanelTitle>
             <DailyChart $days={dailyRows.length}>
-              {dailyRows.map((row) => (
-                <DailyColumn key={row.key}>
-                  <DailyBar
-                    $tone={dailyLimitTone(row)}
-                    style={{ height: `${dailyBarHeight(dailyUsageValue(row), maxDaily)}%` }}
-                    title={dailyLimitTitle({ ...row, label: row.titleLabel || row.label })}
-                  />
-                  <small>{row.label}</small>
-                </DailyColumn>
-              ))}
+              {dailyRows.map((row) => {
+                /* Tri-state daily pixels: no rows → a hollow "no usage
+                   recorded" marker (never a measured 0), recorded rows →
+                   the measured bar, all-archive rows labelled as archive. */
+                const presentation = tokenomicsDailyBucketPresentation(row);
+                const noData = presentation.kind === "no_data";
+                const title = tokenomicsDailyBucketTitle(
+                  row,
+                  presentation,
+                  dailyLimitTitle({ ...row, label: row.titleLabel || row.label }),
+                );
+                return (
+                  <DailyColumn key={row.key}>
+                    <DailyBar
+                      $noData={noData ? true : undefined}
+                      $tone={noData ? "quiet" : dailyLimitTone(row)}
+                      style={noData ? undefined : { height: `${dailyBarHeight(dailyUsageValue(row), maxDaily)}%` }}
+                      title={title}
+                    />
+                    <small>{row.label}</small>
+                  </DailyColumn>
+                );
+              })}
             </DailyChart>
           </ChartCard>
         </ChartGrid>
@@ -3073,24 +3340,24 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
             <tbody>
               <tr>
                 <td>Today</td>
-                <TokenCell value={today.input} />
-                <TokenCell value={today.output} />
-                <TokenCell value={today.cache} />
-                <CostCell value={today.cost} />
+                <TokenCell value={todayCells.input} unknown_reason={todayCells.reason} />
+                <TokenCell value={todayCells.output} unknown_reason={todayCells.reason} />
+                <TokenCell value={todayCells.cache} unknown_reason={todayCells.reason} />
+                <CostCell value={todayCells.cost} unknown_reason={todayCells.reason} />
               </tr>
               <tr>
                 <td title="Last 30 Days">Last 30 Days</td>
-                <TokenCell value={last30Days.input} />
-                <TokenCell value={last30Days.output} />
-                <TokenCell value={last30Days.cache} />
-                <CostCell value={last30Days.cost} />
+                <TokenCell value={last30DayCells.input} unknown_reason={last30DayCells.reason} />
+                <TokenCell value={last30DayCells.output} unknown_reason={last30DayCells.reason} />
+                <TokenCell value={last30DayCells.cache} unknown_reason={last30DayCells.reason} />
+                <CostCell value={last30DayCells.cost} unknown_reason={last30DayCells.reason} />
               </tr>
             </tbody>
           </UsageTable>
           <ModelList>
             {breakdown.length ? breakdown.map((item) => (
               <ModelRow
-                $provider={PROVIDER_ACCOUNT_FILTER_PROVIDERS.includes(String(item.label || "").toLowerCase())
+                $provider={HISTORICAL_ACCOUNT_FILTER_PROVIDERS.includes(String(item.label || "").toLowerCase())
                   ? String(item.label).toLowerCase()
                   : undefined}
                 key={item.label}
@@ -3144,6 +3411,62 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
             ))}
           </StorageRows>
         </StorageCard>
+
+        {/* LIVE harness accounts: account_list + the roster watch. Separate
+            from the history filter pills above by design — this row is real
+            accounts with live swap, never derived from stored usage rows. */}
+        <HarnessAccountsCard aria-label="Harness accounts">
+          <PanelTitle>
+            <span>
+              <AccountsIcon aria-hidden="true" />
+              Accounts
+            </span>
+            <HarnessWatchBadge
+              $live={harnessRoster.watchLive ? true : undefined}
+              title={harnessRoster.watchLive
+                ? "Roster changes arrive live from the harness"
+                : `Snapshot only — ${harnessRoster.staleReason || "the live roster watch is unavailable"}`}
+            >
+              <i aria-hidden="true" />
+              {harnessRoster.watchLive ? "Live" : "Snapshot"}
+            </HarnessWatchBadge>
+          </PanelTitle>
+          {harnessRoster.phase === "loading" ? (
+            <TokenomicsEmpty>Loading harness accounts…</TokenomicsEmpty>
+          ) : harnessRoster.phase === "unsupported" ? (
+            <TokenomicsEmpty>
+              This harness does not support account management (account_management_v1 is not advertised) — not the same as having no accounts.
+            </TokenomicsEmpty>
+          ) : harnessRoster.phase === "unavailable" ? (
+            <TokenomicsEmpty>
+              Accounts unavailable{harnessRoster.reason ? ` — ${harnessRoster.reason}` : ""}.
+            </TokenomicsEmpty>
+          ) : harnessRoster.phase === "empty" ? (
+            <TokenomicsEmpty>No harness accounts yet — add one in the Accounts view.</TokenomicsEmpty>
+          ) : harnessRoster.phase === "unverified" ? (
+            <TokenomicsEmpty>The harness has not confirmed its account roster yet.</TokenomicsEmpty>
+          ) : null}
+          {harnessRoster.descriptors.length > 0 ? (
+            <HarnessAccountChips aria-label="Harness accounts — click one to make it active" role="group">
+              {harnessRoster.descriptors.map((descriptor) => (
+                <HarnessAccountChipRow
+                  descriptor={descriptor}
+                  harness_hourly_rows={harnessHourlyRows}
+                  key={harnessAccountAlias(descriptor)}
+                  on_swap={swapAccount}
+                  summary={summary}
+                  swap={rosterState.swap}
+                />
+              ))}
+            </HarnessAccountChips>
+          ) : null}
+          {rosterState.swap.phase === "failed" ? (
+            <HarnessSwapError role="alert">
+              <span>{rosterState.swap.message}</span>
+              <button onClick={dismissSwapFailure} type="button">Dismiss</button>
+            </HarnessSwapError>
+          ) : null}
+        </HarnessAccountsCard>
         <TokenomicsFooter>
           <span>{lastUpdatedText(summary?.updated_at)}</span>
           <TokenomicsRescanButton
@@ -3832,7 +4155,11 @@ const DailyBar = styled.div`
   align-self: end;
   min-height: 8px;
   border-radius: 5px 5px 2px 2px;
-  background: ${({ $tone }) => {
+  /* A day with no recorded rows is a hollow marker, visually distinct from a
+     measured (even zero) bar: no fill, a faint dashed outline. */
+  border: ${({ $noData }) => ($noData ? "1px dashed rgba(114, 130, 150, 0.4)" : "0")};
+  background: ${({ $noData, $tone }) => {
+    if ($noData) return "transparent";
     if ($tone === "danger") return "#ff5a5f";
     if ($tone === "warn") return "#facc15";
     if ($tone === "quiet") return "rgba(114, 130, 150, 0.25)";
@@ -4228,3 +4555,235 @@ const TokenomicsEmpty = styled.div`
     color: #64748b;
   }
 `;
+
+/* ---- LIVE harness accounts row (account_list + roster watch) ---- */
+
+const HarnessAccountsCard = styled.div`
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 11px;
+  background:
+    radial-gradient(circle at 0% 0%, rgba(var(--forge-tint-rgb), 0.07), transparent 36%),
+    #0d1117;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(var(--forge-tint-rgb), 0.15);
+    background:
+      radial-gradient(circle at 0% 0%, rgba(var(--forge-tint-rgb), 0.08), transparent 36%),
+      #f8fafc;
+  }
+`;
+
+const HarnessWatchBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid ${({ $live }) => ($live ? "rgba(52, 211, 153, 0.4)" : "rgba(250, 204, 21, 0.36)")};
+  border-radius: 999px;
+  color: ${({ $live }) => ($live ? "#34d399" : "#facc15")};
+  background: ${({ $live }) => ($live ? "rgba(52, 211, 153, 0.08)" : "rgba(250, 204, 21, 0.07)")};
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  i {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: currentColor;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: ${({ $live }) => ($live ? "#047857" : "#a16207")};
+    border-color: ${({ $live }) => ($live ? "rgba(4, 120, 87, 0.3)" : "rgba(161, 98, 7, 0.3)")};
+    background: ${({ $live }) => ($live ? "rgba(4, 120, 87, 0.06)" : "rgba(161, 98, 7, 0.06)")};
+  }
+`;
+
+const HarnessAccountChips = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+`;
+
+const HarnessAccountChip = styled.button`
+  display: grid;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 128px;
+  max-width: 240px;
+  padding: 7px 10px;
+  border: 1px solid ${({ $accent, $active }) => ($active ? $accent : "rgba(148, 163, 184, 0.16)")};
+  border-radius: 10px;
+  color: #dfe9f8;
+  background: ${({ $accent, $active }) => ($active
+    ? `color-mix(in srgb, ${$accent} 12%, rgba(16, 21, 28, 0.74))`
+    : "rgba(16, 21, 28, 0.48)")};
+  font: inherit;
+  text-align: left;
+  cursor: ${({ $active }) => ($active ? "default" : "pointer")};
+  opacity: ${({ $inFlight }) => ($inFlight ? 0.78 : 1)};
+  transition: border-color 130ms ease, background 130ms ease, opacity 130ms ease;
+
+  &:hover:not(:disabled) {
+    border-color: ${({ $accent }) => $accent};
+  }
+
+  &:focus-visible {
+    outline: 2px solid ${({ $accent }) => $accent};
+    outline-offset: 2px;
+  }
+
+  &:disabled {
+    cursor: default;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    border-color: ${({ $accent, $active }) => ($active ? $accent : "rgba(71, 85, 105, 0.2)")};
+    background: ${({ $accent, $active }) => ($active
+      ? `color-mix(in srgb, ${$accent} 10%, #ffffff)`
+      : "#f8fafc")};
+  }
+`;
+
+const HarnessChipTop = styled.span`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+`;
+
+const HarnessChipName = styled.strong`
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const HarnessChipBadge = styled.span`
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid ${({ $accent }) => `color-mix(in srgb, ${$accent} 55%, transparent)`};
+  color: ${({ $accent }) => $accent};
+  background: ${({ $accent }) => `color-mix(in srgb, ${$accent} 12%, transparent)`};
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  ${({ $busy }) => ($busy ? "animation: harness-chip-pulse 900ms ease-in-out infinite;" : "")}
+
+  @keyframes harness-chip-pulse {
+    50% {
+      opacity: 0.45;
+    }
+  }
+`;
+
+const HarnessChipMeta = styled.span`
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+  color: #94a3b8;
+  font-size: 10px;
+  font-weight: 700;
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span[data-role="usage"][data-known="true"] {
+    color: #a8c3ee;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+  }
+
+  span[data-role="meter"][data-tone="known"] {
+    color: #a8c3ee;
+    font-variant-numeric: tabular-nums;
+  }
+
+  span[data-role="meter"][data-tone="stale"] {
+    color: #facc15;
+    font-variant-numeric: tabular-nums;
+  }
+
+  span[data-role="meter"][data-tone="bad"] {
+    color: #ff7f89;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+
+    span[data-role="usage"][data-known="true"],
+    span[data-role="meter"][data-tone="known"] {
+      color: #2563eb;
+    }
+
+    span[data-role="meter"][data-tone="stale"] {
+      color: #a16207;
+    }
+
+    span[data-role="meter"][data-tone="bad"] {
+      color: #dc2626;
+    }
+  }
+`;
+
+const HarnessSwapError = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 1px solid rgba(255, 79, 91, 0.34);
+  border-radius: 8px;
+  color: #ff7f89;
+  background: rgba(255, 79, 91, 0.1);
+  font-size: 11px;
+  font-weight: 800;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  button {
+    flex: none;
+    padding: 2px 8px;
+    border: 1px solid rgba(255, 79, 91, 0.4);
+    border-radius: 999px;
+    color: inherit;
+    background: transparent;
+    font: inherit;
+    font-size: 9px;
+    font-weight: 900;
+    cursor: pointer;
+  }
+`;
+
+function AccountsIcon(props) {
+  return (
+    <svg viewBox="0 0 24 24" {...props}>
+      <circle cx="9" cy="8.5" r="3.5" />
+      <path d="M3.5 19c.6-3.2 2.8-5 5.5-5s4.9 1.8 5.5 5" />
+      <path d="M15.5 5.6a3.5 3.5 0 0 1 0 5.8M17.6 14.4c1.6.8 2.6 2.4 2.9 4.6" />
+    </svg>
+  );
+}

@@ -1266,6 +1266,7 @@ fn tokenomics_ensure_column(
 
 fn tokenomics_live_limits_snapshot_from_conn(conn: &rusqlite::Connection) -> Result<Value, String> {
     let limits = tokenomics_daemon_provider_limits(conn)?;
+    let ledger_meter_samples = tokenomics_latest_ledger_meter_samples(conn)?;
     let scope = tokenomics_current_billing_scope();
     let retired_account_keys = tokenomics_retired_provider_account_keys(conn);
     let mut latest_windows = tokenomics_latest_window_rows(conn, None, Some(&scope))?;
@@ -1300,6 +1301,7 @@ fn tokenomics_live_limits_snapshot_from_conn(conn: &rusqlite::Connection) -> Res
         "limits": limits,
         "usage_authority": usage_authority,
         "meter_states": meter_states,
+        "ledger_meter_samples": ledger_meter_samples,
         "haider_code_plan_status": haider_code_plan_status,
         "scan_index": scan_index,
     }))
@@ -2255,6 +2257,92 @@ fn tokenomics_read_stored_ledger_day(
         },
         availability,
     })
+}
+
+/* The ledger may retain many immutable daily readings. The UI summary needs
+   exactly one authority row per verbatim (account, window), selected by the
+   sample timestamp rather than by ingestion order. Serializing the wire type
+   preserves integer basis points and omits absent optional balances instead
+   of manufacturing zeroes. */
+fn tokenomics_latest_ledger_meter_samples(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<haider_rpc_ade::UsageHistoryMeterSampleV1>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT account, window, basis_points, resets_at_ms, grace_until_ms,
+                    sampled_at_ms, plan, credits, hold, stale
+             FROM (
+               SELECT account, window, basis_points, resets_at_ms, grace_until_ms,
+                      sampled_at_ms, plan, credits, hold, stale,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY account, window
+                        ORDER BY sampled_at_ms DESC, date DESC, sample_index DESC, device_id DESC
+                      ) AS latest_rank
+               FROM tokenomics_ledger_meter_samples
+             )
+             WHERE latest_rank=1
+             ORDER BY account, window",
+        )
+        .map_err(|error| format!("Unable to prepare latest usage-history meters: {error}"))?;
+    let stored = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query latest usage-history meters: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Unable to read latest usage-history meter: {error}"))?;
+    stored
+        .into_iter()
+        .map(
+            |(
+                account,
+                window,
+                basis_points,
+                resets_at_ms,
+                grace_until_ms,
+                sampled_at_ms,
+                plan,
+                credits,
+                hold,
+                stale,
+            )| {
+                Ok(haider_rpc_ade::UsageHistoryMeterSampleV1 {
+                    account,
+                    window,
+                    basis_points: u32::try_from(basis_points).map_err(|_| {
+                        format!("Stored usage-history basis_points is invalid: {basis_points}")
+                    })?,
+                    resets_at_ms: resets_at_ms
+                        .map(|value| tokenomics_ledger_stored_u64(value, "meter.resets_at_ms"))
+                        .transpose()?,
+                    grace_until_ms: grace_until_ms
+                        .map(|value| {
+                            tokenomics_ledger_stored_u64(value, "meter.grace_until_ms")
+                        })
+                        .transpose()?,
+                    sampled_at_ms: tokenomics_ledger_stored_u64(
+                        sampled_at_ms,
+                        "meter.sampled_at_ms",
+                    )?,
+                    plan,
+                    credits,
+                    hold,
+                    stale: stale.map(|value| value != 0),
+                })
+            },
+        )
+        .collect()
 }
 
 fn tokenomics_u64(value: Option<&Value>) -> u64 {
@@ -3253,6 +3341,7 @@ async fn tokenomics_refresh_from_daemon(app: &AppHandle) -> Result<Value, String
         let mut latest_windows = tokenomics_latest_window_rows(&conn, None, Some(&scope))?;
         let mut limit_samples =
             tokenomics_provider_limit_sample_sync_rows(&conn, None, Some(&scope))?;
+        let ledger_meter_samples = tokenomics_latest_ledger_meter_samples(&conn)?;
         let retired_keys = tokenomics_retired_provider_account_keys(&conn);
         tokenomics_retain_active_account_rows(&mut latest_windows, &retired_keys);
         tokenomics_retain_active_account_rows(&mut limit_samples, &retired_keys);
@@ -3277,6 +3366,7 @@ async fn tokenomics_refresh_from_daemon(app: &AppHandle) -> Result<Value, String
             "limit_samples": limit_samples,
             "usage_authority": projection.authority,
             "meter_states": projection.meter_states,
+            "ledger_meter_samples": ledger_meter_samples,
             "haider_code_plan_status": plan_status_value,
             "scan_index": tokenomics_scan_index_status(&conn)?,
         });
@@ -3425,7 +3515,24 @@ fn tokenomics_cached_read_only_summary_for(
     }
 
     let conn = tokenomics_open_db(app)?;
-    if let Some(summary) = tokenomics_read_summary_snapshot(&conn, include_rollups, include_cloud) {
+    if let Some(mut summary) =
+        tokenomics_read_summary_snapshot(&conn, include_rollups, include_cloud)
+    {
+        // Upgrade persisted snapshots written before ledger meter publication.
+        // The command boundary must never return an otherwise-valid cached
+        // summary that omits the live account meter input.
+        if let Some(object) = summary.as_object_mut() {
+            object.insert(
+                "ledger_meter_samples".to_string(),
+                json!(tokenomics_latest_ledger_meter_samples(&conn)?),
+            );
+        }
+        let _ = tokenomics_store_summary_snapshot(
+            &conn,
+            include_rollups,
+            include_cloud,
+            &summary,
+        );
         if let Ok(mut cache) = tokenomics_summary_cache().lock() {
             *cache = Some(TokenomicsSummaryCacheEntry {
                 include_rollups,
@@ -10015,6 +10122,7 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     let meter_states = tokenomics_meta_json(conn, TOKENOMICS_DAEMON_METER_STATES_KEY)
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
+    let ledger_meter_samples = tokenomics_latest_ledger_meter_samples(conn)?;
     let haider_code_plan_status =
         tokenomics_meta_json(conn, TOKENOMICS_HAIDER_CODE_PLAN_STATUS_KEY).unwrap_or_else(|| {
             json!({
@@ -10055,6 +10163,7 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     "usage_authority": usage_authority,
     "ledger_authority": ledger_authority,
     "meter_states": meter_states,
+    "ledger_meter_samples": ledger_meter_samples,
     "haider_code_plan_status": haider_code_plan_status,
     "scan_index": scan_index,
     "retired_account_keys": retired_account_keys,
@@ -14331,6 +14440,63 @@ mod tokenomics_tests {
         assert_eq!(day.meter_samples[0].credits, None);
         assert_eq!(day.meter_samples[0].hold, None);
         assert_eq!(day.meter_samples[0].stale, Some(false));
+    }
+
+    #[test]
+    fn usage_history_latest_meter_samples_publish_through_summary_verbatim() {
+        let _storage = process_test_storage_isolation(stringify!(
+            usage_history_latest_meter_samples_publish_through_summary_verbatim
+        ));
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+
+        let mut older = tokenomics_test_ledger_day("device-meter", "2026-08-24");
+        older.meter_samples[0].basis_points = 4_299;
+        older.meter_samples[0].sampled_at_ms = 1_776_000_000_000;
+        older.meter_samples[0].credits = Some(900);
+        tokenomics_ingest_ledger_day(&mut conn, &older, &usage_history_available()).unwrap();
+
+        let mut latest = tokenomics_test_ledger_day("device-meter", "2026-08-25");
+        latest.meter_samples.push(haider_rpc_ade::UsageHistoryMeterSampleV1 {
+            account: "haider-code-api".to_string(),
+            window: "primary".to_string(),
+            basis_points: 4_299,
+            resets_at_ms: None,
+            grace_until_ms: None,
+            sampled_at_ms: 1_777_000_000_001,
+            plan: None,
+            credits: Some(0),
+            hold: Some(25),
+            stale: Some(true),
+        });
+        tokenomics_ingest_ledger_day(&mut conn, &latest, &usage_history_available()).unwrap();
+
+        let summary = tokenomics_summary_from_conn(&conn, false, None).unwrap();
+        let samples = summary
+            .get("ledger_meter_samples")
+            .and_then(Value::as_array)
+            .expect("tokenomics_get_summary must publish latest ledger meter samples");
+        assert_eq!(samples.len(), 2, "one latest row is published for each exact account/window");
+        let weekly = samples
+            .iter()
+            .find(|sample| sample["account"] == "haider-code-api" && sample["window"] == "weekly")
+            .expect("latest weekly sample");
+        assert_eq!(weekly["basis_points"], json!(16_777_217));
+        assert_eq!(weekly["resets_at_ms"], json!(1_800_000_000_000_u64));
+        assert_eq!(weekly["sampled_at_ms"], json!(1_777_000_000_000_u64));
+        assert_eq!(weekly["plan"], json!("go"));
+        assert_eq!(weekly["stale"], json!(false));
+        let weekly = weekly.as_object().unwrap();
+        assert!(!weekly.contains_key("credits"), "absent credits must stay absent, never zero");
+        assert!(!weekly.contains_key("hold"), "absent hold must stay absent, never zero");
+
+        let primary = samples
+            .iter()
+            .find(|sample| sample["window"] == "primary")
+            .expect("primary sample");
+        assert_eq!(primary["credits"], json!(0));
+        assert_eq!(primary["hold"], json!(25));
+        assert_eq!(primary["stale"], json!(true));
     }
 
     #[test]
