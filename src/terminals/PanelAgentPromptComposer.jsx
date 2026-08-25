@@ -6,35 +6,12 @@ import { ScatterPlot } from "@styled-icons/material-rounded/ScatterPlot";
 import { Send } from "@styled-icons/material-rounded/Send";
 
 import {
-  WorkspaceCreateAgentClaudeIcon,
-  WorkspaceCreateAgentCodexIcon,
-  WorkspaceCreateAgentOpenCodeIcon,
   WorkspaceCreateAgentTerminalIcon,
 } from "../app/appStyles.js";
 
 function AgentHarnessIcon({ role }) {
-  const normalizedRole = String(role || "").trim().toLowerCase();
-  if (normalizedRole === "codex") {
-    return <WorkspaceCreateAgentCodexIcon aria-hidden="true" />;
-  }
-  if (normalizedRole === "claude") {
-    return <WorkspaceCreateAgentClaudeIcon aria-hidden="true" />;
-  }
-  if (normalizedRole === "swarm") {
+  if (String(role || "").trim().toLowerCase() === "swarm") {
     return <ScatterPlot aria-hidden="true" />;
-  }
-  if (normalizedRole === "opencode") {
-    return (
-      <WorkspaceCreateAgentOpenCodeIcon
-        aria-hidden="true"
-        fill="none"
-        viewBox="0 0 24 30"
-        xmlns="http://www.w3.org/2000/svg"
-      >
-        <path d="M18 24H6V12H18V24Z" fill="currentColor" opacity="0.72" />
-        <path d="M18 6H6V24H18V6ZM24 30H0V0H24V30Z" fill="currentColor" />
-      </WorkspaceCreateAgentOpenCodeIcon>
-    );
   }
   return <WorkspaceCreateAgentTerminalIcon aria-hidden="true" />;
 }
@@ -664,10 +641,6 @@ const HarnessIcon = styled.span`
     height: 12px;
   }
 
-  &[data-role="opencode"] svg {
-    width: 9px;
-    height: 12px;
-  }
 `;
 
 const TargetDot = styled.span`

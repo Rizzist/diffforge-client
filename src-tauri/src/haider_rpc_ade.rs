@@ -3517,7 +3517,7 @@ pub async fn account_oauth_add(
 /// answer as a catalog that lists nothing; only the caller can decide what to
 /// do about the first.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn account_oauth_import_sources() -> Result<Option<Vec<Value>>, String> {
+pub async fn haider_account_oauth_import_sources() -> Result<Option<Vec<Value>>, String> {
     #[cfg(unix)]
     {
         match rpc_request_with_feature_gate(
@@ -3559,8 +3559,8 @@ fn haider_import_source_is_known(published: Option<&[Value]>, source: &str) -> b
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn account_oauth_import(source: String) -> Result<AccountImportResult, String> {
-    let published = account_oauth_import_sources().await.unwrap_or(None);
+pub async fn haider_account_oauth_import(source: String) -> Result<AccountImportResult, String> {
+    let published = haider_account_oauth_import_sources().await.unwrap_or(None);
     if !haider_import_source_is_known(published.as_deref(), source.as_str()) {
         return Err("invalid_argument".to_string());
     }
@@ -3594,7 +3594,7 @@ pub async fn account_oauth_import(source: String) -> Result<AccountImportResult,
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn account_device_candidates() -> Result<AccountDeviceCandidatesResult, String> {
+pub async fn haider_account_device_candidates() -> Result<AccountDeviceCandidatesResult, String> {
     #[cfg(unix)]
     {
         let response = account_request(
@@ -3621,7 +3621,7 @@ pub async fn account_device_candidates() -> Result<AccountDeviceCandidatesResult
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn account_import_device(candidate: String) -> Result<AccountImportResult, String> {
+pub async fn haider_account_import_device(candidate: String) -> Result<AccountImportResult, String> {
     #[cfg(unix)]
     {
         let response = account_request(

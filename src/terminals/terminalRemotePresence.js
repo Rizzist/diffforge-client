@@ -6,7 +6,6 @@ import { listenShared } from "../app/sharedTauriEvents.js";
 export const TERMINAL_REMOTE_PRESENCE_CHANGED_EVENT = "terminal-remote-presence-changed";
 
 const EMPTY_PRESENCE = Object.freeze({
-  chat_watchers: 0,
   instance_id: null,
   pane_id: "",
   shell_controller: false,
@@ -92,7 +91,6 @@ export function normalizeTerminalRemotePresenceWorkspaceId(
 
 function normalizePresenceItem(item = {}) {
   return {
-    chat_watchers: Math.max(0, Number(item.chat_watchers || 0) || 0),
     instance_id: numberOrNull(item.instance_id),
     pane_id: String(item.pane_id || "").trim(),
     shell_controller: Boolean(item.shell_controller),
@@ -107,7 +105,7 @@ function normalizeSnapshot(snapshot = {}) {
     .map(normalizePresenceItem)
     .filter((item) => (
       item.pane_id
-      && (item.shell_viewers > 0 || item.shell_controller || item.chat_watchers > 0)
+      && (item.shell_viewers > 0 || item.shell_controller)
     ));
   const byStreamKey = {};
   const byTerminalKey = {};
@@ -179,8 +177,7 @@ export function getTerminalRemotePresenceForPane(snapshot, {
   instanceId = 0,
 } = {}) {
   const safePaneId = String(paneId || "").trim();
-  const workspaceProvided = String(workspaceId || "").trim() !== "";
-  const safeWorkspaceId = normalizeTerminalRemotePresenceWorkspaceId(workspaceId);
+  void workspaceId;
   const safeInstanceId = numberOrNull(instanceId);
   if (!safePaneId) {
     return EMPTY_PRESENCE;
@@ -197,24 +194,6 @@ export function getTerminalRemotePresenceForPane(snapshot, {
     ));
     if (exact) {
       return exact;
-    }
-  }
-
-  // Chat-only presence can arrive with no instance id (a web client watching
-  // the transcript without an attached shell). Pane ids are only unique WITHIN
-  // a workspace, so this branch MUST match the workspace or it would paint
-  // workspace B's badge onto workspace A's identically-named pane. Without a
-  // workspace id on either side we cannot disambiguate, so we decline rather
-  // than guess — no single-pane fallback.
-  if (workspaceProvided) {
-    const chatOnly = items.find((item) => (
-      item.pane_id === safePaneId
-      && item.instance_id === null
-      && item.chat_watchers > 0
-      && normalizeTerminalRemotePresenceWorkspaceId(item?.workspace_id) === safeWorkspaceId
-    ));
-    if (chatOnly) {
-      return chatOnly;
     }
   }
 

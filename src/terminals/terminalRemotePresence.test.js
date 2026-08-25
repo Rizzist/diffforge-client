@@ -27,7 +27,6 @@ test("terminal remote presence workspace normalization mirrors backend keys", ()
 
 test("terminal remote presence matches equivalent normalized workspace ids", () => {
   const item = {
-    chat_watchers: 0,
     instance_id: 3,
     pane_id: "shared-pane",
     shell_controller: false,

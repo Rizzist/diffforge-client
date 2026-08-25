@@ -2,9 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import styled from "styled-components";
+import {
+  accountPushRosterRow,
+  LEGACY_ACCOUNT_UNAVAILABLE_REASON,
+} from "./accountPushPresentation.js";
 
-// Push a signed-in coding-agent account (Claude Code / Codex / OpenCode) from
-// THIS device to another connected device so it can run the agent there.
+// Push a Haider-vault account from THIS device to another connected device.
 //  - Push:        copy the account credentials to the target device.
 //  - Push & Wipe: copy, then surgically remove ONLY this account locally, so the
 //                 same subscription is never live on two machines at once (an
@@ -12,14 +15,12 @@ import styled from "styled-components";
 //                 This frees the local machine to run a different account.
 // The Tauri backend owns the crypto/transport; this view is the control surface.
 
-const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
+const ACCOUNT_ROSTER_CHANGED_EVENT = "account-roster-changed";
 const PUSH_CHANGED_EVENT = "agent-account-push-changed";
-const AGENT_KINDS = ["claude", "codex", "opencode"];
-const PROVIDER_LABELS = {
-  claude: "Claude Code",
-  codex: "Codex",
-  opencode: "OpenCode",
-};
+const PUSH_AVAILABILITY_UNKNOWN = Object.freeze({
+  state: "unknown",
+  reason: "Account-push availability has not been published by this app.",
+});
 
 // Non-terminal states show a spinner; applied/wiped are success; failed is error.
 const PUSH_STATE_TEXT = {
@@ -28,9 +29,10 @@ const PUSH_STATE_TEXT = {
   delivered: "Delivered…",
   applied: "Account added on that device",
   wiped: "Moved — removed from this device",
+  unavailable: "Account push unavailable",
   failed: "Couldn’t push",
 };
-const PUSH_TERMINAL = new Set(["applied", "wiped", "failed"]);
+const PUSH_TERMINAL = new Set(["applied", "wiped", "unavailable", "failed"]);
 const PUSH_SUCCESS = new Set(["applied", "wiped"]);
 
 function deviceIdOf(device) {
@@ -84,21 +86,9 @@ function devicePushCapableOf(device) {
   return Boolean(value);
 }
 
-function profileNeedsLogin(profile) {
-  const authStatus = profile?.auth_status || {};
-  return Boolean(authStatus.needs_login || (!profile?.identity?.auth_ready && !profile?.is_default));
-}
-
-function profileDisplayName(profile) {
-  const alias = String(profile?.alias || "").trim();
-  if (alias) {
-    return alias;
-  }
-  const email = String(profile?.identity?.email || "").trim();
-  if (profile?.is_default) {
-    return profile?.label || "Default";
-  }
-  return profile?.label || email || "Account";
+function accountDisplayName(account) {
+  const row = account?.source || {};
+  return String(row.label || row.identity || account.alias || "Account").trim();
 }
 
 function DeviceGlyph() {
@@ -119,38 +109,33 @@ function PushGlyph() {
   );
 }
 
-function DevicePushPanel({ device, accounts, push, onSubmit, onDismiss }) {
-  const deviceId = deviceIdOf(device);
-  const pushableByKind = useMemo(() => {
-    const out = {};
-    AGENT_KINDS.forEach((kind) => {
-      const profiles = (accounts?.[kind]?.profiles || []).filter((profile) => !profileNeedsLogin(profile));
-      if (profiles.length) {
-        out[kind] = profiles;
-      }
-    });
-    return out;
-  }, [accounts]);
-  const availableKinds = useMemo(() => AGENT_KINDS.filter((kind) => pushableByKind[kind]), [pushableByKind]);
-
-  const [kind, setKind] = useState(() => availableKinds[0] || "");
-  const [profileId, setProfileId] = useState(() => pushableByKind[availableKinds[0]]?.[0]?.id || "");
+function DevicePushPanel({
+  device,
+  accounts,
+  availability,
+  rosterAvailability,
+  push,
+  onSubmit,
+  onDismiss,
+}) {
+  const roster = useMemo(
+    () => (Array.isArray(accounts) ? accounts : []).map(accountPushRosterRow),
+    [accounts],
+  );
+  const availableAccounts = useMemo(
+    () => roster.filter((account) => account.state === "available"),
+    [roster],
+  );
+  const [selectedAlias, setSelectedAlias] = useState(() => availableAccounts[0]?.alias || "");
   const [wipeArmed, setWipeArmed] = useState(false);
   const wipeTimerRef = useRef(null);
 
   useEffect(() => {
     // Keep the selection valid as the account list changes underneath us.
-    if (!availableKinds.includes(kind)) {
-      const nextKind = availableKinds[0] || "";
-      setKind(nextKind);
-      setProfileId(pushableByKind[nextKind]?.[0]?.id || "");
-      return;
+    if (!availableAccounts.some((account) => account.alias === selectedAlias)) {
+      setSelectedAlias(availableAccounts[0]?.alias || "");
     }
-    const profiles = pushableByKind[kind] || [];
-    if (!profiles.some((profile) => profile.id === profileId)) {
-      setProfileId(profiles[0]?.id || "");
-    }
-  }, [availableKinds, kind, profileId, pushableByKind]);
+  }, [availableAccounts, selectedAlias]);
 
   useEffect(() => () => {
     if (wipeTimerRef.current) {
@@ -168,6 +153,7 @@ function DevicePushPanel({ device, accounts, push, onSubmit, onDismiss }) {
 
   const inFlight = Boolean(push && !PUSH_TERMINAL.has(push.state));
   const capable = devicePushCapableOf(device);
+  const selectedAccount = availableAccounts.find((account) => account.alias === selectedAlias);
 
   const handleWipe = useCallback(() => {
     if (!wipeArmed) {
@@ -179,16 +165,38 @@ function DevicePushPanel({ device, accounts, push, onSubmit, onDismiss }) {
       return;
     }
     disarmWipe();
-    onSubmit(device, { agent_kind: kind, profile_id: profileId, wipe: true });
-  }, [device, disarmWipe, kind, onSubmit, profileId, wipeArmed]);
+    onSubmit(device, {
+      agent_kind: selectedAccount?.provider,
+      profile_id: selectedAccount?.alias,
+      wipe: true,
+    });
+  }, [device, disarmWipe, onSubmit, selectedAccount, wipeArmed]);
 
-  if (!availableKinds.length) {
+  if (availability?.state !== "available") {
     return (
       <PushPanel>
-        <PushEmpty>
-          No signed-in agent accounts to push yet. Sign into Claude Code, Codex, or OpenCode in a
-          terminal — captured accounts appear here automatically.
+        <PushEmpty role="status">
+          Account push is unavailable — {availability?.reason || PUSH_AVAILABILITY_UNKNOWN.reason}
         </PushEmpty>
+        <PushPanelFooter>
+          <PushGhostButton onClick={onDismiss} type="button">Close</PushGhostButton>
+        </PushPanelFooter>
+      </PushPanel>
+    );
+  }
+
+  if (rosterAvailability?.state !== "available") {
+    return (
+      <PushPanel>
+        <PushEmpty role="status">
+          The Haider account roster is {rosterAvailability?.state === "unavailable"
+            ? "unavailable"
+            : "of unknown availability"}
+          {rosterAvailability?.reason ? ` — ${rosterAvailability.reason}` : ""}.
+        </PushEmpty>
+        <PushPanelFooter>
+          <PushGhostButton onClick={onDismiss} type="button">Close</PushGhostButton>
+        </PushPanelFooter>
       </PushPanel>
     );
   }
@@ -206,53 +214,47 @@ function DevicePushPanel({ device, accounts, push, onSubmit, onDismiss }) {
     );
   }
 
-  const profiles = pushableByKind[kind] || [];
-  const canSubmit = Boolean(kind && profileId) && !inFlight;
+  if (!availableAccounts.length) {
+    return (
+      <PushPanel>
+        <PushEmpty>
+          No transferable Haider-vault account was published. Manage accounts in the Accounts view.
+        </PushEmpty>
+        {roster.some((account) => account.state === "unavailable") ? (
+          <PushEmpty>{LEGACY_ACCOUNT_UNAVAILABLE_REASON}</PushEmpty>
+        ) : null}
+        <PushPanelFooter>
+          <PushGhostButton onClick={onDismiss} type="button">Close</PushGhostButton>
+        </PushPanelFooter>
+      </PushPanel>
+    );
+  }
+
+  const canSubmit = Boolean(selectedAccount) && !inFlight;
 
   return (
     <PushPanel>
-      <PushFieldLabel>Account type</PushFieldLabel>
-      <PushSegmented role="tablist" aria-label="Agent type">
-        {availableKinds.map((option) => (
-          <PushSegment
-            aria-selected={option === kind}
-            data-active={option === kind ? "true" : undefined}
-            disabled={inFlight}
-            key={option}
-            onClick={() => {
-              disarmWipe();
-              setKind(option);
-              setProfileId(pushableByKind[option]?.[0]?.id || "");
-            }}
-            role="tab"
-            type="button"
-          >
-            {PROVIDER_LABELS[option] || option}
-          </PushSegment>
-        ))}
-      </PushSegmented>
-
       <PushFieldLabel>Account</PushFieldLabel>
       <PushAccountList>
-        {profiles.map((profile) => {
-          const name = profileDisplayName(profile);
-          const email = String(profile?.identity?.email || "").trim();
-          const selected = profile.id === profileId;
+        {availableAccounts.map((account) => {
+          const name = accountDisplayName(account);
+          const identity = String(account.source?.identity || "").trim();
+          const selected = account.alias === selectedAlias;
           return (
             <PushAccountPill
               data-selected={selected ? "true" : undefined}
               disabled={inFlight}
-              key={profile.id}
+              key={`${account.provider}:${account.alias}`}
               onClick={() => {
                 disarmWipe();
-                setProfileId(profile.id);
+                setSelectedAlias(account.alias);
               }}
-              title={email || name}
+              title={identity || name}
               type="button"
             >
               <i aria-hidden="true" data-on={selected ? "true" : undefined} />
               <span>{name}</span>
-              {email && email !== name ? <em>{email}</em> : null}
+              <em>{account.provider} · {account.alias}</em>
             </PushAccountPill>
           );
         })}
@@ -263,7 +265,9 @@ function DevicePushPanel({ device, accounts, push, onSubmit, onDismiss }) {
           {!PUSH_TERMINAL.has(push.state) ? <PushSpinner aria-hidden="true" /> : null}
           <span>
             {PUSH_STATE_TEXT[push.state] || push.state}
-            {push.state === "failed" && push.message ? ` — ${push.message}` : ""}
+            {(push.state === "failed" || push.state === "unavailable") && push.message
+              ? ` — ${push.message}`
+              : ""}
           </span>
         </PushStatus>
       ) : null}
@@ -292,7 +296,11 @@ function DevicePushPanel({ device, accounts, push, onSubmit, onDismiss }) {
           disabled={!canSubmit}
           onClick={() => {
             disarmWipe();
-            onSubmit(device, { agent_kind: kind, profile_id: profileId, wipe: false });
+            onSubmit(device, {
+              agent_kind: selectedAccount?.provider,
+              profile_id: selectedAccount?.alias,
+              wipe: false,
+            });
           }}
           type="button"
         >
@@ -305,14 +313,21 @@ function DevicePushPanel({ device, accounts, push, onSubmit, onDismiss }) {
 }
 
 export default function DevicesView({ active = true, deviceRows = [], local_device_id: localDeviceId = "" }) {
-  const [accounts, setAccounts] = useState(null);
+  const [accountSnapshot, setAccountSnapshot] = useState(null);
+  const [pushAvailability, setPushAvailability] = useState(PUSH_AVAILABILITY_UNKNOWN);
   const [openDeviceId, setOpenDeviceId] = useState("");
   const [pushByDevice, setPushByDevice] = useState({});
 
   const refreshAccounts = useCallback(() => {
-    invoke("agent_accounts_state")
-      .then((state) => setAccounts(state?.agents || null))
-      .catch(() => {});
+    invoke("account_list", { provider: null })
+      .then((snapshot) => setAccountSnapshot(snapshot || null))
+      .catch((error) => setAccountSnapshot({
+        availability: {
+          state: "unavailable",
+          reason: String(error?.message || error || "The Haider account roster is unavailable."),
+        },
+        descriptors: [],
+      }));
   }, []);
 
   useEffect(() => {
@@ -322,8 +337,16 @@ export default function DevicesView({ active = true, deviceRows = [], local_devi
     let cancelled = false;
     let unlisten = null;
     refreshAccounts();
+    void invoke("account_list_watch").catch(() => {});
+    void invoke("agent_account_push_availability")
+      .then((availability) => {
+        if (!cancelled) setPushAvailability(availability || PUSH_AVAILABILITY_UNKNOWN);
+      })
+      .catch(() => {
+        if (!cancelled) setPushAvailability(PUSH_AVAILABILITY_UNKNOWN);
+      });
     const interval = window.setInterval(refreshAccounts, 6000);
-    listen(AGENT_ACCOUNTS_CHANGED_EVENT, () => {
+    listen(ACCOUNT_ROSTER_CHANGED_EVENT, () => {
       if (!cancelled) {
         refreshAccounts();
       }
@@ -426,6 +449,20 @@ export default function DevicesView({ active = true, deviceRows = [], local_devi
     if (!deviceId || !agentKind || !profileId) {
       return;
     }
+    if (pushAvailability?.state !== "available") {
+      setPushByDevice((current) => ({
+        ...current,
+        [deviceId]: {
+          push_id: "",
+          agent_kind: agentKind,
+          profile_id: profileId,
+          wipe,
+          state: "unavailable",
+          message: pushAvailability?.reason || PUSH_AVAILABILITY_UNKNOWN.reason,
+        },
+      }));
+      return;
+    }
     setPushByDevice((current) => ({
       ...current,
       [deviceId]: { push_id: "", agent_kind: agentKind, profile_id: profileId, wipe, state: "sealing", message: "" },
@@ -437,6 +474,18 @@ export default function DevicesView({ active = true, deviceRows = [], local_devi
       wipe_local_after: wipe,
     })
       .then((result) => {
+        if (result?.state === "unavailable") {
+          setPushAvailability(result);
+          setPushByDevice((current) => ({
+            ...current,
+            [deviceId]: {
+              ...(current[deviceId] || { agent_kind: agentKind, profile_id: profileId, wipe }),
+              state: "unavailable",
+              message: result.reason || "Account push is unavailable.",
+            },
+          }));
+          return;
+        }
         const pushId = result?.push_id || "";
         setPushByDevice((current) => (
           current[deviceId]
@@ -454,7 +503,7 @@ export default function DevicesView({ active = true, deviceRows = [], local_devi
           },
         }));
       });
-  }, []);
+  }, [pushAvailability]);
 
   const dismissPush = useCallback((deviceId) => {
     setOpenDeviceId((current) => (current === deviceId ? "" : current));
@@ -474,10 +523,22 @@ export default function DevicesView({ active = true, deviceRows = [], local_devi
         <DevicesHeader>
           <h1>Devices</h1>
           <p>
-            Push a signed-in agent account to another device so it can run Claude Code, Codex, or
-            OpenCode there — no browser login needed on the remote machine.
+            Account push is a device feature for transferring a Haider-vault account. Its current
+            availability is published by this app.
           </p>
         </DevicesHeader>
+
+        <PushAvailabilityNotice
+          data-state={pushAvailability?.state || "unknown"}
+          role="status"
+        >
+          <strong>Account push</strong>
+          <span>
+            {pushAvailability?.state === "available"
+              ? "Available"
+              : pushAvailability?.reason || PUSH_AVAILABILITY_UNKNOWN.reason}
+          </span>
+        </PushAvailabilityNotice>
 
         {thisDevice ? (
           <DeviceCard data-self="true">
@@ -565,16 +626,20 @@ export default function DevicesView({ active = true, deviceRows = [], local_devi
                 </DeviceCardHead>
                 {isOpen && nativeOnline ? (
                   <DevicePushPanel
-                    accounts={accounts}
+                    accounts={accountSnapshot?.descriptors}
+                    availability={pushAvailability}
                     device={device}
                     onDismiss={() => dismissPush(deviceId)}
                     onSubmit={submitPush}
                     push={push}
+                    rosterAvailability={accountSnapshot?.availability}
                   />
                 ) : push && PUSH_TERMINAL.has(push.state) ? (
                   <CardStatusStrip data-tone={PUSH_SUCCESS.has(push.state) ? "ok" : "error"}>
                     {PUSH_STATE_TEXT[push.state] || push.state}
-                    {push.state === "failed" && push.message ? ` — ${push.message}` : ""}
+                    {(push.state === "failed" || push.state === "unavailable") && push.message
+                      ? ` — ${push.message}`
+                      : ""}
                   </CardStatusStrip>
                 ) : null}
               </DeviceCard>
@@ -632,6 +697,30 @@ const DevicesHeader = styled.header`
   html[data-forge-theme="light"] & p {
     color: #64748b;
   }
+`;
+
+const PushAvailabilityNotice = styled.div`
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: 10px;
+  color: rgba(251, 191, 36, 0.94);
+  background: rgba(245, 158, 11, 0.08);
+  font-size: 11.5px;
+  line-height: 1.4;
+
+  strong { flex: none; }
+  span { color: rgba(203, 213, 225, 0.82); }
+
+  &[data-state="available"] {
+    border-color: rgba(74, 222, 128, 0.3);
+    color: rgba(74, 222, 128, 0.94);
+    background: rgba(74, 222, 128, 0.08);
+  }
+
+  html[data-forge-theme="light"] & span { color: #475569; }
 `;
 
 const DevicesSectionLabel = styled.div`
@@ -852,50 +941,6 @@ const PushFieldLabel = styled.div`
   font-weight: 800;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-`;
-
-const PushSegmented = styled.div`
-  display: inline-flex;
-  gap: 4px;
-  padding: 3px;
-  border-radius: 10px;
-  background: rgba(30, 41, 59, 0.5);
-  align-self: flex-start;
-  max-width: 100%;
-  flex-wrap: wrap;
-
-  html[data-forge-theme="light"] & {
-    background: rgba(226, 232, 240, 0.7);
-  }
-`;
-
-const PushSegment = styled.button`
-  padding: 5px 12px;
-  border: 0;
-  border-radius: 8px;
-  color: rgba(203, 213, 225, 0.8);
-  background: transparent;
-  font-size: 11.5px;
-  font-weight: 700;
-  cursor: pointer;
-  transition: background 120ms ease, color 120ms ease;
-
-  &[data-active="true"] {
-    color: rgba(226, 232, 240, 0.98);
-    background: rgba(var(--forge-tint-rgb), 0.32);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.7;
-  }
-
-  html[data-forge-theme="light"] & {
-    color: rgba(51, 65, 85, 0.8);
-  }
-  html[data-forge-theme="light"] &[data-active="true"] {
-    color: rgba(15, 23, 42, 0.95);
-  }
 `;
 
 const PushAccountList = styled.div`

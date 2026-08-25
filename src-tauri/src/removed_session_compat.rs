@@ -11,20 +11,6 @@ pub(crate) static OPENCODE_DB_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()
     std::sync::OnceLock::new();
 
 #[derive(Clone, Default)]
-struct AgentThreadTranscriptNativeWatchRequest {
-    agent_id: String,
-    cwd: String,
-    instance_id: Option<u64>,
-    pane_id: String,
-    provider_session_id: String,
-    source: String,
-    terminal_index: Option<i64>,
-    thread_id: String,
-    transcript_path: Option<String>,
-    workspace_id: String,
-}
-
-#[derive(Clone, Default)]
 struct CodexObservedSession {
     session_id: String,
     session_title: String,
@@ -43,14 +29,6 @@ struct CodexThreadTranscriptMessage {
 
 struct CodexThreadTranscriptResult {
     messages: Vec<CodexThreadTranscriptMessage>,
-}
-
-#[derive(Clone)]
-struct AgentChatSessionObservedTerminalPresence {
-    workspace_id: String,
-    pane_id: String,
-    instance_id: Option<u64>,
-    origins: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -98,8 +76,6 @@ struct AgentChatTurnDiffContext {
     files_omitted: usize,
     truncated: bool,
 }
-
-type AgentChatSessionSyncSettleObserver = Box<dyn FnOnce(bool) + Send + 'static>;
 
 fn clean_codex_id(value: impl AsRef<str>) -> String {
     value
@@ -253,113 +229,4 @@ fn read_agent_thread_transcript(
     _max_messages: usize,
 ) -> Result<CodexThreadTranscriptResult, String> {
     Err(legacy_session_unavailable("Provider"))
-}
-
-fn register_agent_thread_transcript_native_watch(
-    _app: &AppHandle,
-    _request: &AgentThreadTranscriptNativeWatchRequest,
-) -> Result<(), String> {
-    Ok(())
-}
-
-fn unregister_agent_thread_transcript_native_watch(_pane_id: &str, _instance_id: Option<u64>) {}
-
-fn trigger_agent_thread_transcript_native_watch(
-    _app: &AppHandle,
-    _pane_id: &str,
-    _instance_id: Option<u64>,
-    _reason: &'static str,
-) -> usize {
-    0
-}
-
-fn agent_chat_session_set_terminal_observed(
-    _workspace_id: &str,
-    _pane_id: &str,
-    _instance_id: Option<u64>,
-    _origin: Option<&str>,
-    _active: bool,
-) -> usize {
-    0
-}
-
-fn agent_chat_session_touch_terminal_observed(
-    _workspace_id: &str,
-    _pane_id: &str,
-    _instance_id: Option<u64>,
-    _origin: Option<&str>,
-) -> usize {
-    0
-}
-
-fn agent_chat_session_clear_observed_terminal_matching(
-    _workspace_id: Option<&str>,
-    _pane_id: &str,
-    _instance_id: Option<u64>,
-) -> bool {
-    false
-}
-
-fn agent_chat_session_clear_observed_terminals() -> bool {
-    false
-}
-
-fn agent_chat_session_prune_stale_observed_terminals(
-    _now_ms: u64,
-    _stale_after_ms: u64,
-) -> bool {
-    false
-}
-
-fn agent_chat_session_has_observed_terminal_origins() -> bool {
-    false
-}
-
-fn agent_chat_session_terminal_identity_is_observed(
-    _workspace_id: &str,
-    _pane_id: &str,
-    _instance_id: Option<u64>,
-) -> bool {
-    false
-}
-
-fn agent_chat_session_observed_terminal_presence_entries(
-) -> Vec<AgentChatSessionObservedTerminalPresence> {
-    Vec::new()
-}
-
-fn agent_chat_session_sync_provider(_agent_id: &str) -> Option<&'static str> {
-    None
-}
-
-fn agent_chat_session_sync_spawn_with_state(
-    _state: CloudMcpState,
-    _agent_id: String,
-    _provider_session_id: String,
-    _cwd: String,
-    _context: AgentChatSessionSyncContext,
-    _reason: &'static str,
-) {
-}
-
-fn agent_chat_session_sync_spawn_with_state_observed(
-    _state: CloudMcpState,
-    _agent_id: String,
-    _provider_session_id: String,
-    _cwd: String,
-    _context: AgentChatSessionSyncContext,
-    _reason: &'static str,
-    on_settled: Option<AgentChatSessionSyncSettleObserver>,
-) {
-    if let Some(on_settled) = on_settled {
-        on_settled(false);
-    }
-}
-
-fn agent_chat_session_sync_spawn_from_payload_repair(
-    _app: AppHandle,
-    _payload: &Value,
-    _reason: &'static str,
-) -> bool {
-    false
 }

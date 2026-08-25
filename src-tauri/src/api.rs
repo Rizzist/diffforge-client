@@ -4723,6 +4723,67 @@ async fn agent_statuses() -> Result<Vec<AgentStatus>, String> {
     Err("Legacy harness status inventory is unavailable; use the Haider daemon.".to_string())
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum AgentStatusesPublication {
+    Published { statuses: Value },
+    Unavailable { reason: String },
+}
+
+impl AgentStatusesPublication {
+    fn from_result(result: Result<Vec<AgentStatus>, String>) -> Self {
+        match result {
+            Ok(statuses) => match serde_json::to_value(statuses) {
+                Ok(statuses) => Self::Published { statuses },
+                Err(error) => Self::Unavailable {
+                    reason: format!("Unable to serialize the published agent inventory: {error}"),
+                },
+            },
+            Err(reason) => Self::Unavailable { reason },
+        }
+    }
+
+    fn published(statuses: Value) -> Self {
+        Self::Published { statuses }
+    }
+}
+
+async fn agent_statuses_publication() -> AgentStatusesPublication {
+    AgentStatusesPublication::from_result(agent_statuses().await)
+}
+
+#[tauri::command]
+async fn tools_agent_statuses() -> AgentStatusesPublication {
+    agent_statuses_publication().await
+}
+
+#[cfg(test)]
+mod agent_statuses_publication_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_inventory_keeps_its_reason_and_never_becomes_an_empty_list() {
+        let publication = AgentStatusesPublication::from_result(Err(
+            "Haider agent inventory is unavailable.".to_string(),
+        ));
+        let value = serde_json::to_value(publication).unwrap();
+
+        assert_eq!(value["state"], "unavailable");
+        assert_eq!(value["reason"], "Haider agent inventory is unavailable.");
+        assert!(value.get("statuses").is_none());
+    }
+
+    #[test]
+    fn a_healthy_empty_inventory_requires_an_explicit_publication() {
+        let publication = AgentStatusesPublication::from_result(Ok(Vec::new()));
+        let value = serde_json::to_value(publication).unwrap();
+
+        assert_eq!(value["state"], "published");
+        assert_eq!(value["statuses"], json!([]));
+        assert!(value.get("reason").is_none());
+    }
+}
+
 async fn install_agent(_provider: String) -> Result<AgentInstallResult, String> {
     Err("DiffForge does not install harness CLIs.".to_string())
 }

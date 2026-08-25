@@ -14,7 +14,7 @@ import {
 
 /* Harness-owned account management (936 account_* doors). The daemon's vault
    is the single credential authority for every surface — this view LISTS,
-   ADDS (API key + OAuth), IMPORTS, SWITCHES, and REMOVES through RPC doors
+   ADDS (API key + OAuth), SWITCHES, and REMOVES through RPC doors
    and never sees a secret back. List freshness is poll-by-revision until the
    watch door lands (937 delta). */
 
@@ -24,41 +24,6 @@ const LIST_POLL_MS = 5000;
 const LABEL_MAX = 64;
 const OAUTH_POLL_MS = 1500;
 
-/* Sources this build shipped knowing about. The daemon owns the real catalog
-   (account_oauth_import_sources_v1); this list is the floor for daemons that
-   predate it, and it is exactly how grok-cli went a release with no import
-   path at all while these three looked complete. */
-const LEGACY_IMPORT_SOURCES = [
-  { source: "codex", available: true },
-  { source: "claude-code", available: true },
-  { source: "kimi-code", available: true },
-];
-
-/* Display spelling only — the catalog decides what exists, this decides how a
-   known name is capitalized, and anything new still renders readably. */
-const IMPORT_SOURCE_LABELS = {
-  codex: "Codex CLI",
-  "claude-code": "Claude Code",
-  "kimi-code": "Kimi Code",
-  "grok-cli": "Grok CLI",
-};
-
-function importSourceLabel(source) {
-  const known = IMPORT_SOURCE_LABELS[source];
-  if (known) {
-    return known;
-  }
-  return String(source || "")
-    .split(/[-_]/)
-    .filter(Boolean)
-    .map((word) => (
-      word.toLowerCase() === "cli"
-        ? "CLI"
-        : word.charAt(0).toUpperCase() + word.slice(1)
-    ))
-    .join(" ");
-}
-
 const STATUS_LABELS = {
   ok: "ok",
   limited: "limited",
@@ -66,221 +31,6 @@ const STATUS_LABELS = {
   revoked: "revoked",
   needs_attention: "needs attention",
 };
-
-/* Direct-CLI terminal logins (codex/claude/opencode), captured from the
-   profile dirs by the Rust watcher. Separate from the harness vault: these
-   authenticate raw CLI terminals, not harness sessions. */
-const CLI_KINDS = [
-  { kind: "claude", label: "Claude Code" },
-  { kind: "codex", label: "Codex" },
-  { kind: "opencode", label: "OpenCode" },
-];
-
-/* One machine login can appear under several profile ids; the email is the
-   identity, so fold duplicates and let an active row win. */
-function collapseProfilesByEmail(profiles) {
-  const byEmail = new Map();
-  const visible = [];
-  for (const profile of Array.isArray(profiles) ? profiles : []) {
-    const email = String(profile?.identity?.email || profile?.email || "").trim().toLowerCase();
-    if (!email) {
-      visible.push(profile);
-      continue;
-    }
-    const existing = byEmail.get(email);
-    if (!existing) {
-      byEmail.set(email, profile);
-      visible.push(profile);
-      continue;
-    }
-    if (profile?.is_active && !existing.is_active) {
-      const index = visible.indexOf(existing);
-      const merged = { ...profile, alias: profile.alias || existing.alias };
-      if (index >= 0) visible[index] = merged;
-      byEmail.set(email, merged);
-    }
-  }
-  return visible;
-}
-
-function CliProfilesSection() {
-  const [agents, setAgents] = useState(null);
-  const [error, setError] = useState("");
-  const [pendingKind, setPendingKind] = useState("");
-  const [confirmKey, setConfirmKey] = useState("");
-  const pendingRef = useRef("");
-  const pendingTimerRef = useRef(null);
-
-  const refresh = useCallback(() => {
-    invoke("agent_accounts_state")
-      .then((state) => setAgents(state?.agents || null))
-      .catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    refresh();
-    /* Logins inside profile dirs change identity without emitting an event,
-       so a slow poll backs up the capture watcher. */
-    const timer = window.setInterval(refresh, 6000);
-    return () => {
-      window.clearInterval(timer);
-      if (pendingTimerRef.current) window.clearTimeout(pendingTimerRef.current);
-    };
-  }, [refresh]);
-
-  /* Logging in opens a terminal and finishes out of band — hold the kind
-     busy briefly so the row reads as pending, and let the watcher settle. */
-  const holdPending = useCallback((kind) => {
-    pendingRef.current = kind;
-    setPendingKind(kind);
-    if (pendingTimerRef.current) window.clearTimeout(pendingTimerRef.current);
-    pendingTimerRef.current = window.setTimeout(() => {
-      pendingRef.current = "";
-      setPendingKind("");
-    }, 30000);
-  }, []);
-
-  const beginLogin = useCallback((kind) => {
-    if (pendingRef.current) return;
-    setError(`${kind} CLI login is unavailable; add or import the account through Haider.`);
-  }, []);
-
-  const beginProfileLogin = useCallback((kind, profileId) => {
-    if (pendingRef.current) return;
-    setError("");
-    holdPending(kind);
-    invoke("agent_accounts_start_profile_login", { agent_kind: kind, profile_id: profileId })
-      .then(refresh)
-      .catch((failure) => {
-        pendingRef.current = "";
-        setPendingKind("");
-        setError(String(failure?.message || failure || "Unable to open the account login terminal."));
-      });
-  }, [holdPending, refresh]);
-
-  /* Codex re-authenticates on switch rather than swapping a stored profile,
-     so its "use this" path is the login door. */
-  const setActiveProfile = useCallback((kind, profileId) => {
-    setError("");
-    if (kind === "codex") {
-      beginProfileLogin(kind, profileId);
-      return;
-    }
-    invoke("agent_accounts_set_active", { agent_kind: kind, profile_id: profileId })
-      .then(refresh)
-      .catch((failure) => setError(String(failure?.message || failure || "Unable to switch account.")));
-  }, [beginProfileLogin, refresh]);
-
-  const removeProfile = useCallback((kind, profileId) => {
-    setConfirmKey("");
-    setError("");
-    invoke("agent_accounts_remove", { agent_kind: kind, profile_id: profileId })
-      .then(refresh)
-      .catch((failure) => setError(String(failure?.message || failure || "Unable to delete the profile.")));
-  }, [refresh]);
-
-  if (!agents) return null;
-
-  return (
-    <>
-      <SectionTitle>CLI profiles</SectionTitle>
-      <SectionNote>
-        Logins for direct CLI terminals. Sign into another account in any
-        terminal and it is captured here automatically.
-      </SectionNote>
-      {error && <Notice data-tone="error" role="status"><span>{error}</span></Notice>}
-      {CLI_KINDS.map(({ kind, label }) => {
-        const entry = agents[kind];
-        if (!entry) return null;
-        const profiles = collapseProfilesByEmail(entry.profiles);
-        return (
-          <ProviderGroup key={kind}>
-            <ProviderHeadRow>
-              <ProviderName>{label}</ProviderName>
-              <GhostButton
-                aria-label={`Add a ${label} account`}
-                disabled={Boolean(pendingKind)}
-                onClick={() => beginLogin(kind)}
-                title={`Open the ${label} login in a terminal`}
-                type="button"
-              >
-                <Add aria-hidden="true" />
-                Add
-              </GhostButton>
-            </ProviderHeadRow>
-            {!profiles.length ? (
-              <EmptyState>No {label} logins captured yet.</EmptyState>
-            ) : profiles.map((profile) => {
-              const email = profile.identity?.email || "";
-              const alias = String(profile.alias || "").trim();
-              const name = profile.is_default
-                ? (profile.label || "Default")
-                : (alias || profile.label || "Account");
-              const detail = profile.is_default ? (alias || email) : (alias ? "" : email);
-              const needsLogin = Boolean(
-                profile.auth_status?.needs_login || !profile.identity?.auth_ready,
-              );
-              const canDelete = !profile.is_default && !profile.is_active;
-              return (
-                <AccountRow data-busy={pendingKind === kind ? "true" : undefined} key={profile.id}>
-                  <AccountIdentity>
-                    <strong>{name}</strong>
-                    <span>{detail || kind}</span>
-                  </AccountIdentity>
-                  {needsLogin ? (
-                    <GhostButton
-                      disabled={Boolean(pendingKind)}
-                      onClick={() => beginProfileLogin(kind, profile.id)}
-                      title={profile.auth_status?.message || "Sign in again for this account"}
-                      type="button"
-                    >
-                      Log in
-                    </GhostButton>
-                  ) : profile.is_active ? (
-                    <ActiveTag>Active</ActiveTag>
-                  ) : (
-                    <GhostButton
-                      disabled={Boolean(pendingKind)}
-                      onClick={() => setActiveProfile(kind, profile.id)}
-                      title={`Use this account for new ${label} terminals`}
-                      type="button"
-                    >
-                      Set active
-                    </GhostButton>
-                  )}
-                  {canDelete && (
-                    confirmKey === `${kind}:${profile.id}` ? (
-                      <InlineConfirm data-danger="true">
-                        <span>Deletes the saved login.</span>
-                        <ConfirmButton
-                          data-danger="true"
-                          onClick={() => removeProfile(kind, profile.id)}
-                          type="button"
-                        >
-                          Delete
-                        </ConfirmButton>
-                        <GhostButton onClick={() => setConfirmKey("")} type="button">Keep</GhostButton>
-                      </InlineConfirm>
-                    ) : (
-                      <RowIconButton
-                        aria-label={`Delete ${name}`}
-                        onClick={() => setConfirmKey(`${kind}:${profile.id}`)}
-                        title="Delete this profile and its saved login"
-                        type="button"
-                      >
-                        <Close aria-hidden="true" />
-                      </RowIconButton>
-                    )
-                  )}
-                </AccountRow>
-              );
-            })}
-          </ProviderGroup>
-        );
-      })}
-    </>
-  );
-}
 
 function errorCode(error) {
   return String(error?.message || error || "");
@@ -311,11 +61,7 @@ export default function AccountsView({ active = false }) {
   const [renamingAlias, setRenamingAlias] = useState("");
   const [labelDraft, setLabelDraft] = useState("");
   const [confirmEpoch, setConfirmEpoch] = useState("");
-  const [candidates, setCandidates] = useState(null); // {discovery_disabled, candidates}
   const [library, setLibrary] = useState(null);
-  /* null until asked. A daemon that publishes no catalog leaves the shipped
-     floor in place; one that publishes a catalog replaces it outright. */
-  const [importSources, setImportSources] = useState(null);
   const oauthFlowRef = useRef(null);
   oauthFlowRef.current = oauthFlow;
 
@@ -333,9 +79,6 @@ export default function AccountsView({ active = false }) {
     if (!active) return undefined;
     void refresh();
     void invoke("haider_library_snapshot").then(setLibrary).catch(() => {});
-    void invoke("account_oauth_import_sources")
-      .then((sources) => setImportSources(Array.isArray(sources) ? sources : null))
-      .catch(() => setImportSources(null));
     const timer = window.setInterval(() => void refresh(), LIST_POLL_MS);
     return () => window.clearInterval(timer);
   }, [active, refresh]);
@@ -519,33 +262,6 @@ export default function AccountsView({ active = false }) {
       }).catch(() => {});
     }
   }, []);
-
-  const importSource = useCallback((source) => {
-    void run(`import:${source}`, () => invoke("account_oauth_import", { source }))
-      .then((ok) => {
-        if (ok) setNotice({ tone: "ok", text: "Imported and refreshed the login." });
-      });
-  }, [run]);
-
-  const scanDevice = useCallback(async () => {
-    setBusy("scan");
-    try {
-      const result = await invoke("account_device_candidates");
-      setCandidates(result || { candidates: [] });
-      void refresh(); // scanning auto-adopts importable candidates (contract §9)
-    } catch (error) {
-      setNotice({ tone: "error", text: publicCodeMessage(errorCode(error)) });
-    } finally {
-      setBusy("");
-    }
-  }, [refresh]);
-
-  const importCandidate = useCallback((candidate) => {
-    void run(`candidate:${candidate}`, () => invoke("account_import_device", { candidate }))
-      .then((ok) => {
-        if (ok) void scanDevice();
-      });
-  }, [run, scanDevice]);
 
   const accountPresentation = accountListPresentation(snapshot, loadError);
   const descriptors = accountPresentation.descriptors || [];
@@ -736,35 +452,6 @@ export default function AccountsView({ active = false }) {
           <Add aria-hidden="true" />
           API key
         </GhostButton>
-        {(importSources || LEGACY_IMPORT_SOURCES).map((entry) => {
-          const label = importSourceLabel(entry.source);
-          /* available is point-in-time, so an unavailable source is shown and
-             disabled rather than hidden — with the daemon's own sentence for
-             why, which is the whole reason it sends one. */
-          const available = entry.available !== false;
-          const reason = entry.unavailable_reason?.message;
-          return (
-            <GhostButton
-              disabled={busy === `import:${entry.source}` || !available}
-              key={entry.source}
-              onClick={() => importSource(entry.source)}
-              title={available
-                ? `Import the ${label} login from this machine`
-                : reason || `No ${label} login is available on this machine`}
-              type="button"
-            >
-              Import {label}
-            </GhostButton>
-          );
-        })}
-        <GhostButton
-          disabled={busy === "scan"}
-          onClick={() => void scanDevice()}
-          title="Scans local CLI stores; importable logins are adopted automatically"
-          type="button"
-        >
-          Scan device logins
-        </GhostButton>
       </AddBar>
 
       {addMode === "api" && (
@@ -882,40 +569,6 @@ export default function AccountsView({ active = false }) {
         </OauthCard>
       )}
 
-      <CliProfilesSection />
-
-      {candidates && (
-        <>
-          <SectionTitle>Device logins</SectionTitle>
-          {candidates.discovery_disabled ? (
-            <EmptyState>Device credential discovery is disabled.</EmptyState>
-          ) : !candidates.candidates?.length ? (
-            <EmptyState>No importable CLI logins were found.</EmptyState>
-          ) : (
-            candidates.candidates.map((candidate) => (
-              <AccountRow key={candidate.candidate}>
-                <AccountIdentity>
-                  <strong>{candidate.account_label || candidate.source_label}</strong>
-                  <span>{candidate.provider} · {candidate.freshness}</span>
-                </AccountIdentity>
-                {candidate.import_supported ? (
-                  <GhostButton
-                    disabled={busy === `candidate:${candidate.candidate}`}
-                    onClick={() => importCandidate(candidate.candidate)}
-                    type="button"
-                  >
-                    Import
-                  </GhostButton>
-                ) : (
-                  <StatusBadge data-state="expired">
-                    {candidate.unsupported_reason || "unsupported"}
-                  </StatusBadge>
-                )}
-              </AccountRow>
-            ))
-          )}
-        </>
-      )}
     </Root>
   );
 }
@@ -1018,22 +671,6 @@ const RenameForm = styled.form`
     color: var(--forge-text);
     font-size: 12.5px;
   }
-`;
-
-const ProviderHeadRow = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-
-  ${ProviderName} { margin-bottom: 6px; }
-`;
-
-const SectionNote = styled.p`
-  margin: -2px 0 8px;
-  color: var(--forge-text-muted);
-  font-size: 11.5px;
-  line-height: 1.5;
 `;
 
 const AccountRow = styled.div`

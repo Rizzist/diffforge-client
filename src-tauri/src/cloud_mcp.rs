@@ -7242,13 +7242,9 @@ fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Res
                     .unwrap_or(false);
             if !ack_recorded && cloud_mcp_agent_chat_sync_response_accepted(response) {
                 agent_chat_repair_pending = true;
-                if let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get() {
-                    agent_chat_repair_pending = agent_chat_session_sync_spawn_from_payload_repair(
-                        app.clone(),
-                        &payload,
-                        "agent_chat_ack_repair",
-                    );
-                }
+                // Legacy provider transcript repair was removed with the
+                // provider-session synchronizer. Retain the honest pending
+                // marker for an old durable row; do not fabricate a repair.
             }
             agent_chat_payload = Some(payload);
         }
@@ -19473,7 +19469,10 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
         let _ = state.global_ws_events.send(message);
         return;
     }
-    if cloud_mcp_handle_agent_session_observer_subscription(state, &message, &direct_kind) {
+    if cloud_mcp_handle_agent_session_observer_subscription(state, &message, &direct_kind)
+        .await
+        .is_unavailable()
+    {
         return;
     }
     if cloud_mcp_handle_terminal_io_message(state, &message, &direct_kind).await {
@@ -19720,7 +19719,10 @@ async fn cloud_mcp_handle_current_epoch_global_ws_message(
                 );
             }
         }
-        if cloud_mcp_handle_agent_session_observer_subscription(state, &event, &event_kind) {
+        if cloud_mcp_handle_agent_session_observer_subscription(state, &event, &event_kind)
+            .await
+            .is_unavailable()
+        {
             return;
         }
         if cloud_mcp_handle_terminal_io_message(state, &event, &event_kind).await {
@@ -25361,6 +25363,40 @@ const CLOUD_MCP_AGENT_INVENTORY_FALLBACK_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const CLOUD_MCP_AGENT_INVENTORY_WATCH_DEBOUNCE_MS: u64 = 10_000;
 const CLOUD_MCP_AGENT_ADMIN_RETRY_TTL_SECS: u64 = 5 * 60;
 
+fn cloud_mcp_agent_inventory_unavailable_payload(reason: &str, source: &str) -> Value {
+    json!({
+        "state": "unavailable",
+        "reason": reason,
+        "source": source,
+        "updated_at_ms": cloud_mcp_now_ms(),
+    })
+}
+
+fn cloud_mcp_emit_agent_inventory_unavailable(app: &AppHandle, reason: &str, source: &str) {
+    let _ = app.emit(
+        CLOUD_MCP_AGENT_INVENTORY_EVENT,
+        cloud_mcp_agent_inventory_unavailable_payload(reason, source),
+    );
+}
+
+#[cfg(test)]
+mod cloud_mcp_agent_inventory_availability_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_inventory_event_carries_reason_without_fabricating_statuses() {
+        let payload = cloud_mcp_agent_inventory_unavailable_payload(
+            "Haider inventory is offline.",
+            "test_probe",
+        );
+
+        assert_eq!(payload["state"], "unavailable");
+        assert_eq!(payload["reason"], "Haider inventory is offline.");
+        assert_eq!(payload["source"], "test_probe");
+        assert!(payload.get("statuses").is_none());
+    }
+}
+
 static CLOUD_MCP_AGENT_INVENTORY_SIGNATURE: OnceLock<StdMutex<String>> = OnceLock::new();
 static CLOUD_MCP_AGENT_INVENTORY_WATCHER: OnceLock<StdMutex<Option<notify::RecommendedWatcher>>> =
     OnceLock::new();
@@ -25702,7 +25738,10 @@ fn cloud_mcp_latest_agent_model_catalog_value(agent_kind: &str) -> Option<Value>
         .and_then(|catalog| serde_json::to_value(catalog).ok())
 }
 
-async fn cloud_mcp_agent_update_status_payload(app: &AppHandle, state: &CloudMcpState) -> Value {
+async fn cloud_mcp_agent_update_status_payload(
+    app: &AppHandle,
+    state: &CloudMcpState,
+) -> AgentStatusesPublication {
     let cached = {
         let snapshots = state.runtime_snapshots.lock().await;
         snapshots
@@ -25711,14 +25750,10 @@ async fn cloud_mcp_agent_update_status_payload(app: &AppHandle, state: &CloudMcp
             .and_then(|snapshot| snapshot.get("coding_agents"))
             .cloned()
     };
-    let mut statuses = if let Some(cached) = cached.filter(Value::is_array) {
-        cached
+    let mut publication = if let Some(cached) = cached.filter(Value::is_array) {
+        AgentStatusesPublication::published(cached)
     } else {
-        agent_statuses()
-            .await
-            .ok()
-            .and_then(|statuses| serde_json::to_value(statuses).ok())
-            .unwrap_or_else(|| json!([]))
+        agent_statuses_publication().await
     };
     let progresses = {
         let _guard = CLOUD_MCP_AGENT_UPDATE_PROGRESS_FILE_LOCK
@@ -25727,8 +25762,10 @@ async fn cloud_mcp_agent_update_status_payload(app: &AppHandle, state: &CloudMcp
             .ok();
         cloud_mcp_agent_update_progresses(app)
     };
-    cloud_mcp_merge_agent_update_progress_into_statuses(&mut statuses, &progresses);
-    statuses
+    if let AgentStatusesPublication::Published { statuses } = &mut publication {
+        cloud_mcp_merge_agent_update_progress_into_statuses(statuses, &progresses);
+    }
+    publication
 }
 
 async fn cloud_mcp_publish_agent_update_progress(
@@ -25784,16 +25821,22 @@ async fn cloud_mcp_publish_agent_update_progress(
         )
         .await;
     }
-    let statuses = cloud_mcp_agent_update_status_payload(app, state).await;
-    let _ = cloud_mcp_sync_agent_installations_internal(
-        state,
-        String::new(),
-        None,
-        None,
-        statuses,
-        Some(reason.to_string()),
-    )
-    .await;
+    match cloud_mcp_agent_update_status_payload(app, state).await {
+        AgentStatusesPublication::Published { statuses } => {
+            let _ = cloud_mcp_sync_agent_installations_internal(
+                state,
+                String::new(),
+                None,
+                None,
+                statuses,
+                Some(reason.to_string()),
+            )
+            .await;
+        }
+        AgentStatusesPublication::Unavailable {
+            reason: unavailable_reason,
+        } => cloud_mcp_emit_agent_inventory_unavailable(app, &unavailable_reason, reason),
+    }
 }
 
 async fn cloud_mcp_enrich_agent_statuses_with_update_progress(
@@ -26494,42 +26537,6 @@ mod cloud_mcp_agent_model_catalog_tests {
     }
 
     #[test]
-    fn opencode_agent_models_result_maps_provider_scoped_catalog() {
-        let request = json!({
-            "id": "models-request-1",
-            "kind": "list_agent_models",
-            "target_device_id": "desktop-primary",
-            "target_terminal_id": "term-1",
-            "agent_kind": "opencode",
-            "workspace_id": "workspace-1"
-        });
-        let models = opencode_model_catalog_entries_from_ids(
-            &[
-                "openai/gpt-5.5".to_string(),
-                "anthropic/claude-sonnet-4-5".to_string(),
-            ],
-            "cli",
-        );
-        let payload = cloud_mcp_agent_models_result_payload(
-            &request,
-            "opencode",
-            models,
-            true,
-            Some("opencode 1.2.3".to_string()),
-            None,
-        );
-
-        assert_eq!(payload["kind"], json!("agent_models_result"));
-        assert_eq!(payload["request_id"], json!("models-request-1"));
-        assert_eq!(payload["agent_kind"], json!("opencode"));
-        assert_eq!(payload["complete"], json!(true));
-        assert_eq!(payload["harness_version"], json!("opencode 1.2.3"));
-        assert_eq!(payload["models"][0]["id"], json!("openai/gpt-5.5"));
-        assert_eq!(payload["models"][0]["provider"], json!("openai"));
-        assert_eq!(payload["models"][0]["source"], json!("harness_api"));
-    }
-
-    #[test]
     fn list_agent_models_detector_accepts_cloud_event_wrapped_event_kind() {
         let _storage = process_test_storage_isolation(
             "list_agent_models_detector_accepts_cloud_event_wrapped_event_kind",
@@ -26895,10 +26902,15 @@ pub(crate) async fn cloud_mcp_agent_inventory_probe_and_sync(
     reason: &str,
     force: bool,
 ) {
-    let Ok(statuses) = agent_statuses().await else {
-        return;
+    let mut payload = match agent_statuses_publication().await {
+        AgentStatusesPublication::Published { statuses } => statuses,
+        AgentStatusesPublication::Unavailable {
+            reason: unavailable_reason,
+        } => {
+            cloud_mcp_emit_agent_inventory_unavailable(app, &unavailable_reason, reason);
+            return;
+        }
     };
-    let mut payload = serde_json::to_value(&statuses).unwrap_or_else(|_| json!([]));
     cloud_mcp_enrich_agent_statuses_with_update_progress(app, &mut payload).await;
     cloud_mcp_refresh_agent_model_catalogs_from_status_payload(&payload, reason).await;
     cloud_mcp_enrich_agent_status_payload_with_cached_catalogs(&mut payload);
@@ -26916,6 +26928,7 @@ pub(crate) async fn cloud_mcp_agent_inventory_probe_and_sync(
     let _ = app.emit(
         CLOUD_MCP_AGENT_INVENTORY_EVENT,
         json!({
+            "state": "published",
             "statuses": payload.clone(),
             "reason": reason,
             "updated_at_ms": cloud_mcp_now_ms(),
@@ -27565,22 +27578,6 @@ mod agent_update_progress_tests {
         assert_eq!(failed.stage, "failed");
         assert_eq!(failed.failed_stage.as_deref(), Some("installing"));
         assert_eq!(failed.stage_seq, 10);
-    }
-
-    #[test]
-    fn update_registry_is_generic_for_supported_agent_definitions() {
-        for (provider, id, package) in [
-            (AgentProvider::Codex, "codex", "@openai/codex"),
-            (AgentProvider::Claude, "claude", "@anthropic-ai/claude-code"),
-            (AgentProvider::OpenCode, "opencode", "opencode-ai"),
-        ] {
-            let definition = agent_definition(provider);
-            assert_eq!(definition.id, id);
-            assert_eq!(definition.install_package, package);
-            assert!(definition.install_command.contains(package));
-            let progress = agent_update_progress_begin(None, id, "1.0.0", "1.1.0", 1);
-            assert_eq!(progress.provider, id);
-        }
     }
 
     #[test]
@@ -28785,7 +28782,6 @@ fn cloud_mcp_remote_device_lever_action(command_kind: &str) -> Option<&'static s
             Some("notify")
         }
         "app_update_now" | "update_app" | "app_update" => Some("app_update_now"),
-        "agent_account_start_login_transaction" => Some("account_login_transaction"),
         "agent_account_switch"
         | "switch_agent_account"
         | "agent_profile_switch"
@@ -28899,21 +28895,17 @@ fn cloud_mcp_apply_remote_device_lever(
                 .await;
             }
             "account_switch" => {
-                let provider = cloud_mcp_payload_text(
+                let alias = cloud_mcp_payload_text(
                     &event,
-                    &["provider", "agent_provider", "agent_id", "target_agent_id"],
+                    &["alias", "account_alias", "account_id", "profile_id"],
                 )
-                .unwrap_or_default();
-                let profile_id = cloud_mcp_payload_text(&event, &["account_id", "profile_id"])
                     .or_else(|| cloud_mcp_payload_text(&event, &["payload", "account_id"]))
                     .unwrap_or_default();
-                let result =
-                    agent_accounts_set_active(app.clone(), provider.clone(), profile_id.clone())
-                        .await;
+                let result = haider_rpc_ade::account_set_active(alias.clone(), false).await;
                 let (status, message) = match result {
                     Ok(_) => (
                         "completed",
-                        format!("Active {provider} account switched to {profile_id}."),
+                        format!("Active Haider account switched to {alias}."),
                     ),
                     Err(error) => ("failed", error),
                 };
@@ -28922,78 +28914,26 @@ fn cloud_mcp_apply_remote_device_lever(
                 )
                 .await;
             }
-            "account_login_transaction" => {
-                let provider = cloud_mcp_remote_command_field_text(
-                    &event,
-                    &[
-                        "provider",
-                        "agent_kind",
-                        "agent_provider",
-                        "agent_id",
-                        "target_agent_id",
-                    ],
-                )
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-                let profile_id = cloud_mcp_remote_command_field_text(
-                    &event,
-                    &["profile_id", "account_id", "account_profile_id"],
-                )
-                .unwrap_or_default();
-                if provider != "codex" {
+            "agent_account_push" => {
+                let push_availability = agent_account_push_availability_state();
+                if !push_availability.is_available() {
+                    let reason = push_availability
+                        .reason()
+                        .unwrap_or("Account push is unavailable.");
                     let details = json!({
-                        "provider": provider,
-                        "profile_id": profile_id,
-                        "required_provider": "codex",
+                        "availability": push_availability,
+                        "contract": AGENT_ACCOUNT_PUSH_CONTRACT,
                     });
                     let _ = cloud_mcp_send_remote_command_status_event(
                         &state,
                         &event,
                         "failed",
-                        "The login transaction action is reserved for Codex device authorization.",
+                        reason,
                         Some(&details),
                     )
                     .await;
                     return;
                 }
-                let result = agent_accounts_start_profile_login(
-                    app.clone(),
-                    provider.clone(),
-                    profile_id.clone(),
-                )
-                .await;
-                match result {
-                    Ok(details) => {
-                        let _ = cloud_mcp_send_remote_command_status_event(
-                            &state,
-                            &event,
-                            "completed",
-                            "Codex device authorization started; activation remains pending until the expected changed login is validated.",
-                            Some(&details),
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        let details = json!({
-                            "provider": provider,
-                            "profile_id": profile_id,
-                            "error": error,
-                        });
-                        let _ = cloud_mcp_send_remote_command_status_event(
-                            &state,
-                            &event,
-                            "failed",
-                            details
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .unwrap_or("Unable to start Codex device authorization."),
-                            Some(&details),
-                        )
-                        .await;
-                    }
-                }
-            }
-            "agent_account_push" => {
                 let push_id = cloud_mcp_remote_command_field_text(&event, &["push_id"])
                     .or_else(|| cloud_mcp_remote_command_field_text(&event, &["intent_id"]))
                     .unwrap_or_default();
@@ -29008,6 +28948,7 @@ fn cloud_mcp_apply_remote_device_lever(
                     cloud_mcp_remote_command_field_text(&event, &["sealed_algorithm"])
                         .unwrap_or_default();
                 let result = (|| -> Result<Value, String> {
+                    agent_account_push_require_available()?;
                     if push_id.trim().is_empty() {
                         return Err("Agent account push is missing push_id.".to_string());
                     }
@@ -29258,7 +29199,6 @@ fn cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
             | "app_update_now"
             | "update_app"
             | "app_update"
-            | "agent_account_start_login_transaction"
             | "agent_account_switch"
             | "switch_agent_account"
             | "agent_profile_switch"
@@ -30913,7 +30853,14 @@ fn cloud_mcp_desktop_device_profile() -> Value {
             let device_id = cloud_mcp_stable_desktop_device_id(&device_name, platform);
             let (device_key_id, device_public_key) =
                 cloud_mcp_stable_desktop_device_key_metadata(&device_id);
-            let push_key_metadata = agent_account_push_public_key_metadata().ok();
+            let push_availability = agent_account_push_availability_state();
+            let push_available = push_availability.is_available();
+            let push_unavailable_reason = push_availability.reason().unwrap_or_default();
+            let push_key_metadata = push_available
+                .then(agent_account_push_public_key_metadata)
+                .transpose()
+                .ok()
+                .flatten();
             let push_public_key = push_key_metadata
                 .as_ref()
                 .map(|metadata| metadata.public_key_b64.clone())
@@ -30922,7 +30869,9 @@ fn cloud_mcp_desktop_device_profile() -> Value {
                 .as_ref()
                 .map(|metadata| metadata.algorithm.clone())
                 .unwrap_or_else(|| AGENT_ACCOUNT_PUSH_SEALED_ALGORITHM.to_string());
-            let push_capable = push_key_metadata.is_some() && !push_public_key.is_empty();
+            let push_capable = push_available
+                && push_key_metadata.is_some()
+                && !push_public_key.is_empty();
             json!({
                     "device_id": device_id,
                     "device_name": device_name,
@@ -30932,6 +30881,8 @@ fn cloud_mcp_desktop_device_profile() -> Value {
                 "device_public_key": device_public_key,
                 "device_key_algorithm": "sha256-local-anchor-v1",
                 "push_capable": push_capable,
+                "push_availability": push_availability,
+                "push_unavailable_reason": push_unavailable_reason,
                 "push_public_key": push_public_key,
                 "push_key_algorithm": push_key_algorithm,
                     "platform": platform,
@@ -35903,7 +35854,6 @@ struct CloudMcpTerminalRemotePresenceEntry {
     stream_key: String,
     shell_viewers: usize,
     shell_controller: bool,
-    chat_watchers: usize,
 }
 
 fn cloud_mcp_terminal_remote_presence_identity_key(
@@ -35999,10 +35949,6 @@ fn cloud_mcp_collect_terminal_remote_presence_stale_origins_at(
     for (stream_key, origin) in &expired {
         cloud_mcp_terminal_io_forget_acked_origin(state, stream_key, origin);
     }
-    changed |= agent_chat_session_prune_stale_observed_terminals(
-        now_ms,
-        TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS,
-    );
     (changed, expired)
 }
 
@@ -36151,7 +36097,7 @@ fn cloud_mcp_terminal_remote_presence_has_tracked_origins(state: &CloudMcpState)
         .lock()
         .map(|owners| !owners.is_empty())
         .unwrap_or(false);
-    has_shell_viewers || has_shell_controllers || agent_chat_session_has_observed_terminal_origins()
+    has_shell_viewers || has_shell_controllers
 }
 
 fn cloud_mcp_terminal_remote_presence_next_reaper_delay_ms(
@@ -36190,9 +36136,6 @@ fn cloud_mcp_terminal_remote_presence_next_reaper_delay_ms(
                 .saturating_sub(now_ms)
                 .clamp(TERMINAL_REMOTE_PRESENCE_REAPER_GRACE_MS, ceiling_ms),
         ),
-        // Chat-observed terminal origins are pruned by the same pass but do
-        // not expose per-origin deadlines; fall back to the full interval.
-        None if agent_chat_session_has_observed_terminal_origins() => Some(ceiling_ms),
         None => None,
     }
 }
@@ -36285,14 +36228,11 @@ fn cloud_mcp_terminal_remote_presence_entry_value(
         "stream_key": entry.stream_key,
         "shell_viewers": entry.shell_viewers,
         "shell_controller": entry.shell_controller,
-        "chat_watchers": entry.chat_watchers,
     })
 }
 
 async fn cloud_mcp_terminal_remote_presence_snapshot_payload(state: &CloudMcpState) -> Value {
     let _ = cloud_mcp_prune_terminal_remote_presence_stale_origins(state);
-    let local_device = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
-        .unwrap_or_else(|| "desktop-primary".to_string());
     let local_connection_id = {
         let runtime = state.inner.lock().await;
         runtime.global_ws_connection_id.clone()
@@ -36360,48 +36300,6 @@ async fn cloud_mcp_terminal_remote_presence_snapshot_payload(state: &CloudMcpSta
             entry.shell_controller = true;
             if entry.stream_key.is_empty() {
                 entry.stream_key = target.stream_key.clone();
-            }
-        }
-    }
-
-    for observed in agent_chat_session_observed_terminal_presence_entries() {
-        let chat_watchers = observed
-            .origins
-            .iter()
-            .filter(|origin| {
-                cloud_mcp_remote_presence_origin_is_remote(origin, local_connection_id)
-            })
-            .count();
-        if chat_watchers == 0 {
-            continue;
-        }
-        let workspace_id = cloud_mcp_workspace_id_match_key(&observed.workspace_id);
-        let key = cloud_mcp_terminal_remote_presence_identity_key(
-            &workspace_id,
-            &observed.pane_id,
-            observed.instance_id,
-        );
-        let stream_key = observed.instance_id.map(|instance_id| {
-            cloud_mcp_terminal_output_stream_key(
-                &local_device,
-                &workspace_id,
-                observed.pane_id.trim(),
-                instance_id,
-            )
-        });
-        let entry = entries
-            .entry(key)
-            .or_insert_with(|| CloudMcpTerminalRemotePresenceEntry {
-                workspace_id,
-                pane_id: observed.pane_id.trim().to_string(),
-                instance_id: observed.instance_id,
-                stream_key: stream_key.clone().unwrap_or_default(),
-                ..CloudMcpTerminalRemotePresenceEntry::default()
-            });
-        entry.chat_watchers = chat_watchers;
-        if entry.stream_key.is_empty() {
-            if let Some(stream_key) = stream_key {
-                entry.stream_key = stream_key;
             }
         }
     }
@@ -36490,7 +36388,6 @@ fn cloud_mcp_clear_terminal_remote_presence_state(state: &CloudMcpState, reason:
         acked.clear();
         state.terminal_io_acking_streams.store(0, Ordering::SeqCst);
     }
-    let _ = agent_chat_session_clear_observed_terminals();
     cloud_mcp_schedule_terminal_remote_presence_emit(state, reason);
 }
 
@@ -36650,16 +36547,6 @@ fn cloud_mcp_clear_terminal_remote_presence_for_terminal(
                 .fetch_sub(removed, Ordering::SeqCst);
         }
     }
-    changed |= agent_chat_session_clear_observed_terminal_matching(
-        workspace_match_key.as_deref(),
-        pane_id,
-        Some(instance_id),
-    );
-    changed |= agent_chat_session_clear_observed_terminal_matching(
-        workspace_match_key.as_deref(),
-        pane_id,
-        None,
-    );
     if changed {
         cloud_mcp_schedule_terminal_remote_presence_emit(state, reason);
     }
@@ -37854,11 +37741,37 @@ async fn cloud_mcp_handle_terminal_io_message(
     true
 }
 
-fn cloud_mcp_handle_agent_session_observer_subscription(
+const CLOUD_MCP_AGENT_SESSION_OBSERVER_UNAVAILABLE_REASON: &str =
+    "Legacy provider-session observation is unavailable; use the Haider daemon session roster.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloudMcpAgentSessionObserverDisposition {
+    NotObserverMessage,
+    Unavailable { reason: &'static str },
+}
+
+impl CloudMcpAgentSessionObserverDisposition {
+    fn is_unavailable(self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
+}
+
+fn cloud_mcp_agent_session_observer_unavailable_payload(message: &Value, kind: &str) -> Value {
+    json!({
+        "kind": "session.observer.unavailable",
+        "event_kind": "session.observer.unavailable",
+        "request_id": cloud_mcp_payload_text(message, &["id", "request_id"]),
+        "request_kind": kind,
+        "state": "unavailable",
+        "reason": CLOUD_MCP_AGENT_SESSION_OBSERVER_UNAVAILABLE_REASON,
+    })
+}
+
+async fn cloud_mcp_handle_agent_session_observer_subscription(
     state: &CloudMcpState,
     message: &Value,
     fallback_kind: &str,
-) -> bool {
+) -> CloudMcpAgentSessionObserverDisposition {
     let direct_kind = cloud_mcp_terminal_output_message_kind(message);
     let kind = if direct_kind.is_empty() {
         fallback_kind.trim().to_ascii_lowercase()
@@ -37869,107 +37782,55 @@ fn cloud_mcp_handle_agent_session_observer_subscription(
         kind.as_str(),
         "session.watch" | "session.unwatch" | "session.heartbeat"
     ) {
-        return false;
+        return CloudMcpAgentSessionObserverDisposition::NotObserverMessage;
     }
-    let heartbeat = kind == "session.heartbeat";
-    let active =
-        kind == "session.watch" && message.get("active").and_then(Value::as_bool) != Some(false);
-    let stream_key = cloud_mcp_terminal_output_message_stream_key(message).unwrap_or_default();
-    let stream_target = cloud_mcp_terminal_io_target(&stream_key).ok();
-    let parts = stream_key.split(':').collect::<Vec<_>>();
-    let workspace_id = cloud_mcp_payload_text(message, &["w", "workspace_id"])
-        .or_else(|| {
-            stream_target
-                .as_ref()
-                .map(|target| target.workspace_id.clone())
-        })
-        .or_else(|| {
-            parts
-                .get(1)
-                .map(|value| cloud_mcp_terminal_output_decode_key_component(value))
-        })
-        .map(|value| cloud_mcp_workspace_id_match_key(&value))
-        .unwrap_or_default();
-    let pane_id = cloud_mcp_payload_text(message, &["p", "pane_id", "terminal_id"])
-        .or_else(|| stream_target.as_ref().map(|target| target.pane_id.clone()))
-        .or_else(|| {
-            parts
-                .get(2)
-                .map(|value| cloud_mcp_terminal_output_decode_key_component(value))
-        })
-        .unwrap_or_default();
-    let instance_id = cloud_mcp_payload_u64(message, &["i", "terminal_instance_id", "instance_id"])
-        .or_else(|| stream_target.as_ref().map(|target| target.instance_id))
-        .or_else(|| {
-            parts.get(3).and_then(|value| {
-                cloud_mcp_terminal_output_decode_key_component(value)
-                    .parse::<u64>()
-                    .ok()
-            })
+    let payload = cloud_mcp_agent_session_observer_unavailable_payload(message, &kind);
+    if let Some(sender) = state.global_ws_tx.lock().await.as_ref().cloned() {
+        let _ = sender.send(payload);
+    }
+    CloudMcpAgentSessionObserverDisposition::Unavailable {
+        reason: CLOUD_MCP_AGENT_SESSION_OBSERVER_UNAVAILABLE_REASON,
+    }
+}
+
+#[cfg(test)]
+mod cloud_mcp_removed_session_observer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retired_session_observer_returns_and_emits_typed_unavailable() {
+        let state = CloudMcpState::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        *state.global_ws_tx.lock().await = Some(sender);
+        let message = json!({
+            "id": "observer-request-1",
+            "kind": "session.watch",
+            "workspace_id": "workspace-a",
+            "pane_id": "pane-a",
         });
-    if workspace_id.trim().is_empty() || pane_id.trim().is_empty() {
-        return true;
-    }
-    let origin = cloud_mcp_payload_text(message, &["origin_connection_id"]);
-    let subscription_count = if heartbeat {
-        agent_chat_session_touch_terminal_observed(
-            &workspace_id,
-            &pane_id,
-            instance_id,
-            origin.as_deref(),
+
+        let disposition = cloud_mcp_handle_agent_session_observer_subscription(
+            &state,
+            &message,
+            "session.watch",
         )
-    } else {
-        agent_chat_session_set_terminal_observed(
-            &workspace_id,
-            &pane_id,
-            instance_id,
-            origin.as_deref(),
-            active,
-        )
-    };
-    if active || (heartbeat && subscription_count > 0) {
-        cloud_mcp_schedule_terminal_remote_presence_reaper(state);
-    }
-    if !heartbeat {
-        cloud_mcp_schedule_terminal_remote_presence_emit(
-            state,
-            if active {
-                "session_watch"
-            } else {
-                "session_unwatch"
-            },
+        .await;
+        assert_eq!(
+            disposition,
+            CloudMcpAgentSessionObserverDisposition::Unavailable {
+                reason: CLOUD_MCP_AGENT_SESSION_OBSERVER_UNAVAILABLE_REASON,
+            }
         );
+        let response = receiver.try_recv().expect("typed unavailable response");
+        assert_eq!(response["state"], "unavailable");
+        assert_eq!(
+            response["reason"],
+            CLOUD_MCP_AGENT_SESSION_OBSERVER_UNAVAILABLE_REASON
+        );
+        assert_eq!(response["request_id"], "observer-request-1");
+        assert!(response.get("subscription_count").is_none());
+        assert!(response.get("triggered_watch_count").is_none());
     }
-    let triggered = if active {
-        CLOUD_MCP_SYNC_STATUS_APP
-            .get()
-            .map(|app| {
-                trigger_agent_thread_transcript_native_watch(
-                    app,
-                    &pane_id,
-                    instance_id,
-                    "session-observer-opened",
-                )
-            })
-            .unwrap_or_default()
-    } else {
-        0
-    };
-    log_cloud_sync_event(
-        "agent_chat_session.observer_subscription",
-        json!({
-            "active": active,
-            "heartbeat": heartbeat,
-            "instance_id": instance_id,
-            "origin_connection_id": origin,
-            "pane_id": pane_id,
-            "stream_key": stream_key,
-            "subscription_count": subscription_count,
-            "triggered_watch_count": triggered,
-            "workspace_id": workspace_id,
-        }),
-    );
-    true
 }
 
 fn cloud_mcp_terminal_output_stream_is_subscribed(state: &CloudMcpState, stream_key: &str) -> bool {
@@ -45135,1728 +44996,6 @@ async fn cloud_mcp_publish_terminal_state_live_update(
     cloud_mcp_publish_device_live_state_snapshot_debounced(state, reason).await;
 }
 
-#[derive(Clone)]
-struct CloudMcpAgentChatTurnGitSnapshot {
-    repo_root: PathBuf,
-    start_tree: String,
-    started_at: String,
-    started_at_ms: u64,
-    turn_key: String,
-}
-
-struct CloudMcpAgentChatTurnGitDiff {
-    file_change: Option<Value>,
-    turn_diff: Option<AgentChatTurnDiffContext>,
-    raw: Value,
-}
-
-#[derive(Clone, Default)]
-struct CloudMcpAgentChatTurnGitStatusEntry {
-    status: String,
-    path: String,
-    old_path: Option<String>,
-}
-
-#[derive(Clone)]
-enum CloudMcpAgentChatTurnGitSnapshotState {
-    Pending { started_at_ms: u64 },
-    Ready(CloudMcpAgentChatTurnGitSnapshot),
-    Failed { started_at_ms: u64 },
-}
-
-impl CloudMcpAgentChatTurnGitSnapshotState {
-    fn started_at_ms(&self) -> u64 {
-        match self {
-            Self::Pending { started_at_ms } | Self::Failed { started_at_ms } => *started_at_ms,
-            Self::Ready(snapshot) => snapshot.started_at_ms,
-        }
-    }
-}
-
-static CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOTS: OnceLock<(
-    StdMutex<HashMap<String, CloudMcpAgentChatTurnGitSnapshotState>>,
-    std::sync::Condvar,
-)> = OnceLock::new();
-static CLOUD_MCP_AGENT_CHAT_TURN_GIT_TEMP_INDEX_SEQ: AtomicU64 = AtomicU64::new(1);
-const CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_MAX: usize = 512;
-const CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_TTL_MS: u64 = 6 * 60 * 60 * 1000;
-const CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_MAX_CHARS: usize = 48_000;
-const CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_MAX_BYTES: usize = 384 * 1024;
-const CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_CAP_HEADROOM_BYTES: usize = 4 * 1024;
-const CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_TIMEOUT_MS: u64 = 3_000;
-
-fn cloud_mcp_agent_chat_turn_git_snapshots() -> &'static (
-    StdMutex<HashMap<String, CloudMcpAgentChatTurnGitSnapshotState>>,
-    std::sync::Condvar,
-) {
-    CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOTS
-        .get_or_init(|| (StdMutex::new(HashMap::new()), std::sync::Condvar::new()))
-}
-
-fn cloud_mcp_agent_chat_turn_iso_from_ms(ms: u64) -> String {
-    let secs = (ms / 1000) as i64;
-    let millis = ms % 1000;
-    let days = secs.div_euclid(86_400);
-    let secs_of_day = secs.rem_euclid(86_400);
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        year,
-        month,
-        day,
-        secs_of_day / 3_600,
-        (secs_of_day % 3_600) / 60,
-        secs_of_day % 60,
-        millis,
-    )
-}
-
-fn cloud_mcp_agent_chat_turn_hook_ms(payload: &TerminalActivityHookPayload) -> u64 {
-    payload.hook_timestamp_ms.max(payload.observed_at_ms)
-}
-
-fn cloud_mcp_agent_chat_turn_started_at(payload: &TerminalActivityHookPayload) -> String {
-    payload
-        .prompt_ready_at
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            cloud_mcp_agent_chat_turn_iso_from_ms(cloud_mcp_agent_chat_turn_hook_ms(payload))
-        })
-}
-
-fn cloud_mcp_agent_chat_turn_completed_at(payload: &TerminalActivityHookPayload) -> String {
-    payload
-        .completed_at
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            cloud_mcp_agent_chat_turn_iso_from_ms(cloud_mcp_agent_chat_turn_hook_ms(payload))
-        })
-}
-
-fn cloud_mcp_agent_chat_turn_native_id(payload: &TerminalActivityHookPayload) -> String {
-    payload
-        .provider_turn_id
-        .as_deref()
-        .or(payload.turn_id.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn cloud_mcp_agent_chat_turn_key_from_start(payload: &TerminalActivityHookPayload) -> String {
-    let native = cloud_mcp_agent_chat_turn_native_id(payload);
-    if !native.is_empty() {
-        return native;
-    }
-    if let Some(started_at) = payload
-        .prompt_ready_at
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return format!("turn-start:{started_at}");
-    }
-    format!(
-        "turn-start-ms-{}",
-        cloud_mcp_agent_chat_turn_hook_ms(payload)
-    )
-}
-
-fn cloud_mcp_agent_chat_turn_prompt_start_key(
-    payload: &TerminalActivityHookPayload,
-) -> Option<String> {
-    payload
-        .prompt_ready_at
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|started_at| format!("turn-start:{started_at}"))
-}
-
-fn cloud_mcp_agent_chat_turn_snapshot_key(
-    provider: &str,
-    session_id: &str,
-    turn_key: &str,
-) -> String {
-    format!(
-        "{}:{}:{}",
-        provider.trim(),
-        session_id.trim(),
-        turn_key.trim()
-    )
-}
-
-fn cloud_mcp_agent_chat_turn_git_env(index_path: Option<&Path>) -> Vec<(String, String)> {
-    let mut env_vars = vec![
-        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-        ("GCM_INTERACTIVE".to_string(), "Never".to_string()),
-    ];
-    if let Some(index_path) = index_path {
-        env_vars.push((
-            "GIT_INDEX_FILE".to_string(),
-            index_path.to_string_lossy().to_string(),
-        ));
-    }
-    env_vars
-}
-
-fn cloud_mcp_agent_chat_turn_git_run(
-    root: &Path,
-    args: &[&str],
-    index_path: Option<&Path>,
-) -> Result<CommandCapture, String> {
-    cloud_mcp_agent_chat_turn_git_run_with_timeout(root, args, index_path, Duration::from_secs(2))
-}
-
-fn cloud_mcp_agent_chat_turn_git_run_with_timeout(
-    root: &Path,
-    args: &[&str],
-    index_path: Option<&Path>,
-    timeout: Duration,
-) -> Result<CommandCapture, String> {
-    let safe_directory = format!("safe.directory={}", root.to_string_lossy());
-    let mut owned_args = Vec::with_capacity(args.len() + 4);
-    owned_args.push("-c".to_string());
-    owned_args.push(safe_directory);
-    owned_args.push("-c".to_string());
-    owned_args.push("core.quotepath=off".to_string());
-    owned_args.extend(args.iter().map(|arg| (*arg).to_string()));
-    let borrowed_args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let env_vars = cloud_mcp_agent_chat_turn_git_env(index_path);
-    run_command_capture_with_env("git", &borrowed_args, None, timeout, Some(root), &env_vars)
-}
-
-fn cloud_mcp_agent_chat_turn_git_root(cwd: &str) -> Option<PathBuf> {
-    let cwd = cwd.trim();
-    if cwd.is_empty() {
-        return None;
-    }
-    let cwd = PathBuf::from(cwd);
-    if !cwd.is_dir() {
-        return None;
-    }
-    let env_vars = cloud_mcp_agent_chat_turn_git_env(None);
-    let output = run_command_capture_with_env(
-        "git",
-        &["rev-parse", "--show-toplevel"],
-        None,
-        Duration::from_secs(2),
-        Some(&cwd),
-        &env_vars,
-    )
-    .ok()?;
-    if output.exit_code != Some(0) {
-        return None;
-    }
-    let root = output.stdout.trim();
-    (!root.is_empty()).then(|| PathBuf::from(root))
-}
-
-fn cloud_mcp_agent_chat_turn_temp_index_path() -> PathBuf {
-    let seq = CLOUD_MCP_AGENT_CHAT_TURN_GIT_TEMP_INDEX_SEQ.fetch_add(1, Ordering::Relaxed);
-    env::temp_dir().join(format!(
-        "diffforge-turn-index-{}-{}-{seq}",
-        std::process::id(),
-        cloud_mcp_now_ms()
-    ))
-}
-
-fn cloud_mcp_agent_chat_turn_cleanup_index(path: &Path) {
-    let _ = fs::remove_file(path);
-    let mut lock_path = path.to_path_buf();
-    lock_path.set_extension("lock");
-    let _ = fs::remove_file(lock_path);
-}
-
-fn cloud_mcp_agent_chat_turn_git_snapshot_tree(root: &Path) -> Option<String> {
-    let index_path = cloud_mcp_agent_chat_turn_temp_index_path();
-    let read_head =
-        cloud_mcp_agent_chat_turn_git_run(root, &["read-tree", "HEAD"], Some(&index_path))
-            .ok()
-            .is_some_and(|output| output.exit_code == Some(0));
-    if !read_head {
-        let read_empty =
-            cloud_mcp_agent_chat_turn_git_run(root, &["read-tree", "--empty"], Some(&index_path))
-                .ok()
-                .is_some_and(|output| output.exit_code == Some(0));
-        if !read_empty {
-            cloud_mcp_agent_chat_turn_cleanup_index(&index_path);
-            return None;
-        }
-    }
-    let added = cloud_mcp_agent_chat_turn_git_run(root, &["add", "-A"], Some(&index_path))
-        .ok()
-        .is_some_and(|output| output.exit_code == Some(0));
-    if !added {
-        cloud_mcp_agent_chat_turn_cleanup_index(&index_path);
-        return None;
-    }
-    let tree = cloud_mcp_agent_chat_turn_git_run(root, &["write-tree"], Some(&index_path))
-        .ok()
-        .filter(|output| output.exit_code == Some(0))
-        .map(|output| output.stdout.trim().to_string())
-        .filter(|value| !value.is_empty());
-    cloud_mcp_agent_chat_turn_cleanup_index(&index_path);
-    tree
-}
-
-#[cfg(test)]
-fn cloud_mcp_agent_chat_turn_git_record_start(
-    provider: &str,
-    session_id: &str,
-    turn_key: &str,
-    cwd: &str,
-    started_at: &str,
-    started_at_ms: u64,
-) {
-    cloud_mcp_agent_chat_turn_git_mark_start(provider, session_id, turn_key, started_at_ms);
-    cloud_mcp_agent_chat_turn_git_record_start_after_mark(
-        provider,
-        session_id,
-        turn_key,
-        cwd,
-        started_at,
-        started_at_ms,
-    );
-}
-
-fn cloud_mcp_agent_chat_turn_git_mark_start(
-    provider: &str,
-    session_id: &str,
-    turn_key: &str,
-    started_at_ms: u64,
-) {
-    let key = cloud_mcp_agent_chat_turn_snapshot_key(provider, session_id, turn_key);
-    let (snapshots, wake) = cloud_mcp_agent_chat_turn_git_snapshots();
-    if let Ok(mut snapshots) = snapshots.lock() {
-        cloud_mcp_agent_chat_turn_git_prune_locked(&mut snapshots);
-        snapshots.insert(
-            key,
-            CloudMcpAgentChatTurnGitSnapshotState::Pending { started_at_ms },
-        );
-        cloud_mcp_agent_chat_turn_git_prune_locked(&mut snapshots);
-        wake.notify_all();
-    }
-}
-
-fn cloud_mcp_agent_chat_turn_git_prune_locked(
-    snapshots: &mut HashMap<String, CloudMcpAgentChatTurnGitSnapshotState>,
-) {
-    let now = cloud_mcp_now_ms();
-    snapshots.retain(|_, state| {
-        let started_at_ms = state.started_at_ms();
-        started_at_ms == 0
-            || started_at_ms > now
-            || now.saturating_sub(started_at_ms) <= CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_TTL_MS
-    });
-    while snapshots.len() > CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_MAX {
-        let Some(oldest_key) = snapshots
-            .iter()
-            .min_by_key(|(_, state)| state.started_at_ms())
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        snapshots.remove(&oldest_key);
-    }
-}
-
-fn cloud_mcp_agent_chat_turn_git_finish_start(
-    provider: &str,
-    session_id: &str,
-    turn_key: &str,
-    started_at_ms: u64,
-    snapshot: Option<CloudMcpAgentChatTurnGitSnapshot>,
-) {
-    let key = cloud_mcp_agent_chat_turn_snapshot_key(provider, session_id, turn_key);
-    let (snapshots, wake) = cloud_mcp_agent_chat_turn_git_snapshots();
-    if let Ok(mut snapshots) = snapshots.lock() {
-        if matches!(
-            snapshots.get(&key),
-            Some(CloudMcpAgentChatTurnGitSnapshotState::Pending { .. })
-        ) {
-            let state = snapshot
-                .map(CloudMcpAgentChatTurnGitSnapshotState::Ready)
-                .unwrap_or(CloudMcpAgentChatTurnGitSnapshotState::Failed { started_at_ms });
-            snapshots.insert(key, state);
-            cloud_mcp_agent_chat_turn_git_prune_locked(&mut snapshots);
-            wake.notify_all();
-        }
-    }
-}
-
-fn cloud_mcp_agent_chat_turn_git_record_start_after_mark(
-    provider: &str,
-    session_id: &str,
-    turn_key: &str,
-    cwd: &str,
-    started_at: &str,
-    started_at_ms: u64,
-) {
-    let snapshot = cloud_mcp_agent_chat_turn_git_root(cwd).and_then(|repo_root| {
-        cloud_mcp_agent_chat_turn_git_snapshot_tree(&repo_root).map(|start_tree| {
-            CloudMcpAgentChatTurnGitSnapshot {
-                repo_root,
-                start_tree,
-                started_at: started_at.to_string(),
-                started_at_ms,
-                turn_key: turn_key.to_string(),
-            }
-        })
-    });
-    cloud_mcp_agent_chat_turn_git_finish_start(
-        provider,
-        session_id,
-        turn_key,
-        started_at_ms,
-        snapshot,
-    );
-}
-
-fn cloud_mcp_agent_chat_turn_git_take_snapshot(
-    provider: &str,
-    session_id: &str,
-    turn_key: &str,
-) -> Option<CloudMcpAgentChatTurnGitSnapshot> {
-    cloud_mcp_agent_chat_turn_git_take_snapshot_key(provider, session_id, turn_key, "")
-}
-
-fn cloud_mcp_agent_chat_turn_git_take_snapshot_key(
-    provider: &str,
-    session_id: &str,
-    turn_key: &str,
-    alias_turn_key: &str,
-) -> Option<CloudMcpAgentChatTurnGitSnapshot> {
-    if turn_key.trim().is_empty() {
-        return None;
-    }
-    let (snapshots, wake) = cloud_mcp_agent_chat_turn_git_snapshots();
-    let mut snapshots = snapshots.lock().ok()?;
-    cloud_mcp_agent_chat_turn_git_prune_locked(&mut snapshots);
-    let key = cloud_mcp_agent_chat_turn_snapshot_key(provider, session_id, turn_key);
-    if !snapshots.contains_key(&key) {
-        return None;
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let Some(state) = snapshots.get(&key).cloned() else {
-            return None;
-        };
-        match state {
-            CloudMcpAgentChatTurnGitSnapshotState::Ready(mut snapshot) => {
-                snapshots.remove(&key);
-                let alias_turn_key = alias_turn_key.trim();
-                if !alias_turn_key.is_empty() && alias_turn_key != snapshot.turn_key {
-                    snapshot.turn_key = alias_turn_key.to_string();
-                }
-                return Some(snapshot);
-            }
-            CloudMcpAgentChatTurnGitSnapshotState::Failed { .. } => {
-                snapshots.remove(&key);
-                return None;
-            }
-            CloudMcpAgentChatTurnGitSnapshotState::Pending { started_at_ms } => {
-                let now = Instant::now();
-                if now >= deadline {
-                    snapshots.insert(
-                        key.clone(),
-                        CloudMcpAgentChatTurnGitSnapshotState::Failed { started_at_ms },
-                    );
-                    continue;
-                }
-                let wait = deadline.saturating_duration_since(now);
-                match wake.wait_timeout(snapshots, wait) {
-                    Ok((guard, result)) => {
-                        snapshots = guard;
-                        if result.timed_out()
-                            && matches!(
-                                snapshots.get(&key),
-                                Some(CloudMcpAgentChatTurnGitSnapshotState::Pending { .. })
-                            )
-                        {
-                            snapshots.insert(
-                                key.clone(),
-                                CloudMcpAgentChatTurnGitSnapshotState::Failed { started_at_ms },
-                            );
-                        }
-                    }
-                    Err(_) => return None,
-                }
-            }
-        }
-    }
-}
-
-fn cloud_mcp_agent_chat_turn_git_take_completion_snapshot(
-    payload: &TerminalActivityHookPayload,
-    provider: &str,
-    session_id: &str,
-    native_turn_id: &str,
-) -> Option<CloudMcpAgentChatTurnGitSnapshot> {
-    let native_turn_id = native_turn_id.trim();
-    if !native_turn_id.is_empty() {
-        if let Some(snapshot) =
-            cloud_mcp_agent_chat_turn_git_take_snapshot(provider, session_id, native_turn_id)
-        {
-            return Some(snapshot);
-        }
-    }
-    if let Some(prompt_start_key) = cloud_mcp_agent_chat_turn_prompt_start_key(payload) {
-        let alias = if native_turn_id.is_empty() {
-            ""
-        } else {
-            native_turn_id
-        };
-        return cloud_mcp_agent_chat_turn_git_take_snapshot_key(
-            provider,
-            session_id,
-            &prompt_start_key,
-            alias,
-        );
-    }
-    None
-}
-
-fn cloud_mcp_agent_chat_turn_git_clear_session(provider: &str, session_id: &str) {
-    let prefix = format!("{}:{}:", provider.trim(), session_id.trim());
-    if prefix == "::" {
-        return;
-    }
-    let (snapshots, wake) = cloud_mcp_agent_chat_turn_git_snapshots();
-    if let Ok(mut snapshots) = snapshots.lock() {
-        snapshots.retain(|key, _| !key.starts_with(&prefix));
-        wake.notify_all();
-    }
-}
-
-#[cfg(test)]
-fn cloud_mcp_agent_chat_turn_git_clear_all_snapshots() {
-    let (snapshots, wake) = cloud_mcp_agent_chat_turn_git_snapshots();
-    if let Ok(mut snapshots) = snapshots.lock() {
-        snapshots.clear();
-        wake.notify_all();
-    }
-}
-
-fn cloud_mcp_agent_chat_turn_git_name_status_entries(
-    name_status: &str,
-) -> Vec<CloudMcpAgentChatTurnGitStatusEntry> {
-    let mut entries = Vec::new();
-    for line in name_status.lines() {
-        let parts = line.split('\t').collect::<Vec<_>>();
-        let status = parts.first().copied().unwrap_or_default().trim();
-        if status.is_empty() {
-            continue;
-        }
-        let (path, old_path) = if status.starts_with('R') || status.starts_with('C') {
-            (
-                parts.get(2).copied().unwrap_or_default().trim().to_string(),
-                parts
-                    .get(1)
-                    .copied()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string),
-            )
-        } else {
-            (
-                parts.get(1).copied().unwrap_or_default().trim().to_string(),
-                None,
-            )
-        };
-        if !path.is_empty() {
-            entries.push(CloudMcpAgentChatTurnGitStatusEntry {
-                status: status.to_string(),
-                path,
-                old_path,
-            });
-        }
-    }
-    entries
-}
-
-fn cloud_mcp_agent_chat_turn_git_name_status_map(
-    name_status: &str,
-) -> HashMap<String, CloudMcpAgentChatTurnGitStatusEntry> {
-    cloud_mcp_agent_chat_turn_git_name_status_entries(name_status)
-        .into_iter()
-        .map(|entry| (entry.path.clone(), entry))
-        .collect()
-}
-
-fn cloud_mcp_agent_chat_turn_git_numstat_rename_path(path: &str) -> Option<String> {
-    let path = path.trim();
-    if path.is_empty() || !path.contains("=>") {
-        return None;
-    }
-    if let Some(arrow) = path.find("=>") {
-        if let Some(open) = path[..arrow].rfind('{') {
-            if let Some(close_offset) = path[arrow + 2..].find('}') {
-                let close = arrow + 2 + close_offset;
-                let base = path[..open].trim_end();
-                let renamed = path[arrow + 2..close].trim();
-                let suffix = path[close + 1..].trim_start();
-                if !renamed.is_empty() {
-                    return Some(format!("{base}{renamed}{suffix}"));
-                }
-            }
-        }
-        let renamed = path[arrow + 2..].trim();
-        if !renamed.is_empty() {
-            return Some(renamed.to_string());
-        }
-    }
-    None
-}
-
-fn cloud_mcp_agent_chat_turn_git_parse_numstat(
-    repo_root: &Path,
-    numstat: &str,
-    name_status: &str,
-) -> Vec<Value> {
-    let status_by_path = cloud_mcp_agent_chat_turn_git_name_status_map(name_status);
-    let status_entries = cloud_mcp_agent_chat_turn_git_name_status_entries(name_status);
-    let mut files = Vec::new();
-    for (line_index, line) in numstat.lines().enumerate() {
-        let mut parts = line.splitn(3, '\t');
-        let additions_text = parts.next().unwrap_or_default().trim();
-        let deletions_text = parts.next().unwrap_or_default().trim();
-        let raw_path = parts.next().unwrap_or_default().trim();
-        let mut path = raw_path.to_string();
-        if path.is_empty() {
-            continue;
-        }
-        if !status_by_path.contains_key(&path) {
-            if let Some(rename_path) = cloud_mcp_agent_chat_turn_git_numstat_rename_path(&path) {
-                path = rename_path;
-            }
-        }
-        let mut status_entry = status_by_path.get(&path).cloned();
-        if status_entry.is_none() {
-            if let Some(entry) = status_entries.get(line_index) {
-                if entry.status.starts_with('R')
-                    || entry.status.starts_with('C')
-                    || raw_path.contains("=>")
-                {
-                    path = entry.path.clone();
-                    status_entry = Some(entry.clone());
-                }
-            }
-        }
-        let additions = additions_text.parse::<i64>().ok();
-        let deletions = deletions_text.parse::<i64>().ok();
-        let binary = additions.is_none() || deletions.is_none();
-        let status = status_entry
-            .as_ref()
-            .map(|entry| entry.status.as_str())
-            .unwrap_or_default();
-        let missing_path = !repo_root.join(&path).exists();
-        let kind = if status.starts_with('R') {
-            "rename"
-        } else if status.starts_with('A') || status.starts_with('C') {
-            "create"
-        } else if status.starts_with('D')
-            || (missing_path && additions.unwrap_or(0) == 0 && deletions.unwrap_or(0) >= 0)
-        {
-            "delete"
-        } else {
-            "edit"
-        };
-        let mut file = serde_json::Map::new();
-        file.insert("path".to_string(), json!(path));
-        file.insert("kind".to_string(), json!(kind));
-        if let Some(old_path) = status_entry
-            .as_ref()
-            .and_then(|entry| entry.old_path.as_ref())
-            .filter(|old_path| !old_path.trim().is_empty())
-        {
-            file.insert("old_path".to_string(), json!(old_path));
-        }
-        file.insert("additions".to_string(), json!(additions.unwrap_or(0)));
-        file.insert("deletions".to_string(), json!(deletions.unwrap_or(0)));
-        if binary {
-            file.insert("binary".to_string(), json!(true));
-        }
-        files.push(Value::Object(file));
-    }
-    files
-}
-
-fn cloud_mcp_agent_chat_turn_git_diff_header_path(raw: &str) -> Option<String> {
-    let mut path = raw.trim();
-    if path == "/dev/null" || path.is_empty() {
-        return None;
-    }
-    if let Some(stripped) = path.strip_prefix("a/").or_else(|| path.strip_prefix("b/")) {
-        path = stripped;
-    }
-    Some(path.trim_matches('"').to_string())
-}
-
-fn cloud_mcp_agent_chat_turn_git_patch_section_path(section: &str) -> Option<String> {
-    let mut deleted_path = None;
-    for line in section.lines() {
-        if line.starts_with("@@ ") {
-            break;
-        }
-        if let Some(path) = line.strip_prefix("+++ ") {
-            if let Some(path) = cloud_mcp_agent_chat_turn_git_diff_header_path(path) {
-                return Some(path);
-            }
-        } else if let Some(path) = line.strip_prefix("--- ") {
-            deleted_path = cloud_mcp_agent_chat_turn_git_diff_header_path(path);
-        }
-    }
-    deleted_path
-}
-
-fn cloud_mcp_agent_chat_turn_git_unified_patch(section: &str) -> Option<String> {
-    let start = section
-        .find("\n--- ")
-        .map(|index| index + 1)
-        .or_else(|| section.find("--- "))?;
-    let patch = section[start..].to_string();
-    if patch.contains("\n@@ ") || patch.starts_with("@@ ") {
-        Some(patch)
-    } else {
-        None
-    }
-}
-
-fn cloud_mcp_agent_chat_turn_git_patch_map(patch_output: &str) -> HashMap<String, String> {
-    let mut patches = HashMap::new();
-    let mut section = String::new();
-    let flush = |section: &mut String, patches: &mut HashMap<String, String>| {
-        if section.trim().is_empty() {
-            section.clear();
-            return;
-        }
-        if let (Some(path), Some(patch)) = (
-            cloud_mcp_agent_chat_turn_git_patch_section_path(section),
-            cloud_mcp_agent_chat_turn_git_unified_patch(section),
-        ) {
-            patches.insert(path, patch);
-        }
-        section.clear();
-    };
-    for chunk in patch_output.split_inclusive('\n') {
-        if chunk.starts_with("diff --git ") {
-            flush(&mut section, &mut patches);
-        }
-        section.push_str(chunk);
-    }
-    flush(&mut section, &mut patches);
-    patches
-}
-
-fn cloud_mcp_agent_chat_turn_diff_totals(files: &[Value]) -> (i64, i64) {
-    let total_additions = files
-        .iter()
-        .filter_map(|file| file.get("additions").and_then(Value::as_i64))
-        .sum::<i64>();
-    let total_deletions = files
-        .iter()
-        .filter_map(|file| file.get("deletions").and_then(Value::as_i64))
-        .sum::<i64>();
-    (total_additions, total_deletions)
-}
-
-fn cloud_mcp_agent_chat_turn_diff_message(
-    files: &[Value],
-    files_omitted: usize,
-    truncated: bool,
-    total_additions: i64,
-    total_deletions: i64,
-) -> Value {
-    let mut message = json!({
-        "id": "cap-check",
-        "role": "system",
-        "kind": "turn_diff",
-        "turn_id": "cap-check",
-        "files": files,
-        "total_additions": total_additions,
-        "total_deletions": total_deletions,
-    });
-    if files_omitted > 0 {
-        if let Some(object) = message.as_object_mut() {
-            object.insert("files_omitted".to_string(), json!(files_omitted));
-        }
-    }
-    if truncated {
-        if let Some(object) = message.as_object_mut() {
-            object.insert("truncated".to_string(), json!(true));
-        }
-    }
-    message
-}
-
-fn cloud_mcp_agent_chat_turn_diff_messages_effective_max_bytes() -> usize {
-    CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_MAX_BYTES
-        .saturating_sub(CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_CAP_HEADROOM_BYTES)
-}
-
-fn cloud_mcp_agent_chat_turn_diff_messages_bytes(
-    files: &[Value],
-    files_omitted: usize,
-    truncated: bool,
-    total_additions: i64,
-    total_deletions: i64,
-) -> usize {
-    serde_json::to_vec(&vec![cloud_mcp_agent_chat_turn_diff_message(
-        files,
-        files_omitted,
-        truncated,
-        total_additions,
-        total_deletions,
-    )])
-    .map(|bytes| bytes.len())
-    .unwrap_or(usize::MAX)
-}
-
-fn cloud_mcp_agent_chat_turn_git_attach_patches(
-    files: Vec<Value>,
-    patches: &HashMap<String, String>,
-) -> (Vec<Value>, i64, i64, usize, bool, Value) {
-    let original_file_count = files.len();
-    let (total_additions, total_deletions) = cloud_mcp_agent_chat_turn_diff_totals(&files);
-    let mut files = files;
-    let mut per_file_truncated = 0usize;
-    for file in files.iter_mut() {
-        let binary = file.get("binary").and_then(Value::as_bool).unwrap_or(false);
-        if binary {
-            continue;
-        }
-        let Some(path) = file.get("path").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(patch) = patches.get(path) else {
-            continue;
-        };
-        let truncated = patch.chars().count() > CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_MAX_CHARS;
-        let patch = if truncated {
-            per_file_truncated = per_file_truncated.saturating_add(1);
-            cloud_mcp_truncate_chars(patch, CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_MAX_CHARS)
-        } else {
-            patch.clone()
-        };
-        if let Some(object) = file.as_object_mut() {
-            object.insert("patch".to_string(), json!(patch));
-            if truncated {
-                object.insert("patch_truncated".to_string(), json!(true));
-            }
-        }
-    }
-
-    let mut record_truncated = per_file_truncated > 0;
-    let mut patches_dropped = 0usize;
-    let effective_messages_max = cloud_mcp_agent_chat_turn_diff_messages_effective_max_bytes();
-    while cloud_mcp_agent_chat_turn_diff_messages_bytes(
-        &files,
-        0,
-        record_truncated,
-        total_additions,
-        total_deletions,
-    ) > effective_messages_max
-    {
-        let largest = files
-            .iter()
-            .enumerate()
-            .filter_map(|(index, file)| {
-                file.get("patch")
-                    .and_then(Value::as_str)
-                    .map(|patch| (index, patch.chars().count()))
-            })
-            .max_by_key(|(_, len)| *len);
-        let Some((index, _)) = largest else {
-            break;
-        };
-        if let Some(object) = files.get_mut(index).and_then(Value::as_object_mut) {
-            object.remove("patch");
-            object.insert("patch_truncated".to_string(), json!(true));
-            patches_dropped = patches_dropped.saturating_add(1);
-            record_truncated = true;
-        } else {
-            break;
-        }
-    }
-
-    let mut files_omitted = 0usize;
-    let mut final_bytes = cloud_mcp_agent_chat_turn_diff_messages_bytes(
-        &files,
-        files_omitted,
-        record_truncated,
-        total_additions,
-        total_deletions,
-    );
-    if final_bytes > effective_messages_max {
-        record_truncated = true;
-        let mut low = 0usize;
-        let mut high = files.len();
-        while low < high {
-            let keep = low + (high - low).div_ceil(2);
-            let omitted = original_file_count.saturating_sub(keep);
-            let candidate_bytes = cloud_mcp_agent_chat_turn_diff_messages_bytes(
-                &files[..keep],
-                omitted,
-                record_truncated,
-                total_additions,
-                total_deletions,
-            );
-            if candidate_bytes <= effective_messages_max {
-                low = keep;
-            } else {
-                high = keep.saturating_sub(1);
-            }
-        }
-        files.truncate(low);
-        files_omitted = original_file_count.saturating_sub(files.len());
-        final_bytes = cloud_mcp_agent_chat_turn_diff_messages_bytes(
-            &files,
-            files_omitted,
-            record_truncated,
-            total_additions,
-            total_deletions,
-        );
-    }
-    (
-        files,
-        total_additions,
-        total_deletions,
-        files_omitted,
-        record_truncated,
-        json!({
-            "per_file_patch_chars": CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_MAX_CHARS,
-            "serialized_messages_bytes": final_bytes,
-            "serialized_messages_limit_bytes": CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_MAX_BYTES,
-            "serialized_messages_effective_limit_bytes": effective_messages_max,
-            "serialized_messages_cap_headroom_bytes": CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_CAP_HEADROOM_BYTES,
-            "original_file_count": original_file_count,
-            "files_emitted": original_file_count.saturating_sub(files_omitted),
-            "files_omitted": files_omitted,
-            "per_file_patches_truncated": per_file_truncated,
-            "patches_dropped_for_record_cap": patches_dropped,
-            "files_dropped_for_record_cap": files_omitted,
-            "files_omitted_for_record_cap": files_omitted,
-            "record_truncated": record_truncated,
-        }),
-    )
-}
-
-fn cloud_mcp_agent_chat_turn_git_diff(
-    snapshot: Option<CloudMcpAgentChatTurnGitSnapshot>,
-) -> CloudMcpAgentChatTurnGitDiff {
-    cloud_mcp_agent_chat_turn_git_diff_with_patch_timeout(
-        snapshot,
-        Duration::from_millis(CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_TIMEOUT_MS),
-    )
-}
-
-fn cloud_mcp_agent_chat_turn_git_diff_with_patch_timeout(
-    snapshot: Option<CloudMcpAgentChatTurnGitSnapshot>,
-    patch_timeout: Duration,
-) -> CloudMcpAgentChatTurnGitDiff {
-    let Some(snapshot) = snapshot else {
-        return CloudMcpAgentChatTurnGitDiff {
-            file_change: None,
-            turn_diff: None,
-            raw: json!({
-                "skipped": "missing_start_snapshot",
-            }),
-        };
-    };
-    let Some(end_tree) = cloud_mcp_agent_chat_turn_git_snapshot_tree(&snapshot.repo_root) else {
-        return CloudMcpAgentChatTurnGitDiff {
-            file_change: None,
-            turn_diff: None,
-            raw: json!({
-                "repo_root": snapshot.repo_root.to_string_lossy(),
-                "start_tree": snapshot.start_tree,
-                "skipped": "end_snapshot_failed",
-            }),
-        };
-    };
-    let numstat = cloud_mcp_agent_chat_turn_git_run(
-        &snapshot.repo_root,
-        &[
-            "diff-tree",
-            "-r",
-            "--find-renames",
-            "--numstat",
-            &snapshot.start_tree,
-            &end_tree,
-        ],
-        None,
-    )
-    .ok()
-    .filter(|output| output.exit_code == Some(0))
-    .map(|output| output.stdout)
-    .unwrap_or_default();
-    let name_status = cloud_mcp_agent_chat_turn_git_run(
-        &snapshot.repo_root,
-        &[
-            "diff-tree",
-            "-r",
-            "--find-renames",
-            "--name-status",
-            &snapshot.start_tree,
-            &end_tree,
-        ],
-        None,
-    )
-    .ok()
-    .filter(|output| output.exit_code == Some(0))
-    .map(|output| output.stdout)
-    .unwrap_or_default();
-    let files =
-        cloud_mcp_agent_chat_turn_git_parse_numstat(&snapshot.repo_root, &numstat, &name_status);
-    let additions = files
-        .iter()
-        .filter_map(|file| file.get("additions").and_then(Value::as_i64))
-        .sum::<i64>();
-    let deletions = files
-        .iter()
-        .filter_map(|file| file.get("deletions").and_then(Value::as_i64))
-        .sum::<i64>();
-    let file_change = (!files.is_empty()).then(|| {
-        json!({
-            "files": files.clone(),
-            "summary": format!("{} file{} changed (+{} -{})", files.len(), if files.len() == 1 { "" } else { "s" }, additions, deletions),
-        })
-    });
-    let mut patch_skip_reason = None::<String>;
-    let mut patch_error = None::<String>;
-    let patches = if files.is_empty() {
-        HashMap::new()
-    } else if patch_timeout == Duration::from_millis(0) {
-        patch_skip_reason = Some("timeout".to_string());
-        HashMap::new()
-    } else {
-        match cloud_mcp_agent_chat_turn_git_run_with_timeout(
-            &snapshot.repo_root,
-            &[
-                "diff-tree",
-                "-r",
-                "--find-renames",
-                "-p",
-                &snapshot.start_tree,
-                &end_tree,
-            ],
-            None,
-            patch_timeout,
-        ) {
-            Ok(output) if output.exit_code == Some(0) => {
-                cloud_mcp_agent_chat_turn_git_patch_map(&output.stdout)
-            }
-            Ok(output) => {
-                patch_skip_reason = Some("patch_command_failed".to_string());
-                patch_error = Some(clean_terminal_telemetry_text(&output.stderr));
-                HashMap::new()
-            }
-            Err(error) => {
-                patch_skip_reason = Some(if error.contains("timed out") {
-                    "timeout".to_string()
-                } else {
-                    "patch_command_failed".to_string()
-                });
-                patch_error = Some(clean_terminal_telemetry_text(&error));
-                HashMap::new()
-            }
-        }
-    };
-    let (
-        turn_diff_files,
-        turn_diff_total_additions,
-        turn_diff_total_deletions,
-        turn_diff_files_omitted,
-        turn_diff_truncated,
-        caps,
-    ) = cloud_mcp_agent_chat_turn_git_attach_patches(files.clone(), &patches);
-    let patch_generation = json!({
-        "patch_timeout_ms": u64::try_from(patch_timeout.as_millis()).unwrap_or(u64::MAX),
-        "patch_skipped": patch_skip_reason.is_some(),
-        "patch_skip_reason": patch_skip_reason,
-        "patch_error": patch_error,
-        "patch_count": patches.len(),
-        "caps": caps,
-    });
-    let raw = json!({
-        "repo_root": snapshot.repo_root.to_string_lossy(),
-        "start_tree": snapshot.start_tree,
-        "end_tree": end_tree,
-        "numstat": numstat,
-        "name_status": name_status,
-        "generation": patch_generation,
-    });
-    let turn_diff = (!turn_diff_files.is_empty()).then(|| AgentChatTurnDiffContext {
-        turn_id: String::new(),
-        turn_key: snapshot.turn_key,
-        completed_at: String::new(),
-        raw: raw.clone(),
-        files: turn_diff_files,
-        total_additions: turn_diff_total_additions,
-        total_deletions: turn_diff_total_deletions,
-        files_omitted: turn_diff_files_omitted,
-        truncated: turn_diff_truncated,
-    });
-    CloudMcpAgentChatTurnGitDiff {
-        file_change,
-        turn_diff,
-        raw,
-    }
-}
-
-fn cloud_mcp_agent_chat_status_hook_is_relevant(
-    payload: &TerminalActivityHookPayload,
-    state_value: &str,
-    turn_status: &str,
-) -> bool {
-    let event_type = cloud_mcp_lifecycle_status_key(&payload.event_type);
-    let command_phase = cloud_mcp_lifecycle_status_key(&payload.command_phase);
-    payload.input_ready
-        || payload.terminal_is_prompting_user
-        || payload.provider_blocked_for_user
-        || payload.manual_approval_required
-        || matches!(
-            event_type.as_str(),
-            "provider_turn_started"
-                | "provider_turn_completed"
-                | "provider_turn_waiting"
-                | "provider_turn_error"
-                | "provider_turn_interrupted"
-                | "provider_permission_requested"
-                | "provider_user_prompt_started"
-                | "provider_user_prompt_completed"
-                | "provider_user_prompt_answered"
-        )
-        || matches!(
-            command_phase.as_str(),
-            "awaiting_input"
-                | "awaiting_permission"
-                | "awaiting_user"
-                | "needs_input"
-                | "prompting_user"
-                | "background_waiting"
-        )
-        || matches!(
-            state_value,
-            "paused" | "idle" | "error" | "interrupted" | "closed" | "waiting"
-        )
-        || matches!(
-            turn_status,
-            "completed" | "failed" | "interrupted" | "cancelled"
-        )
-}
-
-fn cloud_mcp_agent_chat_status_from_hook(
-    payload: &TerminalActivityHookPayload,
-    state_value: &str,
-) -> String {
-    let command_phase = cloud_mcp_lifecycle_status_key(&payload.command_phase);
-    if payload.input_ready
-        || payload.terminal_is_prompting_user
-        || payload.provider_blocked_for_user
-        || payload.manual_approval_required
-        || state_value == "paused"
-        || matches!(
-            command_phase.as_str(),
-            "awaiting_input"
-                | "awaiting_permission"
-                | "awaiting_user"
-                | "needs_input"
-                | "prompting_user"
-        )
-    {
-        return "awaiting_input".to_string();
-    }
-    match state_value {
-        "thinking" | "compacting" => "running".to_string(),
-        "error" => "error".to_string(),
-        "interrupted" => "interrupted".to_string(),
-        "idle" => "idle".to_string(),
-        "closed" => "closed".to_string(),
-        value if !value.trim().is_empty() => value.to_string(),
-        _ => "running".to_string(),
-    }
-}
-
-struct CloudMcpAgentChatStatusSyncRequest {
-    provider: String,
-    provider_session_id: String,
-    cwd: String,
-    context: AgentChatSessionSyncContext,
-}
-
-fn cloud_mcp_agent_chat_status_sync_request_from_hook(
-    payload: &TerminalActivityHookPayload,
-    context_entry: Option<&CloudMcpTerminalContextState>,
-    workspace_root: &str,
-    state_value: &str,
-    turn_status: &str,
-) -> Option<CloudMcpAgentChatStatusSyncRequest> {
-    if !cloud_mcp_agent_chat_status_hook_is_relevant(payload, state_value, turn_status) {
-        return None;
-    }
-    let provider_session_id = payload
-        .provider_session_id
-        .as_deref()
-        .or(payload.native_session_id.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let provider = [
-        payload.provider.as_str(),
-        payload.agent_kind.as_str(),
-        payload.agent_id.as_str(),
-    ]
-    .into_iter()
-    .find_map(agent_chat_session_sync_provider)?;
-    let workspace_id = if payload.workspace_id.trim().is_empty() {
-        context_entry
-            .map(|entry| entry.workspace_id.clone())
-            .unwrap_or_default()
-    } else {
-        payload.workspace_id.clone()
-    };
-    let workspace_id = cloud_mcp_workspace_id_match_key(&workspace_id);
-    if workspace_id.trim().is_empty() {
-        return None;
-    }
-    let cwd = if workspace_root.trim().is_empty() {
-        payload.cwd.clone().unwrap_or_default()
-    } else {
-        workspace_root.to_string()
-    };
-    let context = AgentChatSessionSyncContext {
-        workspace_id,
-        workspace_name: if payload.workspace_name.trim().is_empty() {
-            context_entry
-                .map(|entry| entry.workspace_name.clone())
-                .unwrap_or_default()
-        } else {
-            payload.workspace_name.clone()
-        },
-        thread_id: if payload.thread_id.trim().is_empty() {
-            context_entry
-                .and_then(|entry| entry.thread_id.clone())
-                .unwrap_or_default()
-        } else {
-            payload.thread_id.clone()
-        },
-        pane_id: payload.pane_id.clone(),
-        terminal_instance_id: Some(payload.instance_id),
-        terminal_index: payload.terminal_index.map(i64::from),
-        session_mode: context_entry
-            .map(|entry| entry.session_mode.clone())
-            .unwrap_or_default(),
-        status: cloud_mcp_agent_chat_status_from_hook(payload, state_value),
-        source: "terminal_activity_hook_status".to_string(),
-        fork_from_provider_session_id: payload
-            .fork_from_provider_session_id
-            .clone()
-            .unwrap_or_default(),
-        metadata_only: true,
-        ..AgentChatSessionSyncContext::default()
-    };
-    Some(CloudMcpAgentChatStatusSyncRequest {
-        provider: provider.to_string(),
-        provider_session_id: provider_session_id.to_string(),
-        cwd,
-        context,
-    })
-}
-
-/// Per-session last-synced status memo for the hook-driven agent_chat status
-/// sync. Every passive frame of a held-WAITING session qualifies for the
-/// relevance gate, and each spawned sync scans the transcript before its
-/// metadata dedup — without coalescing a long waiting hold turns into an
-/// unbounded rescan backlog. Key: `provider:provider_session_id`; value is
-/// the armed request entry, its unique attempt token, and whether that
-/// attempt COMPLETED successfully (`false` = still in flight). The in-flight
-/// marker coalesces concurrent frames, but only a successful completion may
-/// suppress retries — a failed sync clears its marker so the next identical
-/// waiting frame syncs again. Settlement is token-gated so a LATE settle from
-/// a superseded attempt (waiting → running → identical waiting again) can
-/// never promote or clear a newer attempt's marker (ABA).
-static CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO: OnceLock<
-    StdMutex<HashMap<String, (String, u64, bool)>>,
-> = OnceLock::new();
-static CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO_TOKEN: AtomicU64 = AtomicU64::new(0);
-const CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO_MAX: usize = 2048;
-
-/// Arm the per-session status-sync marker. Returns `None` when this sync
-/// should be SKIPPED (the session's last identical "waiting" request either
-/// synced successfully or is still in flight); otherwise records an in-flight
-/// marker and returns its unique attempt token. Every non-waiting status (and
-/// any changed waiting fingerprint) arms and syncs — status TRANSITIONS
-/// always land. The spawned sync MUST settle the returned token via
-/// `cloud_mcp_agent_chat_status_sync_memo_settle`.
-fn cloud_mcp_agent_chat_status_sync_try_arm(
-    provider: &str,
-    provider_session_id: &str,
-    status: &str,
-    fingerprint: &str,
-) -> Option<u64> {
-    let memo = CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO.get_or_init(|| StdMutex::new(HashMap::new()));
-    let Ok(mut map) = memo.lock() else {
-        // Poisoned memo: fail open (sync anyway) with a token that never
-        // matches an armed marker, so the settle is a no-op.
-        return Some(u64::MAX);
-    };
-    let key = format!("{provider}:{provider_session_id}");
-    let entry = format!("{status}|{fingerprint}");
-    if status == "waiting"
-        && map
-            .get(&key)
-            .is_some_and(|(existing, _, _)| existing == &entry)
-    {
-        return None;
-    }
-    if map.len() >= CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO_MAX && !map.contains_key(&key) {
-        map.clear();
-    }
-    let token = CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO_TOKEN.fetch_add(1, Ordering::AcqRel) + 1;
-    map.insert(key, (entry, token, false));
-    Some(token)
-}
-
-/// Settle the in-flight marker armed by
-/// `cloud_mcp_agent_chat_status_sync_try_arm`: a successful sync promotes it
-/// to the success memo (keeps coalescing identical waiting frames); a failed
-/// sync removes it so the next identical frame RETRIES. Token-gated: a settle
-/// from a superseded attempt is a no-op even when the re-armed entry text is
-/// identical (ABA), and a marker replaced by a newer request is left alone.
-fn cloud_mcp_agent_chat_status_sync_memo_settle(
-    provider: &str,
-    provider_session_id: &str,
-    token: u64,
-    synced: bool,
-) {
-    let memo = CLOUD_MCP_AGENT_CHAT_STATUS_SYNC_MEMO.get_or_init(|| StdMutex::new(HashMap::new()));
-    let Ok(mut map) = memo.lock() else {
-        return;
-    };
-    let key = format!("{provider}:{provider_session_id}");
-    if !map
-        .get(&key)
-        .is_some_and(|(_, armed_token, _)| *armed_token == token)
-    {
-        return;
-    }
-    if synced {
-        if let Some(state) = map.get_mut(&key) {
-            state.2 = true;
-        }
-    } else {
-        map.remove(&key);
-    }
-}
-
-fn cloud_mcp_sync_agent_chat_session_status_from_hook(
-    state: &CloudMcpState,
-    payload: &TerminalActivityHookPayload,
-    context_entry: Option<&CloudMcpTerminalContextState>,
-    workspace_root: &str,
-    state_value: &str,
-    turn_status: &str,
-) {
-    let Some(request) = cloud_mcp_agent_chat_status_sync_request_from_hook(
-        payload,
-        context_entry,
-        workspace_root,
-        state_value,
-        turn_status,
-    ) else {
-        return;
-    };
-    let waiting_fingerprint = format!(
-        "{}|{}|{}|{}|{}|{}",
-        request.context.workspace_id,
-        request.context.thread_id,
-        request.context.pane_id,
-        request
-            .context
-            .terminal_instance_id
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        request.context.session_mode,
-        request.cwd,
-    );
-    let Some(memo_token) = cloud_mcp_agent_chat_status_sync_try_arm(
-        &request.provider,
-        &request.provider_session_id,
-        &request.context.status,
-        &waiting_fingerprint,
-    ) else {
-        return;
-    };
-    if cloud_mcp_agent_chat_turn_git_should_clear(payload, state_value, turn_status) {
-        cloud_mcp_agent_chat_turn_git_clear_session(
-            &request.provider,
-            &request.provider_session_id,
-        );
-    }
-    // The arm above only recorded an in-flight marker. The memo may record
-    // success exclusively AFTER the spawned sync completes OK — a transient
-    // build failure must clear the marker so the next identical waiting frame
-    // retries instead of being suppressed forever. The token gates the settle
-    // to THIS attempt.
-    let memo_provider = request.provider.clone();
-    let memo_session = request.provider_session_id.clone();
-    agent_chat_session_sync_spawn_with_state_observed(
-        state.clone(),
-        request.provider,
-        request.provider_session_id,
-        request.cwd,
-        request.context,
-        "terminal_activity_hook_status",
-        Some(Box::new(move |synced: bool| {
-            cloud_mcp_agent_chat_status_sync_memo_settle(
-                &memo_provider,
-                &memo_session,
-                memo_token,
-                synced,
-            );
-        })),
-    );
-}
-
-#[cfg(test)]
-mod cloud_mcp_agent_chat_status_sync_memo_tests {
-    use super::*;
-
-    #[test]
-    fn waiting_status_sync_coalesces_per_session_until_something_changes() {
-        let arm = cloud_mcp_agent_chat_status_sync_try_arm;
-        let session = format!("ses-{}", uuid::Uuid::new_v4());
-        // First waiting sync for a session always lands.
-        assert!(arm(
-            "opencode",
-            &session,
-            "waiting",
-            "ws-1|thread-1|pane-1|7|native|/repo"
-        )
-        .is_some());
-        // Every further identical passive waiting frame is coalesced.
-        assert!(arm(
-            "opencode",
-            &session,
-            "waiting",
-            "ws-1|thread-1|pane-1|7|native|/repo"
-        )
-        .is_none());
-        assert!(arm(
-            "opencode",
-            &session,
-            "waiting",
-            "ws-1|thread-1|pane-1|7|native|/repo"
-        )
-        .is_none());
-        // A changed fingerprint (something else about the request changed)
-        // syncs again — then coalesces again.
-        assert!(arm(
-            "opencode",
-            &session,
-            "waiting",
-            "ws-1|thread-1|pane-1|8|native|/repo"
-        )
-        .is_some());
-        assert!(arm(
-            "opencode",
-            &session,
-            "waiting",
-            "ws-1|thread-1|pane-1|8|native|/repo"
-        )
-        .is_none());
-        // A status TRANSITION always syncs, and re-arms the waiting memo.
-        assert!(arm(
-            "opencode",
-            &session,
-            "running",
-            "ws-1|thread-1|pane-1|8|native|/repo"
-        )
-        .is_some());
-        assert!(arm(
-            "opencode",
-            &session,
-            "waiting",
-            "ws-1|thread-1|pane-1|8|native|/repo"
-        )
-        .is_some());
-        assert!(arm(
-            "opencode",
-            &session,
-            "waiting",
-            "ws-1|thread-1|pane-1|8|native|/repo"
-        )
-        .is_none());
-        // Non-waiting statuses are never coalesced by this memo.
-        assert!(arm(
-            "opencode",
-            &session,
-            "running",
-            "ws-1|thread-1|pane-1|8|native|/repo"
-        )
-        .is_some());
-        assert!(arm(
-            "opencode",
-            &session,
-            "running",
-            "ws-1|thread-1|pane-1|8|native|/repo"
-        )
-        .is_some());
-        // Sessions are independent.
-        let other = format!("ses-{}", uuid::Uuid::new_v4());
-        assert!(arm(
-            "opencode",
-            &other,
-            "waiting",
-            "ws-1|thread-1|pane-1|8|native|/repo"
-        )
-        .is_some());
-
-        // The memo only records SUCCESS after the spawned sync settles: an
-        // armed in-flight marker coalesces concurrent identical frames, a
-        // FAILED sync clears it so the next identical waiting frame retries,
-        // and a successful sync keeps suppressing duplicates.
-        let flaky = format!("ses-{}", uuid::Uuid::new_v4());
-        let fingerprint = "ws-1|thread-1|pane-1|9|native|/repo";
-        let first_attempt =
-            arm("opencode", &flaky, "waiting", fingerprint).expect("first waiting arm");
-        // Concurrent identical frame while the sync is still in flight.
-        assert!(arm("opencode", &flaky, "waiting", fingerprint).is_none());
-        // Transient build failure: the marker clears and the retry lands.
-        cloud_mcp_agent_chat_status_sync_memo_settle("opencode", &flaky, first_attempt, false);
-        let retry_attempt =
-            arm("opencode", &flaky, "waiting", fingerprint).expect("retry waiting arm");
-        assert_ne!(retry_attempt, first_attempt);
-        // Successful completion promotes the marker to the success memo.
-        cloud_mcp_agent_chat_status_sync_memo_settle("opencode", &flaky, retry_attempt, true);
-        assert!(arm("opencode", &flaky, "waiting", fingerprint).is_none());
-
-        // ABA guard: waiting → running → identical waiting re-arms with a NEW
-        // token; a LATE settle from the superseded first waiting attempt must
-        // neither promote nor clear the newer attempt's marker.
-        let running_attempt = arm("opencode", &flaky, "running", fingerprint).expect("running arm");
-        let waiting_again =
-            arm("opencode", &flaky, "waiting", fingerprint).expect("re-armed waiting");
-        assert_ne!(waiting_again, retry_attempt);
-        // Stale failure from the first waiting attempt: no-op — the current
-        // in-flight marker keeps coalescing.
-        cloud_mcp_agent_chat_status_sync_memo_settle("opencode", &flaky, retry_attempt, false);
-        assert!(arm("opencode", &flaky, "waiting", fingerprint).is_none());
-        // Stale success from the superseded running attempt: also a no-op.
-        cloud_mcp_agent_chat_status_sync_memo_settle("opencode", &flaky, running_attempt, true);
-        assert!(arm("opencode", &flaky, "waiting", fingerprint).is_none());
-        // The CURRENT attempt's failure still clears the marker so the next
-        // identical waiting frame retries.
-        cloud_mcp_agent_chat_status_sync_memo_settle("opencode", &flaky, waiting_again, false);
-        assert!(arm("opencode", &flaky, "waiting", fingerprint).is_some());
-    }
-}
-
-fn cloud_mcp_agent_chat_turn_git_should_clear(
-    payload: &TerminalActivityHookPayload,
-    state_value: &str,
-    turn_status: &str,
-) -> bool {
-    let event_type = cloud_mcp_lifecycle_status_key(&payload.event_type);
-    matches!(
-        event_type.as_str(),
-        "provider_turn_error" | "provider_turn_interrupted"
-    ) || matches!(state_value, "error" | "interrupted" | "closed")
-        || matches!(turn_status, "failed" | "interrupted" | "cancelled")
-}
-
-#[cfg(test)]
-fn cloud_mcp_agent_chat_turn_summary_context_from_hook(
-    payload: &TerminalActivityHookPayload,
-    provider: &str,
-    provider_session_id: &str,
-) -> AgentChatTurnSummaryContext {
-    let (summary, _) =
-        cloud_mcp_agent_chat_turn_contexts_from_hook(payload, provider, provider_session_id);
-    summary
-}
-
-fn cloud_mcp_agent_chat_turn_contexts_from_hook(
-    payload: &TerminalActivityHookPayload,
-    provider: &str,
-    provider_session_id: &str,
-) -> (
-    AgentChatTurnSummaryContext,
-    Option<AgentChatTurnDiffContext>,
-) {
-    let native_turn_id = cloud_mcp_agent_chat_turn_native_id(payload);
-    let snapshot = cloud_mcp_agent_chat_turn_git_take_completion_snapshot(
-        payload,
-        provider,
-        provider_session_id,
-        &native_turn_id,
-    );
-    let started_at = snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.started_at.clone())
-        .unwrap_or_else(|| cloud_mcp_agent_chat_turn_started_at(payload));
-    let started_at_ms = snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.started_at_ms)
-        .unwrap_or_else(|| cloud_mcp_agent_chat_turn_hook_ms(payload));
-    let turn_key = if !native_turn_id.trim().is_empty() {
-        native_turn_id.clone()
-    } else {
-        snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.turn_key.clone())
-            .unwrap_or_else(|| cloud_mcp_agent_chat_turn_key_from_start(payload))
-    };
-    let completed_at = cloud_mcp_agent_chat_turn_completed_at(payload);
-    let completed_at_ms = cloud_mcp_agent_chat_turn_hook_ms(payload);
-    let duration_ms = payload.duration_ms.or_else(|| {
-        completed_at_ms
-            .checked_sub(started_at_ms)
-            .filter(|duration| *duration > 0)
-    });
-    let git_diff = cloud_mcp_agent_chat_turn_git_diff(snapshot);
-    let hook_raw = json!({
-        "event_type": payload.event_type.as_str(),
-        "hook_event_name": payload.hook_event_name.as_str(),
-        "source": payload.source.as_str(),
-        "provider": provider,
-        "provider_session_id": provider_session_id,
-        "native_session_id": payload.native_session_id.clone(),
-        "provider_turn_id": payload.provider_turn_id.clone(),
-        "turn_id": payload.turn_id.clone(),
-        "turn_key": turn_key.as_str(),
-        "started_at": started_at.as_str(),
-        "completed_at": completed_at.as_str(),
-        "duration_ms": duration_ms,
-        "hook_timestamp_ms": payload.hook_timestamp_ms,
-        "observed_at_ms": payload.observed_at_ms,
-    });
-    let mut turn_diff = git_diff.turn_diff;
-    if let Some(diff) = turn_diff.as_mut() {
-        diff.turn_id = native_turn_id.clone();
-        diff.turn_key = turn_key.clone();
-        diff.completed_at = completed_at.clone();
-        if let Some(object) = diff.raw.as_object_mut() {
-            object.insert("hook".to_string(), hook_raw.clone());
-        }
-    }
-    (
-        AgentChatTurnSummaryContext {
-            turn_id: native_turn_id,
-            turn_key,
-            started_at,
-            completed_at,
-            duration_ms,
-            raw: json!({
-                "hook": hook_raw,
-                "git": git_diff.raw,
-            }),
-            file_change: git_diff.file_change,
-        },
-        turn_diff,
-    )
-}
-
-fn cloud_mcp_agent_chat_turn_summary_has_stable_key(payload: &TerminalActivityHookPayload) -> bool {
-    !cloud_mcp_agent_chat_turn_native_id(payload)
-        .trim()
-        .is_empty()
-        || payload
-            .prompt_ready_at
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-}
-
-fn cloud_mcp_sync_agent_chat_turn_summary_from_hook(
-    state: &CloudMcpState,
-    payload: &TerminalActivityHookPayload,
-    context_entry: Option<&CloudMcpTerminalContextState>,
-    workspace_root: &str,
-    state_value: &str,
-    turn_status: &str,
-) {
-    let event_type = cloud_mcp_lifecycle_status_key(&payload.event_type);
-    if !matches!(
-        event_type.as_str(),
-        "provider_turn_started" | "provider_turn_completed"
-    ) {
-        return;
-    }
-    let Some(request) = cloud_mcp_agent_chat_status_sync_request_from_hook(
-        payload,
-        context_entry,
-        workspace_root,
-        state_value,
-        turn_status,
-    ) else {
-        return;
-    };
-    if event_type == "provider_turn_started" {
-        let started_at = cloud_mcp_agent_chat_turn_started_at(payload);
-        let turn_key = cloud_mcp_agent_chat_turn_key_from_start(payload);
-        let started_at_ms = cloud_mcp_agent_chat_turn_hook_ms(payload);
-        cloud_mcp_agent_chat_turn_git_mark_start(
-            &request.provider,
-            &request.provider_session_id,
-            &turn_key,
-            started_at_ms,
-        );
-        tauri::async_runtime::spawn_blocking(move || {
-            cloud_mcp_agent_chat_turn_git_record_start_after_mark(
-                &request.provider,
-                &request.provider_session_id,
-                &turn_key,
-                &request.cwd,
-                &started_at,
-                started_at_ms,
-            );
-        });
-        return;
-    }
-    if !cloud_mcp_agent_chat_turn_summary_has_stable_key(payload) {
-        return;
-    }
-    let payload = payload.clone();
-    let state = state.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let (summary, turn_diff) = cloud_mcp_agent_chat_turn_contexts_from_hook(
-            &payload,
-            &request.provider,
-            &request.provider_session_id,
-        );
-        let mut context = request.context;
-        context.metadata_only = false;
-        context.source = "terminal_activity_hook_turn_summary".to_string();
-        context.turn_summary = Some(summary);
-        context.turn_diff = turn_diff;
-        agent_chat_session_sync_spawn_with_state(
-            state,
-            request.provider,
-            request.provider_session_id,
-            request.cwd,
-            context,
-            "terminal_activity_hook_turn_summary",
-        );
-    });
-}
-
 fn cloud_mcp_agent_chat_hook_workspace_root(
     payload: &TerminalActivityHookPayload,
     context_entry: Option<&CloudMcpTerminalContextState>,
@@ -47060,22 +45199,6 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     } else {
         Some(cloud_mcp_workspace_runtime_epoch(state))
     };
-    cloud_mcp_sync_agent_chat_session_status_from_hook(
-        state,
-        payload,
-        context_entry.as_ref(),
-        &workspace_root,
-        state_value,
-        turn_status,
-    );
-    cloud_mcp_sync_agent_chat_turn_summary_from_hook(
-        state,
-        payload,
-        context_entry.as_ref(),
-        &workspace_root,
-        state_value,
-        turn_status,
-    );
     let terminal_state_summary = format!("Terminal {}.", state_value);
     let terminal_is_prompting_user = payload.terminal_is_prompting_user;
     let prompt_id = if terminal_is_prompting_user {
@@ -66805,7 +64928,6 @@ mod cloud_mcp_tests {
             "termio_flow_ack_state_follows_lease_reap_and_terminal_close",
         );
         let _guard = process_test_env_lock();
-        let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
             .unwrap_or_else(|| "desktop-primary".to_string());
@@ -66882,7 +65004,6 @@ mod cloud_mcp_tests {
             .unwrap()
             .contains_key(&close_stream));
         assert_eq!(state.terminal_io_acking_streams.load(Ordering::SeqCst), 0);
-        let _ = agent_chat_session_clear_observed_terminals();
     }
 
     #[test]
@@ -67059,7 +65180,6 @@ mod cloud_mcp_tests {
         let _storage =
             isolated_cloud_mcp_test_storage("terminal_remote_presence_ignores_unknown_origin");
         let _guard = process_test_env_lock();
-        let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
             .unwrap_or_else(|| "desktop-primary".to_string());
@@ -67090,17 +65210,8 @@ mod cloud_mcp_tests {
                 last_seen_ms: cloud_mcp_now_ms(),
             },
         );
-        agent_chat_session_set_terminal_observed(
-            "workspace-unknown-origin",
-            "pane-unknown-origin",
-            Some(10),
-            None,
-            true,
-        );
-
         let snapshot = cloud_mcp_terminal_remote_presence_snapshot_payload(&state).await;
         assert_eq!(snapshot["items"].as_array().map(Vec::len).unwrap_or(0), 0);
-        let _ = agent_chat_session_clear_observed_terminals();
     }
 
     #[tokio::test]
@@ -67109,7 +65220,6 @@ mod cloud_mcp_tests {
             "terminal_remote_presence_emits_normalized_workspace_key",
         );
         let _guard = process_test_env_lock();
-        let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
             .unwrap_or_else(|| "desktop-primary".to_string());
@@ -67143,7 +65253,6 @@ mod cloud_mcp_tests {
         assert_eq!(items[0]["instance_id"], json!(13));
         assert_eq!(items[0]["stream_key"], json!(stream_key));
         assert_eq!(items[0]["shell_viewers"], json!(1));
-        let _ = agent_chat_session_clear_observed_terminals();
     }
 
     #[test]
@@ -67151,7 +65260,6 @@ mod cloud_mcp_tests {
         let _storage =
             isolated_cloud_mcp_test_storage("terminal_remote_presence_reaper_drops_stale_origins");
         let _guard = process_test_env_lock();
-        let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
             .unwrap_or_else(|| "desktop-primary".to_string());
@@ -67181,14 +65289,6 @@ mod cloud_mcp_tests {
                 last_seen_ms,
             },
         );
-        agent_chat_session_set_terminal_observed(
-            workspace_id,
-            pane_id,
-            Some(11),
-            Some("viewer-stale"),
-            true,
-        );
-
         let changed = cloud_mcp_prune_terminal_remote_presence_stale_origins_at(
             &state,
             cloud_mcp_now_ms()
@@ -67202,18 +65302,11 @@ mod cloud_mcp_tests {
             .unwrap()
             .is_empty());
         assert!(state.terminal_io_control_owners.lock().unwrap().is_empty());
-        assert!(!agent_chat_session_terminal_identity_is_observed(
-            workspace_id,
-            pane_id,
-            Some(11),
-        ));
-        let _ = agent_chat_session_clear_observed_terminals();
     }
 
     #[test]
     fn termio_stale_reap_collects_expired_stream_origin_pairs() {
         let _guard = process_test_env_lock();
-        let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let now_ms = cloud_mcp_now_ms();
         let stale_seen_ms =
@@ -67288,13 +65381,11 @@ mod cloud_mcp_tests {
         assert!(subscriptions.get(&stream_b).is_none());
         drop(subscriptions);
         assert!(state.terminal_io_control_owners.lock().unwrap().is_empty());
-        let _ = agent_chat_session_clear_observed_terminals();
     }
 
     #[test]
     fn terminal_remote_presence_reaper_tracks_earliest_deadline_not_double_ttl() {
         let _guard = process_test_env_lock();
-        let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let stream_key = "device:workspace:pane:41".to_string();
         let ceiling_ms = TERMINAL_REMOTE_PRESENCE_STALE_ORIGIN_TTL_MS
@@ -67385,7 +65476,6 @@ mod cloud_mcp_tests {
             cloud_mcp_terminal_remote_presence_reaper_sleep_ms(&state, wake_ms + next_delay_ms),
             ceiling_ms
         );
-        let _ = agent_chat_session_clear_observed_terminals();
     }
 
     #[tokio::test]
@@ -67394,7 +65484,6 @@ mod cloud_mcp_tests {
             "terminal_remote_presence_reaper_task_reaps_overdue_lease_promptly",
         );
         let _guard = process_test_env_lock();
-        let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let stream_key = "device:workspace:pane:61".to_string();
         let overdue_ms = cloud_mcp_now_ms()
@@ -67438,7 +65527,6 @@ mod cloud_mcp_tests {
             );
             sleep(Duration::from_millis(100)).await;
         }
-        let _ = agent_chat_session_clear_observed_terminals();
     }
 
     #[test]
@@ -67770,7 +65858,6 @@ mod cloud_mcp_tests {
             "terminal_remote_presence_close_cleanup_clears_pane_identity",
         );
         let _guard = process_test_env_lock();
-        let _ = agent_chat_session_clear_observed_terminals();
         let state = CloudMcpState::new();
         let device_id = cloud_mcp_payload_text(&cloud_mcp_desktop_device_profile(), &["device_id"])
             .unwrap_or_else(|| "desktop-primary".to_string());
@@ -67804,21 +65891,6 @@ mod cloud_mcp_tests {
             .lock()
             .unwrap()
             .insert(stream_key.clone(), CloudMcpTerminalIoTail::default());
-        agent_chat_session_set_terminal_observed(
-            workspace_id,
-            pane_id,
-            Some(12),
-            Some("viewer-close"),
-            true,
-        );
-        agent_chat_session_set_terminal_observed(
-            workspace_id,
-            pane_id,
-            None,
-            Some("viewer-close"),
-            true,
-        );
-
         assert!(cloud_mcp_clear_terminal_remote_presence_for_terminal(
             &state,
             "",
@@ -67844,17 +65916,6 @@ mod cloud_mcp_tests {
             .unwrap()
             .get(&stream_key)
             .is_none());
-        assert!(!agent_chat_session_terminal_identity_is_observed(
-            workspace_id,
-            pane_id,
-            Some(12),
-        ));
-        assert!(!agent_chat_session_terminal_identity_is_observed(
-            workspace_id,
-            pane_id,
-            None,
-        ));
-        let _ = agent_chat_session_clear_observed_terminals();
     }
 
     #[test]
@@ -69145,58 +67206,6 @@ mod cloud_mcp_tests {
         );
     }
 
-    fn cloud_mcp_test_dir(prefix: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        env::temp_dir().join(format!("{prefix}-{suffix}"))
-    }
-
-    fn cloud_mcp_test_git(root: &Path, args: &[&str]) -> bool {
-        Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-
-    fn cloud_mcp_test_git_output(root: &Path, args: &[&str]) -> String {
-        Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-            .unwrap_or_default()
-    }
-
-    fn cloud_mcp_init_test_repo(root: &Path) -> bool {
-        if Command::new("git").arg("--version").output().is_err() {
-            return false;
-        }
-        fs::create_dir_all(root).unwrap();
-        if !cloud_mcp_test_git(root, &["init"]) {
-            return false;
-        }
-        if !cloud_mcp_test_git(root, &["config", "user.name", "Diff Forge Test"]) {
-            return false;
-        }
-        if !cloud_mcp_test_git(root, &["config", "user.email", "test@diffforge.local"]) {
-            return false;
-        }
-        fs::write(root.join("edit.txt"), "old\n").unwrap();
-        fs::write(root.join("delete.txt"), "delete me\n").unwrap();
-        if !cloud_mcp_test_git(root, &["add", "edit.txt", "delete.txt"]) {
-            return false;
-        }
-        cloud_mcp_test_git(root, &["commit", "-m", "initial"])
-    }
-
     #[test]
     fn tokenomics_periodic_local_cleanup_sweeps_staged_chat_attachments() {
         let path = chat_attachment_stage_root()
@@ -69214,94 +67223,6 @@ mod cloud_mcp_tests {
 
         assert!(removed >= 1);
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn agent_chat_turn_git_numstat_rename_path_expands_subdir_braces() {
-        assert_eq!(
-            cloud_mcp_agent_chat_turn_git_numstat_rename_path("arch/{i386 => x86}/Makefile"),
-            Some("arch/x86/Makefile".to_string())
-        );
-        assert_eq!(
-            cloud_mcp_agent_chat_turn_git_numstat_rename_path("src/{old.rs => new.rs}"),
-            Some("src/new.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn agent_chat_turn_git_deleted_sql_patch_ignores_hunk_comment_headers() {
-        let _storage = isolated_cloud_mcp_test_storage(
-            "agent_chat_turn_git_deleted_sql_patch_ignores_hunk_comment_headers",
-        );
-        let patches = cloud_mcp_agent_chat_turn_git_patch_map(
-            "diff --git a/db/schema.sql b/db/schema.sql\n\
-             deleted file mode 100644\n\
-             index 1111111..0000000\n\
-             --- a/db/schema.sql\n\
-             +++ /dev/null\n\
-             @@ -1,2 +0,0 @@\n\
-             --- comment line\n\
-             -SELECT 1;\n",
-        );
-
-        assert!(patches.contains_key("db/schema.sql"));
-        assert!(!patches.contains_key("comment line"));
-    }
-
-    #[test]
-    fn agent_chat_status_hooks_map_to_metadata_only_sync_requests() {
-        for event_type in [
-            "provider-turn-started",
-            "provider-turn-completed",
-            "provider-turn-error",
-            "provider-turn-interrupted",
-            "provider-permission-requested",
-            "provider-user-prompt-started",
-        ] {
-            let payload = agent_chat_status_hook_test_payload(event_type);
-            let request = cloud_mcp_agent_chat_status_sync_request_from_hook(
-                &payload, None, "", "thinking", "running",
-            )
-            .expect("relevant hook should request metadata sync");
-            assert_eq!(request.provider, "codex");
-            assert_eq!(request.provider_session_id, "session-a");
-            assert_eq!(request.cwd, "/tmp/project");
-            assert!(request.context.metadata_only);
-            assert_eq!(request.context.source, "terminal_activity_hook_status");
-            assert_eq!(request.context.workspace_id, "workspace-a");
-        }
-
-        let payload = agent_chat_status_hook_test_payload("provider-message-displayed");
-        assert!(cloud_mcp_agent_chat_status_sync_request_from_hook(
-            &payload, None, "", "thinking", "running",
-        )
-        .is_none());
-
-        let mut payload = agent_chat_status_hook_test_payload("provider-user-prompt-started");
-        payload.source = "cli-hook:manual-prompt".to_string();
-        payload.activity_status = "awaiting_input".to_string();
-        payload.command_phase = "awaiting_input".to_string();
-        payload.terminal_is_prompting_user = true;
-        payload.prompt_id = Some("permission-request-abc".to_string());
-        payload.interaction_id = Some("uir:permission-request-abc".to_string());
-        payload.interaction_revision = Some(7);
-        payload.interaction_source = Some("provider_hook".to_string());
-        payload.prompt_kind = Some("approval".to_string());
-        payload.prompt_options = vec![TerminalActivityHookPromptOption {
-            id: "trust_all_and_continue".to_string(),
-            label: "Trust all and continue".to_string(),
-            description: None,
-            value: Some("2".to_string()),
-            danger: Some(true),
-        }];
-        assert_eq!(
-            cloud_mcp_agent_chat_status_from_hook(&payload, "paused"),
-            "awaiting_input"
-        );
-        assert!(cloud_mcp_agent_chat_status_sync_request_from_hook(
-            &payload, None, "", "paused", "pending",
-        )
-        .is_some());
     }
 
     #[tokio::test]
@@ -70239,773 +68160,6 @@ mod cloud_mcp_tests {
         );
 
         let _ = fs::remove_dir_all(cache_root);
-    }
-
-    #[test]
-    fn agent_chat_turn_git_capture_maps_fixture_changes_without_real_index_mutation() {
-        let _storage = isolated_cloud_mcp_test_storage(
-            "agent_chat_turn_git_capture_maps_fixture_changes_without_real_index_mutation",
-        );
-        let _guard = process_test_env_lock();
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        let root = cloud_mcp_test_dir("diffforge-turn-git");
-        if !cloud_mcp_init_test_repo(&root) {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-        let root_text = root.to_string_lossy().to_string();
-        let started_at_ms = cloud_mcp_now_ms();
-        cloud_mcp_agent_chat_turn_git_record_start(
-            "codex",
-            "session-git",
-            "turn-git",
-            &root_text,
-            "2026-07-02T00:00:00.000Z",
-            started_at_ms,
-        );
-
-        fs::write(root.join("edit.txt"), "old\nnew\n").unwrap();
-        fs::remove_file(root.join("delete.txt")).unwrap();
-        fs::write(root.join("create.txt"), "created\n").unwrap();
-
-        let snapshot =
-            cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-git", "turn-git");
-        let diff = cloud_mcp_agent_chat_turn_git_diff(snapshot);
-        let file_change = diff.file_change.expect("file change");
-        let files = file_change["files"].as_array().expect("files");
-        let file_for = |path: &str| {
-            files
-                .iter()
-                .find(|file| file["path"] == json!(path))
-                .unwrap_or_else(|| panic!("missing file change for {path}"))
-        };
-        let create = file_for("create.txt");
-        let edit = file_for("edit.txt");
-        let delete = file_for("delete.txt");
-
-        assert_eq!(files.len(), 3);
-        assert_eq!(create["kind"], json!("create"));
-        assert_eq!(create["additions"], json!(1));
-        assert_eq!(create["deletions"], json!(0));
-        assert_eq!(edit["kind"], json!("edit"));
-        assert_eq!(edit["additions"], json!(1));
-        assert_eq!(edit["deletions"], json!(0));
-        assert_eq!(delete["kind"], json!("delete"));
-        assert_eq!(delete["additions"], json!(0));
-        assert_eq!(delete["deletions"], json!(1));
-        assert_eq!(file_change["summary"], json!("3 files changed (+2 -1)"));
-        let numstat = diff.raw["numstat"].as_str().unwrap_or_default();
-        assert!(numstat.contains("1\t0\tcreate.txt"));
-        assert!(numstat.contains("1\t0\tedit.txt"));
-        assert!(numstat.contains("0\t1\tdelete.txt"));
-        let name_status = diff.raw["name_status"].as_str().unwrap_or_default();
-        assert!(name_status.contains("A\tcreate.txt"));
-        assert!(name_status.contains("M\tedit.txt"));
-        assert!(name_status.contains("D\tdelete.txt"));
-        assert!(
-            cloud_mcp_test_git_output(&root, &["diff", "--cached", "--name-only"])
-                .trim()
-                .is_empty()
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn agent_chat_turn_git_capture_builds_turn_diff_patches() {
-        let _storage =
-            isolated_cloud_mcp_test_storage("agent_chat_turn_git_capture_builds_turn_diff_patches");
-        let _guard = process_test_env_lock();
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        let root = cloud_mcp_test_dir("diffforge-turn-diff");
-        if !cloud_mcp_init_test_repo(&root) {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-        let rename_seed = (0..20)
-            .map(|index| format!("rename line {index}\n"))
-            .collect::<String>();
-        fs::write(root.join("rename.txt"), rename_seed.clone()).unwrap();
-        if !cloud_mcp_test_git(&root, &["add", "rename.txt"])
-            || !cloud_mcp_test_git(&root, &["commit", "-m", "add rename fixture"])
-        {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-        let root_text = root.to_string_lossy().to_string();
-        cloud_mcp_agent_chat_turn_git_record_start(
-            "codex",
-            "session-diff",
-            "turn-diff",
-            &root_text,
-            "2026-07-02T00:00:00.000Z",
-            cloud_mcp_now_ms(),
-        );
-
-        fs::write(root.join("edit.txt"), "old\nnew\n").unwrap();
-        fs::remove_file(root.join("delete.txt")).unwrap();
-        fs::write(root.join("create.txt"), "created\n").unwrap();
-        fs::rename(root.join("rename.txt"), root.join("renamed.txt")).unwrap();
-        fs::write(
-            root.join("renamed.txt"),
-            rename_seed.replacen("rename line 19", "rename line nineteen", 1),
-        )
-        .unwrap();
-        fs::write(root.join("binary.bin"), [0_u8, 159, 146, 150]).unwrap();
-
-        let snapshot =
-            cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-diff", "turn-diff");
-        let diff = cloud_mcp_agent_chat_turn_git_diff(snapshot);
-        let turn_diff = diff.turn_diff.expect("turn diff");
-        let files = turn_diff.files;
-        let file_for = |path: &str| {
-            files
-                .iter()
-                .find(|file| file["path"] == json!(path))
-                .unwrap_or_else(|| panic!("missing turn diff file for {path}"))
-        };
-        let create = file_for("create.txt");
-        let edit = file_for("edit.txt");
-        let delete = file_for("delete.txt");
-        let rename = file_for("renamed.txt");
-        let binary = file_for("binary.bin");
-
-        assert_eq!(create["kind"], json!("create"));
-        assert_eq!(edit["kind"], json!("edit"));
-        assert_eq!(delete["kind"], json!("delete"));
-        assert_eq!(rename["kind"], json!("rename"));
-        assert_eq!(rename["old_path"], json!("rename.txt"));
-        assert_eq!(binary["binary"], json!(true));
-        for file in [create, edit, delete, rename] {
-            let patch = file["patch"].as_str().expect("text patch");
-            assert!(patch.contains("--- "));
-            assert!(patch.contains("+++ "));
-            assert!(patch.contains("@@"));
-        }
-        assert!(binary.get("patch").is_none());
-        assert_eq!(turn_diff.raw["generation"]["patch_skipped"], json!(false));
-        let total_additions = files
-            .iter()
-            .filter_map(|file| file["additions"].as_i64())
-            .sum::<i64>();
-        let total_deletions = files
-            .iter()
-            .filter_map(|file| file["deletions"].as_i64())
-            .sum::<i64>();
-        assert_eq!(turn_diff.total_additions, total_additions);
-        assert_eq!(turn_diff.total_deletions, total_deletions);
-        assert!(turn_diff.total_additions >= 3);
-        assert!(turn_diff.total_deletions >= 2);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn agent_chat_turn_git_capture_matches_non_ascii_numstat_and_patch_paths() {
-        let _storage = isolated_cloud_mcp_test_storage(
-            "agent_chat_turn_git_capture_matches_non_ascii_numstat_and_patch_paths",
-        );
-        let _guard = process_test_env_lock();
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        let root = cloud_mcp_test_dir("diffforge-turn-nonascii");
-        if !cloud_mcp_init_test_repo(&root) {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-        let path = "café.txt";
-        fs::write(root.join(path), "old\n").unwrap();
-        if !cloud_mcp_test_git(&root, &["add", path])
-            || !cloud_mcp_test_git(&root, &["commit", "-m", "add non-ascii fixture"])
-        {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-        cloud_mcp_agent_chat_turn_git_record_start(
-            "codex",
-            "session-nonascii",
-            "turn-nonascii",
-            &root.to_string_lossy(),
-            "2026-07-02T00:00:00.000Z",
-            cloud_mcp_now_ms(),
-        );
-        fs::write(root.join(path), "old\nnew\n").unwrap();
-
-        let snapshot = cloud_mcp_agent_chat_turn_git_take_snapshot(
-            "codex",
-            "session-nonascii",
-            "turn-nonascii",
-        );
-        let diff = cloud_mcp_agent_chat_turn_git_diff(snapshot);
-        let turn_diff = diff.turn_diff.expect("turn diff");
-        let file = turn_diff
-            .files
-            .iter()
-            .find(|file| file["path"] == json!(path))
-            .expect("non-ascii path should match numstat and patch headers");
-
-        assert_eq!(file["additions"], json!(1));
-        assert_eq!(file["deletions"], json!(0));
-        assert!(file["patch"]
-            .as_str()
-            .is_some_and(|patch| patch.contains("+++ b/café.txt")));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn agent_chat_turn_git_no_changes_has_no_turn_diff() {
-        let _storage =
-            isolated_cloud_mcp_test_storage("agent_chat_turn_git_no_changes_has_no_turn_diff");
-        let _guard = process_test_env_lock();
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        let root = cloud_mcp_test_dir("diffforge-turn-no-diff");
-        if !cloud_mcp_init_test_repo(&root) {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-        cloud_mcp_agent_chat_turn_git_record_start(
-            "codex",
-            "session-no-diff",
-            "turn-no-diff",
-            &root.to_string_lossy(),
-            "2026-07-02T00:00:00.000Z",
-            cloud_mcp_now_ms(),
-        );
-
-        let snapshot =
-            cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-no-diff", "turn-no-diff");
-        let diff = cloud_mcp_agent_chat_turn_git_diff(snapshot);
-
-        assert!(diff.file_change.is_none());
-        assert!(diff.turn_diff.is_none());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn agent_chat_turn_git_patch_timeout_emits_counts_only_turn_diff() {
-        let _storage = isolated_cloud_mcp_test_storage(
-            "agent_chat_turn_git_patch_timeout_emits_counts_only_turn_diff",
-        );
-        let _guard = process_test_env_lock();
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        let root = cloud_mcp_test_dir("diffforge-turn-diff-timeout");
-        if !cloud_mcp_init_test_repo(&root) {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-        cloud_mcp_agent_chat_turn_git_record_start(
-            "codex",
-            "session-timeout",
-            "turn-timeout",
-            &root.to_string_lossy(),
-            "2026-07-02T00:00:00.000Z",
-            cloud_mcp_now_ms(),
-        );
-        fs::write(root.join("edit.txt"), "old\nnew\n").unwrap();
-
-        let snapshot =
-            cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-timeout", "turn-timeout");
-        let diff = cloud_mcp_agent_chat_turn_git_diff_with_patch_timeout(
-            snapshot,
-            Duration::from_millis(0),
-        );
-        let turn_diff = diff.turn_diff.expect("turn diff");
-        assert_eq!(turn_diff.files.len(), 1);
-        assert_eq!(turn_diff.files[0]["additions"], json!(1));
-        assert_eq!(turn_diff.files[0]["deletions"], json!(0));
-        assert!(turn_diff.files[0].get("patch").is_none());
-        assert_eq!(
-            turn_diff.raw["generation"]["patch_skip_reason"],
-            json!("timeout")
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn agent_chat_turn_diff_caps_per_file_and_drops_largest_patches_first() {
-        let one_file = vec![json!({
-            "path": "large.rs",
-            "kind": "edit",
-            "additions": 1,
-            "deletions": 1
-        })];
-        let mut one_patch = HashMap::new();
-        one_patch.insert("large.rs".to_string(), "x".repeat(50_000));
-        let (files, total_additions, total_deletions, files_omitted, truncated, caps) =
-            cloud_mcp_agent_chat_turn_git_attach_patches(one_file, &one_patch);
-        assert_eq!(total_additions, 1);
-        assert_eq!(total_deletions, 1);
-        assert_eq!(files_omitted, 0);
-        assert!(truncated);
-        assert_eq!(
-            files[0]["patch"].as_str().unwrap().chars().count(),
-            CLOUD_MCP_AGENT_CHAT_TURN_DIFF_PATCH_MAX_CHARS
-        );
-        assert_eq!(files[0]["patch_truncated"], json!(true));
-        assert_eq!(caps["per_file_patches_truncated"], json!(1));
-
-        let files = (0..10)
-            .map(|index| {
-                json!({
-                    "path": format!("file-{index}.rs"),
-                    "kind": "edit",
-                    "additions": 1,
-                    "deletions": 1
-                })
-            })
-            .collect::<Vec<_>>();
-        let patches = (0..10)
-            .map(|index| {
-                (
-                    format!("file-{index}.rs"),
-                    "x".repeat(40_000 + (index * 500)),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let (files, total_additions, total_deletions, files_omitted, truncated, caps) =
-            cloud_mcp_agent_chat_turn_git_attach_patches(files, &patches);
-        assert_eq!(total_additions, 10);
-        assert_eq!(total_deletions, 10);
-        assert_eq!(files_omitted, 0);
-        assert!(truncated);
-        assert!(caps["patches_dropped_for_record_cap"].as_u64().unwrap_or(0) > 0);
-        let dropped = files
-            .iter()
-            .enumerate()
-            .filter_map(|(index, file)| file.get("patch").is_none().then_some(index))
-            .collect::<Vec<_>>();
-        assert!(dropped.contains(&9));
-        let smallest_dropped = dropped.iter().copied().min().unwrap_or(10);
-        for (index, file) in files.iter().enumerate() {
-            if index > smallest_dropped {
-                assert!(file.get("patch").is_none());
-            }
-        }
-
-        let metadata_only_files = (0..7000)
-            .map(|index| {
-                json!({
-                    "path": format!("very/long/generated/path/{index}/module/file-{index}.rs"),
-                    "kind": "edit",
-                    "additions": 1,
-                    "deletions": 1
-                })
-            })
-            .collect::<Vec<_>>();
-        let (files, total_additions, total_deletions, files_omitted, truncated, caps) =
-            cloud_mcp_agent_chat_turn_git_attach_patches(metadata_only_files, &HashMap::new());
-        assert!(truncated);
-        assert_eq!(total_additions, 7000);
-        assert_eq!(total_deletions, 7000);
-        assert_eq!(files_omitted, 7000usize.saturating_sub(files.len()));
-        assert_eq!(caps["files_omitted"], json!(files_omitted));
-        let message = cloud_mcp_agent_chat_turn_diff_message(
-            &files,
-            files_omitted,
-            truncated,
-            total_additions,
-            total_deletions,
-        );
-        assert_eq!(message["files_omitted"], json!(files_omitted));
-        assert!(caps["files_dropped_for_record_cap"].as_u64().unwrap_or(0) > 0);
-        assert!(
-            caps["serialized_messages_bytes"]
-                .as_u64()
-                .unwrap_or(u64::MAX)
-                <= u64::try_from(CLOUD_MCP_AGENT_CHAT_TURN_DIFF_MESSAGES_MAX_BYTES).unwrap()
-        );
-        assert!(files.len() < 7000);
-    }
-
-    #[test]
-    fn agent_chat_turn_git_capture_non_git_cwd_noops() {
-        let _guard = process_test_env_lock();
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        let root = cloud_mcp_test_dir("diffforge-turn-non-git");
-        fs::create_dir_all(&root).unwrap();
-        assert!(cloud_mcp_agent_chat_turn_git_root(&root.to_string_lossy()).is_none());
-        cloud_mcp_agent_chat_turn_git_record_start(
-            "codex",
-            "session-non-git",
-            "turn-non-git",
-            &root.to_string_lossy(),
-            "2026-07-02T00:00:00.000Z",
-            cloud_mcp_now_ms(),
-        );
-        assert!(cloud_mcp_agent_chat_turn_git_take_snapshot(
-            "codex",
-            "session-non-git",
-            "turn-non-git"
-        )
-        .is_none());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn agent_chat_turn_summary_aliases_prompt_start_snapshot_to_native_turn_id() {
-        let _storage = isolated_cloud_mcp_test_storage(
-            "agent_chat_turn_summary_aliases_prompt_start_snapshot_to_native_turn_id",
-        );
-        let _guard = process_test_env_lock();
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        let root = cloud_mcp_test_dir("diffforge-turn-alias");
-        if !cloud_mcp_init_test_repo(&root) {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-        let mut start_payload = agent_chat_status_hook_test_payload("provider-turn-started");
-        start_payload.provider_session_id = Some("session-alias".to_string());
-        start_payload.provider_turn_id = None;
-        start_payload.turn_id = None;
-        start_payload.prompt_ready_at = Some("2026-07-02T00:00:00.000Z".to_string());
-        start_payload.cwd = Some(root.to_string_lossy().to_string());
-        start_payload.hook_timestamp_ms = cloud_mcp_now_ms();
-        start_payload.observed_at_ms = start_payload.hook_timestamp_ms;
-        let start_key = cloud_mcp_agent_chat_turn_key_from_start(&start_payload);
-        cloud_mcp_agent_chat_turn_git_record_start(
-            "codex",
-            "session-alias",
-            &start_key,
-            &root.to_string_lossy(),
-            "2026-07-02T00:00:00.000Z",
-            start_payload.hook_timestamp_ms,
-        );
-        fs::write(root.join("edit.txt"), "old\nnew\n").unwrap();
-
-        let mut completion_payload = agent_chat_status_hook_test_payload("provider-turn-completed");
-        completion_payload.provider_session_id = Some("session-alias".to_string());
-        completion_payload.provider_turn_id = Some("native-turn-alias".to_string());
-        completion_payload.turn_id = Some("native-turn-alias".to_string());
-        completion_payload.prompt_ready_at = Some("2026-07-02T00:00:00.000Z".to_string());
-        completion_payload.completed_at = Some("2026-07-02T00:00:03.000Z".to_string());
-        completion_payload.cwd = Some(root.to_string_lossy().to_string());
-        completion_payload.hook_timestamp_ms = start_payload.hook_timestamp_ms + 3000;
-        completion_payload.observed_at_ms = completion_payload.hook_timestamp_ms;
-
-        assert!(cloud_mcp_agent_chat_turn_summary_has_stable_key(
-            &completion_payload
-        ));
-        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
-            &completion_payload,
-            "codex",
-            "session-alias",
-        );
-
-        assert_eq!(summary.turn_key, "native-turn-alias");
-        assert!(summary.file_change.is_some());
-        assert!(summary.raw["git"]["numstat"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("edit.txt"));
-        assert!(
-            cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-alias", &start_key)
-                .is_none()
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn agent_chat_turn_summary_does_not_use_latest_session_snapshot_fallback() {
-        let _storage = isolated_cloud_mcp_test_storage(
-            "agent_chat_turn_summary_does_not_use_latest_session_snapshot_fallback",
-        );
-        let _guard = process_test_env_lock();
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        let root = cloud_mcp_test_dir("diffforge-turn-no-latest");
-        if !cloud_mcp_init_test_repo(&root) {
-            let _ = fs::remove_dir_all(&root);
-            return;
-        }
-        cloud_mcp_agent_chat_turn_git_record_start(
-            "codex",
-            "session-no-latest",
-            "turn-a",
-            &root.to_string_lossy(),
-            "2026-07-02T00:00:00.000Z",
-            cloud_mcp_now_ms(),
-        );
-        fs::write(root.join("edit.txt"), "old\nnew\n").unwrap();
-        let mut payload = agent_chat_status_hook_test_payload("provider-turn-completed");
-        payload.provider_session_id = Some("session-no-latest".to_string());
-        payload.provider_turn_id = None;
-        payload.turn_id = None;
-        payload.prompt_ready_at = None;
-        payload.completed_at = Some("2026-07-02T00:00:03.000Z".to_string());
-        payload.cwd = Some(root.to_string_lossy().to_string());
-        payload.hook_timestamp_ms = cloud_mcp_now_ms();
-        payload.observed_at_ms = payload.hook_timestamp_ms;
-
-        assert!(!cloud_mcp_agent_chat_turn_summary_has_stable_key(&payload));
-        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
-            &payload,
-            "codex",
-            "session-no-latest",
-        );
-
-        assert!(summary.file_change.is_none());
-        assert_eq!(
-            summary.raw["git"]["skipped"],
-            json!("missing_start_snapshot")
-        );
-        assert!(cloud_mcp_agent_chat_turn_git_take_snapshot(
-            "codex",
-            "session-no-latest",
-            "turn-a"
-        )
-        .is_some());
-
-        let _ = fs::remove_dir_all(&root);
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-    }
-
-    #[test]
-    fn agent_chat_turn_git_snapshot_map_prunes_ttl_and_oldest_entries() {
-        let _guard = process_test_env_lock();
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        let now = cloud_mcp_now_ms();
-        for index in 0..(CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_MAX + 1) {
-            cloud_mcp_agent_chat_turn_git_mark_start(
-                "codex",
-                "session-prune",
-                &format!("turn-{index}"),
-                now + index as u64,
-            );
-        }
-        let (snapshots, _) = cloud_mcp_agent_chat_turn_git_snapshots();
-        let snapshots = snapshots.lock().unwrap();
-        assert_eq!(snapshots.len(), CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_MAX);
-        assert!(
-            !snapshots.contains_key(&cloud_mcp_agent_chat_turn_snapshot_key(
-                "codex",
-                "session-prune",
-                "turn-0"
-            ))
-        );
-        drop(snapshots);
-
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        cloud_mcp_agent_chat_turn_git_mark_start(
-            "codex",
-            "session-prune",
-            "turn-old",
-            now.saturating_sub(CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_TTL_MS + 1),
-        );
-        cloud_mcp_agent_chat_turn_git_mark_start("codex", "session-prune", "turn-new", now);
-        let (snapshots, _) = cloud_mcp_agent_chat_turn_git_snapshots();
-        let snapshots = snapshots.lock().unwrap();
-        assert!(
-            !snapshots.contains_key(&cloud_mcp_agent_chat_turn_snapshot_key(
-                "codex",
-                "session-prune",
-                "turn-old"
-            ))
-        );
-        assert!(
-            snapshots.contains_key(&cloud_mcp_agent_chat_turn_snapshot_key(
-                "codex",
-                "session-prune",
-                "turn-new"
-            ))
-        );
-        drop(snapshots);
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-    }
-
-    #[test]
-    fn agent_chat_hook_workspace_root_prefers_payload_cwd_over_context_root() {
-        let _storage = isolated_cloud_mcp_test_storage(
-            "agent_chat_hook_workspace_root_prefers_payload_cwd_over_context_root",
-        );
-        let _guard = process_test_env_lock();
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-        let payload_root = cloud_mcp_test_dir("diffforge-turn-payload-cwd");
-        let context_root = cloud_mcp_test_dir("diffforge-turn-context-root");
-        if !cloud_mcp_init_test_repo(&payload_root) || !cloud_mcp_init_test_repo(&context_root) {
-            let _ = fs::remove_dir_all(&payload_root);
-            let _ = fs::remove_dir_all(&context_root);
-            return;
-        }
-        let payload_root_text = payload_root.to_string_lossy().to_string();
-        let context_root_text = context_root.to_string_lossy().to_string();
-        let payload_git_root_text = cloud_mcp_agent_chat_turn_git_root(&payload_root_text)
-            .unwrap_or_else(|| payload_root.clone())
-            .to_string_lossy()
-            .to_string();
-        let mut payload = agent_chat_status_hook_test_payload("provider-turn-started");
-        payload.provider_session_id = Some("session-cwd".to_string());
-        payload.provider_turn_id = Some("turn-cwd".to_string());
-        payload.turn_id = Some("turn-cwd".to_string());
-        payload.prompt_ready_at = Some("2026-07-02T00:00:00.000Z".to_string());
-        payload.cwd = Some(payload_root_text.clone());
-        payload.hook_timestamp_ms = cloud_mcp_now_ms();
-        payload.observed_at_ms = payload.hook_timestamp_ms;
-        let context = CloudMcpTerminalContextState {
-            last_prompt: String::new(),
-            repo_id: "repo-a".to_string(),
-            agent_id: "codex".to_string(),
-            working_directory: PathBuf::from("/tmp/context-workdir"),
-            repo_root: context_root.clone(),
-            prompt_event_id: None,
-            prompt_event_source: None,
-            prompt_event_submitted_at: None,
-            terminal_index: Some(0),
-            thread_id: Some("thread-a".to_string()),
-            launch_epoch: Some("pane-a:7".to_string()),
-            workspace_id: "workspace-a".to_string(),
-            workspace_name: "Workspace A".to_string(),
-            session_mode: String::new(),
-            todo_id: None,
-            todo_dispatch_id: None,
-            todo_command_id: None,
-            created_ms: 0,
-            local_task_id: None,
-            saw_agent_activity: false,
-            work_brief: String::new(),
-            work_brief_reported: false,
-            done_reported: false,
-        };
-
-        let workspace_root = cloud_mcp_agent_chat_hook_workspace_root(&payload, Some(&context));
-        assert_eq!(
-            workspace_root, payload_root_text,
-            "payload cwd should win over context root"
-        );
-        let request = cloud_mcp_agent_chat_status_sync_request_from_hook(
-            &payload,
-            Some(&context),
-            &workspace_root,
-            "thinking",
-            "running",
-        )
-        .expect("hook should produce sync request");
-        assert_eq!(request.cwd, payload_root_text);
-        let turn_key = cloud_mcp_agent_chat_turn_key_from_start(&payload);
-        cloud_mcp_agent_chat_turn_git_record_start(
-            &request.provider,
-            &request.provider_session_id,
-            &turn_key,
-            &request.cwd,
-            "2026-07-02T00:00:00.000Z",
-            payload.hook_timestamp_ms,
-        );
-        fs::write(payload_root.join("payload-only.txt"), "payload\n").unwrap();
-        fs::write(context_root.join("context-only.txt"), "context\n").unwrap();
-
-        let mut completion_payload = agent_chat_status_hook_test_payload("provider-turn-completed");
-        completion_payload.provider_session_id = Some("session-cwd".to_string());
-        completion_payload.provider_turn_id = Some("turn-cwd".to_string());
-        completion_payload.turn_id = Some("turn-cwd".to_string());
-        completion_payload.prompt_ready_at = Some("2026-07-02T00:00:00.000Z".to_string());
-        completion_payload.completed_at = Some("2026-07-02T00:00:03.000Z".to_string());
-        completion_payload.cwd = Some(payload_root_text.clone());
-        completion_payload.hook_timestamp_ms = payload.hook_timestamp_ms + 3000;
-        completion_payload.observed_at_ms = completion_payload.hook_timestamp_ms;
-        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
-            &completion_payload,
-            "codex",
-            "session-cwd",
-        );
-        assert_eq!(
-            summary.raw["git"]["repo_root"],
-            json!(payload_git_root_text)
-        );
-        let files = summary
-            .file_change
-            .as_ref()
-            .and_then(|file_change| file_change["files"].as_array())
-            .expect("payload cwd file change");
-        assert!(files
-            .iter()
-            .any(|file| file["path"] == json!("payload-only.txt")));
-        assert!(!files
-            .iter()
-            .any(|file| file["path"] == json!("context-only.txt")));
-
-        payload.cwd = None;
-        assert_eq!(
-            cloud_mcp_agent_chat_hook_workspace_root(&payload, Some(&context)),
-            context_root_text
-        );
-        let _ = fs::remove_dir_all(&payload_root);
-        let _ = fs::remove_dir_all(&context_root);
-        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
-    }
-
-    #[test]
-    fn agent_chat_turn_key_fallback_uses_hook_timestamp_not_wall_clock() {
-        let mut payload = agent_chat_status_hook_test_payload("provider-turn-started");
-        payload.provider_turn_id = None;
-        payload.turn_id = None;
-        payload.prompt_ready_at = None;
-        payload.hook_timestamp_ms = 42;
-        payload.observed_at_ms = 41;
-
-        assert_eq!(
-            cloud_mcp_agent_chat_turn_key_from_start(&payload),
-            "turn-start-ms-42"
-        );
-    }
-
-    #[test]
-    fn agent_chat_turn_summary_missing_start_snapshot_has_no_file_change() {
-        let _storage = isolated_cloud_mcp_test_storage(
-            "agent_chat_turn_summary_missing_start_snapshot_has_no_file_change",
-        );
-        let mut payload = agent_chat_status_hook_test_payload("provider-turn-completed");
-        payload.turn_status = "completed".to_string();
-        payload.provider_session_id = Some("session-missing-start".to_string());
-        payload.provider_turn_id = Some("turn-missing-start".to_string());
-        payload.turn_id = Some("turn-missing-start".to_string());
-        payload.hook_timestamp_ms = 1_788_200_001_000;
-        payload.observed_at_ms = 1_788_200_001_000;
-        payload.completed_at = Some("2026-09-01T00:00:01.000Z".to_string());
-
-        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
-            &payload,
-            "codex",
-            "session-missing-start",
-        );
-
-        assert!(summary.file_change.is_none());
-        assert_eq!(
-            summary.raw["git"]["skipped"],
-            json!("missing_start_snapshot")
-        );
-        assert_eq!(summary.turn_key, "turn-missing-start");
-    }
-
-    #[test]
-    fn agent_chat_turn_summary_app_restart_mid_turn_noops_without_snapshot() {
-        let _storage = isolated_cloud_mcp_test_storage(
-            "agent_chat_turn_summary_app_restart_mid_turn_noops_without_snapshot",
-        );
-        let mut payload = agent_chat_status_hook_test_payload("provider-turn-completed");
-        payload.turn_status = "completed".to_string();
-        payload.provider_session_id = Some("session-after-restart".to_string());
-        payload.provider_turn_id = None;
-        payload.turn_id = None;
-        payload.prompt_ready_at = Some("2026-09-01T00:00:00.000Z".to_string());
-        payload.completed_at = Some("2026-09-01T00:00:05.000Z".to_string());
-        payload.hook_timestamp_ms = 1_788_200_005_000;
-        payload.observed_at_ms = 1_788_200_005_000;
-
-        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
-            &payload,
-            "codex",
-            "session-after-restart",
-        );
-
-        assert!(summary.file_change.is_none());
-        assert_eq!(
-            summary.raw["git"]["skipped"],
-            json!("missing_start_snapshot")
-        );
-        assert_eq!(summary.turn_id, "");
-        assert_eq!(summary.turn_key, "turn-start:2026-09-01T00:00:00.000Z");
-        assert_eq!(summary.started_at, "2026-09-01T00:00:00.000Z");
-        assert_eq!(summary.completed_at, "2026-09-01T00:00:05.000Z");
     }
 
     #[test]
@@ -78585,28 +75739,25 @@ mod cloud_mcp_tests {
     }
 
     #[test]
-    fn codex_remote_account_transaction_is_rust_owned_and_never_classified_as_raw_activate() {
-        let transaction = json!({
-            "command_kind": "agent_account_start_login_transaction",
-            "provider": "codex",
-            "profile_id": "codex-profile-a",
-        });
-        assert!(cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
-            &transaction,
+    fn haider_remote_account_switch_is_rust_owned_and_legacy_login_is_not() {
+        assert!(!cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
+            &json!({"command_kind": "agent_account_start_login_transaction"}),
             false,
         ));
         assert_eq!(
             cloud_mcp_remote_device_lever_action("agent_account_start_login_transaction"),
-            Some("account_login_transaction")
+            None
         );
-        assert_ne!(
-            cloud_mcp_remote_device_lever_action("agent_account_start_login_transaction"),
-            Some("account_switch")
-        );
+        assert!(cloud_mcp_remote_command_is_rust_owned_for_dispatcher(
+            &json!({
+                "command_kind": "agent_account_switch",
+                "alias": "work",
+            }),
+            false,
+        ));
         assert_eq!(
             cloud_mcp_remote_device_lever_action("agent_account_switch"),
-            Some("account_switch"),
-            "Claude/OpenCode legacy activation remains on the no-login path"
+            Some("account_switch")
         );
     }
 

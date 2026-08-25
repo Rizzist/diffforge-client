@@ -18,7 +18,7 @@ test("the accounts row lists from account_list and re-lists on the pinned roster
   assert.match(view, /listen\(HARNESS_ROSTER_CHANGED_EVENT/);
   assert.match(
     view,
-    /driveHarnessRosterStartup\(\{[\s\S]{0,500}?registerListener: \(\) => listen\(HARNESS_ROSTER_CHANGED_EVENT[\s\S]{0,900}?attachWatch: \(\) => invoke\("account_list_watch"\),\s*\n\s*takeBaseline: \(\) => invoke\("account_list", \{ provider: null \}\)/,
+    /driveHarnessRosterStartup\(\{[\s\S]{0,500}?registerListener: \(\) => listen\(HARNESS_ROSTER_CHANGED_EVENT[\s\S]{0,900}?attachWatch: \(\) => invoke\("account_list_watch"\),\s*\n\s*takeBaseline: relist,/,
     "production must delegate listener -> watch -> baseline ordering to the pinned startup machine",
   );
   assert.match(
@@ -33,17 +33,66 @@ test("the accounts row lists from account_list and re-lists on the pinned roster
   );
 });
 
-test("swap wiring is optimistic-NEVER: begin marks in-flight, confirm waits for the daemon result", () => {
+test("account_list responses commit monotonically and never write after deactivation", () => {
+  const view = read("AccountTokenomicsView.jsx");
+  const hook = view.slice(
+    view.indexOf("function useHarnessAccountRoster"),
+    view.indexOf("harness account management wiring"),
+  );
+  assert.match(hook, /const sequence = \+\+listRequestSequenceRef\.current;/);
+  assert.match(
+    hook,
+    /if \(!rosterWritableRef\.current\) return "inactive";\s*\n\s*if \(sequence !== listRequestSequenceRef\.current\) return "superseded";[\s\S]{0,120}?harnessRosterOnListResult/,
+    "an older successful response must be dropped before it can overwrite a newer roster",
+  );
+  assert.match(
+    hook,
+    /catch \(error\) \{\s*\n\s*if \(!rosterWritableRef\.current\) return "inactive";\s*\n\s*if \(sequence !== listRequestSequenceRef\.current\) return "superseded";/,
+    "an older failure must not replace a newer authoritative snapshot",
+  );
+  assert.match(
+    hook,
+    /return \(\) => \{\s*\/\*[\s\S]{0,240}?\*\/\s*listRequestSequenceRef\.current \+= 1;\s*\n\s*cancelled = true;/,
+    "deactivation/unmount must supersede the prior lifetime's success or error even when listener restart rejects before taking a baseline",
+  );
+  assert.match(hook, /rosterWritableRef\.current = false;/);
+});
+
+test("the excised credential registry is split: historical overlay deleted, usage refresh rewired to roster", () => {
+  const view = read("AccountTokenomicsView.jsx");
+  assert.doesNotMatch(view, /agent_accounts_state/);
+  assert.doesNotMatch(view, /agent-accounts-changed/);
+  assert.doesNotMatch(view, /useAgentAccountsState/);
+  assert.match(view, /\(\) => \(summary \? summaryForMappedNativeDevices\(summary\) : null\)/);
+  assert.doesNotMatch(view, /canonicalizeTokenomicsAccountSummary\(summaryForMappedNativeDevices/);
+  assert.match(
+    view,
+    /const revision = rosterState\.revision;[\s\S]{0,350}?previousRevision === revision[\s\S]{0,300}?refreshTokenomicsLiveLimits\(\{\s*\n\s*force: true,\s*\n\s*syncLimitChanges: true,[\s\S]{0,250}?refreshTokenomicsSummaryIfStale\(\{ force: true \}\)/,
+    "account_list revision changes replace the removed credential-signature refresh trigger",
+  );
+});
+
+test("swap wiring is optimistic-NEVER and inactive settlement always clears its local marker", () => {
   const view = read("AccountTokenomicsView.jsx");
   assert.match(view, /setRosterState\(\(prev\) => harnessSwapBegin\(prev, alias\)\);/);
   assert.match(
     view,
-    /const result = await invoke\("account_set_active", \{\s*\n\s*alias,\s*\n\s*confirm_new_epoch: Boolean\(confirmNewEpoch\),\s*\n\s*\}\);[\s\S]{0,400}?harnessSwapConfirm\(prev, alias, result\)/,
-    "the active marker may move only after the daemon's success result",
+    /const result = await invoke\("account_set_active", \{\s*\n\s*alias,\s*\n\s*confirm_new_epoch: Boolean\(confirmNewEpoch\),\s*\n\s*\}\);[\s\S]{0,450}?harnessSwapConfirm\(prev, alias, result\)[\s\S]{0,120}?if \(rosterWritableRef\.current\) void relist\(\);/,
+    "success must clear the swap marker and immediately request the authoritative roster",
   );
   assert.match(view, /setRosterState\(\(prev\) => harnessSwapFail\(prev, alias, error\)\);/);
+  assert.match(
+    view,
+    /await invoke\("account_set_active",[\s\S]{0,400}?if \(!rosterMountedRef\.current\) return;[\s\S]{0,400}?harnessSwapConfirm/,
+    "unmount drops settlement, while a still-mounted inactive hook clears the local marker",
+  );
+  assert.match(
+    view,
+    /catch \(error\) \{\s*\n\s*if \(!rosterMountedRef\.current\) return;\s*\n\s*if \(!rosterWritableRef\.current\) \{\s*\n\s*setRosterState\(\(prev\) => harnessSwapConfirm\(prev\)\);\s*\n\s*return;/,
+    "an inactive failed settlement must clear in_flight instead of preserving a permanent block",
+  );
   /* No direct descriptor mutation anywhere in the view: active flags come
-     exclusively from the daemon (list results and set_active results). */
+     exclusively from account_list publications. */
   assert.doesNotMatch(view, /descriptor\.active\s*=/);
   assert.doesNotMatch(view, /\.active = true/);
 

@@ -16095,21 +16095,17 @@ function WorkspaceTerminal({
   const terminalDragHandleVisible = !terminalChromeDocked || showDockedTerminalDragHandle;
   const remoteShellViewerCount = Number(terminalRemotePresence?.shell_viewers || 0);
   const remoteShellHasController = Boolean(terminalRemotePresence?.shell_controller);
-  const remoteChatWatcherCount = Number(terminalRemotePresence?.chat_watchers || 0);
   const showRemotePresence = Boolean(
     !terminalChromeDocked
       && !terminalClosed
       && !terminalClosing
-      && (remoteShellViewerCount > 0 || remoteShellHasController || remoteChatWatcherCount > 0),
+      && (remoteShellViewerCount > 0 || remoteShellHasController),
   );
   const remoteShellPresenceTitle = remoteShellViewerCount > 0
     ? `${remoteShellViewerCount} web shell ${remoteShellViewerCount === 1 ? "viewer" : "viewers"}${remoteShellHasController ? " · controlling" : ""}`
     : remoteShellHasController
       ? "Web shell controller connected"
       : "";
-  const remoteChatPresenceTitle = remoteChatWatcherCount > 0
-    ? `${remoteChatWatcherCount} web chat ${remoteChatWatcherCount === 1 ? "viewer" : "viewers"} connected`
-    : "";
 
   return (
     <TerminalWorkspaceSurface
@@ -16170,15 +16166,6 @@ function WorkspaceTerminal({
                     >
                       <ButtonWebIcon aria-hidden="true" />
                       {Math.max(1, remoteShellViewerCount)}
-                    </TerminalRemotePresenceBadge>
-                  )}
-                  {remoteChatWatcherCount > 0 && (
-                    <TerminalRemotePresenceBadge
-                      data-kind="chat"
-                      title={remoteChatPresenceTitle}
-                    >
-                      <ButtonBotIcon aria-hidden="true" />
-                      {remoteChatWatcherCount}
                     </TerminalRemotePresenceBadge>
                   )}
                 </TerminalRemotePresenceGroup>

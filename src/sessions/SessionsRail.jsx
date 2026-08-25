@@ -24,6 +24,7 @@ import {
   sessionActivityVisualState,
   sessionRunIsActive,
 } from "./sessionActivity.js";
+import { SessionAvailabilityAffordance } from "./sessionAvailability.js";
 import { ModelBrandIcon } from "./modelBrand.jsx";
 
 /* Session Deck rail list: a prominent "New chat" compose row on top, then
@@ -273,6 +274,7 @@ export default function SessionsRail({
         <SessionRowTitle data-shell={shellPrefs[session.id] === true ? "on" : undefined}>
           {session.title}
         </SessionRowTitle>
+        <RailAvailabilityAffordance session={session} />
         {statusSlot(session)}
         {/* Row actions replace the time on hover — same slot, so the row
             never reflows under the pointer. */}
@@ -755,6 +757,35 @@ const SessionRowTitle = styled.span`
 
   &[data-shell="on"] {
     opacity: 1;
+  }
+
+  [data-collapsed="true"] & {
+    display: none;
+  }
+`;
+
+const RailAvailabilityAffordance = styled(SessionAvailabilityAffordance)`
+  flex: 0 0 auto;
+  max-width: 82px;
+  padding: 1px 4px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--forge-amber) 42%, transparent);
+  border-radius: 4px;
+  color: var(--forge-amber);
+  font-size: 8px;
+  font-weight: 760;
+  line-height: 1.25;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+
+  &[data-session-availability="daemon-unavailable"] {
+    border-color: color-mix(in srgb, var(--forge-red) 42%, transparent);
+    color: var(--forge-red);
+  }
+
+  &[data-session-availability="legacy-provenance"] {
+    border-color: var(--forge-border-strong);
+    color: var(--forge-text-muted);
   }
 
   [data-collapsed="true"] & {

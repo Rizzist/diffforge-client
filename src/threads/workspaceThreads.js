@@ -955,7 +955,7 @@ function isTranscriptHistoryProjectionSource(source) {
   return Boolean(
     safeSource.endsWith("-session")
       || safeSource === "codex-rollout"
-      || safeSource === "agent_thread_transcript"
+      || safeSource === "agent_thread_transcript" // removed-harness-door-literal-allowlist: historical source label, not a Tauri invocation
       || THREAD_AGENT_IDS.includes(safeSource)
       || safeSource.includes("transcript")
       || safeSource.includes("session-history"),

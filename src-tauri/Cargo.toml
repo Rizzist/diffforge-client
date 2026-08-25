@@ -9,6 +9,13 @@ edition = "2021"
 name = "rust_diffforge_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Dormant regression corpus for the retained pre-Haider credential-transfer
+# implementation. Normal CI exercises the quarantine contract instead; this
+# corpus can be revived while replacing the transfer boundary, before the
+# runtime quarantine switch is flipped.
+account-push-unquarantined-tests = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -153,18 +153,21 @@ test("swap is optimistic-NEVER: begin and failure leave the displayed active acc
   );
 });
 
-test("the daemon's success result is the confirmation that moves the active marker", () => {
+test("swap success clears only the marker and waits for account_list to publish roster facts", () => {
   const began = harnessSwapBegin(readyState(), "personal");
   const confirmed = harnessSwapConfirm(began, "personal", {
     descriptor: descriptor("personal", { active: true, label: "Personal" }),
     prior_alias: "work",
     revision: 8,
   });
-  assert.equal(confirmed.swap.phase, "idle");
-  assert.equal(confirmed.revision, 8);
-  assert.equal(confirmed.descriptors.find((row) => row.alias === "personal").active, true);
-  assert.equal(confirmed.descriptors.find((row) => row.alias === "personal").label, "Personal");
-  assert.equal(confirmed.descriptors.find((row) => row.alias === "work").active, false);
+  assert.deepEqual(confirmed.swap, { phase: "idle", alias: "", message: "" });
+  assert.equal(
+    confirmed.descriptors,
+    began.descriptors,
+    "even a successful point response must not replace or edit cached descriptors",
+  );
+  assert.deepEqual(confirmed.descriptors, readyState().descriptors);
+  assert.equal(confirmed.revision, 7, "revision changes only when account_list republishes it");
 });
 
 test("cache_epoch_confirmation_required becomes a typed confirm state, not a silent retry", () => {

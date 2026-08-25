@@ -570,7 +570,6 @@ import {
   ButtonLogoutIcon,
   ButtonSettingsIcon,
   ButtonForgeIcon,
-  ButtonCodeIcon,
   ButtonBotIcon,
   ButtonTerminalIcon,
   ButtonKeyIcon,
@@ -3489,12 +3488,9 @@ const CLOUD_WORKSPACE_STAGE_ORDER = Object.freeze({
 });
 const AGENT_PROVIDERS = [
   { id: "haider", label: "Haider Agent", shortLabel: "Haider" },
-  { id: "codex", label: "Codex", shortLabel: "Codex" },
-  { id: "claude", label: "Claude Code", shortLabel: "Claude" },
-  { id: "opencode", label: "OpenCode", shortLabel: "OpenCode" },
 ];
 const LOOPSPACE_SEND_MESSAGE_AGENT_OPTIONS = AGENT_PROVIDERS.filter((provider) => (
-  provider.id === "codex" || provider.id === "claude"
+  provider.id === "haider"
 ));
 const LOOPSPACE_SEND_MESSAGE_AGENT_IDS = new Set(
   LOOPSPACE_SEND_MESSAGE_AGENT_OPTIONS.map((provider) => provider.id),
@@ -3502,31 +3498,14 @@ const LOOPSPACE_SEND_MESSAGE_AGENT_IDS = new Set(
 const AGENT_LAUNCH_DEFAULTS_STORAGE_KEY = "diffforge.agentLaunchDefaults.v1";
 const WORKSPACE_TERMINAL_ROLE_GENERIC = "generic";
 const WORKSPACE_TERMINAL_ROLE_OPTIONS = [
-  { id: "codex", label: "Codex", shortLabel: "CX" },
-  { id: "claude", label: "Claude Code", shortLabel: "CL" },
+  { id: "haider", label: "Haider", shortLabel: "HA" },
   { id: WORKSPACE_TERMINAL_ROLE_GENERIC, label: "Terminal", shortLabel: "SH" },
-  { id: "opencode", label: "OpenCode", shortLabel: "OC" },
 ];
 const AGENT_INSTALL_GUIDES = {
   haider: {
     native_install_url: "https://github.com/Rizzist/haider-agent/releases/latest",
     native_install_label: "GitHub release binaries",
     install_command: "",
-  },
-  codex: {
-    native_install_url: "https://github.com/openai/codex/releases/latest",
-    native_install_label: "GitHub release binaries",
-    install_command: "npm install -g @openai/codex",
-  },
-  claude: {
-    native_install_url: "https://code.claude.com/docs/en/quickstart",
-    native_install_label: "Native install guide",
-    install_command: "npm install -g @anthropic-ai/claude-code",
-  },
-  opencode: {
-    native_install_url: "https://opencode.ai/docs/",
-    native_install_label: "Install script / package guide",
-    install_command: "npm install -g opencode-ai",
   },
 };
 const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
@@ -3546,34 +3525,18 @@ const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
   npm_latest_version: "Not checked",
   npm_update_available: false,
   recommend_native_install: true,
-  connect_command: provider.id === "haider"
-    ? "haider login"
-    : provider.id === "codex"
-      ? "codex login --device-auth"
-      : provider.id === "opencode"
-        ? "opencode auth login"
-        : "claude",
-  image_input_supported: provider.id !== "opencode",
-  image_input_support: provider.id === "opencode" ? "conditional" : "supported",
-  image_input_reason: provider.id === "opencode"
-    ? "OpenCode image input depends on the selected model."
-    : `${provider.label} supports image input.`,
+  connect_command: "haider login",
+  image_input_supported: null,
+  image_input_support: "unknown",
+  image_input_reason: `${provider.label} has not published image-input support.`,
   active_model: "",
-  active_model_supports_images: provider.id !== "opencode",
+  active_model_supports_images: null,
 }));
 
 
 function canonicalCodingAgentId(value) {
   const normalized = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
-  if (normalized === "codex" || normalized === "openai-codex") {
-    return "codex";
-  }
-  if (normalized === "claude" || normalized === "claude-code" || normalized === "claudecode") {
-    return "claude";
-  }
-  if (normalized === "opencode" || normalized === "open-code" || normalized === "open-code-ai" || normalized === "opencode-ai") {
-    return "opencode";
-  }
+  if (normalized === "haider" || normalized === "haider-agent") return "haider";
   return "";
 }
 
@@ -4090,7 +4053,7 @@ function loopspaceGraphMessageFlowParentPortY(nodeLayout, flowBounds, node = nul
 
 function normalizeLoopspaceSendMessageAgentId(value) {
   const agentId = normalizeAgentLaunchAgentId(value);
-  return LOOPSPACE_SEND_MESSAGE_AGENT_IDS.has(agentId) ? agentId : "codex";
+  return LOOPSPACE_SEND_MESSAGE_AGENT_IDS.has(agentId) ? agentId : "haider";
 }
 
 
@@ -7667,7 +7630,7 @@ function LoopspaceRuntimeView({
           model: template.model || sendMessageDefaults?.model || "",
           reasoning_effort: template.reasoning_effort || template.effort || sendMessageDefaults?.reasoning_effort || "",
           speed: template.speed || sendMessageDefaults?.speed || "",
-          target_agent_id: sendMessageDefaults?.target_agent_id || "codex",
+          target_agent_id: sendMessageDefaults?.target_agent_id || "haider",
         }
       : template.id === "dispatch_todos"
         ? {
@@ -7679,7 +7642,7 @@ function LoopspaceRuntimeView({
             model: template.model || dispatchTodosDefaults?.model || "",
             reasoning_effort: template.reasoning_effort || template.effort || dispatchTodosDefaults?.reasoning_effort || "",
             speed: template.speed || dispatchTodosDefaults?.speed || "",
-            target_agent_id: dispatchTodosDefaults?.target_agent_id || "codex",
+            target_agent_id: dispatchTodosDefaults?.target_agent_id || "haider",
             target_terminal_mode: dispatchTodosDefaults?.target_terminal_mode || "auto",
           }
         : template;
@@ -14365,24 +14328,6 @@ function getAgentTone(agent) {
 }
 
 
-function normalizeManagedAgentProviderId(value) {
-  const providerId = String(value || "").trim().toLowerCase();
-  const providerKey = providerId.replace(/[\s_-]+/g, "");
-  if (providerKey === "codex" || providerKey === "openai" || providerKey === "chatgpt") {
-    return "codex";
-  }
-  if (providerKey === "claude" || providerKey === "anthropic" || providerKey === "claudecode") {
-    return "claude";
-  }
-  if (providerKey === "opencode") {
-    return "opencode";
-  }
-  return "";
-}
-
-
-
-
 function cleanWorkspaceRootDirectory(value) {
   if (typeof value !== "string") {
     return "";
@@ -14441,7 +14386,7 @@ function getWorkspaceTerminalRoleIds(roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIO
 
 function getWorkspaceTerminalFallbackRole(
   roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
-  fallback = "codex",
+  fallback = "haider",
 ) {
   const roleIds = getWorkspaceTerminalRoleIds(roleOptions);
   const fallbackRole = String(fallback || "").toLowerCase().trim();
@@ -14456,7 +14401,7 @@ function getWorkspaceTerminalFallbackRole(
 
 function normalizeWorkspaceTerminalRole(
   value,
-  fallback = "codex",
+  fallback = "haider",
   roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
 ) {
   const roleId = String(value || "").toLowerCase().trim();
@@ -14480,7 +14425,7 @@ function normalizeWorkspaceTerminalRole(
 
 
 function getWorkspaceTerminalPaneAgentId(role) {
-  return normalizeWorkspaceTerminalRole(role, "codex");
+  return normalizeWorkspaceTerminalRole(role, "haider");
 }
 
 
@@ -15839,7 +15784,7 @@ export default function App() {
     devices: false,
   }));
   const [viewMotion, setViewMotion] = useState("entered");
-  const [activeAgent, setActiveAgent] = useState("codex");
+  const [activeAgent, setActiveAgent] = useState("haider");
   const [agentStatuses, setAgentStatuses] = useState(DEFAULT_AGENT_STATUSES);
   const [agentStatusState, setAgentStatusState] = useState("idle");
   const [agentStatusError, setAgentStatusError] = useState("");
@@ -15890,23 +15835,18 @@ export default function App() {
           : "General";
   const accountDisplayName = String(user?.name || user?.email || "Account").trim() || "Account";
   const accountInitial = accountDisplayName.charAt(0).toUpperCase();
-  // Per-subscription remaining, averaged into the headline percent. Unknown
-  // usage counts as full (100% left), matching the old single-number rule.
-  // TODO: feed real rate-limit windows (haiderd) into pctLeft per account.
+  // The daemon usage roster is rendered in Tokenomics. Until it publishes a
+  // current aggregate here, absence remains unknown rather than becoming 100%.
   const accountUsageBreakdown = useMemo(() => {
     const accounts = [
-      { id: "codex", label: "Codex", color: "#62a0ff", pctLeft: null },
-      { id: "claude", label: "Claude Code", color: "#ff9a3d", pctLeft: null },
+      { id: "haider", label: "Haider", color: "#62a0ff", pct: null },
     ].map((account) => ({
       ...account,
-      pct: Number.isFinite(account.pctLeft)
-        ? Math.max(0, Math.min(100, Math.round(account.pctLeft)))
-        : 100,
+      pct: Number.isFinite(account.pct)
+        ? Math.max(0, Math.min(100, Math.round(account.pct)))
+        : null,
     }));
-    const total = Math.round(
-      accounts.reduce((sum, account) => sum + account.pct, 0) / accounts.length,
-    );
-    return { accounts, total };
+    return { accounts, total: null };
   }, []);
   // While settings (or a view re-homed under it) is active, the rail's list
   // area shows the settings nav instead of workspaces, so switching between
@@ -18390,7 +18330,7 @@ export default function App() {
     };
   }, [accountMenuOpen]);
 
-  // Codex-style Haider sessions: the rail lists them day-grouped; every
+  // Haider sessions: the rail lists them day-grouped; every
   // opened session keeps its PTY alive in SessionSurface. Declared after
   // showView so the useCallback dep reads an initialized binding (a TDZ
   // ReferenceError in the packaged app taught us the hard way).
@@ -21044,7 +20984,7 @@ export default function App() {
       { event, status, message, details },
     ).catch(() => {});
     const rustOwnedCommands = new Set([
-      "agent_uninstall", "uninstall_agent", "cli_uninstall",
+      "agent_uninstall", "uninstall_agent", "cli_uninstall", // removed-harness-door-literal-allowlist: remote event aliases, not Tauri invocations
       "app_show_window", "show_window", "open_app_window", "app_open_window",
       "app_hide_window", "hide_window", "app_background", "hide_app_window",
       "device_notify", "notify_device", "device_notification", "send_notification",
@@ -21157,7 +21097,7 @@ export default function App() {
           return;
         }
 
-        if (["agent_install", "install_agent", "agent_update", "update_agent"].includes(kind)) {
+        if (["agent_install", "install_agent", "agent_update", "update_agent"].includes(kind)) { // removed-harness-door-literal-allowlist: remote event aliases, not Tauri invocations
           await recordStatus(
             event,
             "failed",
@@ -24482,10 +24422,16 @@ export default function App() {
                             <div>
                               <RailTokenomicsIcon aria-hidden="true" />
                               <span>Usage</span>
-                              <em>{accountUsageBreakdown.total}% left</em>
+                              <em>
+                                {Number.isFinite(accountUsageBreakdown.total)
+                                  ? `${accountUsageBreakdown.total}% left`
+                                  : "Unknown"}
+                              </em>
                             </div>
                             <AccountUsageTrack aria-hidden="true">
-                              {accountUsageBreakdown.accounts.map((account) => (
+                              {accountUsageBreakdown.accounts.filter((account) => (
+                                Number.isFinite(account.pct)
+                              )).map((account) => (
                                 <i
                                   key={account.id}
                                   style={{
@@ -24499,7 +24445,9 @@ export default function App() {
                               {accountUsageBreakdown.accounts.map((account) => (
                                 <span key={account.id}>
                                   <i aria-hidden="true" style={{ background: account.color }} />
-                                  {account.label} {account.pct}%
+                                  {account.label} {Number.isFinite(account.pct)
+                                    ? `${account.pct}%`
+                                    : "unknown"}
                                 </span>
                               ))}
                             </AccountUsageLegend>
@@ -25125,11 +25073,7 @@ export default function App() {
                           <AgentCard data-tone={getAgentTone(agent)} key={agent.id}>
                             <AgentCardHeader>
                               <AgentIcon data-tone={getAgentTone(agent)}>
-                                {agent.id === "codex" || agent.id === "opencode" ? (
-                                  <ButtonCodeIcon aria-hidden="true" />
-                                ) : (
-                                  <ButtonBotIcon aria-hidden="true" />
-                                )}
+                                <ButtonBotIcon aria-hidden="true" />
                               </AgentIcon>
                               <div>
                                 <AgentName data-agent={agent.id}>{agent.label}</AgentName>

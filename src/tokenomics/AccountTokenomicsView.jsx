@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 import { Refresh } from "@styled-icons/material-rounded/Refresh";
@@ -76,6 +77,41 @@ import {
   harnessSwapFail,
 } from "./harnessAccountRoster.js";
 import {
+  createHarnessAddFlowState,
+  createHarnessImportCatalogState,
+  createHarnessImportState,
+  createHarnessRemoveState,
+  harnessAddFlowBegin,
+  harnessAddFlowCancel,
+  harnessAddFlowClaimPayload,
+  harnessAddFlowDismiss,
+  harnessAddFlowExpire,
+  harnessAddFlowOnClaimError,
+  harnessAddFlowOnClaimResult,
+  harnessAddFlowOnStartError,
+  harnessAddFlowOnStartResult,
+  harnessAddFlowOnStatus,
+  harnessAddFlowOnStatusError,
+  harnessAddFlowShouldPoll,
+  harnessApiKeySubmitPayload,
+  harnessImportBegin,
+  harnessImportCatalogOnError,
+  harnessImportCatalogOnResult,
+  harnessImportCatalogPresentation,
+  harnessImportDismiss,
+  harnessImportOnError,
+  harnessImportOnResult,
+  harnessManageFailureMessage,
+  harnessOauthExpiryWaitMs,
+  harnessRemoveBegin,
+  harnessRemoveDismiss,
+  harnessRemoveOnError,
+  harnessRemoveOnRefreshResult,
+  harnessRemoveOnResult,
+  harnessRemoveRequest,
+} from "./harnessAccountManage.js";
+import { providerAuthOptions } from "../sessions/haiderClientContract.js";
+import {
   harnessAccountMeterPresentation,
   harnessAccountUsagePresentation,
   harnessMeterLine,
@@ -146,8 +182,6 @@ const PROVIDER_ACCENTS = {
 
 const TOKENOMICS_PROVIDER_ACCOUNT_FILTER_NONE = "__none__";
 
-const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
-
 /* Rust boundary event for the live account roster watch (haider_rpc_ade.rs,
    account_list_watch_v1). Payloads are revision-only change signals or watch
    readiness transitions — never roster data. */
@@ -159,13 +193,30 @@ function useHarnessAccountRoster(active) {
   const [rosterState, setRosterState] = useState(createHarnessRosterState);
   const rosterStateRef = useRef(rosterState);
   rosterStateRef.current = rosterState;
+  const rosterMountedRef = useRef(true);
+  const rosterWritableRef = useRef(active);
+  rosterWritableRef.current = active;
+  const listRequestSequenceRef = useRef(0);
 
-  const relist = useCallback(() => {
-    invoke("account_list", { provider: null }).then((result) => {
+  useEffect(() => () => {
+    rosterMountedRef.current = false;
+    rosterWritableRef.current = false;
+  }, []);
+
+  const relist = useCallback(async () => {
+    const sequence = ++listRequestSequenceRef.current;
+    try {
+      const result = await invoke("account_list", { provider: null });
+      if (!rosterWritableRef.current) return "inactive";
+      if (sequence !== listRequestSequenceRef.current) return "superseded";
       setRosterState((prev) => harnessRosterOnListResult(prev, result));
-    }).catch((error) => {
+      return "refreshed";
+    } catch (error) {
+      if (!rosterWritableRef.current) return "inactive";
+      if (sequence !== listRequestSequenceRef.current) return "superseded";
       setRosterState((prev) => harnessRosterOnListError(prev, error));
-    });
+      return "failed";
+    }
   }, []);
 
   useEffect(() => {
@@ -188,7 +239,7 @@ function useHarnessAccountRoster(active) {
         if (relistNow) relist();
       }),
       attachWatch: () => invoke("account_list_watch"),
-      takeBaseline: () => invoke("account_list", { provider: null }),
+      takeBaseline: relist,
       onListenerFailure: (error) => {
         setRosterState((prev) => harnessRosterOnWatchState(
           prev,
@@ -204,12 +255,9 @@ function useHarnessAccountRoster(active) {
           createHarnessRosterWatchUnavailable(harnessRosterErrorCode(error)),
         ));
       },
-      onBaselineResult: (result) => {
-        setRosterState((prev) => harnessRosterOnListResult(prev, result));
-      },
-      onBaselineFailure: (error) => {
-        setRosterState((prev) => harnessRosterOnListError(prev, error));
-      },
+      /* relist owns request sequencing and applies the baseline itself. */
+      onBaselineResult: () => {},
+      onBaselineFailure: () => {},
       isCancelled: () => cancelled,
     }).then(({ unlisten: next }) => {
       if (cancelled) {
@@ -219,12 +267,17 @@ function useHarnessAccountRoster(active) {
       unlisten = next;
     });
     return () => {
+      /* Deactivation and unmount supersede every list issued by this active
+         lifetime, even if reactivation's listener rejects before a new
+         baseline can advance the sequence. */
+      listRequestSequenceRef.current += 1;
       cancelled = true;
       if (unlisten) unlisten();
     };
   }, [active, relist]);
 
   const swapAccount = useCallback(async (descriptor, confirmNewEpoch = false) => {
+    if (!rosterWritableRef.current) return;
     const alias = harnessAccountAlias(descriptor);
     const gate = harnessSwapAllowed(rosterStateRef.current, descriptor);
     if (!confirmNewEpoch && !gate.allowed) return;
@@ -235,11 +288,18 @@ function useHarnessAccountRoster(active) {
         alias,
         confirm_new_epoch: Boolean(confirmNewEpoch),
       });
-      /* The daemon confirmed: only now does the displayed active account
-         move, and only to what the daemon returned. */
+      if (!rosterMountedRef.current) return;
+      /* A point success clears only the marker. account_list remains the sole
+         authority for active flags and revision. Clearing the local operation
+         marker is safe while inactive and prevents a stuck swap on reopen. */
       setRosterState((prev) => harnessSwapConfirm(prev, alias, result));
-      relist();
+      if (rosterWritableRef.current) void relist();
     } catch (error) {
+      if (!rosterMountedRef.current) return;
+      if (!rosterWritableRef.current) {
+        setRosterState((prev) => harnessSwapConfirm(prev));
+        return;
+      }
       setRosterState((prev) => harnessSwapFail(prev, alias, error));
     }
   }, [relist]);
@@ -248,8 +308,558 @@ function useHarnessAccountRoster(active) {
     setRosterState((prev) => harnessSwapDismissFailure(prev));
   }, []);
 
-  return { rosterState, swapAccount, dismissSwapFailure };
+  return { rosterState, swapAccount, dismissSwapFailure, relist };
 }
+
+/* ---- harness account management wiring (add / import / remove) ----------
+   Every decision lives in harnessAccountManage.js; this hook only performs
+   the invokes those decisions call for. The roster itself is NEVER edited
+   here: a completed add or remove reaches pixels exclusively through the
+   daemon's account_list (the roster watch, plus the explicit re-list each
+   success triggers). */
+
+const HARNESS_OAUTH_POLL_MS = 1500;
+const HARNESS_OAUTH_MAX_POLL_LIFETIME_MS = 10 * 60 * 1000;
+
+function useHarnessAccountManagement(active, relist) {
+  const [addMode, setAddMode] = useState(""); // "" | "oauth" | "api_key"
+  const addModeRef = useRef(addMode);
+  addModeRef.current = addMode;
+  const [libraryState, setLibraryState] = useState({ state: "idle", library: null, reason: "" });
+  const libraryReadGenerationRef = useRef(0);
+  const [catalog, setCatalog] = useState(createHarnessImportCatalogState);
+  const catalogReadGenerationRef = useRef(0);
+  const [addFlow, setAddFlow] = useState(createHarnessAddFlowState);
+  const addFlowRef = useRef(addFlow);
+  addFlowRef.current = addFlow;
+  const [oauthDraft, setOauthDraft] = useState({ provider: "", alias: "" });
+  const [importState, setImportState] = useState(createHarnessImportState);
+  const importStateRef = useRef(importState);
+  importStateRef.current = importState;
+  const [removeState, setRemoveState] = useState(createHarnessRemoveState);
+  const removeStateRef = useRef(removeState);
+  removeStateRef.current = removeState;
+  const [apiMetadata, setApiMetadata] = useState({ provider: "", alias: "" });
+  const apiMetadataRef = useRef(apiMetadata);
+  apiMetadataRef.current = apiMetadata;
+  const apiKeyRef = useRef("");
+  const apiKeyInputRef = useRef(null);
+  const [apiKeyPresent, setApiKeyPresent] = useState(false);
+  const [apiBusy, setApiBusy] = useState(false);
+  const apiBusyRef = useRef(apiBusy);
+  apiBusyRef.current = apiBusy;
+  const apiAttemptGenerationRef = useRef(0);
+  const [apiError, setApiError] = useState("");
+  const managementMountedRef = useRef(true);
+  const managementActiveRef = useRef(active);
+  managementActiveRef.current = active;
+  const managementCanWrite = useCallback(
+    () => managementMountedRef.current && managementActiveRef.current,
+    [],
+  );
+
+  const resetPublishedAuthorities = useCallback(() => {
+    libraryReadGenerationRef.current += 1;
+    catalogReadGenerationRef.current += 1;
+    if (!managementMountedRef.current) return;
+    setLibraryState({ state: "idle", library: null, reason: "" });
+    setCatalog(createHarnessImportCatalogState());
+  }, []);
+
+  const commitAddFlow = useCallback((next) => {
+    addFlowRef.current = next;
+    if (managementCanWrite()) setAddFlow(next);
+  }, [managementCanWrite]);
+
+  const commitImportState = useCallback((next) => {
+    importStateRef.current = next;
+    if (managementCanWrite()) setImportState(next);
+  }, [managementCanWrite]);
+
+  const commitRemoveState = useCallback((next) => {
+    removeStateRef.current = next;
+    if (managementCanWrite()) setRemoveState(next);
+  }, [managementCanWrite]);
+
+  const clearApiKeySecret = useCallback(() => {
+    apiAttemptGenerationRef.current += 1;
+    apiBusyRef.current = false;
+    apiKeyRef.current = "";
+    if (apiKeyInputRef.current) apiKeyInputRef.current.value = "";
+    if (managementCanWrite()) {
+      setApiKeyPresent(false);
+      setApiBusy(false);
+    }
+  }, [managementCanWrite]);
+
+  const cancelDaemonFlow = useCallback(async (payload) => {
+    if (!payload) return;
+    try {
+      await invoke("account_oauth_cancel", payload);
+    } catch (error) {
+      /* Cancellation is best-effort after unmount. While the surface remains
+         writable, retain the daemon's reason on the cancelled attempt. */
+      if (!managementCanWrite()) return;
+      const current = addFlowRef.current;
+      if (current.phase !== "cancelled") return;
+      commitAddFlow({
+        ...current,
+        message: `Cancellation could not be confirmed (${harnessRosterErrorCode(error) || "connection changed"}).`,
+      });
+    }
+  }, [commitAddFlow, managementCanWrite]);
+
+  const openOauthAuthorization = useCallback(async (attempt = addFlowRef.current) => {
+    const authorizationUrl = String(attempt?.authorizationUrl || "").trim();
+    if (!authorizationUrl) return;
+    try {
+      await openUrl(authorizationUrl);
+    } catch (error) {
+      if (!managementCanWrite()) return;
+      const current = addFlowRef.current;
+      if (
+        current.phase !== "pending"
+        || current.flowId !== attempt.flowId
+        || current.attemptId !== attempt.attemptId
+        || current.authorizationUrl !== authorizationUrl
+      ) return;
+      commitAddFlow({
+        ...current,
+        message: `The browser could not be opened (${harnessRosterErrorCode(error) || "open failed"}); use the URL below.`,
+      });
+    }
+  }, [commitAddFlow, managementCanWrite]);
+
+  useEffect(() => {
+    managementMountedRef.current = true;
+    return () => {
+      managementMountedRef.current = false;
+      managementActiveRef.current = false;
+      apiAttemptGenerationRef.current += 1;
+      libraryReadGenerationRef.current += 1;
+      catalogReadGenerationRef.current += 1;
+      apiKeyRef.current = "";
+      const { state: cancelled, cancelPayload } = harnessAddFlowCancel(addFlowRef.current);
+      addFlowRef.current = cancelled;
+      void cancelDaemonFlow(cancelPayload);
+    };
+  }, [cancelDaemonFlow]);
+
+  useEffect(() => {
+    if (active) return;
+    apiAttemptGenerationRef.current += 1;
+    apiKeyRef.current = "";
+    const { cancelPayload } = harnessAddFlowCancel(addFlowRef.current);
+    const idleAddFlow = createHarnessAddFlowState();
+    const idleImport = createHarnessImportState();
+    const idleRemove = createHarnessRemoveState();
+    addFlowRef.current = idleAddFlow;
+    importStateRef.current = idleImport;
+    removeStateRef.current = idleRemove;
+    apiBusyRef.current = false;
+    addModeRef.current = "";
+    resetPublishedAuthorities();
+    if (apiKeyInputRef.current) apiKeyInputRef.current.value = "";
+    /* The component is still mounted here. Reset the rendered state as well
+       as the refs so a later reactivation cannot resurrect an abandoned
+       starting/claiming/import/remove/API attempt. */
+    if (managementMountedRef.current) {
+      setAddFlow(idleAddFlow);
+      setImportState(idleImport);
+      setRemoveState(idleRemove);
+      setApiBusy(false);
+      setApiKeyPresent(false);
+      setApiError("");
+      setAddMode("");
+    }
+    void cancelDaemonFlow(cancelPayload);
+  }, [active, cancelDaemonFlow, resetPublishedAuthorities]);
+
+  /* The provider options for both add paths come from PUBLISHED authorities:
+     the library snapshot's per-provider auth_methods (OAuth sign-in and API
+     key), and the daemon's import catalog (import sources) — never a local
+     provider list. */
+  useEffect(() => {
+    if (!active || !addMode) return undefined;
+    const readGeneration = ++libraryReadGenerationRef.current;
+    setLibraryState({ state: "loading", library: null, reason: "" });
+    invoke("haider_library_snapshot").then((snapshot) => {
+      if (!managementCanWrite() || libraryReadGenerationRef.current !== readGeneration) return;
+      setLibraryState({ state: "loaded", library: snapshot, reason: "" });
+    }).catch((error) => {
+      if (!managementCanWrite() || libraryReadGenerationRef.current !== readGeneration) return;
+      setLibraryState({ state: "error", library: null, reason: harnessRosterErrorCode(error) });
+    });
+    return () => {
+      if (libraryReadGenerationRef.current === readGeneration) libraryReadGenerationRef.current += 1;
+    };
+  }, [active, addMode, managementCanWrite]);
+
+  useEffect(() => {
+    if (!active || addMode !== "oauth") return undefined;
+    const readGeneration = ++catalogReadGenerationRef.current;
+    setCatalog(createHarnessImportCatalogState());
+    /* Registration is pending post-excision; rejection renders as a failed read. */
+    invoke("haider_account_oauth_import_sources").then((result) => {
+      if (!managementCanWrite() || catalogReadGenerationRef.current !== readGeneration) return;
+      setCatalog(harnessImportCatalogOnResult(result));
+    }).catch((error) => {
+      if (!managementCanWrite() || catalogReadGenerationRef.current !== readGeneration) return;
+      setCatalog(harnessImportCatalogOnError(error));
+    });
+    return () => {
+      if (catalogReadGenerationRef.current === readGeneration) catalogReadGenerationRef.current += 1;
+    };
+  }, [active, addMode, managementCanWrite]);
+
+  const startOauth = useCallback(async () => {
+    const begun = harnessAddFlowBegin(addFlowRef.current, oauthDraft);
+    if (begun === addFlowRef.current || begun.phase !== "starting") return;
+    commitAddFlow(begun);
+    try {
+      const result = await invoke("account_oauth_start", {
+        provider: begun.provider,
+        desired_alias: begun.alias,
+      });
+      const next = harnessAddFlowOnStartResult(begun, result);
+      /* Close/unmount may win while start is in flight. Always await the
+         result, then cancel a daemon-created flow instead of dropping it. */
+      if (addFlowRef.current !== begun || !managementCanWrite()) {
+        if (next.phase === "pending") {
+          void cancelDaemonFlow({ flow_id: next.flowId, attempt_id: next.attemptId });
+        }
+        return;
+      }
+      commitAddFlow(next);
+      if (next.phase === "pending" && next.authorizationUrl) {
+        void openOauthAuthorization(next);
+      }
+    } catch (error) {
+      if (addFlowRef.current !== begun || !managementCanWrite()) return;
+      const next = harnessAddFlowOnStartError(begun, error);
+      commitAddFlow(next);
+    }
+  }, [cancelDaemonFlow, commitAddFlow, managementCanWrite, oauthDraft, openOauthAuthorization]);
+
+  /* One status request at a time. A separate expiry timer bounds even a stuck
+     bridge promise; cleanup stops both timers, and every post-await state write
+     is gated by the live surface plus all three attempt identities. */
+  useEffect(() => {
+    if (!active || !harnessAddFlowShouldPoll(addFlow)) return undefined;
+    let pollCancelled = false;
+    let pollTimer = 0;
+    let expiryTimer = 0;
+    const effectFlowId = addFlow.flowId;
+    const effectAttemptId = addFlow.attemptId;
+    const fallbackExpiresAtMs = Date.now() + HARNESS_OAUTH_MAX_POLL_LIFETIME_MS;
+    const deadlineMs = Number.isInteger(addFlow.expiresAtMs)
+      ? addFlow.expiresAtMs
+      : fallbackExpiresAtMs;
+    const wallStartedAtMs = Date.now();
+    const monotonicStartedAtMs = performance.now();
+    const monotonicDeadlineMs = monotonicStartedAtMs + Math.max(0, deadlineMs - wallStartedAtMs);
+
+    const expire = () => {
+      if (pollCancelled || !managementCanWrite()) return;
+      const current = addFlowRef.current;
+      if (current.flowId !== effectFlowId || current.attemptId !== effectAttemptId) return;
+      const expired = harnessAddFlowExpire(current, Math.max(Date.now(), deadlineMs), fallbackExpiresAtMs);
+      if (expired.state === current) return;
+      pollCancelled = true;
+      window.clearTimeout(pollTimer);
+      commitAddFlow(expired.state);
+      void cancelDaemonFlow(expired.cancelPayload);
+    };
+
+    const armExpiry = () => {
+      if (pollCancelled || !managementCanWrite()) return;
+      const waitMs = harnessOauthExpiryWaitMs({
+        deadlineMs,
+        wallNowMs: Date.now(),
+        monotonicDeadlineMs,
+        monotonicNowMs: performance.now(),
+      });
+      if (waitMs > 0) {
+        expiryTimer = window.setTimeout(armExpiry, waitMs);
+        return;
+      }
+      expire();
+    };
+
+    const poll = async () => {
+      if (pollCancelled || !managementCanWrite()) return;
+      const flow = addFlowRef.current;
+      if (
+        !harnessAddFlowShouldPoll(flow)
+        || flow.flowId !== effectFlowId
+        || flow.attemptId !== effectAttemptId
+      ) return;
+      let next;
+      try {
+        const result = await invoke("account_oauth_status", {
+          flow_id: flow.flowId,
+          attempt_id: flow.attemptId,
+        });
+        if (pollCancelled || !managementCanWrite()) return;
+        next = harnessAddFlowOnStatus(
+          addFlowRef.current,
+          flow.flowId,
+          flow.attemptId,
+          result,
+        );
+      } catch (error) {
+        if (pollCancelled || !managementCanWrite()) return;
+        next = harnessAddFlowOnStatusError(
+          addFlowRef.current,
+          flow.flowId,
+          flow.attemptId,
+          error,
+        );
+      }
+      if (next === addFlowRef.current) {
+        pollTimer = window.setTimeout(poll, HARNESS_OAUTH_POLL_MS);
+        return;
+      }
+      commitAddFlow(next);
+      if (next.phase !== "claiming") return;
+      const claimAttempt = next;
+      const claim = harnessAddFlowClaimPayload(claimAttempt);
+      try {
+        await invoke("account_oauth_add", claim);
+        const settled = harnessAddFlowOnClaimResult(claimAttempt);
+        /* A completed add NEVER fabricates a roster entry: the new account
+           appears only through the daemon's account_list re-read. Settlement
+           belongs to this attempt, so panel close cannot suppress the read. */
+        if (settled.relist) void relist();
+        if (managementCanWrite() && addFlowRef.current === claimAttempt) {
+          commitAddFlow(settled.state);
+        }
+      } catch (error) {
+        if (!managementCanWrite() || addFlowRef.current !== claimAttempt) return;
+        commitAddFlow(harnessAddFlowOnClaimError(claimAttempt, error));
+      }
+    };
+
+    armExpiry();
+    if (!pollCancelled) {
+      pollTimer = window.setTimeout(poll, Math.min(HARNESS_OAUTH_POLL_MS, Math.max(0, deadlineMs - Date.now())));
+    }
+    return () => {
+      pollCancelled = true;
+      window.clearTimeout(pollTimer);
+      window.clearTimeout(expiryTimer);
+    };
+  }, [
+    active,
+    addFlow.phase,
+    addFlow.flowId,
+    addFlow.attemptId,
+    addFlow.expiresAtMs,
+    cancelDaemonFlow,
+    commitAddFlow,
+    managementCanWrite,
+    relist,
+  ]);
+
+  const cancelOauth = useCallback(() => {
+    const { state: next, cancelPayload } = harnessAddFlowCancel(addFlowRef.current);
+    /* Clear the REF synchronously: state clears only on the next render, and
+       a poll landing in that window must not claim a dismissed flow. */
+    commitAddFlow(next);
+    void cancelDaemonFlow(cancelPayload);
+  }, [cancelDaemonFlow, commitAddFlow]);
+
+  const dismissAddFlow = useCallback(() => {
+    const next = harnessAddFlowDismiss(addFlowRef.current);
+    commitAddFlow(next);
+  }, [commitAddFlow]);
+
+  const importSource = useCallback((source) => {
+    const { state: next, payload } = harnessImportBegin(importStateRef.current, source);
+    commitImportState(next);
+    if (!payload) return;
+    const importAttempt = next;
+    invoke("haider_account_oauth_import", payload).then(() => {
+      const settled = harnessImportOnResult(importAttempt);
+      if (managementCanWrite() && importStateRef.current === importAttempt) {
+        commitImportState(settled.state);
+      }
+      /* Same law as the sign-in flow: the imported account arrives only via
+         the daemon's account_list re-read. */
+      if (settled.relist) void relist();
+    }).catch((error) => {
+      if (!managementCanWrite() || importStateRef.current !== importAttempt) return;
+      commitImportState(harnessImportOnError(importAttempt, error).state);
+    });
+  }, [commitImportState, managementCanWrite, relist]);
+
+  const dismissImport = useCallback(() => {
+    commitImportState(harnessImportDismiss(importStateRef.current));
+  }, [commitImportState]);
+
+  const editApiMetadata = useCallback((field, value) => {
+    if (field !== "provider" && field !== "alias") return;
+    const next = { ...apiMetadataRef.current, [field]: String(value ?? "") };
+    apiMetadataRef.current = next;
+    if (managementCanWrite()) setApiMetadata(next);
+  }, [managementCanWrite]);
+
+  const editApiKey = useCallback((value) => {
+    apiKeyRef.current = String(value ?? "");
+    if (managementCanWrite()) setApiKeyPresent(apiKeyRef.current.length > 0);
+  }, [managementCanWrite]);
+
+  const submitApiKey = useCallback(async () => {
+    if (apiBusyRef.current || !managementCanWrite()) return;
+    const payload = harnessApiKeySubmitPayload({
+      provider: apiMetadataRef.current.provider,
+      alias: apiMetadataRef.current.alias,
+      key: apiKeyRef.current,
+    });
+    if (!payload) return;
+    const attemptGeneration = ++apiAttemptGenerationRef.current;
+    const apiAttemptIsCurrent = () => (
+      apiAttemptGenerationRef.current === attemptGeneration && managementCanWrite()
+    );
+    apiBusyRef.current = true;
+    setApiBusy(true);
+    setApiError("");
+    try {
+      await invoke("account_add_api_key", payload);
+      if (!apiAttemptIsCurrent()) return;
+      const emptyMetadata = { provider: "", alias: "" };
+      apiMetadataRef.current = emptyMetadata;
+      setApiMetadata(emptyMetadata);
+      addModeRef.current = "";
+      resetPublishedAuthorities();
+      setAddMode("");
+      void relist();
+    } catch (error) {
+      if (!apiAttemptIsCurrent()) return;
+      setApiError(harnessManageFailureMessage(harnessRosterErrorCode(error)));
+    } finally {
+      /* Every attempt wipes its own short-lived payload. Only the current
+         generation may touch the ref/DOM/rendered state: an older settlement
+         cannot erase a newer secret or close its panel after reactivation. */
+      payload.api_key = "";
+      if (apiAttemptIsCurrent()) {
+        apiKeyRef.current = "";
+        if (apiKeyInputRef.current) apiKeyInputRef.current.value = "";
+        apiBusyRef.current = false;
+        setApiKeyPresent(false);
+        setApiBusy(false);
+      }
+    }
+  }, [managementCanWrite, relist, resetPublishedAuthorities]);
+
+  const requestRemove = useCallback((descriptor, revision) => {
+    commitRemoveState(harnessRemoveRequest(
+      removeStateRef.current,
+      harnessAccountAlias(descriptor),
+      revision,
+    ));
+  }, [commitRemoveState]);
+
+  const dismissRemove = useCallback(() => {
+    commitRemoveState(harnessRemoveDismiss(removeStateRef.current));
+  }, [commitRemoveState]);
+
+  const confirmRemove = useCallback(() => {
+    const { state: next, payload } = harnessRemoveBegin(removeStateRef.current);
+    commitRemoveState(next);
+    if (!payload) return;
+    const removeAttempt = next;
+    invoke("account_remove", {
+      alias: payload.alias,
+      expected_revision: payload.expected_revision,
+    }).then(() => {
+      const settled = harnessRemoveOnResult(removeAttempt);
+      if (managementCanWrite() && removeStateRef.current === removeAttempt) {
+        commitRemoveState(settled.state);
+      }
+      /* The chip disappears only when account_list stops publishing it —
+         never by a local splice ahead of the daemon's confirmation. */
+      if (settled.relist) void relist();
+    }).catch(async (error) => {
+      if (!managementCanWrite() || removeStateRef.current !== removeAttempt) return;
+      const failed = harnessRemoveOnError(removeAttempt, error);
+      commitRemoveState(failed.state);
+      if (!failed.relist) return;
+      const refreshed = await relist();
+      if (managementCanWrite() && removeStateRef.current === failed.state) {
+        commitRemoveState(harnessRemoveOnRefreshResult(failed.state, refreshed));
+      }
+    });
+  }, [commitRemoveState, managementCanWrite, relist]);
+
+  const toggleAddPanel = useCallback(() => {
+    const next = addModeRef.current ? "" : "oauth";
+    if (!next) clearApiKeySecret();
+    resetPublishedAuthorities();
+    addModeRef.current = next;
+    if (managementCanWrite()) setAddMode(next);
+  }, [clearApiKeySecret, managementCanWrite, resetPublishedAuthorities]);
+
+  const selectAddMode = useCallback((nextMode) => {
+    const next = nextMode === "oauth" || nextMode === "api_key" ? nextMode : "";
+    if (addModeRef.current === "api_key" && next !== "api_key") clearApiKeySecret();
+    if (addModeRef.current !== next) resetPublishedAuthorities();
+    addModeRef.current = next;
+    if (managementCanWrite()) setAddMode(next);
+  }, [clearApiKeySecret, managementCanWrite, resetPublishedAuthorities]);
+
+  const closeAddPanel = useCallback(() => {
+    cancelOauth();
+    clearApiKeySecret();
+    resetPublishedAuthorities();
+    setApiError("");
+    addModeRef.current = "";
+    setAddMode("");
+  }, [cancelOauth, clearApiKeySecret, resetPublishedAuthorities]);
+
+  const oauthProviders = useMemo(
+    () => providerAuthOptions(libraryState.library, "oauth"),
+    [libraryState.library],
+  );
+  const apiProviders = useMemo(
+    () => providerAuthOptions(libraryState.library, "api_key"),
+    [libraryState.library],
+  );
+
+  return {
+    addMode,
+    setAddMode: selectAddMode,
+    toggleAddPanel,
+    closeAddPanel,
+    libraryState,
+    oauthProviders,
+    apiProviders,
+    catalogPresentation: harnessImportCatalogPresentation(catalog),
+    addFlow,
+    oauthDraft,
+    setOauthDraft,
+    startOauth,
+    cancelOauth,
+    dismissAddFlow,
+    openOauthAuthorization,
+    importState,
+    importSource,
+    dismissImport,
+    apiMetadata,
+    apiKeyInputRef,
+    apiKeyPresent,
+    apiBusy,
+    apiError,
+    editApiMetadata,
+    editApiKey,
+    submitApiKey,
+    removeState,
+    requestRemove,
+    dismissRemove,
+    confirmRemove,
+  };
+}
+/* ---- end harness account management wiring ---- */
 
 function scheduleTokenomicsIdleTask(callback, { delay_ms: delayMs = 0, timeout = 1200 } = {}) {
   if (typeof window === "undefined") {
@@ -298,75 +908,6 @@ function scheduleTokenomicsIdleTask(callback, { delay_ms: delayMs = 0, timeout =
     }
   };
 }
-
-/* Credential state is read here ONLY as a refresh trigger: a login or an
-   account switch changes which meters are authoritative, so the usage scan
-   re-runs when the credential signature moves. Managing those profiles now
-   lives in the Accounts view — this tab is usage analytics. */
-function useAgentAccountsState(active = true) {
-  const [accounts, setAccounts] = useState(null);
-  const refresh = useCallback(() => {
-    invoke("agent_accounts_state").then((state) => {
-      setAccounts(state?.agents || null);
-    }).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    if (!active) {
-      return undefined;
-    }
-    let cancelled = false;
-    let unlisten = null;
-    refresh();
-    const interval = window.setInterval(refresh, 6000);
-    listen(AGENT_ACCOUNTS_CHANGED_EVENT, () => {
-      if (!cancelled) refresh();
-    }).then((next) => {
-      if (cancelled) {
-        next();
-        return;
-      }
-      unlisten = next;
-    }).catch(() => {});
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-      if (unlisten) unlisten();
-    };
-  }, [active, refresh]);
-
-  return { accounts, refresh };
-}
-
-function tokenomicsAgentCredentialProfileSignature(profile = {}) {
-  const identity = profile?.identity || {};
-  const authStatus = profile?.auth_status || {};
-  return [
-    String(profile?.id || "").trim(),
-    profile?.is_active ? "active" : "inactive",
-    normalizeTokenomicsEmail(identity?.email || profile?.email),
-    identity?.auth_ready ? "auth-ready" : "auth-missing",
-    authStatus?.needs_login ? "needs-login" : "login-ok",
-    String(authStatus?.reason || "").trim(),
-  ].join("~");
-}
-
-function tokenomicsAgentCredentialSignature(agentAccounts) {
-  if (!agentAccounts || typeof agentAccounts !== "object") return "";
-  return HISTORICAL_ACCOUNT_FILTER_PROVIDERS.map((providerId) => {
-    const entry = agentAccounts?.[providerId] || {};
-    const profiles = Array.isArray(entry?.profiles) ? entry.profiles : [];
-    const profileParts = profiles
-      .map((profile) => tokenomicsAgentCredentialProfileSignature(profile))
-      .sort();
-    return [
-      providerId,
-      String(entry?.active_profile_id || "").trim(),
-      profileParts.join("|"),
-    ].join(":");
-  }).join("||");
-}
-
 
 function createTokenomicsStoreState() {
   return {
@@ -2782,12 +3323,14 @@ function HarnessAccountChipView({
   const usageKnown = usage.state === "known";
   const meterLine = harnessMeterLine(meter);
   const {
+    authKindLabel,
     confirmEpoch,
     disabled,
     inFlight,
     isActive,
     label,
     provider,
+    swappable,
     title,
   } = harnessAccountChipPresentation(descriptor, swap, {
     meterTitle: meterLine.title,
@@ -2797,14 +3340,18 @@ function HarnessAccountChipView({
       : "",
   });
   const accent = harnessProviderAccent(provider);
+  /* Swap is an OAuth affordance: a PUBLISHED api_key auth kind renders no
+     click-to-swap (owner intent — the provider selects API-key accounts).
+     An UNKNOWN kind keeps the affordance: absence is never read as api_key. */
   return (
     <HarnessAccountChip
       $accent={accent}
       $active={isActive}
       $inFlight={inFlight}
+      $swappable={swappable}
       aria-pressed={isActive}
       disabled={disabled}
-      onClick={isActive ? undefined : () => onSwap(descriptor, confirmEpoch)}
+      onClick={isActive || !swappable ? undefined : () => onSwap(descriptor, confirmEpoch)}
       title={title}
       type="button"
     >
@@ -2816,6 +3363,7 @@ function HarnessAccountChipView({
       </HarnessChipTop>
       <HarnessChipMeta>
         <span data-role="provider">{provider}</span>
+        {authKindLabel ? <span data-role="auth">{authKindLabel}</span> : null}
         <span data-role="usage" data-known={usageKnown ? "true" : "false"}>
           {usageKnown ? formatTokens(usage.totalTokens) : "—"}
         </span>
@@ -2865,19 +3413,18 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   }, setTokenomicsState] = useState(() => tokenomicsStore.state);
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
   const [usageRateWindowKind, setUsageRateWindowKind] = useState("5_hour");
-  const { accounts: agentAccounts } = useAgentAccountsState(active);
-  const { rosterState, swapAccount, dismissSwapFailure } = useHarnessAccountRoster(active);
+  const { rosterState, swapAccount, dismissSwapFailure, relist } = useHarnessAccountRoster(active);
+  const manage = useHarnessAccountManagement(active, relist);
   const harnessRoster = useMemo(() => harnessRosterPresentation(rosterState), [rosterState]);
-  /* Per-account ledger lanes match on the VERBATIM lane account key, so they
-     read the raw summary rows — canonicalization rewrites keys for the
-     historical filters and must not touch live-account matching. */
+  const lastUsageRosterRevisionRef = useRef(null);
+  /* Management affordances appear only when the daemon supports account
+     management; an unsupported/unavailable/loading roster hides them. */
+  const harnessManageVisible = harnessRoster.phase === "ready"
+    || harnessRoster.phase === "empty"
+    || harnessRoster.phase === "unverified";
+  /* Per-account ledger lanes and historical filters both read stored summary
+     rows. The live account_list roster must not rewrite those archive keys. */
   const harnessHourlyRows = useMemo(() => hourlyRowsForDisplay(summary), [summary]);
-  const agentCredentialSignature = useMemo(
-    () => tokenomicsAgentCredentialSignature(agentAccounts),
-    [agentAccounts],
-  );
-  const lastAgentCredentialSignatureRef = useRef("");
-
   const refresh = useCallback(async () => {
     updateTokenomicsStore({ error: "", status: "refreshing" });
     await refreshTokenomicsLiveLimits({ force: true, syncLimitChanges: true });
@@ -2937,25 +3484,35 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
     };
   }, [active]);
 
+  /* The excised credential registry used to trigger a usage refresh whenever
+     its account signature changed. account_list now owns that fact: a newly
+     published roster revision refreshes the live meters and stored summary,
+     while the historical display remains independent of the live roster. */
   useEffect(() => {
-    if (!active) return;
-    if (!agentCredentialSignature) return;
-    const previousSignature = lastAgentCredentialSignatureRef.current;
-    lastAgentCredentialSignatureRef.current = agentCredentialSignature;
-    if (!previousSignature || previousSignature === agentCredentialSignature) return;
+    if (!active) {
+      lastUsageRosterRevisionRef.current = null;
+      return undefined;
+    }
+    const revision = rosterState.revision;
+    if (!Number.isInteger(revision)) return undefined;
+    const previousRevision = lastUsageRosterRevisionRef.current;
+    lastUsageRosterRevisionRef.current = revision;
+    if (previousRevision == null || previousRevision === revision) return undefined;
+    let cancelled = false;
     void refreshTokenomicsLiveLimits({
       force: true,
       syncLimitChanges: true,
     }).finally(() => {
-      void refreshTokenomicsSummaryIfStale({ force: true });
+      if (!cancelled) void refreshTokenomicsSummaryIfStale({ force: true });
     });
-  }, [active, agentCredentialSignature]);
+    return () => {
+      cancelled = true;
+    };
+  }, [active, rosterState.revision]);
 
   const visibleSummary = useMemo(
-    () => (summary
-      ? canonicalizeTokenomicsAccountSummary(summaryForMappedNativeDevices(summary), agentAccounts)
-      : null),
-    [agentAccounts, summary],
+    () => (summary ? summaryForMappedNativeDevices(summary) : null),
+    [summary],
   );
   // Cloud sync is intentionally ignored on this client, so Tokenomics always
   // renders the local device only. There is no device picker: the device filter
@@ -2979,8 +3536,8 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
       : accountKeyForProvider(providerAccountKeys, selectedProvider)
   ), [providerAccountKeys, selectedProvider]);
   const accountOptionsByProvider = useMemo(
-    () => providerAccountOptionsByProvider(visibleSummary, selectedDeviceId, selectedScopeKey, agentAccounts),
-    [agentAccounts, visibleSummary, selectedDeviceId, selectedScopeKey],
+    () => providerAccountOptionsByProvider(visibleSummary, selectedDeviceId, selectedScopeKey),
+    [visibleSummary, selectedDeviceId, selectedScopeKey],
   );
   const accountOptionGroups = useMemo(
     () => providerAccountOptionGroups(accountOptionsByProvider, selectedProvider),
@@ -3442,22 +3999,45 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
               Accounts unavailable{harnessRoster.reason ? ` — ${harnessRoster.reason}` : ""}.
             </TokenomicsEmpty>
           ) : harnessRoster.phase === "empty" ? (
-            <TokenomicsEmpty>No harness accounts yet — add one in the Accounts view.</TokenomicsEmpty>
+            <TokenomicsEmpty>No harness accounts yet — add one with the + chip.</TokenomicsEmpty>
           ) : harnessRoster.phase === "unverified" ? (
             <TokenomicsEmpty>The harness has not confirmed its account roster yet.</TokenomicsEmpty>
           ) : null}
-          {harnessRoster.descriptors.length > 0 ? (
+          {harnessRoster.descriptors.length > 0 || harnessManageVisible ? (
             <HarnessAccountChips aria-label="Harness accounts — click one to make it active" role="group">
               {harnessRoster.descriptors.map((descriptor) => (
-                <HarnessAccountChipRow
-                  descriptor={descriptor}
-                  harness_hourly_rows={harnessHourlyRows}
-                  key={harnessAccountAlias(descriptor)}
-                  on_swap={swapAccount}
-                  summary={summary}
-                  swap={rosterState.swap}
-                />
+                <HarnessChipShell key={harnessAccountAlias(descriptor)}>
+                  <HarnessAccountChipRow
+                    descriptor={descriptor}
+                    harness_hourly_rows={harnessHourlyRows}
+                    on_swap={swapAccount}
+                    summary={summary}
+                    swap={rosterState.swap}
+                  />
+                  {harnessManageVisible ? (
+                    <HarnessChipRemove
+                      aria-label={`Remove ${harnessAccountAlias(descriptor)}`}
+                      disabled={manage.removeState.phase === "confirm" || manage.removeState.phase === "in_flight"}
+                      onClick={() => manage.requestRemove(descriptor, rosterState.revision)}
+                      title="Remove this account from the harness vault"
+                      type="button"
+                    >
+                      ×
+                    </HarnessChipRemove>
+                  ) : null}
+                </HarnessChipShell>
               ))}
+              {harnessManageVisible ? (
+                <HarnessAddChip
+                  aria-expanded={manage.addMode ? "true" : "false"}
+                  aria-label="Add a harness account"
+                  onClick={manage.toggleAddPanel}
+                  title="Add an account — OAuth sign-in, import, or API key"
+                  type="button"
+                >
+                  +
+                </HarnessAddChip>
+              ) : null}
             </HarnessAccountChips>
           ) : null}
           {rosterState.swap.phase === "failed" ? (
@@ -3465,6 +4045,276 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
               <span>{rosterState.swap.message}</span>
               <button onClick={dismissSwapFailure} type="button">Dismiss</button>
             </HarnessSwapError>
+          ) : null}
+          {manage.removeState.phase === "confirm" ? (
+            <HarnessManageConfirm role="alertdialog" aria-label={`Remove ${manage.removeState.alias}?`}>
+              <span>
+                Remove {manage.removeState.alias}? The credential leaves the
+                harness vault (removal is durable).
+              </span>
+              <button
+                data-danger="true"
+                onClick={manage.confirmRemove}
+                type="button"
+              >
+                Remove
+              </button>
+              <button onClick={manage.dismissRemove} type="button">Keep</button>
+            </HarnessManageConfirm>
+          ) : manage.removeState.phase === "in_flight" ? (
+            <HarnessManageConfirm>
+              <span>Removing {manage.removeState.alias}… waiting for the daemon.</span>
+            </HarnessManageConfirm>
+          ) : manage.removeState.phase === "failed" ? (
+            <HarnessSwapError role="alert">
+              <span>Remove failed — {manage.removeState.message}</span>
+              <button onClick={manage.dismissRemove} type="button">Dismiss</button>
+            </HarnessSwapError>
+          ) : null}
+          {harnessManageVisible && manage.addMode ? (
+            <HarnessManagePanel>
+              <HarnessManageModeRow aria-label="Add account method">
+                <button
+                  data-active={manage.addMode === "oauth" ? "true" : undefined}
+                  onClick={() => manage.setAddMode("oauth")}
+                  type="button"
+                >
+                  OAuth sign-in
+                </button>
+                <button
+                  data-active={manage.addMode === "api_key" ? "true" : undefined}
+                  onClick={() => manage.setAddMode("api_key")}
+                  type="button"
+                >
+                  API key
+                </button>
+                <button
+                  aria-label="Close add account"
+                  data-close="true"
+                  onClick={manage.closeAddPanel}
+                  type="button"
+                >
+                  Close
+                </button>
+              </HarnessManageModeRow>
+              {manage.addMode === "oauth" && manage.addFlow.phase === "idle" ? (
+                <>
+                  <HarnessManageForm
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void manage.startOauth();
+                    }}
+                  >
+                    <label>
+                      Provider
+                      {manage.libraryState.state === "loading" || manage.libraryState.state === "idle" ? (
+                        <HarnessManageNote>Reading the daemon's provider catalog…</HarnessManageNote>
+                      ) : manage.libraryState.state === "error" ? (
+                        <HarnessManageNote data-tone="error">
+                          Provider catalog unavailable — {manage.libraryState.reason}
+                        </HarnessManageNote>
+                      ) : manage.oauthProviders.length === 0 ? (
+                        <HarnessManageNote>
+                          The daemon published no providers advertising OAuth sign-in.
+                        </HarnessManageNote>
+                      ) : (
+                        <select
+                          onChange={(event) => manage.setOauthDraft((draft) => ({ ...draft, provider: event.target.value }))}
+                          value={manage.oauthDraft.provider}
+                        >
+                          <option value="">Choose…</option>
+                          {manage.oauthProviders.map((provider) => (
+                            <option key={provider} value={provider}>{provider}</option>
+                          ))}
+                        </select>
+                      )}
+                    </label>
+                    <label>
+                      Alias (optional)
+                      <input
+                        autoComplete="off"
+                        onChange={(event) => manage.setOauthDraft((draft) => ({ ...draft, alias: event.target.value }))}
+                        placeholder={manage.oauthDraft.provider || "derived"}
+                        value={manage.oauthDraft.alias}
+                      />
+                    </label>
+                    <button disabled={!manage.oauthDraft.provider} type="submit">Start sign-in</button>
+                  </HarnessManageForm>
+                  <HarnessManageImport>
+                    <strong>Import an existing sign-in</strong>
+                    {manage.catalogPresentation.phase === "loading" ? (
+                      <HarnessManageNote>Reading the daemon's import catalog…</HarnessManageNote>
+                    ) : manage.catalogPresentation.phase === "unpublished" ? (
+                      <HarnessManageNote>This daemon does not publish an import catalog.</HarnessManageNote>
+                    ) : manage.catalogPresentation.phase === "unavailable" ? (
+                      <HarnessManageNote data-tone="error">
+                        Import catalog unavailable — {manage.catalogPresentation.reason}
+                      </HarnessManageNote>
+                    ) : manage.catalogPresentation.phase === "empty" ? (
+                      <HarnessManageNote>The daemon's import catalog lists no sources.</HarnessManageNote>
+                    ) : (
+                      <HarnessManageImportRow>
+                        {manage.catalogPresentation.rows.map((row) => (
+                          <button
+                            disabled={row.available !== true || manage.importState.phase === "in_flight"}
+                            key={row.source}
+                            onClick={() => manage.importSource(row.source)}
+                            title={row.available === true
+                              ? `Import the ${row.source} sign-in${row.provider ? ` (${row.provider})` : ""}`
+                              : row.available === false
+                                ? (row.unavailableReason || "Unavailable")
+                                : "Availability unknown — the daemon did not say"}
+                            type="button"
+                          >
+                            {row.source}
+                            {manage.importState.phase === "in_flight" && manage.importState.source === row.source
+                              ? " — importing…"
+                              : ""}
+                          </button>
+                        ))}
+                      </HarnessManageImportRow>
+                    )}
+                    {manage.importState.phase === "failed" ? (
+                      <HarnessManageNote data-tone="error">
+                        Import failed — {manage.importState.message}
+                        {" "}
+                        <button onClick={manage.dismissImport} type="button">Dismiss</button>
+                      </HarnessManageNote>
+                    ) : null}
+                  </HarnessManageImport>
+                </>
+              ) : null}
+              {manage.addMode === "oauth" && manage.addFlow.phase !== "idle" ? (
+                <HarnessManageFlowCard data-phase={manage.addFlow.phase}>
+                  {manage.addFlow.phase === "starting" ? (
+                    <span>Starting sign-in for {manage.addFlow.provider}…</span>
+                  ) : null}
+                  {manage.addFlow.phase === "pending" ? (
+                    <>
+                      <span>
+                        {manage.addFlow.userCode
+                          ? "Enter this code in your browser to finish signing in:"
+                          : manage.addFlow.authorizationUrl
+                            ? "Finish signing in with your browser — this completes automatically."
+                            : "The daemon started the flow but published no URL or code."}
+                      </span>
+                      {manage.addFlow.userCode ? (
+                        <HarnessManageCode>{manage.addFlow.userCode}</HarnessManageCode>
+                      ) : null}
+                      {manage.addFlow.authorizationUrl ? (
+                        <HarnessManageUrl
+                          onClick={() => void manage.openOauthAuthorization()}
+                          type="button"
+                        >
+                          {manage.addFlow.authorizationUrl}
+                        </HarnessManageUrl>
+                      ) : null}
+                      {manage.addFlow.message ? (
+                        <HarnessManageNote data-tone="error">{manage.addFlow.message}</HarnessManageNote>
+                      ) : null}
+                      <button onClick={manage.cancelOauth} type="button">Cancel</button>
+                    </>
+                  ) : null}
+                  {manage.addFlow.phase === "claiming" ? (
+                    <span>Completing sign-in…</span>
+                  ) : null}
+                  {manage.addFlow.phase === "succeeded" ? (
+                    <>
+                      <span>Signed in — the roster updates from the daemon's account list.</span>
+                      <button onClick={manage.dismissAddFlow} type="button">Done</button>
+                    </>
+                  ) : null}
+                  {manage.addFlow.phase === "unavailable" ? (
+                    <>
+                      <span>
+                        Sign-in is unavailable for {manage.addFlow.provider}
+                        {manage.addFlow.message ? ` — ${manage.addFlow.message}` : ""}.
+                      </span>
+                      <button onClick={manage.dismissAddFlow} type="button">Close</button>
+                    </>
+                  ) : null}
+                  {manage.addFlow.phase === "failed" ? (
+                    <>
+                      <span>{manage.addFlow.message}</span>
+                      <button onClick={manage.dismissAddFlow} type="button">Close</button>
+                    </>
+                  ) : null}
+                  {manage.addFlow.phase === "cancelled" ? (
+                    <>
+                      <span>Sign-in cancelled.</span>
+                      <button onClick={manage.dismissAddFlow} type="button">Close</button>
+                    </>
+                  ) : null}
+                </HarnessManageFlowCard>
+              ) : null}
+              {manage.addMode === "api_key" ? (
+                <>
+                  <HarnessManageForm
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void manage.submitApiKey();
+                    }}
+                  >
+                    <label>
+                      Provider
+                      {manage.libraryState.state === "loading" || manage.libraryState.state === "idle" ? (
+                        <HarnessManageNote>Reading the daemon's provider catalog…</HarnessManageNote>
+                      ) : manage.libraryState.state === "error" ? (
+                        <HarnessManageNote data-tone="error">
+                          Provider catalog unavailable — {manage.libraryState.reason}
+                        </HarnessManageNote>
+                      ) : manage.apiProviders.length === 0 ? (
+                        <HarnessManageNote>
+                          The daemon published no providers advertising API-key auth.
+                        </HarnessManageNote>
+                      ) : (
+                        <select
+                          onChange={(event) => manage.editApiMetadata("provider", event.target.value)}
+                          value={manage.apiMetadata.provider}
+                        >
+                          <option value="">Choose…</option>
+                          {manage.apiProviders.map((provider) => (
+                            <option key={provider} value={provider}>{provider}</option>
+                          ))}
+                        </select>
+                      )}
+                    </label>
+                    <label>
+                      Alias (optional)
+                      <input
+                        autoComplete="off"
+                        onChange={(event) => manage.editApiMetadata("alias", event.target.value)}
+                        placeholder="derived if empty"
+                        value={manage.apiMetadata.alias}
+                      />
+                    </label>
+                    <label data-grow="true">
+                      API key
+                      <input
+                        autoComplete="off"
+                        onChange={(event) => manage.editApiKey(event.target.value)}
+                        placeholder="sk-…"
+                        ref={manage.apiKeyInputRef}
+                        type="password"
+                      />
+                    </label>
+                    <button
+                      disabled={!manage.apiMetadata.provider || !manage.apiKeyPresent || manage.apiBusy}
+                      type="submit"
+                    >
+                      {manage.apiBusy ? "Validating…" : "Add key"}
+                    </button>
+                  </HarnessManageForm>
+                  {manage.apiError ? (
+                    <HarnessManageNote data-tone="error">{manage.apiError}</HarnessManageNote>
+                  ) : null}
+                  <HarnessManageNote>
+                    API-key accounts carry no switch — the provider selects
+                    them. The key is validated once and never shown again.
+                  </HarnessManageNote>
+                </>
+              ) : null}
+            </HarnessManagePanel>
           ) : null}
         </HarnessAccountsCard>
         <TokenomicsFooter>
@@ -4628,7 +5478,7 @@ const HarnessAccountChip = styled.button`
     : "rgba(16, 21, 28, 0.48)")};
   font: inherit;
   text-align: left;
-  cursor: ${({ $active }) => ($active ? "default" : "pointer")};
+  cursor: ${({ $active, $swappable }) => ($active || $swappable === false ? "default" : "pointer")};
   opacity: ${({ $inFlight }) => ($inFlight ? 0.78 : 1)};
   transition: border-color 130ms ease, background 130ms ease, opacity 130ms ease;
 
@@ -4775,6 +5625,430 @@ const HarnessSwapError = styled.div`
     font-size: 9px;
     font-weight: 900;
     cursor: pointer;
+  }
+`;
+
+/* ---- harness account management (add / import / remove) styles ---- */
+
+const HarnessChipShell = styled.div`
+  position: relative;
+  display: flex;
+  min-width: 0;
+`;
+
+const HarnessChipRemove = styled.button`
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 999px;
+  color: #94a3b8;
+  background: #0d1117;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
+
+  ${HarnessChipShell}:hover &,
+  ${HarnessChipShell}:focus-within & {
+    opacity: 1;
+  }
+
+  &:hover {
+    color: #ff7f89;
+    border-color: rgba(255, 79, 91, 0.5);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+    background: #f8fafc;
+    border-color: rgba(71, 85, 105, 0.3);
+
+    &:hover {
+      color: #dc2626;
+      border-color: rgba(220, 38, 38, 0.45);
+    }
+  }
+`;
+
+const HarnessAddChip = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  min-width: 34px;
+  min-height: 44px;
+  padding: 0 10px;
+  border: 1px dashed rgba(148, 163, 184, 0.32);
+  border-radius: 10px;
+  color: #94a3b8;
+  background: transparent;
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 130ms ease, color 130ms ease;
+
+  &:hover,
+  &[aria-expanded="true"] {
+    border-color: rgba(96, 165, 250, 0.6);
+    color: #a8c3ee;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+    border-color: rgba(71, 85, 105, 0.32);
+
+    &:hover,
+    &[aria-expanded="true"] {
+      border-color: rgba(37, 99, 235, 0.55);
+      color: #2563eb;
+    }
+  }
+`;
+
+const HarnessManagePanel = styled.div`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px dashed rgba(148, 163, 184, 0.24);
+  border-radius: 10px;
+  background: rgba(16, 21, 28, 0.4);
+
+  html[data-forge-theme="light"] & {
+    background: #f1f5f9;
+    border-color: rgba(71, 85, 105, 0.24);
+  }
+`;
+
+const HarnessManageModeRow = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+
+  button {
+    padding: 2px 9px;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    border-radius: 999px;
+    color: #94a3b8;
+    background: transparent;
+    font: inherit;
+    font-size: 10px;
+    font-weight: 800;
+    cursor: pointer;
+  }
+
+  button[data-active="true"] {
+    color: #a8c3ee;
+    border-color: rgba(96, 165, 250, 0.55);
+    background: rgba(96, 165, 250, 0.09);
+  }
+
+  button[data-close="true"] {
+    margin-left: auto;
+  }
+
+  html[data-forge-theme="light"] & button {
+    color: #64748b;
+    border-color: rgba(71, 85, 105, 0.26);
+  }
+
+  html[data-forge-theme="light"] & button[data-active="true"] {
+    color: #2563eb;
+    border-color: rgba(37, 99, 235, 0.5);
+    background: rgba(37, 99, 235, 0.07);
+  }
+`;
+
+const HarnessManageForm = styled.form`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  min-width: 0;
+
+  label {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    color: #738196;
+    font-size: 9px;
+    font-weight: 900;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+  }
+
+  label[data-grow="true"] {
+    flex: 1;
+    min-width: 150px;
+  }
+
+  input,
+  select {
+    padding: 4px 8px;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    border-radius: 8px;
+    color: #dfe9f8;
+    background: rgba(13, 17, 23, 0.85);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  > button[type="submit"] {
+    padding: 4px 12px;
+    border: 0;
+    border-radius: 999px;
+    color: #fff;
+    background: #2563eb;
+    font: inherit;
+    font-size: 10px;
+    font-weight: 900;
+    cursor: pointer;
+  }
+
+  > button[type="submit"]:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  html[data-forge-theme="light"] & input,
+  html[data-forge-theme="light"] & select {
+    color: #0f172a;
+    background: #ffffff;
+    border-color: rgba(71, 85, 105, 0.26);
+  }
+`;
+
+const HarnessManageNote = styled.span`
+  color: #9db1c9;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1.5;
+  text-transform: none;
+  letter-spacing: normal;
+
+  &[data-tone="error"] {
+    color: #ff7f89;
+  }
+
+  button {
+    padding: 1px 7px;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    color: inherit;
+    background: transparent;
+    font: inherit;
+    font-size: 9px;
+    font-weight: 900;
+    cursor: pointer;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+
+    &[data-tone="error"] {
+      color: #dc2626;
+    }
+  }
+`;
+
+const HarnessManageImport = styled.div`
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+
+  strong {
+    color: #738196;
+    font-size: 9px;
+    font-weight: 900;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+  }
+`;
+
+const HarnessManageImportRow = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+
+  button {
+    padding: 3px 10px;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    border-radius: 999px;
+    color: #dfe9f8;
+    background: rgba(16, 21, 28, 0.48);
+    font: inherit;
+    font-size: 10.5px;
+    font-weight: 800;
+    cursor: pointer;
+  }
+
+  button:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  button:hover:not(:disabled) {
+    border-color: rgba(96, 165, 250, 0.6);
+  }
+
+  html[data-forge-theme="light"] & button {
+    color: #0f172a;
+    background: #ffffff;
+    border-color: rgba(71, 85, 105, 0.26);
+  }
+`;
+
+const HarnessManageFlowCard = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(96, 165, 250, 0.3);
+  border-radius: 9px;
+  color: #dfe9f8;
+  background: rgba(96, 165, 250, 0.05);
+  font-size: 11px;
+  font-weight: 700;
+
+  &[data-phase="failed"],
+  &[data-phase="unavailable"] {
+    border-color: rgba(255, 79, 91, 0.34);
+    color: #ff7f89;
+    background: rgba(255, 79, 91, 0.07);
+  }
+
+  &[data-phase="succeeded"] {
+    border-color: rgba(52, 211, 153, 0.4);
+    color: #34d399;
+    background: rgba(52, 211, 153, 0.07);
+  }
+
+  span {
+    min-width: 0;
+  }
+
+  button {
+    padding: 2px 9px;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    color: inherit;
+    background: transparent;
+    font: inherit;
+    font-size: 9px;
+    font-weight: 900;
+    cursor: pointer;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+
+    &[data-phase="failed"],
+    &[data-phase="unavailable"] {
+      color: #dc2626;
+    }
+
+    &[data-phase="succeeded"] {
+      color: #047857;
+    }
+  }
+`;
+
+const HarnessManageCode = styled.code`
+  padding: 2px 9px;
+  border: 1px dashed rgba(148, 163, 184, 0.4);
+  border-radius: 7px;
+  color: #dfe9f8;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    border-color: rgba(71, 85, 105, 0.4);
+  }
+`;
+
+const HarnessManageUrl = styled.button`
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0;
+  border: 0 !important;
+  color: #a8c3ee;
+  background: transparent;
+  font: inherit;
+  font-size: 10.5px;
+  text-decoration: underline;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+
+  html[data-forge-theme="light"] & {
+    color: #2563eb;
+  }
+`;
+
+const HarnessManageConfirm = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 1px solid rgba(250, 204, 21, 0.36);
+  border-radius: 8px;
+  color: #facc15;
+  background: rgba(250, 204, 21, 0.07);
+  font-size: 11px;
+  font-weight: 800;
+
+  span {
+    min-width: 0;
+    flex: 1;
+  }
+
+  button {
+    flex: none;
+    padding: 2px 9px;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    color: inherit;
+    background: transparent;
+    font: inherit;
+    font-size: 9px;
+    font-weight: 900;
+    cursor: pointer;
+  }
+
+  button[data-danger="true"] {
+    border-color: rgba(255, 79, 91, 0.6);
+    color: #ff7f89;
+    background: rgba(255, 79, 91, 0.09);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #a16207;
+    border-color: rgba(161, 98, 7, 0.3);
+    background: rgba(161, 98, 7, 0.05);
+
+    button[data-danger="true"] {
+      color: #dc2626;
+      border-color: rgba(220, 38, 38, 0.5);
+    }
   }
 `;
 

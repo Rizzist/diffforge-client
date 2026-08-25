@@ -1,48 +1,17 @@
 export const AGENT_LAUNCH_DEFAULTS_STORAGE_VERSION = 1;
 
 export const AGENT_LAUNCH_MODEL_OPTIONS = Object.freeze({
-  claude: Object.freeze([
-    { detail: "Balanced Claude Code default", label: "Sonnet", value: "sonnet" },
-    { detail: "Higher capability Claude model", label: "Opus", speed_modes: ["standard", "fast"], value: "opus" },
-    { detail: "Lower-latency Claude model", label: "Haiku", value: "haiku" },
-    { detail: "Latest Claude alias when available", label: "Fable", value: "fable" },
-  ]),
-  codex: Object.freeze([
-    { detail: "Latest Codex model", label: "GPT-5.5", speed_modes: ["standard", "fast"], thinking_power: "medium", value: "gpt-5.5" },
-    { detail: "Balanced coding model", label: "GPT-5.4", speed_modes: ["standard", "fast"], thinking_power: "medium", value: "gpt-5.4" },
-    { detail: "Faster lower-cost coding model", label: "GPT-5.4 mini", thinking_power: "medium", value: "gpt-5.4-mini" },
-    { detail: "Research preview quick coding model", label: "Codex Spark", speed: "fast", thinking_power: "high", value: "gpt-5.3-codex-spark" },
-  ]),
-  opencode: Object.freeze([
-    { detail: "OpenAI model through OpenCode", label: "GPT-5.5", value: "openai/gpt-5.5" },
-    { detail: "OpenAI mini model through OpenCode", label: "GPT-5.4 mini", value: "openai/gpt-5.4-mini" },
-    { detail: "Anthropic model through OpenCode", label: "Claude Sonnet", value: "anthropic/claude-sonnet-4-5" },
-    { detail: "Google model through OpenCode", label: "Gemini 2.5 Pro", value: "google/gemini-2.5-pro" },
-  ]),
+  // The Haider library snapshot is the model authority. An empty local floor
+  // is intentional: absence from the daemon must not become a guessed model.
+  haider: Object.freeze([]),
 });
 
 export const BUILTIN_AGENT_LAUNCH_DEFAULTS = Object.freeze({
-  claude: Object.freeze({ effort: "default", model: "sonnet", speed: "standard" }),
-  codex: Object.freeze({ effort: "medium", model: "gpt-5.5", speed: "standard" }),
-  opencode: Object.freeze({ effort: "default", model: "anthropic/claude-sonnet-4-5", speed: "standard" }),
+  haider: Object.freeze({ effort: "default", model: "", speed: "standard" }),
 });
 
 const AGENT_LAUNCH_EFFORT_OPTIONS = Object.freeze({
-  claude: Object.freeze([
-    { label: "Default", value: "default" },
-    { label: "Low", value: "low" },
-    { label: "Medium", value: "medium" },
-    { label: "High", value: "high" },
-    { label: "XHigh", value: "xhigh" },
-    { label: "Max", value: "max" },
-  ]),
-  codex: Object.freeze([
-    { label: "Low", value: "low" },
-    { label: "Medium", value: "medium" },
-    { label: "High", value: "high" },
-    { label: "XHigh", value: "xhigh" },
-  ]),
-  opencode: Object.freeze([
+  haider: Object.freeze([
     { label: "Provider default", value: "default" },
   ]),
 });
@@ -65,15 +34,7 @@ function agentLaunchEffortLabel(value) {
 
 export function normalizeAgentLaunchAgentId(value) {
   const normalized = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
-  if (normalized === "codex" || normalized === "openai-codex") {
-    return "codex";
-  }
-  if (normalized === "claude" || normalized === "claude-code" || normalized === "claudecode") {
-    return "claude";
-  }
-  if (normalized === "opencode" || normalized === "open-code" || normalized === "open-code-ai" || normalized === "opencode-ai") {
-    return "opencode";
-  }
+  if (normalized === "haider" || normalized === "haider-agent") return "haider";
   return "";
 }
 
@@ -191,12 +152,8 @@ export function agentLaunchModelSupportsFast(agentId, model, modelCatalog = null
   if (Array.isArray(option?.speed_modes) && option.speed_modes.includes("fast")) {
     return true;
   }
-  if (normalizedAgentId === "codex") {
-    return normalizedModel === "gpt-5.5" || normalizedModel === "gpt-5.4";
-  }
-  if (normalizedAgentId === "claude") {
-    return normalizedModel === "opus" || normalizedModel.includes("opus");
-  }
+  void normalizedAgentId;
+  void normalizedModel;
   return false;
 }
 

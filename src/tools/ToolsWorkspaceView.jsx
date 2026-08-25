@@ -30,6 +30,10 @@ import {
 import AppSelect from "../app/AppSelect.jsx";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import { CLI_CATALOG, cliInstallManager } from "./cliCatalog.js";
+import {
+  cliSnapshotFromStatuses,
+  readCliInventoryPublication,
+} from "./cliInventoryAvailability.js";
 import { SKILLS_CATALOG, skillCliBinary, skillCliIcon } from "./skillsCatalog.js";
 import {
   ACCOUNT_DOCUMENTS_CONTRACT,
@@ -1463,31 +1467,6 @@ const AGENT_UPDATE_STAGE_LABELS = {
   verifying: "Verifying…",
 };
 
-function agentUpdateProgressFields(status) {
-  return {
-    update_stage: text(status?.update_stage || status?.updateStage).toLowerCase(),
-    update_stage_seq: Number(status?.update_stage_seq ?? status?.updateStageSeq) || 0,
-    update_to_version: text(status?.update_to_version || status?.updateToVersion),
-    update_error_reason: text(status?.update_error_reason || status?.updateErrorReason),
-    update_failed_stage: text(status?.update_failed_stage || status?.updateFailedStage),
-  };
-}
-
-function cliSnapshotFromStatuses(statuses) {
-  return (Array.isArray(statuses) ? statuses : []).map((status) => ({
-    agent_id: text(status?.provider || status?.id),
-    agent_label: text(status?.label),
-    installed: Boolean(status?.installed),
-    authenticated: Boolean(status?.authenticated),
-    version: text(status?.version),
-    npm_package_version: text(status?.npm_package_version),
-    npm_latest_version: text(status?.npm_latest_version),
-    update_available: Boolean(status?.npm_update_available),
-    ...agentUpdateProgressFields(status),
-    active_model: text(status?.active_model),
-  }));
-}
-
 function SkillIconGlyph({ icon, title }) {
   const CliIcon = skillCliIcon(icon);
   if (CliIcon) return <CliIcon />;
@@ -2272,7 +2251,7 @@ function ToolsWorkspaceView({
   }, [scriptsExplorerCollapsed, scriptsExplorerSize]);
 
   // ---- CLIs ----
-  const [cliStatuses, setCliStatuses] = useState([]);
+  const [cliStatuses, setCliStatuses] = useState(null);
   const [cliState, setCliState] = useState("loading");
   const [cliError, setCliError] = useState("");
   const [cliBusy, setCliBusy] = useState({});
@@ -2419,7 +2398,14 @@ function ToolsWorkspaceView({
     setCliState((current) => (current === "ready" ? "refreshing" : "loading"));
     setCliError("");
     try {
-      const list = [];
+      const inventory = readCliInventoryPublication(await invoke("tools_agent_statuses"));
+      if (inventory.state === "unavailable") {
+        setCliStatuses(null);
+        setCliError(inventory.reason);
+        setCliState("unavailable");
+        return;
+      }
+      const list = inventory.statuses;
       setCliStatuses(list);
       setCliState("ready");
       let checks = {};
@@ -2680,12 +2666,22 @@ function ToolsWorkspaceView({
       if (disposed) {
         return;
       }
-      const statuses = Array.isArray(event?.payload?.statuses) ? event.payload.statuses : [];
-      if (!statuses.length) {
-        return;
+      try {
+        const inventory = readCliInventoryPublication(event?.payload);
+        if (inventory.state === "unavailable") {
+          setCliStatuses(null);
+          setCliError(inventory.reason);
+          setCliState("unavailable");
+        } else {
+          setCliStatuses(inventory.statuses);
+          setCliError("");
+          setCliState("ready");
+        }
+      } catch (error) {
+        setCliStatuses(null);
+        setCliError(getErrorMessage(error, "Unable to read CLI inventory update."));
+        setCliState("error");
       }
-      setCliStatuses(statuses);
-      setCliState("ready");
     }).then((dispose) => {
       if (disposed) {
         dispose();
@@ -6850,9 +6846,18 @@ function ToolsWorkspaceView({
                     {cliState === "refreshing" ? "Checking…" : "Refresh"}
                   </ToolsGhostButton>
                 </CliSearchRow>
-                {cliError && <ToolsError role="alert">{cliError}</ToolsError>}
+                {cliError && cliState !== "unavailable" && (
+                  <ToolsError role="alert">{cliError}</ToolsError>
+                )}
                 {cliMessage && <ToolsNotice>{cliMessage}</ToolsNotice>}
-                {cliState === "loading" ? (
+                {cliState === "ready" && Array.isArray(cliStatuses) && !cliStatuses.length && (
+                  <ToolsNotice>No coding agents are published.</ToolsNotice>
+                )}
+                {cliState === "unavailable" ? (
+                  <ToolsEmpty data-state="unavailable" role="status">
+                    {cliError}
+                  </ToolsEmpty>
+                ) : cliState === "loading" ? (
                   <ToolsEmpty>Checking installed CLIs…</ToolsEmpty>
                 ) : (
                   <CliList aria-label="CLI programs" role="list">

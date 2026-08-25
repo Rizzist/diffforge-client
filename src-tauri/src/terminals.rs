@@ -2617,80 +2617,6 @@ fn terminal_workspace_agent_session_status_from_payload(
     )
 }
 
-fn terminal_record_workspace_provider_session_binding(
-    app: Option<AppHandle>,
-    instance: &TerminalInstance,
-    provider_session_id: String,
-    source: impl Into<String>,
-) {
-    terminal_record_workspace_provider_session_binding_with_transcript_path(
-        app,
-        instance,
-        provider_session_id,
-        source,
-        None,
-    );
-}
-
-fn terminal_register_native_transcript_watch(
-    app: &AppHandle,
-    instance: &TerminalInstance,
-    provider_session_id: &str,
-    transcript_path: Option<&str>,
-    source: &str,
-) {
-    let metadata = instance.metadata.clone();
-    let agent_id = terminal_normalize_agent_kind(Some(&metadata.agent_kind))
-        .or_else(|| terminal_normalize_agent_kind(Some(&metadata.agent_id)))
-        .unwrap_or_else(|| metadata.agent_id.clone());
-    let request = AgentThreadTranscriptNativeWatchRequest {
-        agent_id,
-        cwd: instance.working_directory.to_string_lossy().to_string(),
-        instance_id: Some(instance.id),
-        pane_id: metadata.pane_id,
-        provider_session_id: provider_session_id.to_string(),
-        source: source.to_string(),
-        terminal_index: metadata.terminal_index.map(i64::from),
-        thread_id: metadata.thread_id,
-        transcript_path: transcript_path
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        workspace_id: metadata.workspace_id,
-    };
-    if let Err(error) = register_agent_thread_transcript_native_watch(app, &request) {
-        log_terminal_status_event(
-            "backend.agent_thread_transcript.native_watch_error",
-            json!({
-                "error": clean_terminal_diagnostic_log_text(&error),
-                "instance_id": instance.id,
-                "pane_id": clean_terminal_diagnostic_log_text(&request.pane_id),
-                "provider_session_id_present": !provider_session_id.trim().is_empty(),
-                "source": source,
-            }),
-        );
-    }
-}
-
-fn terminal_record_workspace_provider_session_binding_with_transcript_path(
-    app: Option<AppHandle>,
-    instance: &TerminalInstance,
-    provider_session_id: String,
-    source: impl Into<String>,
-    transcript_path: Option<&str>,
-) {
-    let source = source.into();
-    if let Some(app) = app.as_ref() {
-        terminal_register_native_transcript_watch(
-            app,
-            instance,
-            &provider_session_id,
-            transcript_path,
-            &source,
-        );
-    }
-}
-
 fn terminal_record_workspace_agent_session_history(
     _app: Option<AppHandle>,
     _instance: &TerminalInstance,
@@ -3781,7 +3707,6 @@ fn cleanup_terminal_instance_with_context(
     }
     terminal_structured_interaction_clear_superseded(&metadata.pane_id, id);
     let metadata_fields = terminal_metadata_forensics_json(&metadata);
-    unregister_agent_thread_transcript_native_watch(&metadata.pane_id, Some(id));
     log_terminal_crash_forensics_event(
         "backend.terminal_cleanup.begin",
         json!({
@@ -8254,12 +8179,6 @@ async fn terminal_open(
             provider_session_id.clone(),
             "terminal_open",
         );
-        terminal_record_workspace_provider_session_binding(
-            Some(app.clone()),
-            &instance,
-            provider_session_id,
-            "terminal_open",
-        );
     }
     let headless_output = Arc::clone(&instance.headless_output);
     let launch_epoch = terminal_instance_launch_epoch(&instance);
@@ -8429,7 +8348,7 @@ async fn terminal_open(
 
 #[tauri::command(rename_all = "snake_case")]
 async fn terminal_record_provider_session(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, TerminalState>,
     request: TerminalProviderSessionRecordRequest,
 ) -> Result<TerminalProviderSessionRecordResult, String> {
@@ -8482,12 +8401,6 @@ async fn terminal_record_provider_session(
     }
 
     terminal_runtime_apply_provider_session_id(&instance, &provider_session_id, &source);
-    terminal_record_workspace_provider_session_binding(
-        Some(app),
-        &instance,
-        provider_session_id.clone(),
-        source.clone(),
-    );
     if let Some(coordination) = instance.coordination.clone() {
         terminal_record_coordination_provider_session_id(
             coordination,
@@ -13971,13 +13884,6 @@ fn apply_terminal_activity_hook_payload(
             .filter(|value| !value.is_empty())
             != Some(provider_session_id.as_str());
         if binding_changed {
-            terminal_record_workspace_provider_session_binding_with_transcript_path(
-                Some(app.clone()),
-                instance,
-                provider_session_id.clone(),
-                "terminal_activity_hook",
-                payload.transcript_path.as_deref(),
-            );
             if let Some(coordination) = instance.coordination.clone() {
                 terminal_record_coordination_provider_session_id(
                     coordination,
@@ -13986,35 +13892,6 @@ fn apply_terminal_activity_hook_payload(
                 );
             }
         }
-    }
-    if matches!(
-        payload.event_type.as_str(),
-        "provider-turn-completed" | "provider-turn-error" | "provider-turn-interrupted"
-    ) || terminal_activity_hook_name_key(&payload.hook_event_name) == "transcriptchanged"
-    {
-        let watch_reason =
-            if terminal_activity_hook_name_key(&payload.hook_event_name) == "transcriptchanged" {
-                "terminal-transcript-changed"
-            } else {
-                "terminal-activity-final"
-            };
-        let triggered = trigger_agent_thread_transcript_native_watch(
-            app,
-            &payload.pane_id,
-            Some(payload.instance_id),
-            watch_reason,
-        );
-        log_terminal_status_event(
-            "backend.agent_thread_transcript.native_watch_triggered",
-            json!({
-                "event_type": payload.event_type.clone(),
-                "hook_event_name": payload.hook_event_name.clone(),
-                "instance_id": payload.instance_id,
-                "pane_id": clean_terminal_diagnostic_log_text(&payload.pane_id),
-                "reason": watch_reason,
-                "watch_count": triggered,
-            }),
-        );
     }
     let resume_app = app.clone();
     let resume_cloud_state = cloud_mcp_state.clone();

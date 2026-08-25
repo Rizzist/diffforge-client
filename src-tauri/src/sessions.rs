@@ -159,6 +159,17 @@ fn sessions_status_from_run_state(run_state: Option<&Value>) -> &'static str {
 }
 
 impl SessionRow {
+    fn availability_reason(&self) -> Option<&'static str> {
+        match (self.provenance, self.roster_visible) {
+            (SessionProvenance::Unknown, _) => Some("legacy-provenance"),
+            (SessionProvenance::Haider, false) if self.provider_session_id.trim().is_empty() => {
+                Some("not-published")
+            }
+            (SessionProvenance::Haider, false) => Some("daemon-unavailable"),
+            (SessionProvenance::Haider, true) => None,
+        }
+    }
+
     fn title(&self) -> String {
         sessions_harness_text(self, &["title"])
             .or_else(|| self.title_override.clone())
@@ -312,6 +323,12 @@ impl SessionRow {
                 }
                 .to_string(),
             ),
+        );
+        object.insert(
+            "session_availability_reason".to_string(),
+            self.availability_reason()
+                .map(|reason| Value::String(reason.to_string()))
+                .unwrap_or(Value::Null),
         );
         Value::Object(object)
     }
@@ -1282,6 +1299,10 @@ mod sessions_tests {
         .unwrap();
         assert_eq!(created.provenance, SessionProvenance::Haider);
         assert!(!created.roster_visible);
+        assert_eq!(
+            created.serialized_value()["session_availability_reason"],
+            "not-published"
+        );
         assert!(sessions_list_blocking().unwrap().is_empty());
 
         let locally_updated = session_update_blocking(SessionUpdateArgs {
@@ -1292,6 +1313,10 @@ mod sessions_tests {
         })
         .unwrap();
         assert!(!locally_updated.roster_visible);
+        assert_eq!(
+            locally_updated.serialized_value()["session_availability_reason"],
+            "daemon-unavailable"
+        );
         assert!(sessions_list_blocking().unwrap().is_empty());
 
         let bound = session_update_blocking_with_authority(
@@ -1305,6 +1330,10 @@ mod sessions_tests {
         )
         .unwrap();
         assert!(bound.roster_visible);
+        assert_eq!(
+            bound.serialized_value()["session_availability_reason"],
+            Value::Null
+        );
         assert_eq!(sessions_list_blocking().unwrap().len(), 1);
 
         fs::remove_dir_all(directory).unwrap();
@@ -1332,6 +1361,10 @@ mod sessions_tests {
         assert_eq!(decoded.provenance, SessionProvenance::Unknown);
         assert_eq!(rendered["session_provenance"], "unknown");
         assert_eq!(rendered["session_availability"], "unavailable");
+        assert_eq!(
+            rendered["session_availability_reason"],
+            "legacy-provenance"
+        );
         assert_eq!(
             connection
                 .query_row(
@@ -1471,6 +1504,10 @@ mod sessions_tests {
         assert_eq!(row_json["worker_generation"], Value::Null);
         assert_eq!(row_json["session_provenance"], "unknown");
         assert_eq!(row_json["session_availability"], "unavailable");
+        assert_eq!(
+            row_json["session_availability_reason"],
+            "legacy-provenance"
+        );
         assert!(!row.pinned);
         assert!(row.title_override.is_none());
 

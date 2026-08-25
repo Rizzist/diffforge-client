@@ -41,6 +41,10 @@ import {
 } from "./haiderClientContract.js";
 import { surfaceStatusLabel } from "./sessionStatus.js";
 import {
+  SessionAvailabilityAffordance,
+  sessionAvailabilityPresentation,
+} from "./sessionAvailability.js";
+import {
   rehomeSessionPane,
   rehomeSessionViewMode,
   sessionPaneId,
@@ -1659,6 +1663,9 @@ export default function SessionSurface({
     const statusLine = session && session.id !== "draft"
       ? surfaceStatusLabel(surfaceEntry, session)
       : "";
+    const availability = session && session.id !== "draft"
+      ? sessionAvailabilityPresentation(session)
+      : null;
     return (
       <FloatingControls>
         {showToggle && session && (
@@ -1739,9 +1746,13 @@ export default function SessionSurface({
         </SessionViewToggle>
         )}
         {session && session.id !== "draft" && (
-          <StatusPill data-status={session.status} title={rawStatusLine || statusLine}>
+          <StatusPill
+            data-session-availability={availability?.reason}
+            data-status={availability ? "unavailable" : session.status}
+            title={availability?.detail || rawStatusLine || statusLine}
+          >
             <i aria-hidden="true" />
-            <span>{statusLine}</span>
+            <span>{availability?.label || statusLine}</span>
           </StatusPill>
         )}
         <HeaderIconButton
@@ -1862,7 +1873,8 @@ export default function SessionSurface({
                       aria-hidden="true"
                       data-status={sessionActivityVisualState(session)}
                     />
-                    <span>{session.title}</span>
+                    <HomeContinueSessionTitle>{session.title}</HomeContinueSessionTitle>
+                    <HomeAvailabilityAffordance session={session} />
                     <em>{formatSessionRelativeTime(session.latest_at_ms)}</em>
                   </HomeContinueRow>
                 ))}
@@ -2240,6 +2252,18 @@ const StatusPill = styled.span`
   &[data-status="error"] i {
     background: var(--forge-red);
   }
+
+  &[data-session-availability="daemon-unavailable"] i {
+    background: var(--forge-red);
+  }
+
+  &[data-session-availability="not-published"] i {
+    background: var(--forge-amber);
+  }
+
+  &[data-session-availability="legacy-provenance"] i {
+    background: var(--forge-text-muted);
+  }
 `;
 
 const HeaderIconButton = styled.button`
@@ -2471,7 +2495,7 @@ const HomeContinueRow = styled.button`
   cursor: pointer;
   text-align: left;
 
-  span {
+  > span {
     flex: 1;
     min-width: 0;
     overflow: hidden;
@@ -2488,6 +2512,29 @@ const HomeContinueRow = styled.button`
   &:hover {
     color: var(--forge-text);
     border-color: rgba(var(--forge-tint-soft-rgb), 0.45);
+  }
+`;
+
+const HomeContinueSessionTitle = styled.span``;
+
+const HomeAvailabilityAffordance = styled(SessionAvailabilityAffordance)`
+  flex: 0 0 auto !important;
+  max-width: 92px;
+  padding: 1px 4px;
+  border: 1px solid color-mix(in srgb, var(--forge-amber) 42%, transparent);
+  border-radius: 4px;
+  color: var(--forge-amber);
+  font-size: 8px;
+  line-height: 1.25;
+
+  &[data-session-availability="daemon-unavailable"] {
+    border-color: color-mix(in srgb, var(--forge-red) 42%, transparent);
+    color: var(--forge-red);
+  }
+
+  &[data-session-availability="legacy-provenance"] {
+    border-color: var(--forge-border-strong);
+    color: var(--forge-text-muted);
   }
 `;
 

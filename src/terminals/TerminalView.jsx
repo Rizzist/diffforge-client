@@ -103,9 +103,6 @@ import {
   WorkspaceRootActions,
   WorkspaceRootChooser,
   WorkspaceSetupPanel,
-  WorkspaceCreateAgentClaudeIcon,
-  WorkspaceCreateAgentCodexIcon,
-  WorkspaceCreateAgentOpenCodeIcon,
   WorkspaceCreateAgentTerminalIcon,
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
@@ -133,7 +130,6 @@ import {
   subscribeCloudVoiceAgentEvents,
 } from "../audio/cloudVoiceAgentClient";
 import { AuraModeIcon } from "../aura/AuraModeIcon.jsx";
-import { getAgentModelImageInputCapability } from "../agents/imageInputCapabilities";
 import {
   getBigViewTextDiagnosticFields,
   logBigViewSyncDiagnosticEvent,
@@ -309,9 +305,7 @@ const TERMINAL_DOCUMENT_PANEL_KIND = "docs";
 const TERMINAL_GRID_MAX_BALANCED_COLUMNS = 3;
 const TERMINAL_GRID_DRAG_STRUCTURAL_HYSTERESIS_PX = 20;
 const TERMINAL_EMPTY_AGENT_LAUNCHERS = Object.freeze([
-  { id: "codex", label: "Codex" },
-  { id: "claude", label: "Claude Code" },
-  { id: "opencode", label: "OpenCode" },
+  { id: "haider", label: "Haider" },
   { id: "generic", label: "Shell" },
 ]);
 // Panel order mirrors the Create/Edit Workspace panels grid (WORKSPACE_PANEL_CARDS
@@ -350,7 +344,7 @@ const APP_CONTROL_SEND_MESSAGE_RECOVERY_DELAY_MS = 900;
 const APP_CONTROL_SEND_MESSAGE_MAX_RECOVERY_ATTEMPTS = 1;
 const TODO_QUEUE_RESUME_LOCK_STALE_MS = 30 * 60 * 1000;
 const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index);
-const TODO_QUEUE_AGENT_ROLES = new Set(["codex", "claude", "opencode"]);
+const TODO_QUEUE_AGENT_ROLES = new Set(["haider"]);
 const PANEL_AGENT_PROMPT_COMPLETED_RETENTION_MS = 5000;
 const PANEL_AGENT_PROMPT_SETTLED_STATUSES = new Set([
   "cancelled",
@@ -1313,10 +1307,8 @@ const TerminalSurfaceLayer = styled.div`
 `;
 
 const TERMINAL_TAB_AGENT_META = {
-  claude: { color: "#d97757", label: "Claude Code", short: "CL" },
-  codex: { color: "#7bdc9d", label: "Codex", short: "CX" },
   generic: { color: "#9fb6d9", label: "Terminal", short: ">_" },
-  opencode: { color: "#68d8d6", label: "OpenCode", short: "OC" },
+  haider: { color: "#7bdc9d", label: "Haider", short: "HA" },
 };
 
 function getTerminalTabAgentMeta(role) {
@@ -1351,25 +1343,7 @@ function terminalBillingPlanNameFromStatus(billingStatus, fallback = "free") {
 }
 
 function TerminalEmptyAgentLauncherGlyph({ role_id: roleId }) {
-  if (roleId === "codex") {
-    return <WorkspaceCreateAgentCodexIcon aria-hidden="true" />;
-  }
-  if (roleId === "claude") {
-    return <WorkspaceCreateAgentClaudeIcon aria-hidden="true" />;
-  }
-  if (roleId === "opencode") {
-    return (
-      <WorkspaceCreateAgentOpenCodeIcon
-        aria-hidden="true"
-        fill="none"
-        viewBox="0 0 24 30"
-        xmlns="http://www.w3.org/2000/svg"
-      >
-        <path d="M18 24H6V12H18V24Z" fill="#4B4646" />
-        <path d="M18 6H6V24H18V6ZM24 30H0V0H24V30Z" fill="#F1ECEC" />
-      </WorkspaceCreateAgentOpenCodeIcon>
-    );
-  }
+  void roleId;
   return <WorkspaceCreateAgentTerminalIcon aria-hidden="true" />;
 }
 
@@ -2358,7 +2332,7 @@ const TODO_QUEUE_NOTE_TITLE_LENGTH = 42;
 const TODO_QUEUE_MAX_PASTE_IMAGES = 8;
 const TODO_QUEUE_DRAG_HOLD_MS = 140;
 const ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS = 24;
-const TODO_QUEUE_IMAGE_TERMINALS = new Set(["codex", "claude"]);
+const TODO_QUEUE_IMAGE_TERMINALS = new Set(["haider"]);
 const VOICE_PLAN_STAGE_ORDER = ["execution", "revision"];
 const VOICE_PLAN_COMPLETED_STATUSES = new Set([
   "accepted",
@@ -2458,12 +2432,10 @@ const APP_CONTROL_AGENT_WORKSPACE_IDS = new Set([
   APP_CONTROL_AGENT_WORKSPACE.id,
   "diffforge_app_control",
 ]);
-const APP_CONTROL_AGENT_DEFAULT_ROLE = "claude";
+const APP_CONTROL_AGENT_DEFAULT_ROLE = "haider";
 const APP_CONTROL_AGENT_LABELS = {
-  claude: "Claude Code",
-  codex: "Codex",
   generic: "Terminal",
-  opencode: "OpenCode",
+  haider: "Haider",
 };
 const noopWorkspaceToolHandler = () => {};
 export const TODO_QUEUE_PANE_MODE_NORMAL = "normal";
@@ -2486,13 +2458,7 @@ function normalizeAppControlAgentRole(value) {
   if (normalized === "terminal" || normalized === "shell" || normalized === "plain-shell") {
     return "generic";
   }
-  if (normalized === "claude-code" || normalized === "claudecode") {
-    return "claude";
-  }
-  if (normalized === "open-code" || normalized === "open-code-ai" || normalized === "opencode-ai") {
-    return "opencode";
-  }
-  return ["claude", "codex", "generic", "opencode"].includes(normalized)
+  return ["generic", "haider"].includes(normalized)
     ? normalized
     : APP_CONTROL_AGENT_DEFAULT_ROLE;
 }
@@ -8988,7 +8954,7 @@ function normalizeVoiceAgentQueueArguments(value) {
 
 function normalizeVoiceAgentManagementAgent(value) {
   const agentType = String(value || "").trim();
-  if (["any", "codex", "claude", "opencode"].includes(agentType)) return agentType;
+  if (["any", "haider"].includes(agentType)) return agentType;
   return "";
 }
 
@@ -11009,19 +10975,9 @@ function canonicalTodoQueueModelId(agentId, model) {
     .replace(/[\s_:/]+/g, "-")
     .replace(/[^a-z0-9.+-]+/g, "-")
     .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .replace(/^(anthropic|claude|openai|codex)-/, "");
+    .replace(/^-+|-+$/g, "");
   if (!normalized) return "";
-  if (targetAgentId === "claude" || /(sonnet|opus|haiku)/.test(normalized)) {
-    if (normalized.includes("sonnet")) return "claude:sonnet";
-    if (normalized.includes("opus")) return "claude:opus";
-    if (normalized.includes("haiku")) return "claude:haiku";
-  }
-  if (targetAgentId === "codex" || normalized.includes("gpt")) {
-    if (/gpt-?5[.-]?5|gpt55/.test(normalized)) return "codex:gpt-5.5";
-    return `codex:${normalized}`;
-  }
-  return `${targetAgentId || "model"}:${normalized}`;
+  return targetAgentId ? `${targetAgentId}:${normalized}` : normalized;
 }
 
 function todoQueueModelIdsEqual(agentId, left, right) {
@@ -11851,9 +11807,7 @@ function todoQueueSendTargetMatchesName(candidate, targetTerminalName) {
 
 function getTodoQueueAgentAccentColor(agentId) {
   const normalized = normalizeTodoTerminalAgentId(agentId);
-  if (normalized === "claude") return "#ff9f43";
-  if (normalized === "opencode") return "#41d38a";
-  if (normalized === "codex") return "#62a0ff";
+  if (normalized === "haider") return "#62a0ff";
   return "#8bb8ff";
 }
 
@@ -11905,15 +11859,56 @@ function resolveTodoImageInputSupport({ agent, agent_statuses: agentStatuses, pr
       supported: false,
     };
   }
-
-  return getAgentModelImageInputCapability(agentId, activeModel, {
-    agent_label: agent?.label || agentId,
-  });
+  const publishedState = String(
+    providerBinding?.image_input_support
+      || providerBinding?.imageInputSupport
+      || status?.image_input_support
+      || status?.imageInputSupport
+      || "unknown",
+  ).trim().toLowerCase();
+  const publishedBoolean = providerBinding?.image_input_supported
+    ?? providerBinding?.supports_images
+    ?? status?.image_input_supported
+    ?? status?.active_model_supports_images;
+  if (publishedState === "supported" || publishedBoolean === true) {
+    return {
+      active_model: activeModel,
+      reason: String(
+        providerBinding?.image_input_reason
+          || status?.image_input_reason
+          || "Haider published image-input support for this session.",
+      ),
+      state: "supported",
+      supported: true,
+    };
+  }
+  if (publishedState === "unsupported" || publishedBoolean === false) {
+    return {
+      active_model: activeModel,
+      reason: String(
+        providerBinding?.image_input_reason
+          || status?.image_input_reason
+          || "Haider published that image input is unavailable for this session.",
+      ),
+      state: "unsupported",
+      supported: false,
+    };
+  }
+  return {
+    active_model: activeModel,
+    reason: String(
+      providerBinding?.image_input_reason
+        || status?.image_input_reason
+        || "Haider has not published image-input support for this session.",
+    ),
+    state: "unknown",
+    supported: false,
+  };
 }
 
 function getTodoImageUnsupportedDropMessage(capability) {
   const reason = typeof capability?.reason === "string" ? capability.reason.trim() : "";
-  return reason || "Drop image todos on Codex or Claude with an image-capable model.";
+  return reason || "This terminal has not published image-input support.";
 }
 
 function getTodoImageMimeType(image) {
@@ -23499,7 +23494,7 @@ function TerminalView({
     const sendableActivityAgentReadyFallback = Boolean(
       allowSendableActivityAgentReadyFallback
         && targetUsesActivityHooks
-        && normalizeTodoTerminalAgentId(targetRole) !== "codex"
+        && normalizeTodoTerminalAgentId(targetRole) !== "haider"
         && liveTerminal
         && isTodoQueueSendableActivityStatus(effectiveActivityStatus)
         && !targetThread?.pending_prompt
@@ -35311,8 +35306,8 @@ function TerminalView({
           const terminalAgentId = String(terminalAgent?.id || "").trim().toLowerCase();
           const terminalRoleId = String(terminalRole || "").trim().toLowerCase();
           const terminalPrewarmShell = shouldPrewarmWorkspaceTerminals
-            && terminalAgentId !== "claude"
-            && terminalRoleId !== "claude";
+            && terminalAgentId !== "haider"
+            && terminalRoleId !== "haider";
           const terminalStartupReadyForPane = terminalPrewarmShell || !shouldPrewarmWorkspaceTerminals
             ? terminalStartupReady
             : terminalStartupReady && workspaceTerminalAgentLaunchReady;

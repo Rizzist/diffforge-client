@@ -1,21 +1,7 @@
-// Agent account profiles: manual multi-account switching for the coding
-// agent CLIs (Claude Code, Codex).
-//
-// A profile is a pointer to an isolated CLI home directory. There is no
-// manual "add account" flow: a background watcher pins every authenticated
-// identity it sees in the default CLI homes into its own snapshot profile
-// (credential files copied while they are still valid), so logging into
-// another account in any terminal captures the previous one before the new
-// login overwrites it — both stay switchable afterwards. Keychain-only
-// Claude installs are the one gap: their snapshot carries identity but the
-// OAuth token stays in the Keychain entry keyed to the source dir, so the
-// pinned profile shows "needs login" until used once. The registry holds
-// one `activeProfileId` per agent kind: NEW terminal spawns bind to it via
-// env (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`), already-running panes keep the
-// account they were born with, and the webview shows a restart chip when a
-// pane's stamped profile no longer matches the active one. Switching is
-// always an explicit user action — there is deliberately no automatic
-// rotation on rate limits.
+// The legacy direct-CLI account implementation is retained only as the
+// quarantined account-push wire implementation. Product account authority is
+// Haider's account API. No live path may resolve a legacy registry, profile
+// home, or credential artifact.
 
 const AGENT_ACCOUNTS_CHANGED_EVENT: &str = "agent-accounts-changed";
 const AGENT_ACCOUNTS_FILE: &str = "agent-accounts.json";
@@ -34,6 +20,73 @@ const AGENT_ACCOUNT_PUSH_MAX_BLOB_BYTES: usize = 4 * 1024 * 1024;
 const AGENT_ACCOUNT_PUSH_CONTRACT: &str = "diffforge.agent_account_push.v1";
 const AGENT_ACCOUNT_PUSH_BLOB_TTL_MS: u64 = 5 * 60 * 1000;
 const AGENT_ACCOUNT_PUSH_APPLIED_MAX: usize = 256;
+/// One authority for the temporary product quarantine. The existing wire
+/// contract and transfer implementation stay in-tree, but no sender,
+/// receiver, status watcher, key advertisement, or UI affordance may cross
+/// into them until Haider publishes a credential-transfer capability.
+pub(crate) const ACCOUNT_PUSH_QUARANTINED_PENDING_HARNESS_CREDENTIAL_TRANSFER: bool =
+    !cfg!(all(test, feature = "account-push-unquarantined-tests"));
+const ACCOUNT_PUSH_QUARANTINE_REASON: &str =
+    "Account push is disabled pending a Haider harness credential-transfer capability.";
+const ACCOUNT_PUSH_REQUIRED_CAPABILITY: &str = "harness_credential_transfer";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum AgentAccountPushAvailability {
+    Available {
+        contract: &'static str,
+    },
+    Unavailable {
+        contract: &'static str,
+        reason: &'static str,
+        required_capability: &'static str,
+    },
+}
+
+impl AgentAccountPushAvailability {
+    fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Available { .. } => None,
+            Self::Unavailable { reason, .. } => Some(reason),
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        matches!(self, Self::Available { .. })
+    }
+}
+
+pub(crate) fn agent_account_push_availability_state() -> AgentAccountPushAvailability {
+    if ACCOUNT_PUSH_QUARANTINED_PENDING_HARNESS_CREDENTIAL_TRANSFER {
+        AgentAccountPushAvailability::Unavailable {
+            contract: AGENT_ACCOUNT_PUSH_CONTRACT,
+            reason: ACCOUNT_PUSH_QUARANTINE_REASON,
+            required_capability: ACCOUNT_PUSH_REQUIRED_CAPABILITY,
+        }
+    } else {
+        AgentAccountPushAvailability::Available {
+            contract: AGENT_ACCOUNT_PUSH_CONTRACT,
+        }
+    }
+}
+
+fn agent_account_push_require_available() -> Result<(), String> {
+    let availability = agent_account_push_availability_state();
+    availability.reason().map_or(Ok(()), |reason| Err(reason.to_string()))
+}
+
+/// All retained legacy credential-file transfer code crosses this boundary.
+/// The duplicated check is deliberate: mutating or bypassing an outer entry
+/// guard still cannot resolve a credential artifact while the one quarantine
+/// switch is on.
+fn agent_account_push_require_legacy_credential_access() -> Result<(), String> {
+    agent_account_push_require_available()
+}
+
+#[tauri::command]
+async fn agent_account_push_availability() -> AgentAccountPushAvailability {
+    agent_account_push_availability_state()
+}
 
 static AGENT_ACCOUNTS_PANE_PROFILES: OnceLock<StdMutex<HashMap<String, Value>>> = OnceLock::new();
 static AGENT_ACCOUNTS_PANE_SESSION_IDENTITIES: OnceLock<
@@ -320,6 +373,17 @@ fn agent_accounts_remove_login_bindings(kind: &str, profile_id: &str, generation
     }
 }
 
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+pub(crate) fn agent_accounts_login_terminal_process_exited(
+    app: Option<&AppHandle>,
+    pane_id: &str,
+    instance_id: u64,
+    exit_status: Option<i32>,
+) {
+    let _ = (app, pane_id, instance_id, exit_status);
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 pub(crate) fn agent_accounts_login_terminal_process_exited(
     app: Option<&AppHandle>,
     pane_id: &str,
@@ -340,9 +404,6 @@ pub(crate) fn agent_accounts_login_terminal_process_exited(
             panes.remove(&key)
         });
     if let Some(transaction) = transaction {
-        // Managed login activation is gated by both the PTY's real exit code
-        // and the atomically-published inner-command marker. A watcher and
-        // teardown racing here still get only one marker claim and one CAS.
         let completed = exit_status == Some(0)
             && app.is_some_and(|app| {
                 agent_accounts_consume_login_exit_marker(
@@ -482,6 +543,7 @@ fn agent_accounts_write_private_file_atomic(
         .get_or_init(|| StdMutex::new(()))
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    #[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
     let _claude_state_guard =
         if path.file_name().and_then(|name| name.to_str()) == Some(".claude.json") {
             Some(acquire_claude_workspace_trust_lock(path)?)
@@ -671,6 +733,7 @@ fn agent_account_push_read_or_create_key_file_uncached(
 
 pub(crate) fn agent_account_push_public_key_metadata(
 ) -> Result<AgentAccountPushPublicKeyMetadata, String> {
+    agent_account_push_require_available()?;
     let file = agent_account_push_read_or_create_key_file()?;
     Ok(AgentAccountPushPublicKeyMetadata {
         public_key_b64: file.public_key_b64,
@@ -887,6 +950,11 @@ fn agent_account_push_handle_remote_status_inner(app: Option<&AppHandle>, event:
     if command_kind != "agent_account_push" {
         return false;
     }
+    if !agent_account_push_availability_state().is_available() {
+        // Consume late acknowledgements for the quarantined feature without
+        // touching the pending registry or any wipe/materialization path.
+        return true;
+    }
     let Some(push_id) = agent_account_push_status_push_id(event) else {
         return true;
     };
@@ -1074,6 +1142,14 @@ pub(crate) fn agent_account_push_handle_remote_status(app: &AppHandle, event: &V
     agent_account_push_handle_remote_status_inner(Some(app), event)
 }
 
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+fn agent_accounts_file_path() -> Option<PathBuf> {
+    // Closed by construction: no production caller can resolve the retired
+    // registry, regardless of the account-push quarantine switch.
+    None
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 fn agent_accounts_file_path() -> Option<PathBuf> {
     cloud_mcp_local_data_file_path(AGENT_ACCOUNTS_FILE)
 }
@@ -1370,6 +1446,13 @@ fn agent_accounts_opencode_oauth_provider(auth: &Value) -> Option<String> {
     })
 }
 
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+fn agent_accounts_opencode_identity_with_first_seen(auth: &Value, home: &Path) -> String {
+    let _ = home;
+    agent_accounts_opencode_identity_from_auth(auth)
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 fn agent_accounts_opencode_identity_with_first_seen(auth: &Value, home: &Path) -> String {
     let api_key_identity = agent_accounts_opencode_api_key_identity(auth);
     let oauth_provider = agent_accounts_opencode_oauth_provider(auth);
@@ -1620,6 +1703,13 @@ fn agent_accounts_profile_auth_path(kind: &str, profile_dir: &Path) -> PathBuf {
     }
 }
 
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+fn agent_accounts_migrate_opencode_profile_layout(profile_dir: &Path) -> Result<bool, String> {
+    let _ = profile_dir;
+    Ok(false)
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 fn agent_accounts_migrate_opencode_profile_layout(profile_dir: &Path) -> Result<bool, String> {
     let legacy = profile_dir.join("auth.json");
     let destination = agent_accounts_profile_auth_path("opencode", profile_dir);
@@ -2134,6 +2224,13 @@ fn agent_accounts_default_email(kind: &str) -> String {
 /// keys it may have published before the dedupe existed, so one login stops
 /// rendering as two usage accounts (desktop Tokenomics tab and the cloud
 /// dashboard alike).
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+pub(crate) fn agent_accounts_duplicate_profile_ids(kind: &str) -> Vec<String> {
+    let _ = kind;
+    Vec::new()
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 pub(crate) fn agent_accounts_duplicate_profile_ids(kind: &str) -> Vec<String> {
     let registry = agent_accounts_registry_read();
     let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
@@ -2158,25 +2255,6 @@ pub(crate) fn agent_accounts_duplicate_profile_ids(kind: &str) -> Vec<String> {
         })
         .filter(|id| !canonical_ids.contains(id))
         .collect()
-}
-
-pub(crate) fn agent_accounts_active_profile_id_for_tokenomics(kind: &str) -> String {
-    let registry = agent_accounts_registry_read();
-    let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
-    let default_email = agent_accounts_default_email(kind);
-    let effective_active_id =
-        agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
-    let canonical_ids = agent_accounts_canonical_profile_ids_by_email(
-        kind,
-        &profiles,
-        &effective_active_id,
-        &default_email,
-    );
-    if canonical_ids.contains(&effective_active_id) {
-        effective_active_id
-    } else {
-        AGENT_ACCOUNTS_DEFAULT_PROFILE_ID.to_string()
-    }
 }
 
 fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
@@ -2586,6 +2664,13 @@ fn agent_accounts_default_profile_home_for_launch(kind: &'static str) -> Option<
     })
 }
 
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+fn agent_accounts_profile_home_for_launch(kind: &'static str) -> Option<PathBuf> {
+    let _ = kind;
+    None
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 fn agent_accounts_profile_home_for_launch(kind: &'static str) -> Option<PathBuf> {
     agent_accounts_active_profile_dir(kind)
         .map(PathBuf::from)
@@ -2625,54 +2710,15 @@ fn agent_accounts_launch_profile_label(kind: &'static str) -> (String, String) {
         .unwrap_or((active_id, active_label))
 }
 
-/// All registered profiles of one kind with existing dirs, for tokenomics:
-/// Claude profiles contribute transcript scan roots (`<dir>/projects`), Codex
-/// profiles contribute per-account auth for the live usage endpoint — each
-/// attributed to its own account key.
-pub(crate) fn agent_accounts_profiles_for_tokenomics(
-    kind: &str,
-) -> Vec<(String, String, Option<String>, PathBuf)> {
-    let registry = agent_accounts_registry_read();
-    let (active_id, profiles) = agent_accounts_kind_entry(&registry, kind);
-    let default_email = agent_accounts_default_email(kind);
-    let effective_active_id =
-        agent_accounts_effective_active_profile_id(kind, &active_id, &profiles, &default_email);
-    let canonical_ids = agent_accounts_canonical_profile_ids_by_email(
-        kind,
-        &profiles,
-        &effective_active_id,
-        &default_email,
-    );
-    profiles
-        .iter()
-        .filter_map(|profile| {
-            // Same rule as the switcher pills: duplicate emails collapse to
-            // one canonical profile, with Default owning its current email.
-            let id = agent_accounts_profile_id(profile)?;
-            if !canonical_ids.contains(&id) {
-                return None;
-            }
-            let label = agent_accounts_profile_display_label(profile);
-            let stored_email = profile
-                .get("email")
-                .and_then(Value::as_str)
-                .map(agent_accounts_email_key)
-                .filter(|email| !email.is_empty());
-            let dir = profile
-                .get("dir")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .filter(|path| path.is_dir())?;
-            Some((id, label, stored_email, dir))
-        })
-        .collect()
-}
-
 /// The active Codex profile dir for the coordination kernel's auth bridge:
 /// managed per-slot Codex homes re-link `auth.json` from this dir, so
 /// coordinated panes pick up the active account on (re)launch.
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+pub(crate) fn agent_accounts_active_codex_home() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 pub(crate) fn agent_accounts_active_codex_home() -> Option<PathBuf> {
     agent_accounts_active_profile_dir("codex")
         .map(PathBuf::from)
@@ -2683,6 +2729,12 @@ pub(crate) fn agent_accounts_active_codex_home() -> Option<PathBuf> {
 /// already isolated; the Default profile is first pinned to its captured
 /// per-account snapshot so later `~/.codex/auth.json` changes do not mutate
 /// running managed panes.
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+pub(crate) fn agent_accounts_codex_home_for_launch() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 pub(crate) fn agent_accounts_codex_home_for_launch() -> Option<PathBuf> {
     if let Some(profile_home) = agent_accounts_active_codex_home() {
         return Some(profile_home);
@@ -2700,6 +2752,15 @@ struct AgentAccountsLaunchAccountBinding {
     selected_profile_dir: Option<PathBuf>,
 }
 
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+fn agent_accounts_capture_launch_account_binding(
+    provider_id: &str,
+) -> Option<AgentAccountsLaunchAccountBinding> {
+    let _ = provider_id;
+    None
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 fn agent_accounts_capture_launch_account_binding(
     provider_id: &str,
 ) -> Option<AgentAccountsLaunchAccountBinding> {
@@ -2884,6 +2945,26 @@ fn agent_accounts_stamp_captured_spawn(
 /// provider SessionStart. Correlating by pane, PTY instance, and provider
 /// session prevents later hooks from an old/manual relaunch from overwriting
 /// the identity of the session currently projected by the terminal runtime.
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+fn agent_accounts_observe_terminal_provider_identity(
+    pane_id: &str,
+    instance_id: u64,
+    provider_id: &str,
+    hook_event_name: &str,
+    provider_session_id: Option<&str>,
+    event: &Value,
+) {
+    let _ = (
+        pane_id,
+        instance_id,
+        provider_id,
+        hook_event_name,
+        provider_session_id,
+        event,
+    );
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 fn agent_accounts_observe_terminal_provider_identity(
     pane_id: &str,
     instance_id: u64,
@@ -2969,6 +3050,13 @@ fn agent_accounts_email_key(email: &str) -> String {
 /// only — the live probe (`agent_accounts_profile_email` fallback) derives a
 /// tokenomics key whose label resolution calls back into this function, so
 /// probing here would recurse for profiles missing a stored email.
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+pub(crate) fn agent_accounts_profile_label_for_email(kind: &str, email: &str) -> Option<String> {
+    let _ = (kind, email);
+    None
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 pub(crate) fn agent_accounts_profile_label_for_email(kind: &str, email: &str) -> Option<String> {
     let wanted = agent_accounts_email_key(email);
     if wanted.is_empty() {
@@ -3181,21 +3269,6 @@ fn agent_accounts_profile_email(kind: &str, profile: &Value) -> String {
     };
     let identity = agent_accounts_profile_identity(kind, Some(Path::new(dir)));
     agent_accounts_identity_key(kind, &identity)
-}
-
-pub(crate) fn agent_accounts_active_stable_identity(kind: &str) -> Option<String> {
-    let registry = agent_accounts_registry_read_resolved();
-    let (active_profile_id, profiles) = agent_accounts_kind_entry(&registry, kind);
-    if active_profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
-        let identity = agent_accounts_profile_identity(kind, None);
-        let key = agent_accounts_identity_key(kind, &identity);
-        return (!key.is_empty()).then_some(key);
-    }
-    profiles
-        .iter()
-        .find(|profile| agent_accounts_profile_id(profile).as_deref() == Some(&active_profile_id))
-        .map(|profile| agent_accounts_profile_email(kind, profile))
-        .filter(|identity| !identity.is_empty())
 }
 
 fn agent_accounts_source_is_newer(source: &Path, destination: &Path) -> bool {
@@ -4255,6 +4328,7 @@ fn agent_accounts_write_private_file(path: &Path, bytes: &[u8]) -> Result<(), St
 }
 
 fn agent_account_push_read_file(path: &Path, required: bool) -> Result<Option<String>, String> {
+    agent_account_push_require_legacy_credential_access()?;
     if !path.is_file() {
         if required {
             return Err(format!(
@@ -4286,6 +4360,7 @@ fn agent_account_push_read_file(path: &Path, required: bool) -> Result<Option<St
 }
 
 fn agent_account_push_read_claude_state_subset_file(path: &Path) -> Result<Option<String>, String> {
+    agent_account_push_require_legacy_credential_access()?;
     if !path.is_file() {
         return Err("Required credential file is missing: .claude.json".to_string());
     }
@@ -4375,6 +4450,7 @@ fn agent_account_push_profile_bundle(
     target_device_id: &str,
     sender_device_id: &str,
 ) -> Result<AgentAccountPushBlob, String> {
+    agent_account_push_require_legacy_credential_access()?;
     let registry = agent_accounts_registry_read_resolved();
     let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
     let (profile, profile_dir) = if profile_id == AGENT_ACCOUNTS_DEFAULT_PROFILE_ID {
@@ -4522,6 +4598,7 @@ fn agent_account_push_current_credentials_digest(
     profile_id: &str,
     profile_dir: Option<&Path>,
 ) -> Result<String, String> {
+    agent_account_push_require_legacy_credential_access()?;
     let credential_name = agent_accounts_auth_file_name(kind);
     let path = agent_account_push_source_file_path(kind, profile_id, profile_dir, credential_name)
         .ok_or_else(|| "Unable to resolve current credential file for local wipe.".to_string())?;
@@ -5263,6 +5340,7 @@ fn agent_account_push_mark_applied(
 }
 
 fn agent_accounts_materialize_pushed_account(blob: AgentAccountPushBlob) -> Result<Value, String> {
+    agent_account_push_require_legacy_credential_access()?;
     let kind = agent_accounts_supported_kind(&blob.agent_kind)
         .ok_or_else(|| format!("Unsupported pushed agent kind: {}", blob.agent_kind))?;
     agent_account_push_verify_sender_auth(&blob)?;
@@ -5508,6 +5586,7 @@ fn agent_accounts_wipe_pushed_profile_internal(
     expected_email: &str,
     expected_credentials_sha256: Option<&str>,
 ) -> Result<Value, String> {
+    agent_account_push_require_legacy_credential_access()?;
     let kind = agent_accounts_supported_kind(kind)
         .ok_or_else(|| format!("Unsupported agent kind for local wipe: {kind}"))?;
     let expected_email = agent_accounts_email_key(expected_email);
@@ -6110,6 +6189,12 @@ fn agent_accounts_log_capture_watcher_error(
     );
 }
 
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
+    let _ = app;
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
     let _ = std::thread::Builder::new()
         .name("agent-accounts-capture".to_string())
@@ -6869,6 +6954,47 @@ fn agent_accounts_claude_state_path_for_home(profile_home: &Path) -> PathBuf {
     }
 }
 
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
+fn agent_accounts_ensure_claude_workspace_trust_for_legacy_test(
+    state_path: &Path,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let mut state = match fs::read(state_path) {
+        Ok(raw) if raw.iter().all(u8::is_ascii_whitespace) => json!({}),
+        Ok(raw) => serde_json::from_slice::<Value>(&raw)
+            .map_err(|error| format!("Unable to parse Claude workspace trust state: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => {
+            return Err(format!(
+                "Unable to read Claude workspace trust state {}: {error}",
+                state_path.display()
+            ))
+        }
+    };
+    let root = state
+        .as_object_mut()
+        .ok_or_else(|| "Claude state is not a JSON object.".to_string())?;
+    let projects = root
+        .entry("projects".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "Claude state has an invalid projects value.".to_string())?;
+    let project = projects
+        .entry(workspace_root.to_string_lossy().to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| "Claude state has invalid project state.".to_string())?;
+    project.insert("hasTrustDialogAccepted".to_string(), json!(true));
+    project.insert("hasCompletedProjectOnboarding".to_string(), json!(true));
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|error| format!("Unable to encode Claude workspace trust state: {error}"))?;
+    agent_accounts_write_private_file_atomic(
+        state_path,
+        &bytes,
+        "legacy-test Claude workspace trust",
+    )
+}
+
 fn agent_accounts_reconcile_workspace_trust_in_home(
     kind: &'static str,
     provider_home: Option<&Path>,
@@ -6889,7 +7015,23 @@ fn agent_accounts_reconcile_workspace_trust_in_home(
             })?;
             let state_path = agent_accounts_claude_state_path_for_home(profile_home);
             let key = workspace_root.to_string_lossy().to_string();
+            #[cfg(all(test, feature = "account-push-unquarantined-tests"))]
+            {
+                agent_accounts_ensure_claude_workspace_trust_for_legacy_test(
+                    &state_path,
+                    &workspace_root,
+                )?;
+                return Ok(json!({
+                    "contract": "diffforge.provider_workspace_trust.v1",
+                    "provider": kind,
+                    "state": "resolved",
+                    "workspace_root": key,
+                    "source": "provider_native_state",
+                }));
+            }
+            #[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
             let outcome = ensure_claude_workspace_trust_in_config(&state_path, &workspace_root)?;
+            #[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
             if outcome == ClaudeWorkspaceTrustMergeOutcome::SkippedInvalidConfig {
                 return Ok(json!({
                     "contract": "diffforge.provider_workspace_trust.v1",
@@ -6900,6 +7042,7 @@ fn agent_accounts_reconcile_workspace_trust_in_home(
                     "message": "Claude state is malformed; DiffForge left it unchanged.",
                 }));
             }
+            #[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
             Ok(json!({
                 "contract": "diffforge.provider_workspace_trust.v1",
                 "provider": kind,
@@ -7039,6 +7182,7 @@ fn agent_accounts_reconcile_workspace_trust_for(
     result.ok_or_else(|| format!("Unable to resolve the active {kind} home."))
 }
 
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_reconcile_workspace_trust(
     agent_kind: String,
@@ -7053,6 +7197,7 @@ async fn agent_accounts_reconcile_workspace_trust(
     .map_err(|error| format!("Provider workspace trust worker failed: {error}"))?
 }
 
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_web_login_command(
     app: AppHandle,
@@ -7147,6 +7292,22 @@ async fn agent_accounts_web_login_command(
     .map_err(|error| format!("Provider web login worker failed: {error}"))?
 }
 
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+fn agent_accounts_device_live_state_payload(stale_terminal_inventory: Vec<Value>) -> Value {
+    let _ = stale_terminal_inventory;
+    json!({
+        "contract": "diffforge.provider_accounts_live.v1",
+        "availability": {
+            "state": "unavailable",
+            "reason": "Legacy provider-account inventory is retired; use the Haider account roster.",
+        },
+        "updated_at_ms": todo_dispatch_now_ms(),
+        "stale_terminal_inventory": [],
+        "agents": {},
+    })
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 fn agent_accounts_device_live_state_payload(stale_terminal_inventory: Vec<Value>) -> Value {
     let registry = agent_accounts_registry_read_resolved();
     let sanitize = |kind: &'static str| {
@@ -7182,6 +7343,15 @@ pub(crate) fn agent_accounts_device_live_state() -> Value {
     agent_accounts_device_live_state_payload(Vec::new())
 }
 
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+pub(crate) async fn agent_accounts_device_live_state_for_terminal_state(
+    state: &TerminalState,
+) -> Value {
+    let _ = state;
+    agent_accounts_device_live_state_payload(Vec::new())
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 pub(crate) async fn agent_accounts_device_live_state_for_terminal_state(
     state: &TerminalState,
 ) -> Value {
@@ -7194,6 +7364,13 @@ pub(crate) async fn agent_accounts_device_live_state_for_terminal_state(
     agent_accounts_device_live_state_payload(stale_terminal_inventory)
 }
 
+#[cfg(not(all(test, feature = "account-push-unquarantined-tests")))]
+pub(crate) fn agent_accounts_pane_profile_stamp(pane_id: &str) -> Option<Value> {
+    let _ = pane_id;
+    None
+}
+
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 pub(crate) fn agent_accounts_pane_profile_stamp(pane_id: &str) -> Option<Value> {
     AGENT_ACCOUNTS_PANE_PROFILES
         .get_or_init(|| StdMutex::new(HashMap::new()))
@@ -7505,6 +7682,7 @@ fn agent_accounts_provider_for_kind(kind: &str) -> AgentProvider {
     }
 }
 
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_state() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -7522,6 +7700,7 @@ async fn agent_accounts_state() -> Result<Value, String> {
     .map_err(|error| format!("Agent accounts state worker failed: {error}"))?
 }
 
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_start_profile_login(
     app: AppHandle,
@@ -7588,6 +7767,7 @@ async fn agent_accounts_start_profile_login(
     .map_err(|error| format!("Agent account login worker failed: {error}"))?
 }
 
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_cancel_profile_login(
     agent_kind: String,
@@ -7611,6 +7791,7 @@ async fn agent_accounts_cancel_profile_login(
     }))
 }
 
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_bind_login_terminal(
     state: State<'_, TerminalState>,
@@ -7661,6 +7842,7 @@ async fn agent_accounts_bind_login_terminal(
 /// the default view is synthesized, not a registry profile. Only connected
 /// profiles (a signed-in identity is present) can be customized — the alias
 /// names an account, not an empty dir.
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_update_display(
     app: AppHandle,
@@ -7734,6 +7916,7 @@ async fn agent_accounts_update_display(
     .map_err(|error| format!("Agent accounts update-display worker failed: {error}"))?
 }
 
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_set_active(
     app: AppHandle,
@@ -7817,6 +8000,11 @@ async fn agent_account_push_to_device(
     wipe_local_after: bool,
     target_key_fingerprint: Option<String>,
 ) -> Result<Value, String> {
+    let availability = agent_account_push_availability_state();
+    if !availability.is_available() {
+        return serde_json::to_value(availability)
+            .map_err(|error| format!("Unable to encode account-push availability: {error}"));
+    }
     let kind = agent_accounts_supported_kind(&agent_kind)
         .ok_or_else(|| format!("Unsupported agent kind for account push: {agent_kind}"))?;
     let profile_id = profile_id.trim().to_string();
@@ -8016,6 +8204,7 @@ async fn agent_account_push_to_device(
     }))
 }
 
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_remove(
     app: AppHandle,
@@ -8436,14 +8625,183 @@ async fn agent_accounts_pane_profiles_for_state(state: &TerminalState) -> Value 
     })
 }
 
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 #[tauri::command(rename_all = "snake_case")]
 async fn agent_accounts_pane_profiles(state: State<'_, TerminalState>) -> Result<Value, String> {
     Ok(agent_accounts_pane_profiles_for_state(state.inner()).await)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "account-push-unquarantined-tests"))]
 mod agent_accounts_tests {
     use super::*;
+
+    fn extend_terminal_activity_env_vars(
+        env_vars: &mut Vec<(String, String)>,
+        workspace_root: Option<&Path>,
+        _pane_id: &str,
+        _instance_id: u64,
+        _workspace_id: Option<&str>,
+        _terminal_index: Option<u16>,
+        provider_id: &str,
+        _activity_transport: Option<&TerminalActivityTransportEndpoint>,
+        launch_account_binding: Option<&TerminalProviderLaunchAccountBinding>,
+    ) -> Result<(), String> {
+        if let Some(workspace_root) = workspace_root {
+            set_terminal_env_var(
+                env_vars,
+                "DIFFFORGE_WORKSPACE_ROOT",
+                &workspace_root.to_string_lossy(),
+            );
+        }
+        if agent_accounts_supported_kind(provider_id).is_some() {
+            let binding = launch_account_binding
+                .filter(|binding| binding.matches_provider_id(provider_id))
+                .ok_or_else(|| format!("Missing frozen {provider_id} test account binding."))?;
+            binding.apply_to_env(env_vars);
+        }
+        Ok(())
+    }
+
+    fn stamp_terminal_launch_account(
+        pane_id: &str,
+        instance_id: u64,
+        launch_epoch: &str,
+        provider_id: &str,
+        workspace_id: Option<&str>,
+        terminal_index: Option<u16>,
+        launch_account_binding: &TerminalProviderLaunchAccountBinding,
+        workspace_trust: Option<&Value>,
+    ) {
+        let Some(account_binding) = launch_account_binding
+            .matches_provider_id(provider_id)
+            .then(|| launch_account_binding.captured_account())
+            .flatten()
+        else {
+            return;
+        };
+        agent_accounts_stamp_captured_spawn(
+            pane_id,
+            Some(instance_id),
+            Some(launch_epoch),
+            provider_id,
+            workspace_id,
+            None,
+            terminal_index,
+            account_binding,
+            workspace_trust,
+        );
+    }
+
+    fn prepare_terminal_launch_account(
+        env_vars: &[(String, String)],
+        provider_id: &str,
+        launch_account_binding: &TerminalProviderLaunchAccountBinding,
+    ) -> Result<Option<Value>, String> {
+        if provider_id == "haider" {
+            return Ok(None);
+        }
+        let account_binding = launch_account_binding
+            .matches_provider_id(provider_id)
+            .then(|| launch_account_binding.captured_account())
+            .flatten()
+            .ok_or_else(|| format!("Missing frozen {provider_id} test account binding."))?;
+        agent_accounts_prepare_captured_spawn(env_vars, account_binding)
+    }
+
+    fn legacy_test_codex_rollout_exists(root: &Path, session_id: &str) -> bool {
+        let Ok(entries) = fs::read_dir(root) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                legacy_test_codex_rollout_exists(&path, session_id)
+            } else {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(session_id))
+            }
+        })
+    }
+
+    fn terminal_resolve_provider_resume_session_for_binding(
+        provider: AgentProvider,
+        requested_resume_session_id: Option<String>,
+        working_directory: &str,
+        account_binding: &TerminalProviderLaunchAccountBinding,
+    ) -> (Option<String>, Option<String>) {
+        let Some(session_id) = requested_resume_session_id else {
+            return (None, None);
+        };
+        match (provider, account_binding) {
+            (
+                AgentProvider::OpenCode,
+                TerminalProviderLaunchAccountBinding::OpenCode {
+                    db_path: Some(db_path),
+                    ..
+                },
+            ) => {
+                let resolved = rusqlite::Connection::open(db_path)
+                    .ok()
+                    .and_then(|connection| {
+                        connection
+                            .query_row(
+                                "select id, directory from session where id = ?1 limit 1",
+                                rusqlite::params![session_id],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .ok()
+                    })
+                    .filter(|(_, cwd)| {
+                        working_directory.trim().is_empty()
+                            || cwd.trim().is_empty()
+                            || Path::new(cwd) == Path::new(working_directory)
+                    })
+                    .map(|(id, _)| id);
+                (resolved, None)
+            }
+            (AgentProvider::Codex, _) => {
+                let Some(home) = account_binding.codex_auth_home() else {
+                    return (None, None);
+                };
+                if legacy_test_codex_rollout_exists(&home.join("sessions"), &session_id) {
+                    (
+                        Some(session_id),
+                        Some(home.to_string_lossy().to_string()),
+                    )
+                } else {
+                    (None, None)
+                }
+            }
+            _ => (None, None),
+        }
+    }
+
+    fn apply_codex_resume_home_env(
+        env_vars: &mut Vec<(String, String)>,
+        source_home: &str,
+        _provider_session_id: &str,
+        launch_account_binding: Option<&TerminalProviderLaunchAccountBinding>,
+    ) -> Result<(), String> {
+        let managed_home = env_vars.iter().rev().find_map(|(key, value)| {
+            (key == "DIFFFORGE_CODEX_HOME")
+                .then_some(value.trim())
+                .filter(|value| !value.is_empty())
+        });
+        let launch_home = managed_home.map(PathBuf::from).or_else(|| {
+            launch_account_binding
+                .and_then(TerminalProviderLaunchAccountBinding::codex_auth_home)
+                .map(Path::to_path_buf)
+        });
+        let launch_home = launch_home.unwrap_or_else(|| PathBuf::from(source_home));
+        if launch_home != Path::new(source_home) {
+            return Err("Legacy test resume expected its frozen Codex source home.".to_string());
+        }
+        let launch_home = launch_home.to_string_lossy();
+        set_terminal_env_var(env_vars, "CODEX_HOME", &launch_home);
+        set_terminal_env_var(env_vars, "DIFFFORGE_CODEX_HOME", &launch_home);
+        Ok(())
+    }
 
     // Regression (v0.9.25 startup crash): profile_identity computed the
     // fossil policy, whose helpers called profile_identity back — unbounded
@@ -10946,15 +11304,6 @@ trust_level = "trusted"
         assert_eq!(profiles[1]["is_active"].as_bool(), Some(true));
         assert_eq!(profiles[0]["alias"].as_str(), Some("Admin"));
         assert!(agent_accounts_duplicate_profile_ids("codex").is_empty());
-        let tokenomics_ids = agent_accounts_profiles_for_tokenomics("codex")
-            .into_iter()
-            .map(|(id, _, _, _)| id)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            tokenomics_ids,
-            vec!["cap-admin".to_string(), "cap-work".to_string()]
-        );
-
         assert!(!agent_accounts_capture_kind("codex"));
         let registry_after = agent_accounts_registry_read();
         assert_eq!(
@@ -11038,10 +11387,6 @@ trust_level = "trusted"
             .filter_map(|profile| profile["id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(active_ids, vec!["cap-device"]);
-        assert_eq!(
-            agent_accounts_active_profile_id_for_tokenomics("codex"),
-            "cap-device".to_string()
-        );
     }
 
     #[test]
@@ -13227,5 +13572,189 @@ trust_level = "trusted"
             .lock()
             .unwrap()
             .contains_key("push-failed"));
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(feature = "account-push-unquarantined-tests"))]
+mod account_push_quarantine_tests {
+    use super::*;
+
+    fn quarantine_error() -> String {
+        ACCOUNT_PUSH_QUARANTINE_REASON.to_string()
+    }
+
+    #[test]
+    fn account_push_quarantine_is_one_typed_switch() {
+        assert!(ACCOUNT_PUSH_QUARANTINED_PENDING_HARNESS_CREDENTIAL_TRANSFER);
+        assert_eq!(
+            agent_account_push_availability_state(),
+            AgentAccountPushAvailability::Unavailable {
+                contract: AGENT_ACCOUNT_PUSH_CONTRACT,
+                reason: ACCOUNT_PUSH_QUARANTINE_REASON,
+                required_capability: ACCOUNT_PUSH_REQUIRED_CAPABILITY,
+            }
+        );
+        let source = include_str!("agent_accounts.rs");
+        assert_eq!(
+            source
+                .matches(concat!(
+                    "pub(crate) const ACCOUNT_PUSH_",
+                    "QUARANTINED_PENDING_HARNESS_CREDENTIAL_TRANSFER",
+                ))
+                .count(),
+            1,
+            "the product quarantine must have exactly one switch"
+        );
+    }
+
+    #[test]
+    fn key_advertisement_stops_before_storage_resolution() {
+        assert_eq!(
+            agent_account_push_public_key_metadata().err(),
+            Some(quarantine_error())
+        );
+    }
+
+    #[test]
+    fn legacy_credential_read_boundaries_stop_before_path_access() {
+        let path = Path::new("/this/path/must/not/be/inspected/legacy-auth.json");
+        assert_eq!(
+            agent_account_push_read_file(path, true).unwrap_err(),
+            quarantine_error()
+        );
+        assert_eq!(
+            agent_account_push_read_claude_state_subset_file(path).unwrap_err(),
+            quarantine_error()
+        );
+        assert_eq!(
+            agent_account_push_current_credentials_digest("codex", "default", None).unwrap_err(),
+            quarantine_error()
+        );
+        let live = agent_accounts_device_live_state();
+        assert_eq!(live["availability"]["state"], json!("unavailable"));
+        assert_eq!(live["agents"], json!({}));
+    }
+
+    #[test]
+    fn outbound_bundle_and_wipe_stop_before_legacy_registry_resolution() {
+        assert_eq!(
+            agent_account_push_profile_bundle(
+                "codex",
+                "default",
+                "push-id",
+                "target-device",
+                "sender-device"
+            )
+            .err()
+            .expect("the quarantined bundle path must refuse to build a credential blob"),
+            quarantine_error()
+        );
+        assert_eq!(
+            agent_accounts_wipe_pushed_profile_internal(
+                None,
+                "codex",
+                "default",
+                "owner@example.test",
+                None,
+            )
+            .unwrap_err(),
+            quarantine_error()
+        );
+    }
+
+    #[test]
+    fn inbound_materialization_stops_before_legacy_registry_resolution() {
+        let blob = AgentAccountPushBlob {
+            version: 2,
+            contract: AGENT_ACCOUNT_PUSH_CONTRACT.to_string(),
+            push_id: "push-id".to_string(),
+            target_device_id: "target-device".to_string(),
+            sender_device_id: "sender-device".to_string(),
+            sender_push_public_key_b64: String::new(),
+            sender_key_fingerprint_sha256: String::new(),
+            ack_nonce_b64: String::new(),
+            sender_auth_tag_b64: String::new(),
+            issued_at_ms: 0,
+            expires_at_ms: 1,
+            agent_kind: "codex".to_string(),
+            source_profile_id: "default".to_string(),
+            identity_email: "owner@example.test".to_string(),
+            label: "Owner".to_string(),
+            alias: "owner".to_string(),
+            files: Vec::new(),
+        };
+        assert_eq!(
+            agent_accounts_materialize_pushed_account(blob).unwrap_err(),
+            quarantine_error()
+        );
+    }
+
+    #[test]
+    fn late_push_status_is_consumed_without_touching_pending_state() {
+        let push_id = format!("quarantined-status-{}", uuid::Uuid::new_v4());
+        agent_account_push_pending().lock().unwrap().insert(
+            push_id.clone(),
+            AgentAccountPushPending {
+                agent_kind: "codex".to_string(),
+                profile_id: "default".to_string(),
+                target_device_id: "target-device".to_string(),
+                wipe_local_after: false,
+                identity_email: "owner@example.test".to_string(),
+                delivered: false,
+                created_at_ms: 0,
+                expires_at_ms: u64::MAX,
+                ack_nonce_b64: String::new(),
+                target_push_public_key_b64: String::new(),
+                source_credentials_sha256: String::new(),
+            },
+        );
+        assert!(agent_account_push_handle_remote_status_inner(
+            None,
+            &json!({
+                "event_kind": "remote_command_result",
+                "command_kind": "agent_account_push",
+                "intent_id": push_id.clone(),
+                "status": "completed",
+            }),
+        ));
+        assert!(agent_account_push_pending()
+            .lock()
+            .unwrap()
+            .remove(&push_id)
+            .is_some());
+    }
+
+    #[test]
+    fn sender_and_receiver_guards_precede_credential_payload_work() {
+        let account_source = include_str!("agent_accounts.rs");
+        let sender = account_source
+            .split("async fn agent_account_push_to_device(")
+            .nth(1)
+            .expect("sender entry point");
+        let sender_guard = sender
+            .find("agent_account_push_availability_state()")
+            .expect("sender quarantine guard");
+        let sender_legacy_validation = sender
+            .find("agent_accounts_supported_kind")
+            .expect("legacy sender validation");
+        assert!(
+            sender_guard < sender_legacy_validation,
+            "sender must publish typed unavailability before validating legacy fields"
+        );
+
+        let cloud_source = include_str!("cloud_mcp.rs");
+        let receiver = cloud_source
+            .split("\"agent_account_push\" => {")
+            .nth(1)
+            .expect("receiver entry point");
+        let receiver_guard = receiver
+            .find("agent_account_push_availability_state()")
+            .expect("receiver quarantine guard");
+        let receiver_payload = receiver.find("sealed_blob").expect("sealed receiver payload");
+        assert!(
+            receiver_guard < receiver_payload,
+            "receiver must reject before reading a credential payload"
+        );
     }
 }

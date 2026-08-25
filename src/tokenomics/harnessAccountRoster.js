@@ -14,10 +14,9 @@
 //   as possibly stale with the daemon's reason available.
 // - A missing feature bit is UNSUPPORTED, which is a different fact from an
 //   empty roster.
-// - Swap is optimistic-NEVER: starting a swap changes only the in-flight
-//   marker; the displayed active account moves only on the daemon's success
-//   result (or the roster-changed re-list), and a failure leaves the
-//   displayed active account untouched.
+// - Swap is optimistic-NEVER: point success changes only the in-flight marker;
+//   the displayed active account moves only when account_list republishes it,
+//   and a failure leaves the displayed active account untouched.
 
 export const HARNESS_ACCOUNTS_UNSUPPORTED_CODE = "haider_accounts_unavailable";
 
@@ -323,6 +322,35 @@ export function harnessAccountDisplayLabel(descriptor) {
   ) || "Account";
 }
 
+/* `account.list` descriptors are the daemon's CredentialDescriptor rows
+   carried verbatim, and the daemon publishes `auth_method` as
+   "oauth" | "api_key" (haider-protocol credential.rs). Anything else —
+   including absence — is UNKNOWN, and unknown must never be collapsed into
+   either kind. */
+export function harnessAccountAuthKind(descriptor) {
+  const kind = harnessWireText(descriptor?.auth_method);
+  return kind === "oauth" || kind === "api_key" ? kind : "";
+}
+
+export function harnessAccountAuthKindLabel(descriptor) {
+  const kind = harnessAccountAuthKind(descriptor);
+  if (kind === "oauth") return "OAuth";
+  if (kind === "api_key") return "API key";
+  return "";
+}
+
+/* Owner intent: API-key accounts need no switching ("the user selects the
+   provider anyways"), so ONLY the published api_key fact removes the swap
+   affordance. OAuth keeps it, and an UNKNOWN kind keeps it too — absence is
+   never evidence the account is API-key. */
+export function harnessAccountSwapAffordance(descriptor) {
+  const kind = harnessAccountAuthKind(descriptor);
+  if (kind === "api_key") {
+    return { swappable: false, kind, reason: "api_key_not_switchable" };
+  }
+  return { swappable: true, kind, reason: "" };
+}
+
 /* Pure chip state/title projection. Formatting the recorded token total stays
    with the view's established formatters; all account/swap presentation
    choices live here. */
@@ -337,6 +365,7 @@ export function harnessAccountChipPresentation(
   const isActive = descriptor?.active === true;
   const inFlight = swap?.phase === "in_flight" && swap?.alias === alias;
   const confirmEpoch = swap?.phase === "confirm_epoch" && swap?.alias === alias;
+  const { swappable, kind: authKind } = harnessAccountSwapAffordance(descriptor);
   return {
     alias,
     provider,
@@ -344,6 +373,9 @@ export function harnessAccountChipPresentation(
     isActive,
     inFlight,
     confirmEpoch,
+    authKind,
+    authKindLabel: harnessAccountAuthKindLabel(descriptor),
+    swappable,
     disabled: inFlight || (swap?.phase === "in_flight" && !inFlight),
     title: [
       `${label} (${alias}) · ${provider}`,
@@ -351,7 +383,11 @@ export function harnessAccountChipPresentation(
         ? usageTitle
         : "No harness ledger lanes are keyed to this account yet",
       meterTitle,
-      isActive ? "Active account" : "Click to make this the active account",
+      isActive
+        ? "Active account"
+        : swappable
+          ? "Click to make this the active account"
+          : "API-key account — the provider selects it; switching does not apply",
     ].filter(Boolean).join("\n"),
   };
 }
@@ -366,46 +402,35 @@ export function harnessSwapAllowed(state, descriptor) {
   if (descriptor.active === true) {
     return { allowed: false, reason: "already_active" };
   }
+  /* API-key accounts carry no swap affordance (owner intent); only the
+     PUBLISHED api_key kind refuses — an unknown kind stays swappable. */
+  const affordance = harnessAccountSwapAffordance(descriptor);
+  if (!affordance.swappable) {
+    return { allowed: false, reason: affordance.reason };
+  }
   return { allowed: true, reason: "" };
 }
 
 /* Starting a swap marks ONLY the in-flight alias. Descriptors — and with
-   them the displayed active account — are untouched until the daemon
-   confirms. */
+   them the displayed active account — are untouched until account_list
+   republishes the roster. */
 export function harnessSwapBegin(state, alias) {
   if (state.swap.phase === "in_flight") return state;
   return { ...state, swap: { phase: "in_flight", alias: harnessAccountAlias(alias), message: "" } };
 }
 
-/* The daemon's success result IS the confirmation: it publishes the new
-   active descriptor and the prior alias. Apply exactly those two facts —
-   nothing else is inferred — and clear the in-flight marker. Callers still
-   re-list to reconcile the full roster. */
-export function harnessSwapConfirm(state, alias, result) {
-  const descriptor = result?.descriptor && typeof result.descriptor === "object"
-    ? result.descriptor
-    : null;
-  const priorAlias = harnessAccountAlias(result?.prior_alias);
-  const descriptors = state.descriptors.map((row) => {
-    const rowAlias = harnessAccountAlias(row);
-    if (descriptor && rowAlias === harnessAccountAlias(descriptor)) {
-      return { ...descriptor, active: true };
-    }
-    if (priorAlias && rowAlias === priorAlias) {
-      return { ...row, active: false };
-    }
-    return row;
-  });
+/* Swap success clears only the in-flight marker. The point response is not a
+   roster publication: descriptors, active markers, and revision remain owned
+   exclusively by the follow-up account_list result. */
+export function harnessSwapConfirm(state) {
   return {
     ...state,
-    descriptors,
-    revision: Number.isInteger(result?.revision) ? result.revision : state.revision,
     swap: { phase: "idle", alias: "", message: "" },
   };
 }
 
 export function harnessSwapFailureMessage(code) {
-  if (code.includes("revision_conflict")) return "The account list changed underneath — refreshed; try again.";
+  if (code.includes("revision_conflict")) return "The account list changed underneath — refresh before trying again.";
   if (code.includes("invalid_argument")) return "The daemon rejected the switch (bad alias or provider).";
   if (code.includes("busy")) return "The daemon is busy — try again in a moment.";
   if (code.includes(HARNESS_ACCOUNTS_UNSUPPORTED_CODE)) return "The harness connection is unavailable.";
