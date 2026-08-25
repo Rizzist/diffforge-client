@@ -61,6 +61,7 @@ const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
 const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
 const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
+const FEATURE_USAGE_HISTORY_V1: &str = "usage_history_v1";
 const FEATURE_HAIDER_CODE_PLAN_STATUS_V1: &str = "haider_code_plan_status_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
@@ -220,6 +221,179 @@ pub struct UsageReportResult {
     pub report: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub availability: Option<SnapshotAvailabilityWire>,
+}
+
+/// Root-vs-delegated accounting lane published by usage-history v1.
+///
+/// Wire authority: `crates/haider-protocol/src/usage.rs:20-32`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageHistoryRoleV1 {
+    #[default]
+    Root,
+    Subagent,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Append-only lane dictionary entry. Every descriptor field is genuinely
+/// optional: the daemon publishes anonymous keys such as `{ "id": 2 }`.
+/// Storage callers must retain those `None`s rather than inventing identity.
+///
+/// Wire authority: `crates/haider-protocol/src/usage.rs:34-50`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryKeyV1 {
+    pub id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryRowV1 {
+    pub key_id: u32,
+    pub role: UsageHistoryRoleV1,
+    pub requests: u64,
+    pub errors: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+/// A present slot is sampled even if every row/counter is zero. The enclosing
+/// day uses `None` for not-sampled instead.
+///
+/// Wire authority: `crates/haider-protocol/src/usage.rs:66-74`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistorySlotV1 {
+    #[serde(default)]
+    pub rows: Vec<UsageHistoryRowV1>,
+    #[serde(default)]
+    pub subagents_spawned: u64,
+}
+
+/// Provider meter values are frozen point-in-time ledger facts. In
+/// particular `basis_points` remains an integer and optional balances remain
+/// optional end to end.
+///
+/// Wire authority: `crates/haider-protocol/src/usage.rs:76-104`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryMeterSampleV1 {
+    pub account: String,
+    pub window: String,
+    pub basis_points: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_until_ms: Option<u64>,
+    pub sampled_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryVersionChangeV1 {
+    pub daemon_version: String,
+    pub changed_at_ms: u64,
+}
+
+/// Device-local truth for one UTC day. `slots` is validated as exactly 96 by
+/// the Tokenomics ingestion boundary so malformed payloads never become
+/// ambiguous storage.
+///
+/// Wire authority: `crates/haider-protocol/src/usage.rs:113-128`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryDayV1 {
+    pub date: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub backfilled: bool,
+    #[serde(default)]
+    pub keys: Vec<UsageHistoryKeyV1>,
+    pub slots: Vec<Option<UsageHistorySlotV1>>,
+    #[serde(default)]
+    pub meter_samples: Vec<UsageHistoryMeterSampleV1>,
+    #[serde(default)]
+    pub version_changes: Vec<UsageHistoryVersionChangeV1>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryDailyTotalV1 {
+    pub sampled_slots: u16,
+    pub requests: u64,
+    pub errors: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub subagents_spawned: u64,
+}
+
+/// One absence-preserving range cell. `total: None` is not a zero total.
+///
+/// Wire authority: `crates/haider-protocol/src/usage.rs:145-152`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryRangeDayV1 {
+    pub date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<UsageHistoryDailyTotalV1>,
+}
+
+/// A successful day RPC is still tri-state: feature absence, an absent day
+/// with known device provenance, or a typed day payload.
+///
+/// Response authority: `crates/haider-rpc/src/frame.rs:2942-2950`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UsageHistoryDayRead {
+    Unsupported,
+    NoDay {
+        date: String,
+        device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
+    },
+    Day {
+        date: String,
+        device_id: String,
+        day: UsageHistoryDayV1,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
+    },
+}
+
+/// A typed bounded range or an explicit feature-unsupported state.
+///
+/// Response authority: `crates/haider-rpc/src/frame.rs:2952-2960`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UsageHistoryRangeRead {
+    Unsupported,
+    Range {
+        through_date: String,
+        device_id: String,
+        days: Vec<UsageHistoryRangeDayV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
+    },
 }
 
 /// Last provider-authored Haider Code plan frame observed on the shared ADE
@@ -715,6 +889,11 @@ enum RequestBody {
     },
     #[serde(rename = "usage.report")]
     UsageReport {},
+    /// Request authority: `crates/haider-rpc/src/frame.rs:2361-2367`.
+    #[serde(rename = "usage.history_day")]
+    UsageHistoryDay { date: String },
+    #[serde(rename = "usage.history_range")]
+    UsageHistoryRange { through_date: String, days: u16 },
     #[serde(rename = "session.observe")]
     SessionObserve {
         session_id: String,
@@ -924,6 +1103,23 @@ enum ResponseBody {
     #[serde(rename = "usage.report")]
     UsageReport {
         report: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
+    },
+    #[serde(rename = "usage.history_day")]
+    UsageHistoryDay {
+        date: String,
+        device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        day: Option<UsageHistoryDayV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
+    },
+    #[serde(rename = "usage.history_range")]
+    UsageHistoryRange {
+        through_date: String,
+        device_id: String,
+        days: Vec<UsageHistoryRangeDayV1>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         availability: Option<SnapshotAvailabilityWire>,
     },
@@ -2791,6 +2987,134 @@ pub(crate) async fn usage_report_rpc() -> Result<UsageReportResult, String> {
     }
     #[cfg(not(unix))]
     Err("usage.report unavailable on this platform".to_string())
+}
+
+#[cfg(unix)]
+fn usage_history_feature_gate() -> FeatureGate {
+    FeatureGate::all(BTreeSet::from([FEATURE_USAGE_HISTORY_V1.to_string()]))
+}
+
+#[cfg(unix)]
+fn usage_history_response(
+    method: &str,
+    response: Option<Result<ResponseBody, String>>,
+) -> Result<Option<ResponseBody>, String> {
+    match response {
+        Some(Ok(response)) => Ok(Some(response)),
+        Some(Err(error)) if error.starts_with("missing_feature:") => Ok(None),
+        Some(Err(error)) => Err(format!("{method} failed: {error}")),
+        None => Err(format!("{method} unavailable: no ADE connection")),
+    }
+}
+
+#[cfg(unix)]
+fn usage_history_day_from_rpc(
+    requested_date: &str,
+    response: Option<Result<ResponseBody, String>>,
+) -> Result<UsageHistoryDayRead, String> {
+    let Some(response) = usage_history_response("usage.history_day", response)? else {
+        return Ok(UsageHistoryDayRead::Unsupported);
+    };
+    match response {
+        ResponseBody::UsageHistoryDay {
+            date,
+            device_id,
+            day,
+            availability,
+        } if date == requested_date => match day {
+            Some(day) => Ok(UsageHistoryDayRead::Day {
+                date,
+                device_id,
+                day,
+                availability,
+            }),
+            None => Ok(UsageHistoryDayRead::NoDay {
+                date,
+                device_id,
+                availability,
+            }),
+        },
+        ResponseBody::UsageHistoryDay { date, .. } => Err(format!(
+            "usage.history_day response date mismatch: requested {requested_date}, received {date}"
+        )),
+        _ => Err("usage.history_day response method mismatch".to_string()),
+    }
+}
+
+/// Reads one device-local UTC ledger day. Feature absence is typed as
+/// `Unsupported`; transport/protocol failures remain errors with their reason;
+/// and `day: null` retains the daemon's device provenance in `NoDay`.
+pub(crate) async fn usage_history_day_rpc(date: String) -> Result<UsageHistoryDayRead, String> {
+    #[cfg(unix)]
+    {
+        let response = rpc_request_with_feature_gate(
+            RequestBody::UsageHistoryDay { date: date.clone() },
+            Capability::View,
+            usage_history_feature_gate(),
+            RpcErrorStyle::Public,
+        )
+        .await;
+        return usage_history_day_from_rpc(&date, response);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = date;
+        Ok(UsageHistoryDayRead::Unsupported)
+    }
+}
+
+#[cfg(unix)]
+fn usage_history_range_from_rpc(
+    requested_through_date: &str,
+    response: Option<Result<ResponseBody, String>>,
+) -> Result<UsageHistoryRangeRead, String> {
+    let Some(response) = usage_history_response("usage.history_range", response)? else {
+        return Ok(UsageHistoryRangeRead::Unsupported);
+    };
+    match response {
+        ResponseBody::UsageHistoryRange {
+            through_date,
+            device_id,
+            days,
+            availability,
+        } if through_date == requested_through_date => Ok(UsageHistoryRangeRead::Range {
+            through_date,
+            device_id,
+            days,
+            availability,
+        }),
+        ResponseBody::UsageHistoryRange { through_date, .. } => Err(format!(
+            "usage.history_range response date mismatch: requested {requested_through_date}, received {through_date}"
+        )),
+        _ => Err("usage.history_range response method mismatch".to_string()),
+    }
+}
+
+/// Reads an absence-preserving bounded heatmap range without converting its
+/// typed totals or availability into inferred booleans.
+pub(crate) async fn usage_history_range_rpc(
+    through_date: String,
+    days: u16,
+) -> Result<UsageHistoryRangeRead, String> {
+    #[cfg(unix)]
+    {
+        let response = rpc_request_with_feature_gate(
+            RequestBody::UsageHistoryRange {
+                through_date: through_date.clone(),
+                days,
+            },
+            Capability::View,
+            usage_history_feature_gate(),
+            RpcErrorStyle::Public,
+        )
+        .await;
+        return usage_history_range_from_rpc(&through_date, response);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (through_date, days);
+        Ok(UsageHistoryRangeRead::Unsupported)
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -7532,6 +7856,147 @@ mod tests {
         assert_eq!(availability, Some(SnapshotAvailabilityWire::Unknown));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn usage_history_gate_failure_and_absent_day_are_distinct() {
+        // Feature authority: crates/haider-rpc/src/frame.rs:376-378.
+        assert_eq!(
+            usage_history_day_from_rpc(
+                "2026-08-24",
+                Some(Err(format!(
+                    "missing_feature: daemon does not advertise {FEATURE_USAGE_HISTORY_V1}"
+                )))
+            ),
+            Ok(UsageHistoryDayRead::Unsupported),
+            "a missing bit is unsupported, never empty history"
+        );
+
+        let failed = usage_history_day_from_rpc(
+            "2026-08-24",
+            Some(Err("socket closed during ledger read".to_string())),
+        )
+        .expect_err("an RPC failure must remain an error");
+        assert!(
+            failed.contains("socket closed during ledger read"),
+            "the transport reason must survive: {failed}"
+        );
+
+        // Response authority: crates/haider-rpc/src/frame.rs:2942-2950 says
+        // device_id is present even when day is absent.
+        assert_eq!(
+            usage_history_day_from_rpc(
+                "2026-08-24",
+                Some(Ok(ResponseBody::UsageHistoryDay {
+                    date: "2026-08-24".to_string(),
+                    device_id: "device-ledger-a".to_string(),
+                    day: None,
+                    availability: Some(SnapshotAvailabilityWire::Available),
+                }))
+            ),
+            Ok(UsageHistoryDayRead::NoDay {
+                date: "2026-08-24".to_string(),
+                device_id: "device-ledger-a".to_string(),
+                availability: Some(SnapshotAvailabilityWire::Available),
+            })
+        );
+    }
+
+    #[test]
+    fn usage_history_wire_keeps_anonymous_lane_and_optional_meter_facts() {
+        // Key/meter authority: crates/haider-protocol/src/usage.rs:34-50 and
+        // :76-104. The `{ "id": 2 }` key is present in the live 2026-08-24
+        // backfill and is not a malformed descriptor.
+        let body: ResponseBody = serde_json::from_value(serde_json::json!({
+            "method": "usage.history_day",
+            "date": "2026-08-24",
+            "device_id": "device-live-probe",
+            "day": {
+                "date": "2026-08-24",
+                "device_id": "device-live-probe",
+                "backfilled": true,
+                "keys": [{"id": 2}],
+                "slots": (0..96).map(|index| if index == 7 {
+                    serde_json::json!({
+                        "rows": [{
+                            "key_id": 2,
+                            "role": "root",
+                            "requests": 0,
+                            "errors": 3,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "reasoning_tokens": 0
+                        }],
+                        "subagents_spawned": 0
+                    })
+                } else {
+                    Value::Null
+                }).collect::<Vec<_>>(),
+                "meter_samples": [{
+                    "account": "haider-code-api",
+                    "window": "weekly",
+                    "basis_points": 100,
+                    "sampled_at_ms": 1_777_000_000_000_u64,
+                    "stale": false
+                }],
+                "version_changes": [{
+                    "daemon_version": "0.0.955",
+                    "changed_at_ms": 1_777_000_000_000_u64
+                }]
+            },
+            "availability": {"state": "available"}
+        }))
+        .expect("decode the published anonymous-lane shape");
+        let ResponseBody::UsageHistoryDay { day: Some(day), .. } = body else {
+            panic!("usage history day expected");
+        };
+        assert_eq!(day.slots.len(), 96, "usage.rs:122 fixes the slot count");
+        assert_eq!(
+            day.keys[0],
+            UsageHistoryKeyV1 {
+                id: 2,
+                account: None,
+                provider: None,
+                model: None,
+                api_family: None,
+                effort: None,
+                speed: None,
+            }
+        );
+        assert_eq!(day.slots[7].as_ref().unwrap().rows[0].errors, 3);
+        assert_eq!(day.meter_samples[0].basis_points, 100);
+        assert_eq!(day.meter_samples[0].credits, None);
+        assert_eq!(day.meter_samples[0].hold, None);
+        assert_eq!(day.meter_samples[0].stale, Some(false));
+    }
+
+    #[test]
+    fn usage_history_requests_encode_the_published_method_and_fields() {
+        // Request authority: crates/haider-rpc/src/frame.rs:2361-2367.
+        let day = serde_json::to_value(RequestBody::UsageHistoryDay {
+            date: "2026-08-24".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            day,
+            serde_json::json!({"method":"usage.history_day", "date":"2026-08-24"})
+        );
+        let range = serde_json::to_value(RequestBody::UsageHistoryRange {
+            through_date: "2026-08-25".to_string(),
+            days: 366,
+        })
+        .unwrap();
+        assert_eq!(
+            range,
+            serde_json::json!({
+                "method":"usage.history_range",
+                "through_date":"2026-08-25",
+                "days":366
+            })
+        );
+    }
+
     #[test]
     fn command_invoke_decodes_all_outcomes_and_preserves_the_park_fence() {
         let decode_outcome = |fixture: &[u8]| {
@@ -8635,6 +9100,7 @@ mod tests {
             FEATURE_SESSION_FAST_SELECT_V1,
             FEATURE_COMMAND_DOOR_V1,
             FEATURE_USAGE_REPORT_V1,
+            FEATURE_USAGE_HISTORY_V1,
             FEATURE_HAIDER_CODE_PLAN_STATUS_V1,
         ] {
             assert!(

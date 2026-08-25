@@ -51,6 +51,9 @@ const TOKENOMICS_DAEMON_METER_STATES_KEY: &str = "daemon_meter_states_v1";
 const TOKENOMICS_DAEMON_PROVIDER_LIMITS_KEY: &str = "daemon_provider_limits_v1";
 const TOKENOMICS_HAIDER_CODE_PLAN_STATUS_KEY: &str = "haider_code_plan_status_v1";
 const TOKENOMICS_DAEMON_USAGE_BASELINE_KEY: &str = "daemon_usage_baseline_v1";
+const TOKENOMICS_LEDGER_AUTHORITY_KEY: &str = "usage_history_v1_authority";
+const TOKENOMICS_LEDGER_RANGE_DAYS: u16 = 366;
+const TOKENOMICS_LEDGER_SLOTS_PER_DAY: usize = 96;
 static TOKENOMICS_MAINTENANCE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TOKENOMICS_DB_WRITE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TOKENOMICS_SUMMARY_CACHE: OnceLock<StdMutex<Option<TokenomicsSummaryCacheEntry>>> =
@@ -526,7 +529,109 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
 	           generated_at_ms INTEGER NOT NULL DEFAULT 0,
 	           updated_at TEXT NOT NULL
 	         );
-		         CREATE TABLE IF NOT EXISTS tokenomics_meta(
+	         CREATE TABLE IF NOT EXISTS tokenomics_ledger_coverage(
+	           device_id TEXT NOT NULL,
+	           date TEXT NOT NULL,
+	           state TEXT NOT NULL CHECK(state IN ('day', 'no_day')),
+	           availability_json TEXT NOT NULL,
+	           updated_at TEXT NOT NULL,
+	           PRIMARY KEY(device_id, date)
+	         );
+	         CREATE TABLE IF NOT EXISTS tokenomics_ledger_days(
+	           device_id TEXT NOT NULL,
+	           date TEXT NOT NULL,
+	           backfilled INTEGER NOT NULL CHECK(backfilled IN (0, 1)),
+	           content_hash TEXT NOT NULL,
+	           updated_at TEXT NOT NULL,
+	           PRIMARY KEY(device_id, date)
+	         );
+	         CREATE TABLE IF NOT EXISTS tokenomics_ledger_keys(
+	           device_id TEXT NOT NULL,
+	           date TEXT NOT NULL,
+	           key_id INTEGER NOT NULL,
+	           account TEXT,
+	           provider TEXT,
+	           model TEXT,
+	           api_family TEXT,
+	           effort TEXT,
+	           speed TEXT,
+	           PRIMARY KEY(device_id, date, key_id)
+	         );
+	         CREATE TABLE IF NOT EXISTS tokenomics_ledger_slots(
+	           device_id TEXT NOT NULL,
+	           date TEXT NOT NULL,
+	           slot_index INTEGER NOT NULL CHECK(slot_index >= 0 AND slot_index < 96),
+	           sampled INTEGER NOT NULL CHECK(sampled IN (0, 1)),
+	           subagents_spawned INTEGER,
+	           PRIMARY KEY(device_id, date, slot_index)
+	         );
+	         CREATE TABLE IF NOT EXISTS tokenomics_ledger_rows(
+	           device_id TEXT NOT NULL,
+	           date TEXT NOT NULL,
+	           slot_index INTEGER NOT NULL,
+	           row_index INTEGER NOT NULL,
+	           key_id INTEGER NOT NULL,
+	           role TEXT NOT NULL,
+	           requests INTEGER NOT NULL,
+	           errors INTEGER NOT NULL,
+	           input_tokens INTEGER NOT NULL,
+	           output_tokens INTEGER NOT NULL,
+	           cache_read_tokens INTEGER NOT NULL,
+	           cache_write_tokens INTEGER NOT NULL,
+	           reasoning_tokens INTEGER NOT NULL,
+	           PRIMARY KEY(device_id, date, slot_index, row_index)
+	         );
+	         CREATE TABLE IF NOT EXISTS tokenomics_ledger_meter_samples(
+	           device_id TEXT NOT NULL,
+	           date TEXT NOT NULL,
+	           sample_index INTEGER NOT NULL,
+	           account TEXT NOT NULL,
+	           window TEXT NOT NULL,
+	           basis_points INTEGER NOT NULL,
+	           resets_at_ms INTEGER,
+	           grace_until_ms INTEGER,
+	           sampled_at_ms INTEGER NOT NULL,
+	           plan TEXT,
+	           credits INTEGER,
+	           hold INTEGER,
+	           stale INTEGER,
+	           PRIMARY KEY(device_id, date, sample_index)
+	         );
+	         CREATE TABLE IF NOT EXISTS tokenomics_ledger_version_changes(
+	           device_id TEXT NOT NULL,
+	           date TEXT NOT NULL,
+	           change_index INTEGER NOT NULL,
+	           daemon_version TEXT NOT NULL,
+	           changed_at_ms INTEGER NOT NULL,
+	           PRIMARY KEY(device_id, date, change_index)
+	         );
+	         CREATE TABLE IF NOT EXISTS tokenomics_ledger_ranges(
+	           device_id TEXT NOT NULL,
+	           through_date TEXT NOT NULL,
+	           requested_days INTEGER NOT NULL,
+	           availability_json TEXT NOT NULL,
+	           content_hash TEXT NOT NULL,
+	           updated_at TEXT NOT NULL,
+	           PRIMARY KEY(device_id, through_date, requested_days)
+	         );
+	         CREATE TABLE IF NOT EXISTS tokenomics_ledger_range_days(
+	           device_id TEXT NOT NULL,
+	           through_date TEXT NOT NULL,
+	           requested_days INTEGER NOT NULL,
+	           date TEXT NOT NULL,
+	           total_present INTEGER NOT NULL CHECK(total_present IN (0, 1)),
+	           sampled_slots INTEGER,
+	           requests INTEGER,
+	           errors INTEGER,
+	           input_tokens INTEGER,
+	           output_tokens INTEGER,
+	           cache_read_tokens INTEGER,
+	           cache_write_tokens INTEGER,
+	           reasoning_tokens INTEGER,
+	           subagents_spawned INTEGER,
+	           PRIMARY KEY(device_id, through_date, requested_days, date)
+	         );
+	         CREATE TABLE IF NOT EXISTS tokenomics_meta(
 		           key TEXT PRIMARY KEY,
 		           value TEXT NOT NULL
 	         );
@@ -773,7 +878,7 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
     // tokenomics_display_daily_rollups". Bump the version whenever any view
     // definition below changes (including when a new column must surface
     // through the views).
-    const TOKENOMICS_VIEW_SCHEMA_VERSION: i64 = 3;
+    const TOKENOMICS_VIEW_SCHEMA_VERSION: i64 = 4;
     let view_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| format!("Unable to read Tokenomics schema version: {error}"))?;
@@ -794,6 +899,71 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
          DROP VIEW IF EXISTS tokenomics_daily_rollups;
          DROP VIEW IF EXISTS tokenomics_hourly_rollups;
          DROP VIEW IF EXISTS tokenomics_display_rollups;
+         DROP VIEW IF EXISTS tokenomics_effective_local_rollups;
+         DROP VIEW IF EXISTS tokenomics_ledger_hourly_rollups;
+         CREATE VIEW tokenomics_ledger_hourly_rollups AS
+           SELECT
+                  'ledger-hour:' || hex(r.device_id || '|' || r.date || '|' ||
+                    CAST(r.slot_index / 4 AS TEXT) || '|' || CAST(r.key_id AS TEXT)) AS id,
+                  r.device_id AS device_id,
+                  COALESCE(NULLIF(k.provider, ''), 'unknown') AS provider,
+                  COALESCE(NULLIF(k.api_family, ''),
+                    CASE
+                      WHEN LOWER(COALESCE(k.provider, '')) LIKE '%openai%' THEN 'codex'
+                      WHEN LOWER(COALESCE(k.provider, '')) LIKE '%anthropic%' THEN 'claude'
+                      WHEN LOWER(COALESCE(k.provider, '')) LIKE '%xai%' THEN 'grok'
+                      ELSE 'unknown'
+                    END) AS agent_kind,
+                  NULLIF(k.model, '') AS model,
+                  NULLIF(k.account, '') AS subscription_key,
+                  COALESCE(NULLIF(k.account, ''), 'usage-history-key:' || CAST(r.key_id AS TEXT)) AS provider_account_key,
+                  NULLIF(k.account, '') AS provider_account_label,
+                  'unknown' AS billing_scope_type,
+                  NULL AS billing_team_id,
+                  'haider_usage_history_v1' AS billing_scope_source,
+                  NULL AS workspace_id,
+                  NULL AS repo_path,
+                  'hour' AS bucket_width,
+                  r.date || 'T' || printf('%02d', r.slot_index / 4) || ':00:00Z' AS bucket_start,
+                  COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
+                  COALESCE(SUM(r.input_tokens + r.output_tokens + r.cache_read_tokens + r.cache_write_tokens), 0) AS total_tokens,
+                  0 AS estimated_cost_microusd,
+                  COALESCE(SUM(r.requests), 0) AS event_count,
+                  d.updated_at AS updated_at
+           FROM tokenomics_ledger_rows r
+           JOIN tokenomics_ledger_days d
+             ON d.device_id=r.device_id AND d.date=r.date
+           JOIN tokenomics_ledger_keys k
+             ON k.device_id=r.device_id AND k.date=r.date AND k.key_id=r.key_id
+           GROUP BY r.device_id, r.date, r.slot_index / 4, r.key_id;
+         CREATE VIEW tokenomics_effective_local_rollups AS
+           SELECT r.id, r.device_id, r.provider, r.agent_kind, r.model, r.subscription_key,
+                  r.provider_account_key, r.provider_account_label,
+                  r.billing_scope_type, r.billing_team_id, r.billing_scope_source,
+                  r.workspace_id, r.repo_path,
+                  r.bucket_width, r.bucket_start, r.input_tokens, r.output_tokens,
+                  r.cache_read_tokens, r.cache_write_tokens, r.total_tokens,
+                  r.estimated_cost_microusd, r.event_count, r.updated_at,
+                  'pre_ledger_archive' AS history_source
+           FROM tokenomics_rollups r
+           WHERE NOT EXISTS (
+             SELECT 1 FROM tokenomics_ledger_coverage c
+             WHERE c.device_id=r.device_id
+               AND c.date=substr(r.bucket_start, 1, 10)
+           )
+           UNION ALL
+           SELECT r.id, r.device_id, r.provider, r.agent_kind, r.model, r.subscription_key,
+                  r.provider_account_key, r.provider_account_label,
+                  r.billing_scope_type, r.billing_team_id, r.billing_scope_source,
+                  r.workspace_id, r.repo_path,
+                  r.bucket_width, r.bucket_start, r.input_tokens, r.output_tokens,
+                  r.cache_read_tokens, r.cache_write_tokens, r.total_tokens,
+                  r.estimated_cost_microusd, r.event_count, r.updated_at,
+                  'usage_history_v1' AS history_source
+           FROM tokenomics_ledger_hourly_rollups r;
          CREATE VIEW tokenomics_display_rollups AS
            SELECT id, device_id, provider, agent_kind, model, subscription_key,
                   provider_account_key, provider_account_label,
@@ -801,8 +971,8 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
                   workspace_id, repo_path,
                   bucket_width, bucket_start, input_tokens, output_tokens,
                   cache_read_tokens, cache_write_tokens, total_tokens,
-                  estimated_cost_microusd, event_count, updated_at
-           FROM tokenomics_rollups
+                  estimated_cost_microusd, event_count, updated_at, history_source
+           FROM tokenomics_effective_local_rollups
            UNION ALL
            SELECT id, device_id, provider, agent_kind, model, subscription_key,
                   provider_account_key, provider_account_label,
@@ -810,7 +980,8 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
                   workspace_id, repo_path,
                   bucket_width, bucket_start, input_tokens, output_tokens,
                   cache_read_tokens, cache_write_tokens, total_tokens,
-                  estimated_cost_microusd, event_count, updated_at
+                  estimated_cost_microusd, event_count, updated_at,
+                  'device_rollup' AS history_source
            FROM tokenomics_cloud_rollups
            WHERE TRIM(COALESCE(device_id, ''))!=''
              AND device_id!={current_device_id_sql}
@@ -826,8 +997,8 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
                   workspace_id, repo_path,
                   bucket_width, bucket_start, input_tokens, output_tokens,
                   cache_read_tokens, cache_write_tokens, total_tokens,
-                  estimated_cost_microusd, event_count, updated_at
-           FROM tokenomics_rollups
+                  estimated_cost_microusd, event_count, updated_at, history_source
+           FROM tokenomics_effective_local_rollups
            WHERE bucket_width='hour';
          CREATE VIEW tokenomics_display_hourly_rollups AS
            SELECT id, device_id, provider, agent_kind, model, subscription_key,
@@ -836,7 +1007,7 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
                   workspace_id, repo_path,
                   bucket_width, bucket_start, input_tokens, output_tokens,
                   cache_read_tokens, cache_write_tokens, total_tokens,
-                  estimated_cost_microusd, event_count, updated_at
+                  estimated_cost_microusd, event_count, updated_at, history_source
            FROM tokenomics_display_rollups
            WHERE bucket_width='hour';
          CREATE VIEW tokenomics_daily_rollups AS
@@ -854,7 +1025,8 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
                   COALESCE(SUM(total_tokens), 0) AS total_tokens,
                   COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
                   COALESCE(SUM(event_count), 0) AS event_count,
-                  MAX(updated_at) AS updated_at
+                  MAX(updated_at) AS updated_at,
+                  MAX(history_source) AS history_source
            FROM tokenomics_hourly_rollups
            WHERE LENGTH(substr(bucket_start, 1, 10)) = 10
            GROUP BY device_id, provider, agent_kind, model, subscription_key,
@@ -867,8 +1039,9 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
                   day.workspace_id, day.repo_path,
                   day.bucket_width, day.bucket_start, day.input_tokens, day.output_tokens,
                   day.cache_read_tokens, day.cache_write_tokens, day.total_tokens,
-                  day.estimated_cost_microusd, day.event_count, day.updated_at
-           FROM tokenomics_rollups day
+                  day.estimated_cost_microusd, day.event_count, day.updated_at,
+                  day.history_source
+           FROM tokenomics_effective_local_rollups day
            WHERE day.bucket_width='day'
              AND NOT EXISTS (
                SELECT 1
@@ -899,7 +1072,8 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
                   COALESCE(SUM(total_tokens), 0) AS total_tokens,
                   COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
                   COALESCE(SUM(event_count), 0) AS event_count,
-                  MAX(updated_at) AS updated_at
+                  MAX(updated_at) AS updated_at,
+                  MAX(history_source) AS history_source
            FROM tokenomics_display_hourly_rollups
            WHERE LENGTH(substr(bucket_start, 1, 10)) = 10
            GROUP BY device_id, provider, agent_kind, model, subscription_key,
@@ -912,7 +1086,8 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
                   day.workspace_id, day.repo_path,
                   day.bucket_width, day.bucket_start, day.input_tokens, day.output_tokens,
                   day.cache_read_tokens, day.cache_write_tokens, day.total_tokens,
-                  day.estimated_cost_microusd, day.event_count, day.updated_at
+                  day.estimated_cost_microusd, day.event_count, day.updated_at,
+                  day.history_source
            FROM tokenomics_display_rollups day
            WHERE day.bucket_width='day'
              AND NOT EXISTS (
@@ -1194,6 +1369,892 @@ fn tokenomics_store_meta_json(
     value: &Value,
 ) -> Result<(), String> {
     tokenomics_store_meta_value(conn, key, &value.to_string())
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TokenomicsLedgerIngestResult {
+    changed_days: usize,
+    unchanged_days: usize,
+    recorded_no_days: usize,
+    range_changed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TokenomicsStoredLedgerDay {
+    Uncovered,
+    NoDay {
+        device_id: String,
+        date: String,
+        availability: Option<haider_rpc_ade::SnapshotAvailabilityWire>,
+    },
+    Day {
+        day: haider_rpc_ade::UsageHistoryDayV1,
+        availability: Option<haider_rpc_ade::SnapshotAvailabilityWire>,
+    },
+}
+
+fn tokenomics_ledger_availability_json(
+    availability: &Option<haider_rpc_ade::SnapshotAvailabilityWire>,
+) -> Result<String, String> {
+    serde_json::to_string(availability)
+        .map_err(|error| format!("Unable to encode usage-history availability: {error}"))
+}
+
+fn tokenomics_ledger_availability_from_json(
+    availability: &str,
+) -> Result<Option<haider_rpc_ade::SnapshotAvailabilityWire>, String> {
+    serde_json::from_str(availability)
+        .map_err(|error| format!("Unable to decode usage-history availability: {error}"))
+}
+
+fn tokenomics_upsert_ledger_coverage(
+    conn: &rusqlite::Connection,
+    device_id: &str,
+    date: &str,
+    state: &str,
+    availability_json: &str,
+    updated_at: &str,
+    error_context: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO tokenomics_ledger_coverage(device_id, date, state, availability_json, updated_at)
+         VALUES(?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(device_id, date) DO UPDATE SET
+           state=excluded.state, availability_json=excluded.availability_json,
+           updated_at=excluded.updated_at",
+        rusqlite::params![device_id, date, state, availability_json, updated_at],
+    )
+    .map_err(|error| format!("{error_context}: {error}"))?;
+    Ok(())
+}
+
+fn tokenomics_ledger_is_available(
+    availability: &Option<haider_rpc_ade::SnapshotAvailabilityWire>,
+) -> bool {
+    matches!(
+        availability,
+        Some(haider_rpc_ade::SnapshotAvailabilityWire::Available)
+    )
+}
+
+fn tokenomics_ledger_u64(value: u64, field: &str) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| {
+        format!("usage-history {field} value {value} exceeds SQLite's exact integer range")
+    })
+}
+
+fn tokenomics_ledger_optional_u64(
+    value: Option<u64>,
+    field: &str,
+) -> Result<Option<i64>, String> {
+    value
+        .map(|value| tokenomics_ledger_u64(value, field))
+        .transpose()
+}
+
+fn tokenomics_ledger_role_text(role: haider_rpc_ade::UsageHistoryRoleV1) -> &'static str {
+    match role {
+        haider_rpc_ade::UsageHistoryRoleV1::Root => "root",
+        haider_rpc_ade::UsageHistoryRoleV1::Subagent => "subagent",
+        haider_rpc_ade::UsageHistoryRoleV1::Unknown => "unknown",
+    }
+}
+
+fn tokenomics_ledger_role_from_text(role: &str) -> haider_rpc_ade::UsageHistoryRoleV1 {
+    match role {
+        "root" => haider_rpc_ade::UsageHistoryRoleV1::Root,
+        "subagent" => haider_rpc_ade::UsageHistoryRoleV1::Subagent,
+        _ => haider_rpc_ade::UsageHistoryRoleV1::Unknown,
+    }
+}
+
+fn tokenomics_validate_ledger_day(
+    day: &haider_rpc_ade::UsageHistoryDayV1,
+) -> Result<(), String> {
+    if day.slots.len() != TOKENOMICS_LEDGER_SLOTS_PER_DAY {
+        return Err(format!(
+            "usage-history day {} for {} has {} slots; expected exactly {}",
+            day.date,
+            day.device_id,
+            day.slots.len(),
+            TOKENOMICS_LEDGER_SLOTS_PER_DAY
+        ));
+    }
+    let key_ids = day.keys.iter().map(|key| key.id).collect::<HashSet<_>>();
+    if key_ids.len() != day.keys.len() {
+        return Err(format!(
+            "usage-history day {} for {} has duplicate lane key ids",
+            day.date, day.device_id
+        ));
+    }
+    for (slot_index, slot) in day.slots.iter().enumerate() {
+        for row in slot.iter().flat_map(|slot| slot.rows.iter()) {
+            if !key_ids.contains(&row.key_id) {
+                return Err(format!(
+                    "usage-history day {} slot {slot_index} references missing key {}",
+                    day.date, row.key_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tokenomics_ledger_content_hash<T: Serialize>(value: &T, kind: &str) -> Result<String, String> {
+    let encoded = serde_json::to_string(value)
+        .map_err(|error| format!("Unable to encode usage-history {kind}: {error}"))?;
+    Ok(tokenomics_hash(&encoded))
+}
+
+fn tokenomics_ingest_ledger_day(
+    conn: &mut rusqlite::Connection,
+    day: &haider_rpc_ade::UsageHistoryDayV1,
+    availability: &Option<haider_rpc_ade::SnapshotAvailabilityWire>,
+) -> Result<TokenomicsLedgerIngestResult, String> {
+    if !tokenomics_ledger_is_available(availability) {
+        return Ok(TokenomicsLedgerIngestResult::default());
+    }
+    tokenomics_validate_ledger_day(day)?;
+    let content_hash = tokenomics_ledger_content_hash(day, "day")?;
+    let prior_hash = conn
+        .query_row(
+            "SELECT content_hash FROM tokenomics_ledger_days WHERE device_id=?1 AND date=?2",
+            rusqlite::params![day.device_id.as_str(), day.date.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    // The append-only day can grow while live. An identical canonical payload
+    // is already committed truth and must not churn timestamps or counters.
+    if prior_hash.as_deref() == Some(content_hash.as_str()) {
+        return Ok(TokenomicsLedgerIngestResult {
+            unchanged_days: 1,
+            ..TokenomicsLedgerIngestResult::default()
+        });
+    }
+    let availability_json = tokenomics_ledger_availability_json(availability)?;
+    let updated_at = tokenomics_now_iso_like();
+    tokenomics_with_db_write_transaction(
+        conn,
+        "usage-history ledger day replacement",
+        |transaction| {
+            for (table, delete) in [
+                (
+                    "tokenomics_ledger_rows",
+                    "DELETE FROM tokenomics_ledger_rows WHERE device_id=?1 AND date=?2",
+                ),
+                (
+                    "tokenomics_ledger_slots",
+                    "DELETE FROM tokenomics_ledger_slots WHERE device_id=?1 AND date=?2",
+                ),
+                (
+                    "tokenomics_ledger_keys",
+                    "DELETE FROM tokenomics_ledger_keys WHERE device_id=?1 AND date=?2",
+                ),
+                (
+                    "tokenomics_ledger_meter_samples",
+                    "DELETE FROM tokenomics_ledger_meter_samples WHERE device_id=?1 AND date=?2",
+                ),
+                (
+                    "tokenomics_ledger_version_changes",
+                    "DELETE FROM tokenomics_ledger_version_changes WHERE device_id=?1 AND date=?2",
+                ),
+            ] {
+                transaction
+                    .execute(
+                        delete,
+                        rusqlite::params![day.device_id.as_str(), day.date.as_str()],
+                    )
+                    .map_err(|error| {
+                        format!("Unable to replace usage-history rows in {table}: {error}")
+                    })?;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO tokenomics_ledger_days(device_id, date, backfilled, content_hash, updated_at)
+                     VALUES(?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(device_id, date) DO UPDATE SET
+                       backfilled=excluded.backfilled,
+                       content_hash=excluded.content_hash,
+                       updated_at=excluded.updated_at",
+                    rusqlite::params![
+                        day.device_id.as_str(),
+                        day.date.as_str(),
+                        i64::from(day.backfilled),
+                        content_hash.as_str(),
+                        updated_at.as_str(),
+                    ],
+                )
+                .map_err(|error| format!("Unable to store usage-history day: {error}"))?;
+            tokenomics_upsert_ledger_coverage(
+                transaction,
+                &day.device_id,
+                &day.date,
+                "day",
+                &availability_json,
+                &updated_at,
+                "Unable to store usage-history coverage",
+            )?;
+            {
+                let mut statement = transaction
+                    .prepare(
+                        "INSERT INTO tokenomics_ledger_keys(
+                           device_id, date, key_id, account, provider, model,
+                           api_family, effort, speed
+                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    )
+                    .map_err(|error| format!("Unable to store usage-history key: {error}"))?;
+                for key in &day.keys {
+                    statement
+                        .execute(rusqlite::params![
+                            day.device_id.as_str(),
+                            day.date.as_str(),
+                            i64::from(key.id),
+                            key.account.as_deref(),
+                            key.provider.as_deref(),
+                            key.model.as_deref(),
+                            key.api_family.as_deref(),
+                            key.effort.as_deref(),
+                            key.speed.as_deref(),
+                        ])
+                        .map_err(|error| format!("Unable to store usage-history key: {error}"))?;
+                }
+            }
+            {
+                let mut slot_statement = transaction
+                    .prepare(
+                        "INSERT INTO tokenomics_ledger_slots(
+                           device_id, date, slot_index, sampled, subagents_spawned
+                         ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                    )
+                    .map_err(|error| format!("Unable to store usage-history slot: {error}"))?;
+                let mut row_statement = transaction
+                    .prepare(
+                        "INSERT INTO tokenomics_ledger_rows(
+                           device_id, date, slot_index, row_index, key_id, role,
+                           requests, errors, input_tokens, output_tokens,
+                           cache_read_tokens, cache_write_tokens, reasoning_tokens
+                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    )
+                    .map_err(|error| format!("Unable to store usage-history row: {error}"))?;
+                for (slot_index, slot) in day.slots.iter().enumerate() {
+                    let subagents_spawned = slot
+                        .as_ref()
+                        .map(|slot| {
+                            tokenomics_ledger_u64(
+                                slot.subagents_spawned,
+                                "slot.subagents_spawned",
+                            )
+                        })
+                        .transpose()?;
+                    slot_statement
+                        .execute(rusqlite::params![
+                            day.device_id.as_str(),
+                            day.date.as_str(),
+                            slot_index as i64,
+                            i64::from(slot.is_some()),
+                            subagents_spawned,
+                        ])
+                        .map_err(|error| format!("Unable to store usage-history slot: {error}"))?;
+                    let Some(slot) = slot else {
+                        continue;
+                    };
+                    for (row_index, row) in slot.rows.iter().enumerate() {
+                        row_statement
+                            .execute(rusqlite::params![
+                                day.device_id.as_str(),
+                                day.date.as_str(),
+                                slot_index as i64,
+                                row_index as i64,
+                                i64::from(row.key_id),
+                                tokenomics_ledger_role_text(row.role),
+                                tokenomics_ledger_u64(row.requests, "row.requests")?,
+                                tokenomics_ledger_u64(row.errors, "row.errors")?,
+                                tokenomics_ledger_u64(row.input_tokens, "row.input_tokens")?,
+                                tokenomics_ledger_u64(row.output_tokens, "row.output_tokens")?,
+                                tokenomics_ledger_u64(
+                                    row.cache_read_tokens,
+                                    "row.cache_read_tokens",
+                                )?,
+                                tokenomics_ledger_u64(
+                                    row.cache_write_tokens,
+                                    "row.cache_write_tokens",
+                                )?,
+                                tokenomics_ledger_u64(
+                                    row.reasoning_tokens,
+                                    "row.reasoning_tokens",
+                                )?,
+                            ])
+                            .map_err(|error| {
+                                format!("Unable to store usage-history row: {error}")
+                            })?;
+                    }
+                }
+            }
+            {
+                let mut statement = transaction
+                    .prepare(
+                        "INSERT INTO tokenomics_ledger_meter_samples(
+                           device_id, date, sample_index, account, window, basis_points,
+                           resets_at_ms, grace_until_ms, sampled_at_ms, plan, credits,
+                           hold, stale
+                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    )
+                    .map_err(|error| {
+                        format!("Unable to store usage-history meter sample: {error}")
+                    })?;
+                for (sample_index, sample) in day.meter_samples.iter().enumerate() {
+                    statement
+                        .execute(rusqlite::params![
+                            day.device_id.as_str(),
+                            day.date.as_str(),
+                            sample_index as i64,
+                            sample.account.as_str(),
+                            sample.window.as_str(),
+                            i64::from(sample.basis_points),
+                            tokenomics_ledger_optional_u64(
+                                sample.resets_at_ms,
+                                "meter.resets_at_ms",
+                            )?,
+                            tokenomics_ledger_optional_u64(
+                                sample.grace_until_ms,
+                                "meter.grace_until_ms",
+                            )?,
+                            tokenomics_ledger_u64(
+                                sample.sampled_at_ms,
+                                "meter.sampled_at_ms",
+                            )?,
+                            sample.plan.as_deref(),
+                            sample.credits,
+                            sample.hold,
+                            sample.stale.map(i64::from),
+                        ])
+                        .map_err(|error| {
+                            format!("Unable to store usage-history meter sample: {error}")
+                        })?;
+                }
+            }
+            {
+                let mut statement = transaction
+                    .prepare(
+                        "INSERT INTO tokenomics_ledger_version_changes(
+                           device_id, date, change_index, daemon_version, changed_at_ms
+                         ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                    )
+                    .map_err(|error| {
+                        format!("Unable to store usage-history version change: {error}")
+                    })?;
+                for (change_index, change) in day.version_changes.iter().enumerate() {
+                    statement
+                        .execute(rusqlite::params![
+                            day.device_id.as_str(),
+                            day.date.as_str(),
+                            change_index as i64,
+                            change.daemon_version.as_str(),
+                            tokenomics_ledger_u64(
+                                change.changed_at_ms,
+                                "version.changed_at_ms",
+                            )?,
+                        ])
+                        .map_err(|error| {
+                            format!("Unable to store usage-history version change: {error}")
+                        })?;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(TokenomicsLedgerIngestResult {
+        changed_days: 1,
+        ..TokenomicsLedgerIngestResult::default()
+    })
+}
+
+fn tokenomics_record_ledger_no_day(
+    conn: &rusqlite::Connection,
+    device_id: &str,
+    date: &str,
+    availability: &Option<haider_rpc_ade::SnapshotAvailabilityWire>,
+) -> Result<TokenomicsLedgerIngestResult, String> {
+    if !tokenomics_ledger_is_available(availability) {
+        return Ok(TokenomicsLedgerIngestResult::default());
+    }
+    let existing_day: i64 = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tokenomics_ledger_days WHERE device_id=?1 AND date=?2)",
+            rusqlite::params![device_id, date],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to inspect usage-history day: {error}"))?;
+    if existing_day != 0 {
+        return Err(format!(
+            "usage-history append-only conflict: {device_id} {date} was stored as a day and is now absent"
+        ));
+    }
+    let availability_json = tokenomics_ledger_availability_json(availability)?;
+    let existing = conn
+        .query_row(
+            "SELECT state, availability_json FROM tokenomics_ledger_coverage WHERE device_id=?1 AND date=?2",
+            rusqlite::params![device_id, date],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok();
+    if matches!(
+        existing.as_ref(),
+        Some((state, stored_availability))
+            if state == "no_day" && stored_availability == &availability_json
+    ) {
+        return Ok(TokenomicsLedgerIngestResult {
+            unchanged_days: 1,
+            ..TokenomicsLedgerIngestResult::default()
+        });
+    }
+    tokenomics_upsert_ledger_coverage(
+        conn,
+        device_id,
+        date,
+        "no_day",
+        &availability_json,
+        &tokenomics_now_iso_like(),
+        "Unable to store absent usage-history day",
+    )?;
+    Ok(TokenomicsLedgerIngestResult {
+        recorded_no_days: 1,
+        ..TokenomicsLedgerIngestResult::default()
+    })
+}
+
+fn tokenomics_ingest_ledger_day_read(
+    conn: &mut rusqlite::Connection,
+    read: &haider_rpc_ade::UsageHistoryDayRead,
+) -> Result<TokenomicsLedgerIngestResult, String> {
+    match read {
+        haider_rpc_ade::UsageHistoryDayRead::Unsupported => {
+            Ok(TokenomicsLedgerIngestResult::default())
+        }
+        haider_rpc_ade::UsageHistoryDayRead::NoDay {
+            date,
+            device_id,
+            availability,
+        } => tokenomics_record_ledger_no_day(conn, device_id, date, availability),
+        haider_rpc_ade::UsageHistoryDayRead::Day {
+            date,
+            device_id,
+            day,
+            availability,
+        } => {
+            if day.date != *date || day.device_id != *device_id {
+                return Err(format!(
+                    "usage-history provenance mismatch: response {device_id} {date}, day {} {}",
+                    day.device_id, day.date
+                ));
+            }
+            tokenomics_ingest_ledger_day(conn, day, availability)
+        }
+    }
+}
+
+fn tokenomics_ingest_ledger_range(
+    conn: &mut rusqlite::Connection,
+    read: &haider_rpc_ade::UsageHistoryRangeRead,
+    requested_days: u16,
+) -> Result<TokenomicsLedgerIngestResult, String> {
+    let haider_rpc_ade::UsageHistoryRangeRead::Range {
+        through_date,
+        device_id,
+        days,
+        availability,
+    } = read
+    else {
+        return Ok(TokenomicsLedgerIngestResult::default());
+    };
+    if !tokenomics_ledger_is_available(availability) {
+        return Ok(TokenomicsLedgerIngestResult::default());
+    }
+    let availability_json = tokenomics_ledger_availability_json(availability)?;
+    let content_hash = tokenomics_ledger_content_hash(read, "range")?;
+    let prior_hash = conn
+        .query_row(
+            "SELECT content_hash FROM tokenomics_ledger_ranges
+             WHERE device_id=?1 AND through_date=?2 AND requested_days=?3",
+            rusqlite::params![device_id, through_date, i64::from(requested_days)],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    if prior_hash.as_deref() == Some(content_hash.as_str()) {
+        return Ok(TokenomicsLedgerIngestResult::default());
+    }
+    let updated_at = tokenomics_now_iso_like();
+    tokenomics_with_db_write_transaction(
+        conn,
+        "usage-history range replacement",
+        |transaction| {
+            transaction
+                .execute(
+                    "DELETE FROM tokenomics_ledger_range_days
+                     WHERE device_id=?1 AND through_date=?2 AND requested_days=?3",
+                    rusqlite::params![device_id, through_date, i64::from(requested_days)],
+                )
+                .map_err(|error| format!("Unable to replace usage-history range days: {error}"))?;
+            transaction
+                .execute(
+                    "INSERT INTO tokenomics_ledger_ranges(
+                       device_id, through_date, requested_days, availability_json,
+                       content_hash, updated_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(device_id, through_date, requested_days) DO UPDATE SET
+                       availability_json=excluded.availability_json,
+                       content_hash=excluded.content_hash,
+                       updated_at=excluded.updated_at",
+                    rusqlite::params![
+                        device_id,
+                        through_date,
+                        i64::from(requested_days),
+                        availability_json.as_str(),
+                        content_hash.as_str(),
+                        updated_at.as_str(),
+                    ],
+                )
+                .map_err(|error| format!("Unable to store usage-history range: {error}"))?;
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO tokenomics_ledger_range_days(
+                       device_id, through_date, requested_days, date, total_present,
+                       sampled_slots, requests, errors, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                       subagents_spawned
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                )
+                .map_err(|error| {
+                    format!("Unable to store usage-history range cell: {error}")
+                })?;
+            for range_day in days {
+                let total = range_day.total.as_ref();
+                statement
+                    .execute(rusqlite::params![
+                        device_id,
+                        through_date,
+                        i64::from(requested_days),
+                        range_day.date.as_str(),
+                        i64::from(total.is_some()),
+                        total.map(|total| i64::from(total.sampled_slots)),
+                        total
+                            .map(|total| tokenomics_ledger_u64(total.requests, "range.requests"))
+                            .transpose()?,
+                        total
+                            .map(|total| tokenomics_ledger_u64(total.errors, "range.errors"))
+                            .transpose()?,
+                        total
+                            .map(|total| tokenomics_ledger_u64(total.input_tokens, "range.input_tokens"))
+                            .transpose()?,
+                        total
+                            .map(|total| tokenomics_ledger_u64(total.output_tokens, "range.output_tokens"))
+                            .transpose()?,
+                        total
+                            .map(|total| tokenomics_ledger_u64(total.cache_read_tokens, "range.cache_read_tokens"))
+                            .transpose()?,
+                        total
+                            .map(|total| tokenomics_ledger_u64(total.cache_write_tokens, "range.cache_write_tokens"))
+                            .transpose()?,
+                        total
+                            .map(|total| tokenomics_ledger_u64(total.reasoning_tokens, "range.reasoning_tokens"))
+                            .transpose()?,
+                        total
+                            .map(|total| tokenomics_ledger_u64(total.subagents_spawned, "range.subagents_spawned"))
+                            .transpose()?,
+                    ])
+                    .map_err(|error| {
+                        format!("Unable to store usage-history range cell: {error}")
+                    })?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(TokenomicsLedgerIngestResult {
+        range_changed: true,
+        ..TokenomicsLedgerIngestResult::default()
+    })
+}
+
+fn tokenomics_ledger_stored_u64(value: i64, field: &str) -> Result<u64, String> {
+    u64::try_from(value)
+        .map_err(|_| format!("Stored usage-history {field} is negative: {value}"))
+}
+
+fn tokenomics_read_stored_ledger_day(
+    conn: &rusqlite::Connection,
+    device_id: &str,
+    date: &str,
+) -> Result<TokenomicsStoredLedgerDay, String> {
+    let coverage = match conn.query_row(
+        "SELECT state, availability_json FROM tokenomics_ledger_coverage
+         WHERE device_id=?1 AND date=?2",
+        rusqlite::params![device_id, date],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ) {
+        Ok(coverage) => coverage,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Ok(TokenomicsStoredLedgerDay::Uncovered);
+        }
+        Err(error) => return Err(format!("Unable to read usage-history coverage: {error}")),
+    };
+    let availability = tokenomics_ledger_availability_from_json(&coverage.1)?;
+    if coverage.0 == "no_day" {
+        return Ok(TokenomicsStoredLedgerDay::NoDay {
+            device_id: device_id.to_string(),
+            date: date.to_string(),
+            availability,
+        });
+    }
+    if coverage.0 != "day" {
+        return Err(format!(
+            "Stored usage-history coverage state is invalid: {}",
+            coverage.0
+        ));
+    }
+    let backfilled = conn
+        .query_row(
+            "SELECT backfilled FROM tokenomics_ledger_days WHERE device_id=?1 AND date=?2",
+            rusqlite::params![device_id, date],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("Unable to read usage-history day: {error}"))?
+        != 0;
+    let mut key_statement = conn
+        .prepare(
+            "SELECT key_id, account, provider, model, api_family, effort, speed
+             FROM tokenomics_ledger_keys WHERE device_id=?1 AND date=?2 ORDER BY key_id",
+        )
+        .map_err(|error| format!("Unable to prepare usage-history keys: {error}"))?;
+    let keys = key_statement
+        .query_map(rusqlite::params![device_id, date], |row| {
+            Ok(haider_rpc_ade::UsageHistoryKeyV1 {
+                id: row.get::<_, u32>(0)?,
+                account: row.get(1)?,
+                provider: row.get(2)?,
+                model: row.get(3)?,
+                api_family: row.get(4)?,
+                effort: row.get(5)?,
+                speed: row.get(6)?,
+            })
+        })
+        .map_err(|error| format!("Unable to query usage-history keys: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Unable to read usage-history key: {error}"))?;
+    let mut slots = vec![None; TOKENOMICS_LEDGER_SLOTS_PER_DAY];
+    let mut slot_statement = conn
+        .prepare(
+            "SELECT slot_index, sampled, subagents_spawned
+             FROM tokenomics_ledger_slots WHERE device_id=?1 AND date=?2
+             ORDER BY slot_index",
+        )
+        .map_err(|error| format!("Unable to prepare usage-history slots: {error}"))?;
+    let stored_slots = slot_statement
+        .query_map(rusqlite::params![device_id, date], |row| {
+            Ok((
+                row.get::<_, usize>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query usage-history slots: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Unable to read usage-history slot: {error}"))?;
+    if stored_slots.len() != TOKENOMICS_LEDGER_SLOTS_PER_DAY {
+        return Err(format!(
+            "Stored usage-history day {device_id} {date} has {} slot markers, expected {}",
+            stored_slots.len(),
+            TOKENOMICS_LEDGER_SLOTS_PER_DAY
+        ));
+    }
+    for (slot_index, sampled, subagents_spawned) in stored_slots {
+        if slot_index >= TOKENOMICS_LEDGER_SLOTS_PER_DAY {
+            return Err(format!("Stored usage-history slot index is invalid: {slot_index}"));
+        }
+        if sampled != 0 {
+            let subagents_spawned = subagents_spawned.ok_or_else(|| {
+                format!("Sampled usage-history slot {slot_index} has no subagent count")
+            })?;
+            slots[slot_index] = Some(haider_rpc_ade::UsageHistorySlotV1 {
+                rows: Vec::new(),
+                subagents_spawned: tokenomics_ledger_stored_u64(
+                    subagents_spawned,
+                    "slot.subagents_spawned",
+                )?,
+            });
+        }
+    }
+    let mut row_statement = conn
+        .prepare(
+            "SELECT slot_index, key_id, role, requests, errors, input_tokens,
+                    output_tokens, cache_read_tokens, cache_write_tokens,
+                    reasoning_tokens
+             FROM tokenomics_ledger_rows WHERE device_id=?1 AND date=?2
+             ORDER BY slot_index, row_index",
+        )
+        .map_err(|error| format!("Unable to prepare usage-history rows: {error}"))?;
+    let stored_rows = row_statement
+        .query_map(rusqlite::params![device_id, date], |row| {
+            Ok((
+                row.get::<_, usize>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query usage-history rows: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Unable to read usage-history row: {error}"))?;
+    for (
+        slot_index,
+        key_id,
+        role,
+        requests,
+        errors,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
+    ) in stored_rows
+    {
+        let slot = slots
+            .get_mut(slot_index)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| {
+                format!("Stored usage-history row belongs to unsampled slot {slot_index}")
+            })?;
+        slot.rows.push(haider_rpc_ade::UsageHistoryRowV1 {
+            key_id,
+            role: tokenomics_ledger_role_from_text(&role),
+            requests: tokenomics_ledger_stored_u64(requests, "row.requests")?,
+            errors: tokenomics_ledger_stored_u64(errors, "row.errors")?,
+            input_tokens: tokenomics_ledger_stored_u64(input_tokens, "row.input_tokens")?,
+            output_tokens: tokenomics_ledger_stored_u64(output_tokens, "row.output_tokens")?,
+            cache_read_tokens: tokenomics_ledger_stored_u64(
+                cache_read_tokens,
+                "row.cache_read_tokens",
+            )?,
+            cache_write_tokens: tokenomics_ledger_stored_u64(
+                cache_write_tokens,
+                "row.cache_write_tokens",
+            )?,
+            reasoning_tokens: tokenomics_ledger_stored_u64(
+                reasoning_tokens,
+                "row.reasoning_tokens",
+            )?,
+        });
+    }
+    let mut meter_statement = conn
+        .prepare(
+            "SELECT account, window, basis_points, resets_at_ms, grace_until_ms,
+                    sampled_at_ms, plan, credits, hold, stale
+             FROM tokenomics_ledger_meter_samples
+             WHERE device_id=?1 AND date=?2 ORDER BY sample_index",
+        )
+        .map_err(|error| format!("Unable to prepare usage-history meters: {error}"))?;
+    let stored_meters = meter_statement
+        .query_map(rusqlite::params![device_id, date], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query usage-history meters: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Unable to read usage-history meter: {error}"))?;
+    let meter_samples = stored_meters
+        .into_iter()
+        .map(
+            |(
+                account,
+                window,
+                basis_points,
+                resets_at_ms,
+                grace_until_ms,
+                sampled_at_ms,
+                plan,
+                credits,
+                hold,
+                stale,
+            )| {
+                Ok(haider_rpc_ade::UsageHistoryMeterSampleV1 {
+                    account,
+                    window,
+                    basis_points: u32::try_from(basis_points).map_err(|_| {
+                        format!("Stored usage-history basis_points is invalid: {basis_points}")
+                    })?,
+                    resets_at_ms: resets_at_ms
+                        .map(|value| tokenomics_ledger_stored_u64(value, "meter.resets_at_ms"))
+                        .transpose()?,
+                    grace_until_ms: grace_until_ms
+                        .map(|value| {
+                            tokenomics_ledger_stored_u64(value, "meter.grace_until_ms")
+                        })
+                        .transpose()?,
+                    sampled_at_ms: tokenomics_ledger_stored_u64(
+                        sampled_at_ms,
+                        "meter.sampled_at_ms",
+                    )?,
+                    plan,
+                    credits,
+                    hold,
+                    stale: stale.map(|value| value != 0),
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut version_statement = conn
+        .prepare(
+            "SELECT daemon_version, changed_at_ms
+             FROM tokenomics_ledger_version_changes
+             WHERE device_id=?1 AND date=?2 ORDER BY change_index",
+        )
+        .map_err(|error| format!("Unable to prepare usage-history versions: {error}"))?;
+    let stored_versions = version_statement
+        .query_map(rusqlite::params![device_id, date], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| format!("Unable to query usage-history versions: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Unable to read usage-history version: {error}"))?;
+    let version_changes = stored_versions
+        .into_iter()
+        .map(|(daemon_version, changed_at_ms)| {
+            Ok(haider_rpc_ade::UsageHistoryVersionChangeV1 {
+                daemon_version,
+                changed_at_ms: tokenomics_ledger_stored_u64(
+                    changed_at_ms,
+                    "version.changed_at_ms",
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(TokenomicsStoredLedgerDay::Day {
+        day: haider_rpc_ade::UsageHistoryDayV1 {
+            date: date.to_string(),
+            device_id: device_id.to_string(),
+            backfilled,
+            keys,
+            slots,
+            meter_samples,
+            version_changes,
+        },
+        availability,
+    })
 }
 
 fn tokenomics_u64(value: Option<&Value>) -> u64 {
@@ -1973,8 +3034,169 @@ fn tokenomics_daemon_provider_limits(conn: &rusqlite::Connection) -> Result<Vec<
     ))
 }
 
+#[derive(Debug)]
+struct TokenomicsLedgerRpcBatch {
+    range: Result<haider_rpc_ade::UsageHistoryRangeRead, String>,
+    days: Vec<Result<haider_rpc_ade::UsageHistoryDayRead, String>>,
+}
+
+fn tokenomics_ledger_authority(batch: &TokenomicsLedgerRpcBatch) -> Value {
+    let day_errors = batch
+        .days
+        .iter()
+        .filter_map(|result| result.as_ref().err().cloned())
+        .collect::<Vec<_>>();
+    match &batch.range {
+        Err(reason) => json!({
+            "state": "unavailable",
+            "reason": reason,
+            "source": "usage_history_v1",
+            "day_errors": day_errors,
+        }),
+        Ok(haider_rpc_ade::UsageHistoryRangeRead::Unsupported) => json!({
+            "state": "unsupported",
+            "source": "usage_history_v1",
+            "day_errors": day_errors,
+        }),
+        Ok(haider_rpc_ade::UsageHistoryRangeRead::Range {
+            through_date,
+            device_id,
+            days,
+            availability,
+        }) => {
+            let (state, reason) = match availability {
+                Some(haider_rpc_ade::SnapshotAvailabilityWire::Available) => {
+                    ("available", None)
+                }
+                Some(haider_rpc_ade::SnapshotAvailabilityWire::Unavailable { reason }) => {
+                    ("unavailable", Some(reason.as_str()))
+                }
+                Some(haider_rpc_ade::SnapshotAvailabilityWire::Unknown) => ("unknown", None),
+                None => ("unknown", Some("availability_missing")),
+            };
+            json!({
+                "state": state,
+                "reason": reason,
+                "source": "usage_history_v1",
+                "through_date": through_date,
+                "device_id": device_id,
+                "range_cell_count": days.len(),
+                "availability": availability,
+                "day_errors": day_errors,
+            })
+        }
+    }
+}
+
+fn tokenomics_ledger_covered_dates_for_device(
+    app: &AppHandle,
+    device_id: &str,
+) -> Result<HashSet<String>, String> {
+    let conn = tokenomics_open_db(app)?;
+    let mut statement = conn
+        .prepare("SELECT date FROM tokenomics_ledger_coverage WHERE device_id=?1")
+        .map_err(|error| format!("Unable to prepare usage-history coverage query: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![device_id], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Unable to query usage-history coverage dates: {error}"))?;
+    let mut dates = HashSet::new();
+    for row in rows {
+        dates.insert(
+            row.map_err(|error| format!("Unable to read usage-history coverage date: {error}"))?,
+        );
+    }
+    Ok(dates)
+}
+
+async fn tokenomics_read_ledger_from_daemon(app: &AppHandle) -> TokenomicsLedgerRpcBatch {
+    let through_date = tokenomics_unix_iso_like(tokenomics_unix_now())
+        .chars()
+        .take(10)
+        .collect::<String>();
+    let range = haider_rpc_ade::usage_history_range_rpc(
+        through_date.clone(),
+        TOKENOMICS_LEDGER_RANGE_DAYS,
+    )
+    .await;
+    let mut day_results = Vec::new();
+    let Ok(haider_rpc_ade::UsageHistoryRangeRead::Range {
+        device_id,
+        days,
+        availability: Some(haider_rpc_ade::SnapshotAvailabilityWire::Available),
+        ..
+    }) = &range
+    else {
+        return TokenomicsLedgerRpcBatch {
+            range,
+            days: day_results,
+        };
+    };
+    // The range intentionally preserves `total: null`, which by itself does
+    // not prove whether a day file is absent. Starting at the earliest sampled
+    // cell, read each not-yet-classified date once; then re-read the live UTC
+    // day on every refresh because its append-only file can grow.
+    let earliest_sampled_date = days
+        .iter()
+        .filter(|day| day.total.is_some())
+        .map(|day| day.date.as_str())
+        .min();
+    let mut candidates = earliest_sampled_date
+        .map(|earliest| {
+            days.iter()
+                .filter(|day| day.date.as_str() >= earliest)
+                .map(|day| day.date.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !candidates.iter().any(|date| date == &through_date) {
+        candidates.push(through_date.clone());
+    }
+    candidates.sort();
+    candidates.dedup();
+    let coverage_app = app.clone();
+    let coverage_device = device_id.clone();
+    let covered = tauri::async_runtime::spawn_blocking(move || {
+        tokenomics_ledger_covered_dates_for_device(&coverage_app, &coverage_device)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    for date in candidates {
+        if date != through_date && covered.contains(&date) {
+            continue;
+        }
+        day_results.push(haider_rpc_ade::usage_history_day_rpc(date).await);
+    }
+    TokenomicsLedgerRpcBatch {
+        range,
+        days: day_results,
+    }
+}
+
+fn tokenomics_ingest_ledger_rpc_batch(
+    conn: &mut rusqlite::Connection,
+    batch: &TokenomicsLedgerRpcBatch,
+) -> Result<TokenomicsLedgerIngestResult, String> {
+    let mut aggregate = TokenomicsLedgerIngestResult::default();
+    if let Ok(range) = &batch.range {
+        let result =
+            tokenomics_ingest_ledger_range(conn, range, TOKENOMICS_LEDGER_RANGE_DAYS)?;
+        aggregate.range_changed |= result.range_changed;
+    }
+    for read in batch.days.iter().filter_map(|result| result.as_ref().ok()) {
+        let result = tokenomics_ingest_ledger_day_read(conn, read)?;
+        aggregate.changed_days += result.changed_days;
+        aggregate.unchanged_days += result.unchanged_days;
+        aggregate.recorded_no_days += result.recorded_no_days;
+    }
+    Ok(aggregate)
+}
+
 async fn tokenomics_refresh_from_daemon(app: &AppHandle) -> Result<Value, String> {
     let usage_result = haider_rpc_ade::usage_report_rpc().await;
+    let ledger_batch = tokenomics_read_ledger_from_daemon(app).await;
+    let ledger_authority = tokenomics_ledger_authority(&ledger_batch);
     let plan_status = haider_rpc_ade::haider_code_plan_status_snapshot();
     let refresh_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -2005,17 +3227,25 @@ async fn tokenomics_refresh_from_daemon(app: &AppHandle) -> Result<Value, String
             TOKENOMICS_HAIDER_CODE_PLAN_STATUS_KEY,
             &plan_status_value,
         )?;
+        tokenomics_store_meta_json(&conn, TOKENOMICS_LEDGER_AUTHORITY_KEY, &ledger_authority)?;
 
         let ingest = if tokenomics_usage_authority_available(&projection.authority) {
             tokenomics_ingest_daemon_counters(&mut conn, &projection.counters)?
         } else {
             TokenomicsDaemonIngestResult::default()
         };
+        let ledger_ingest = tokenomics_ingest_ledger_rpc_batch(&mut conn, &ledger_batch)?;
         let mut limits = projection.limits;
         let recorded_samples = tokenomics_record_provider_limit_samples(&conn, &limits)?;
         tokenomics_apply_provider_limit_sample_pacing(&conn, &mut limits)?;
         let recorded_windows = tokenomics_record_latest_windows(&conn, &limits)?;
-        if ingest.inserted_events > 0 || recorded_samples > 0 || recorded_windows > 0 {
+        if ingest.inserted_events > 0
+            || recorded_samples > 0
+            || recorded_windows > 0
+            || ledger_ingest.changed_days > 0
+            || ledger_ingest.recorded_no_days > 0
+            || ledger_ingest.range_changed
+        {
             tokenomics_invalidate_summary_snapshots(&conn)?;
             tokenomics_clear_summary_cache();
         }
@@ -2035,6 +3265,11 @@ async fn tokenomics_refresh_from_daemon(app: &AppHandle) -> Result<Value, String
             "counter_resets": ingest.counter_resets,
             "baseline_seeded": ingest.baseline_seeded,
             "preserved_existing_history": ingest.preserved_existing_history,
+            "ledger_changed_days": ledger_ingest.changed_days,
+            "ledger_unchanged_days": ledger_ingest.unchanged_days,
+            "ledger_recorded_no_days": ledger_ingest.recorded_no_days,
+            "ledger_range_changed": ledger_ingest.range_changed,
+            "ledger_authority": ledger_authority,
             "recorded_samples": recorded_samples,
             "recorded_windows": recorded_windows,
             "limits": limits,
@@ -2072,6 +3307,24 @@ fn tokenomics_summary_recorded_limit_rows(summary: &Value) -> usize {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     recorded_samples.saturating_add(recorded_windows) as usize
+}
+
+fn tokenomics_summary_ledger_changes(summary: &Value) -> usize {
+    let changed_days = summary
+        .get("ledger_changed_days")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let recorded_no_days = summary
+        .get("ledger_recorded_no_days")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let range_changed = summary
+        .get("ledger_range_changed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false) as u64;
+    changed_days
+        .saturating_add(recorded_no_days)
+        .saturating_add(range_changed) as usize
 }
 
 fn tokenomics_summary_cache() -> &'static StdMutex<Option<TokenomicsSummaryCacheEntry>> {
@@ -2235,16 +3488,32 @@ fn tokenomics_cached_live_limits_for(
     Ok(summary)
 }
 
-/// One periodic Tokenomics refresh cycle. The daemon-published usage report is
-/// the per-device input; its deltas and provider windows flow through the
-/// existing device-keyed rollup, retention, and cloud-sync layers.
+/// One periodic Tokenomics refresh cycle. Live counters still come from the
+/// daemon-published usage report; durable day-level history comes from the
+/// device-local ledger and flows through the same cloud-sync layer.
 async fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String> {
     let summary = tokenomics_refresh_from_daemon(app).await?;
     let _ = tokenomics_maybe_prune_usage_events_for_app(app);
-    if tokenomics_summary_inserted_events(&summary) > 0
-        || tokenomics_summary_recorded_limit_rows(&summary) > 0
-    {
+    let inserted_events = tokenomics_summary_inserted_events(&summary);
+    let recorded_limit_rows = tokenomics_summary_recorded_limit_rows(&summary);
+    let ledger_changes = tokenomics_summary_ledger_changes(&summary);
+    if inserted_events > 0 || recorded_limit_rows > 0 || ledger_changes > 0 {
         tokenomics_emit_updated(app, summary.clone());
+    }
+    // cloud_mcp's outer periodic loop already queues ordinary event/window
+    // deltas. A ledger-only change has no scanner event row, so enqueue it
+    // here to preserve the existing device_id-keyed cloud rollup path without
+    // changing tokenomics_cloud_rollups or misreporting it as an event.
+    if ledger_changes > 0 && inserted_events == 0 && recorded_limit_rows == 0 {
+        let state = app.state::<CloudMcpState>();
+        let _ = cloud_mcp_enqueue_tokenomics_sync(
+            app.clone(),
+            state.inner(),
+            CLOUD_MCP_TOKENOMICS_PERIODIC_REASON.to_string(),
+            false,
+            false,
+        )
+        .await;
     }
     Ok(summary)
 }
@@ -3266,7 +4535,8 @@ async fn tokenomics_enqueue_usage_sync_if_needed(
 ) {
     let inserted_events = tokenomics_summary_inserted_events(summary);
     let recorded_limit_rows = tokenomics_summary_recorded_limit_rows(summary);
-    if inserted_events == 0 && recorded_limit_rows == 0 && !force_full {
+    let ledger_changes = tokenomics_summary_ledger_changes(summary);
+    if inserted_events == 0 && recorded_limit_rows == 0 && ledger_changes == 0 && !force_full {
         // The ordinary 60s live-limits poll keeps the old skip-on-no-rows
         // behavior. Only an explicitly forced provider refresh may republish
         // the provider-window baseline without new rows, and only through the
@@ -3292,6 +4562,7 @@ async fn tokenomics_enqueue_usage_sync_if_needed(
             "force_full": force_full,
             "inserted_events": inserted_events,
             "recorded_limit_rows": recorded_limit_rows,
+            "ledger_changes": ledger_changes,
         }),
     );
 }
@@ -4578,7 +5849,7 @@ fn tokenomics_summary_device_identities(
     let table = if include_cloud {
         "tokenomics_display_rollups"
     } else {
-        "tokenomics_rollups"
+        "tokenomics_effective_local_rollups"
     };
     let mut statement = conn
         .prepare(&format!(
@@ -8700,7 +9971,7 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     let total = tokenomics_query_one(
         conn,
         &format!(
-            "SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM tokenomics_rollups WHERE bucket_width='hour' {scope_filter_sql}"
+            "SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM tokenomics_effective_local_rollups WHERE bucket_width='hour' {scope_filter_sql}"
         ),
     )?;
     let retired_account_keys = tokenomics_retired_provider_account_keys(conn);
@@ -8735,6 +10006,12 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     let scan_index = tokenomics_scan_index_status(conn)?;
     let usage_authority = tokenomics_meta_json(conn, TOKENOMICS_DAEMON_USAGE_AUTHORITY_KEY)
         .unwrap_or_else(|| tokenomics_unknown_usage_authority("report_not_requested"));
+    let ledger_authority = tokenomics_meta_json(conn, TOKENOMICS_LEDGER_AUTHORITY_KEY)
+        .unwrap_or_else(|| json!({
+            "state": "unknown",
+            "reason": "history_not_requested",
+            "source": "usage_history_v1",
+        }));
     let meter_states = tokenomics_meta_json(conn, TOKENOMICS_DAEMON_METER_STATES_KEY)
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
@@ -8776,6 +10053,7 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     ],
     "limits": limits,
     "usage_authority": usage_authority,
+    "ledger_authority": ledger_authority,
     "meter_states": meter_states,
     "haider_code_plan_status": haider_code_plan_status,
     "scan_index": scan_index,
@@ -9645,7 +10923,8 @@ fn tokenomics_account_daily_display_rollups(
                    COALESCE(SUM(CASE WHEN COALESCE(total_tokens, 0) > 0 THEN total_tokens ELSE COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0) END), 0) AS total_tokens,
                    COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
                    COALESCE(SUM(event_count), 0) AS event_count,
-                   MAX(updated_at) AS updated_at
+                   MAX(updated_at) AS updated_at,
+                   MAX(history_source) AS history_source
                  FROM {table}
                  WHERE bucket_width='day'
                    AND TRIM({account_key_sql})!=''
@@ -9752,7 +11031,7 @@ fn tokenomics_account_hourly_display_rollups_for_range(
     let table = if include_cloud {
         "tokenomics_display_rollups"
     } else {
-        "tokenomics_rollups"
+        "tokenomics_effective_local_rollups"
     };
     let account_key_sql = "COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, ''), provider || ':' || agent_kind || ':unknown')";
     let account_label_sql = "COALESCE(NULLIF(provider_account_label, ''), CASE WHEN agent_kind='codex' THEN 'Codex account' WHEN agent_kind='claude' THEN 'Claude account' WHEN agent_kind='opencode' THEN 'OpenCode account' ELSE agent_kind || ' account' END)";
@@ -9792,7 +11071,8 @@ fn tokenomics_account_hourly_display_rollups_for_range(
                COALESCE(SUM(CASE WHEN COALESCE(total_tokens, 0) > 0 THEN total_tokens ELSE COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0) END), 0) AS total_tokens,
                COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
                COALESCE(SUM(event_count), 0) AS event_count,
-               MAX(updated_at) AS updated_at
+               MAX(updated_at) AS updated_at,
+               MAX(history_source) AS history_source
 		             FROM {table}
 			             WHERE bucket_width='hour'
 	                   AND TRIM({account_key_sql})!=''
@@ -10907,28 +12187,23 @@ fn tokenomics_all_rollup_day_starts(
         .unwrap_or(0)
         .saturating_mul(86_400);
     let (_, older_than_hour) = tokenomics_utc_hour_bucket_from_unix(older_than_unix);
+    let scope_filter_sql = tokenomics_billing_scope_filter_sql(Some(scope_filter), true);
     let mut statement = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT substr(bucket_start, 1, 10) AS bucket_day
-             FROM tokenomics_rollups
+             FROM tokenomics_effective_local_rollups
              WHERE bucket_width='hour'
                AND bucket_start GLOB '????-??-??T??:00:00Z'
                AND bucket_start < ?1
-               AND COALESCE(NULLIF(billing_scope_type, ''), 'unknown')=?2
-               AND COALESCE(billing_team_id, '')=?3
+               {scope_filter_sql}
              GROUP BY bucket_day
-             ORDER BY bucket_day ASC",
-        )
+             ORDER BY bucket_day ASC"
+        ))
         .map_err(|error| format!("Unable to prepare Tokenomics rollup day listing: {error}"))?;
     let rows = statement
-        .query_map(
-            rusqlite::params![
-                older_than_hour.as_str(),
-                scope_filter.scope_type.as_str(),
-                scope_filter.team_id.as_deref().unwrap_or_default(),
-            ],
-            |row| row.get::<_, String>(0),
-        )
+        .query_map(rusqlite::params![older_than_hour.as_str()], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|error| format!("Unable to query Tokenomics rollup days: {error}"))?;
     let mut days = Vec::new();
     for row in rows {
@@ -12816,6 +14091,483 @@ mod tokenomics_tests {
             }),
             availability: Some(haider_rpc_ade::SnapshotAvailabilityWire::Available),
         })
+    }
+
+    fn usage_history_available() -> Option<haider_rpc_ade::SnapshotAvailabilityWire> {
+        Some(haider_rpc_ade::SnapshotAvailabilityWire::Available)
+    }
+
+    fn tokenomics_test_ledger_day(
+        device_id: &str,
+        date: &str,
+    ) -> haider_rpc_ade::UsageHistoryDayV1 {
+        // Shape authority: crates/haider-protocol/src/usage.rs:34-50,
+        // :66-74, :76-104, and :113-128. Key 2 deliberately matches the
+        // anonymous error-only lane observed in the live 2026-08-24 file.
+        let mut slots = vec![None; TOKENOMICS_LEDGER_SLOTS_PER_DAY];
+        slots[3] = Some(haider_rpc_ade::UsageHistorySlotV1::default());
+        slots[4] = Some(haider_rpc_ade::UsageHistorySlotV1 {
+            rows: vec![haider_rpc_ade::UsageHistoryRowV1 {
+                key_id: 2,
+                role: haider_rpc_ade::UsageHistoryRoleV1::Root,
+                requests: 0,
+                errors: 3,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+            }],
+            subagents_spawned: 0,
+        });
+        slots[5] = Some(haider_rpc_ade::UsageHistorySlotV1 {
+            rows: vec![haider_rpc_ade::UsageHistoryRowV1 {
+                key_id: 7,
+                role: haider_rpc_ade::UsageHistoryRoleV1::Subagent,
+                requests: 1,
+                errors: 0,
+                input_tokens: 7,
+                output_tokens: 5,
+                cache_read_tokens: 3,
+                cache_write_tokens: 2,
+                reasoning_tokens: 1,
+            }],
+            subagents_spawned: 1,
+        });
+        haider_rpc_ade::UsageHistoryDayV1 {
+            date: date.to_string(),
+            device_id: device_id.to_string(),
+            backfilled: true,
+            keys: vec![
+                haider_rpc_ade::UsageHistoryKeyV1 {
+                    id: 2,
+                    account: None,
+                    provider: None,
+                    model: None,
+                    api_family: None,
+                    effort: None,
+                    speed: None,
+                },
+                haider_rpc_ade::UsageHistoryKeyV1 {
+                    id: 7,
+                    account: Some("haider-code-api".to_string()),
+                    provider: Some("openai".to_string()),
+                    model: Some("gpt-5.6-sol".to_string()),
+                    api_family: Some("codex".to_string()),
+                    effort: Some("high".to_string()),
+                    speed: None,
+                },
+            ],
+            slots,
+            meter_samples: vec![haider_rpc_ade::UsageHistoryMeterSampleV1 {
+                account: "haider-code-api".to_string(),
+                window: "weekly".to_string(),
+                basis_points: 16_777_217,
+                resets_at_ms: Some(1_800_000_000_000),
+                grace_until_ms: Some(0),
+                sampled_at_ms: 1_777_000_000_000,
+                plan: Some("go".to_string()),
+                credits: None,
+                hold: None,
+                stale: Some(false),
+            }],
+            version_changes: vec![haider_rpc_ade::UsageHistoryVersionChangeV1 {
+                daemon_version: "0.0.955".to_string(),
+                changed_at_ms: 1_777_000_000_000,
+            }],
+        }
+    }
+
+    #[test]
+    fn usage_history_day_ingestion_is_idempotent_and_preserves_exact_shape() {
+        let _storage = process_test_storage_isolation(stringify!(
+            usage_history_day_ingestion_is_idempotent_and_preserves_exact_shape
+        ));
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let day = tokenomics_test_ledger_day("device-ledger-a", "2026-08-24");
+        let first = tokenomics_ingest_ledger_day(&mut conn, &day, &usage_history_available())
+            .expect("first ledger ingestion");
+        assert_eq!(first.changed_days, 1);
+        let first_changes = conn.total_changes();
+        let second = tokenomics_ingest_ledger_day(&mut conn, &day, &usage_history_available())
+            .expect("repeat ledger ingestion");
+        assert_eq!(
+            second,
+            TokenomicsLedgerIngestResult {
+                unchanged_days: 1,
+                ..TokenomicsLedgerIngestResult::default()
+            },
+            "re-reading the same append-only file must be a no-op"
+        );
+        assert_eq!(
+            conn.total_changes(),
+            first_changes,
+            "the idempotence guard must prevent even delete/reinsert churn"
+        );
+
+        let stored = tokenomics_read_stored_ledger_day(
+            &conn,
+            "device-ledger-a",
+            "2026-08-24",
+        )
+        .unwrap();
+        assert_eq!(
+            stored,
+            TokenomicsStoredLedgerDay::Day {
+                day: day.clone(),
+                availability: usage_history_available(),
+            }
+        );
+        let key: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT account, provider, model, api_family, effort, speed
+                 FROM tokenomics_ledger_keys
+                 WHERE device_id='device-ledger-a' AND date='2026-08-24' AND key_id=2",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            key,
+            (None, None, None, None, None, None),
+            "anonymous lane descriptors stay SQL NULL, never invented strings"
+        );
+        let version: (i64, String) = conn
+            .query_row(
+                "SELECT d.backfilled, v.daemon_version
+                 FROM tokenomics_ledger_days d
+                 JOIN tokenomics_ledger_version_changes v USING(device_id, date)
+                 WHERE d.device_id='device-ledger-a' AND d.date='2026-08-24'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, (1, "0.0.955".to_string()));
+    }
+
+    #[test]
+    fn usage_history_none_slot_and_sampled_zero_are_distinct_end_to_end() {
+        let _storage = process_test_storage_isolation(stringify!(
+            usage_history_none_slot_and_sampled_zero_are_distinct_end_to_end
+        ));
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let day = tokenomics_test_ledger_day("device-slots", "2026-08-24");
+        tokenomics_ingest_ledger_day(&mut conn, &day, &usage_history_available()).unwrap();
+        let markers: Vec<(i64, i64, Option<i64>)> = conn
+            .prepare(
+                "SELECT slot_index, sampled, subagents_spawned
+                 FROM tokenomics_ledger_slots WHERE device_id='device-slots'
+                   AND slot_index IN (2, 3) ORDER BY slot_index",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(markers, vec![(2, 0, None), (3, 1, Some(0))]);
+        let TokenomicsStoredLedgerDay::Day { day, .. } =
+            tokenomics_read_stored_ledger_day(&conn, "device-slots", "2026-08-24")
+                .unwrap()
+        else {
+            panic!("stored day expected");
+        };
+        assert_eq!(day.slots[2], None, "not-sampled must remain None");
+        assert_eq!(
+            day.slots[3],
+            Some(haider_rpc_ade::UsageHistorySlotV1::default()),
+            "a sampled zero slot must remain Some(zero)"
+        );
+    }
+
+    #[test]
+    fn usage_history_meter_integer_and_absent_balances_round_trip_exactly() {
+        let _storage = process_test_storage_isolation(stringify!(
+            usage_history_meter_integer_and_absent_balances_round_trip_exactly
+        ));
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let day = tokenomics_test_ledger_day("device-meter", "2026-08-25");
+        tokenomics_ingest_ledger_day(&mut conn, &day, &usage_history_available()).unwrap();
+        let stored: (i64, Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT basis_points, credits, hold, stale
+                 FROM tokenomics_ledger_meter_samples WHERE device_id='device-meter'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (16_777_217, None, None, Some(0)));
+        let normalized = 16_777_217_u32 as f32 / 10_000.0;
+        let reconstructed = (normalized * 10_000.0).round() as u32;
+        assert_ne!(
+            reconstructed, 16_777_217,
+            "this fixture must detect a normalized-float reconstruction"
+        );
+        let TokenomicsStoredLedgerDay::Day { day, .. } =
+            tokenomics_read_stored_ledger_day(&conn, "device-meter", "2026-08-25")
+                .unwrap()
+        else {
+            panic!("stored day expected");
+        };
+        assert_eq!(day.meter_samples[0].basis_points, 16_777_217);
+        assert_eq!(day.meter_samples[0].credits, None);
+        assert_eq!(day.meter_samples[0].hold, None);
+        assert_eq!(day.meter_samples[0].stale, Some(false));
+    }
+
+    #[test]
+    fn usage_history_authority_replaces_only_covered_dates_and_never_synthesizes() {
+        let _storage = process_test_storage_isolation(stringify!(
+            usage_history_authority_replaces_only_covered_dates_and_never_synthesizes
+        ));
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        for (id, date, tokens) in [
+            ("archive-old", "2026-07-20", 31_i64),
+            ("archive-covered", "2026-08-24", 41_i64),
+            ("archive-no-day", "2026-08-23", 53_i64),
+        ] {
+            let unix = tokenomics_timestamp_unix(&format!("{date}T01:00:00Z")).unwrap();
+            let event = tokenomics_test_event(
+                id,
+                "/tmp/pre-ledger.jsonl",
+                unix,
+                Some("anthropic:claude:archive"),
+                tokens,
+            );
+            assert!(tokenomics_insert_event(&conn, &event).unwrap());
+        }
+        let archive_before: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(total_tokens) FROM tokenomics_rollups",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let day = tokenomics_test_ledger_day("device-test", "2026-08-24");
+        tokenomics_ingest_ledger_day(&mut conn, &day, &usage_history_available()).unwrap();
+        tokenomics_record_ledger_no_day(
+            &conn,
+            "device-test",
+            "2026-08-23",
+            &usage_history_available(),
+        )
+        .unwrap();
+        let archive_after: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(total_tokens) FROM tokenomics_rollups",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            archive_after, archive_before,
+            "ledger ingestion must not rewrite the pre-ledger archive"
+        );
+
+        let effective = tokenomics_query_rows(
+            &conn,
+            "SELECT bucket_start, history_source, SUM(total_tokens) AS total_tokens
+             FROM tokenomics_effective_local_rollups
+             GROUP BY bucket_start, history_source ORDER BY bucket_start",
+        )
+        .unwrap();
+        assert!(effective.iter().any(|row| {
+            row["bucket_start"] == json!("2026-07-20T01:00:00Z")
+                && row["history_source"] == json!("pre_ledger_archive")
+                && row["total_tokens"] == json!(31)
+        }));
+        assert!(!effective
+            .iter()
+            .any(|row| row["bucket_start"] == json!("2026-08-23T01:00:00Z")));
+        assert!(effective.iter().any(|row| {
+            row["bucket_start"] == json!("2026-08-24T01:00:00Z")
+                && row["history_source"] == json!("usage_history_v1")
+                && row["total_tokens"] == json!(17)
+        }));
+        assert_eq!(
+            tokenomics_read_stored_ledger_day(&conn, "device-test", "2026-08-23")
+                .unwrap(),
+            TokenomicsStoredLedgerDay::NoDay {
+                device_id: "device-test".to_string(),
+                date: "2026-08-23".to_string(),
+                availability: usage_history_available(),
+            },
+            "an archive event must never synthesize a ledger day"
+        );
+    }
+
+    #[test]
+    fn usage_history_range_and_cross_device_rollups_preserve_provenance() {
+        let _storage = process_test_storage_isolation(stringify!(
+            usage_history_range_and_cross_device_rollups_preserve_provenance
+        ));
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        for device_id in ["ledger-device-a", "ledger-device-b"] {
+            let day = tokenomics_test_ledger_day(device_id, "2026-08-24");
+            tokenomics_ingest_ledger_day(&mut conn, &day, &usage_history_available()).unwrap();
+        }
+        let rollups = tokenomics_account_hourly_sync_rollups(&conn, None, None).unwrap();
+        assert!(rollups
+            .iter()
+            .any(|row| row["device_id"] == json!("ledger-device-a")));
+        assert!(rollups
+            .iter()
+            .any(|row| row["device_id"] == json!("ledger-device-b")));
+        assert!(rollups
+            .iter()
+            .filter(|row| row["device_id"] == json!("ledger-device-a")
+                || row["device_id"] == json!("ledger-device-b"))
+            .all(|row| row["history_source"] == json!("usage_history_v1")));
+        let personal_scope = TokenomicsBillingScope {
+            scope_type: "personal".to_string(),
+            team_id: None,
+            source: "test".to_string(),
+        };
+        assert_eq!(
+            tokenomics_all_rollup_day_starts(&conn, &personal_scope, 1_787_616_000_000)
+                .unwrap(),
+            vec![("2026-08-24".to_string(), 1_787_529_600_000)],
+            "historical cloud catch-up must discover ledger-derived days"
+        );
+
+        // Range authority: crates/haider-protocol/src/usage.rs:145-152.
+        let range = haider_rpc_ade::UsageHistoryRangeRead::Range {
+            through_date: "2026-08-25".to_string(),
+            device_id: "ledger-device-a".to_string(),
+            days: vec![
+                haider_rpc_ade::UsageHistoryRangeDayV1 {
+                    date: "2026-08-24".to_string(),
+                    total: None,
+                },
+                haider_rpc_ade::UsageHistoryRangeDayV1 {
+                    date: "2026-08-25".to_string(),
+                    total: Some(haider_rpc_ade::UsageHistoryDailyTotalV1::default()),
+                },
+            ],
+            availability: usage_history_available(),
+        };
+        tokenomics_ingest_ledger_range(&mut conn, &range, 2).unwrap();
+        let cells: Vec<(String, i64, Option<i64>)> = conn
+            .prepare(
+                "SELECT date, total_present, sampled_slots
+                 FROM tokenomics_ledger_range_days ORDER BY date",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            cells,
+            vec![
+                ("2026-08-24".to_string(), 0, None),
+                ("2026-08-25".to_string(), 1, Some(0)),
+            ],
+            "range absence and sampled zero are distinct"
+        );
+        let cloud_columns = conn
+            .prepare("PRAGMA table_info(tokenomics_cloud_rollups)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            !cloud_columns.iter().any(|column| column == "history_source"),
+            "tokenomics_cloud_rollups remains untouched in shape"
+        );
+    }
+
+    #[test]
+    fn usage_history_availability_is_authoritative_not_payload_emptiness() {
+        let _storage = process_test_storage_isolation(stringify!(
+            usage_history_availability_is_authoritative_not_payload_emptiness
+        ));
+        let unavailable = TokenomicsLedgerRpcBatch {
+            range: Ok(haider_rpc_ade::UsageHistoryRangeRead::Range {
+                through_date: "2026-08-25".to_string(),
+                device_id: "device-availability".to_string(),
+                days: vec![haider_rpc_ade::UsageHistoryRangeDayV1 {
+                    date: "2026-08-25".to_string(),
+                    total: Some(haider_rpc_ade::UsageHistoryDailyTotalV1::default()),
+                }],
+                availability: Some(haider_rpc_ade::SnapshotAvailabilityWire::Unavailable {
+                    reason: "ledger_locked".to_string(),
+                }),
+            }),
+            days: Vec::new(),
+        };
+        let authority = tokenomics_ledger_authority(&unavailable);
+        assert_eq!(authority["state"], json!("unavailable"));
+        assert_eq!(authority["reason"], json!("ledger_locked"));
+        assert_eq!(authority["range_cell_count"], json!(1));
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let ingest = tokenomics_ingest_ledger_rpc_batch(&mut conn, &unavailable).unwrap();
+        assert_eq!(ingest, TokenomicsLedgerIngestResult::default());
+        let stored_range_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tokenomics_ledger_ranges", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored_range_count, 0);
+
+        let available_empty = TokenomicsLedgerRpcBatch {
+            range: Ok(haider_rpc_ade::UsageHistoryRangeRead::Range {
+                through_date: "2026-08-25".to_string(),
+                device_id: "device-availability".to_string(),
+                days: Vec::new(),
+                availability: usage_history_available(),
+            }),
+            days: Vec::new(),
+        };
+        assert_eq!(
+            tokenomics_ledger_authority(&available_empty)["state"],
+            json!("available"),
+            "an empty available payload must not be inferred unavailable"
+        );
+    }
+
+    #[test]
+    fn usage_history_ledger_only_changes_trigger_existing_sync_path() {
+        let _storage = process_test_storage_isolation(stringify!(
+            usage_history_ledger_only_changes_trigger_existing_sync_path
+        ));
+        let summary = json!({
+            "inserted_events": 0,
+            "recorded_samples": 0,
+            "recorded_windows": 0,
+            "ledger_changed_days": 1,
+            "ledger_recorded_no_days": 0,
+            "ledger_range_changed": false,
+        });
+        assert_eq!(tokenomics_summary_inserted_events(&summary), 0);
+        assert_eq!(tokenomics_summary_recorded_limit_rows(&summary), 0);
+        assert_eq!(
+            tokenomics_summary_ledger_changes(&summary),
+            1,
+            "a ledger-only mutation must not be mislabeled as a scanner event"
+        );
     }
 
     #[test]
