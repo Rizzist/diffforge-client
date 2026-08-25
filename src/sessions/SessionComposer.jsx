@@ -8,7 +8,11 @@ import { KeyboardVoice } from "@styled-icons/material-rounded/KeyboardVoice";
 import { Send } from "@styled-icons/material-rounded/Send";
 
 import { modelGroupSelectionState } from "./haiderClientContract.js";
-import { DELIVERY_MODES, normalizeDeliveryMode } from "./sessionSubmit.js";
+import {
+  DELIVERY_MODES,
+  deliveryModePresentation,
+  normalizeDeliveryMode,
+} from "./sessionSubmit.js";
 
 /* Composer for the session UI view, in the dashboard's visual language:
    a chips row (MODEL / EFFORT / SPEED / PROVIDER / ACCOUNT) above a pill
@@ -57,9 +61,8 @@ export default function SessionComposer({
   /* Present only while a turn is running AND the harness has told us which
      run it is. Absent means no stop button — never a guess. */
   onCancelTurn = null,
-  /* DeliveryMode is independent of queue visibility. The selected value
-     rides the submit request; only queue_control_v1 unlocks the persistent
-     queue panel elsewhere. */
+  /* SessionSurface supplies this callback only with queue_control_v1. Its
+     absence removes the chip as well as the mode-selection callback. */
   deliveryMode = "queue",
   onDeliveryModeChange = null,
 }) {
@@ -375,7 +378,7 @@ export default function SessionComposer({
   const deliveryModeChip = () => {
     if (!onDeliveryModeChange) return null;
     const selected = normalizeDeliveryMode(deliveryMode);
-    const current = DELIVERY_MODES.find((mode) => mode.value === selected) || DELIVERY_MODES[0];
+    const current = deliveryModePresentation(selected);
     return (
       <ChipWrap key="delivery-mode">
         <Chip

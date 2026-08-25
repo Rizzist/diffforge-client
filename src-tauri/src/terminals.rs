@@ -26589,7 +26589,7 @@ mod terminal_tests {
             {
                 let mut writer = instance.writer.lock().await;
                 writer
-                    .write_all(b"sleep 1\r")
+                    .write_all(b"sleep 86400\r")
                     .map_err(|error| error.to_string())?;
                 writer.flush().map_err(|error| error.to_string())?;
             }
@@ -26627,6 +26627,22 @@ mod terminal_tests {
             .await?;
             if restarted || !terminals.read().await.contains_key("pane-generic") {
                 return Err("guarded restart killed foreground shell work".to_string());
+            }
+            if !terminal_restart_has_running_foreground_process(&instance) {
+                return Err("foreground shell work ended during the guarded restart".to_string());
+            }
+
+            /* End the work by an observed PTY transition, not a wall-clock
+               deadline. The old one-second sleep could finish while this
+               task was descheduled by the parallel suite, after the busy
+               assertion but before close_terminal_session acquired its
+               locks. */
+            {
+                let mut writer = instance.writer.lock().await;
+                writer
+                    .write_all(b"\x03")
+                    .map_err(|error| error.to_string())?;
+                writer.flush().map_err(|error| error.to_string())?;
             }
 
             let mut returned_to_prompt = false;

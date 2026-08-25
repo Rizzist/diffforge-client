@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(unix)]
-use std::{collections::VecDeque, sync::Mutex as StdMutex};
+use std::{collections::VecDeque, future::Future, sync::Mutex as StdMutex};
 
 #[cfg(unix)]
 use tokio::{
@@ -45,6 +45,7 @@ const FEATURE_SESSION_EFFORT_SELECT_V1: &str = "session_effort_select_v1";
 const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
 const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
 const FEATURE_RESIDENT_TURN_SUBMIT_V1: &str = "resident_turn_submit_v1";
+const FEATURE_QUEUE_CONTROL_V1: &str = "queue_control_v1";
 const FEATURE_RESIDENT_SESSION_BINDING_V1: &str = "resident_session_binding_v1";
 const FEATURE_SESSION_SEEN_V1: &str = "session_seen_v1";
 const FEATURE_SESSION_NEEDS_INPUT_V1: &str = "session_needs_input_v1";
@@ -82,6 +83,7 @@ const MAX_ACCOUNT_RESTAGE_RETRIES: usize = 3;
 /// the whole ladder before the daemon can drain. One short breath per rung.
 const ACCOUNT_RETRY_BACKOFF: Duration = Duration::from_millis(120);
 const SURFACE_EVENT: &str = "session-surface";
+const SESSION_QUEUE_CHANGED_EVENT: &str = "session-queue-changed";
 const RESIDENT_SESSION_BINDING_EVENT: &str = "resident-session-binding";
 const TOKENOMICS_UPDATED_EVENT: &str = "diffforge://tokenomics-updated";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
@@ -113,6 +115,43 @@ pub(crate) struct ResidentTurnSubmit {
     pub session_id: String,
     pub run_id: String,
     pub accepted_seq: u64,
+    pub disposition: SubmitDisposition,
+}
+
+/// Render-complete row returned by the daemon-owned held-message queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueRowWire {
+    pub id: String,
+    pub text: String,
+    pub mode: DeliveryMode,
+    pub ordinal: u32,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueListResult {
+    pub session_id: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub rows: Vec<QueueRowWire>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueMutationResult {
+    pub session_id: String,
+    pub id: String,
+    pub revision: u64,
+}
+
+/// Structured Tauri rejection for queue operations. In particular, daemon
+/// `ErrorData::RevisionConflict` remains an object all the way to JS.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueueCommandError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 /// Receipt returned when the daemon durably marks a session as seen.
@@ -746,6 +785,20 @@ enum RequestBody {
         attachments: Vec<Value>,
         mode: DeliveryMode,
     },
+    #[serde(rename = "queue.list")]
+    QueueList { session_id: String },
+    #[serde(rename = "queue.remove")]
+    QueueRemove {
+        session_id: String,
+        id: String,
+        revision: u64,
+    },
+    #[serde(rename = "queue.promote_steer")]
+    QueuePromoteSteer {
+        session_id: String,
+        id: String,
+        revision: u64,
+    },
     #[serde(rename = "account.list")]
     AccountList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -934,6 +987,27 @@ enum ResponseBody {
         session_id: String,
         run_id: String,
         accepted_seq: u64,
+        worker_generation: u64,
+        disposition: SubmitDisposition,
+    },
+    #[serde(rename = "queue.list")]
+    QueueList {
+        session_id: String,
+        revision: u64,
+        #[serde(default)]
+        rows: Vec<QueueRowWire>,
+    },
+    #[serde(rename = "queue.remove")]
+    QueueRemove {
+        session_id: String,
+        id: String,
+        revision: u64,
+    },
+    #[serde(rename = "queue.promote_steer")]
+    QueuePromoteSteer {
+        session_id: String,
+        id: String,
+        revision: u64,
     },
     #[serde(rename = "menu.answer")]
     MenuAnswer { resolution_seq: u64 },
@@ -1068,6 +1142,19 @@ enum WireFrame {
         #[serde(default)]
         status: Option<SurfaceStatusWire>,
     },
+    Event {
+        attachment_id: String,
+        session_id: String,
+        envelope: RawEnvelopeWire,
+    },
+    AttachCaughtUp {
+        attachment_id: String,
+        high_water_seq: u64,
+    },
+    Lagged {
+        attachment_id: String,
+        last_queued_seq: u64,
+    },
     HaiderCodePlanStatus {
         provider: String,
         account_alias: String,
@@ -1121,8 +1208,21 @@ enum AttachMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum DeliveryMode {
+pub(crate) enum DeliveryMode {
     Queue,
+    Steer,
+    Subturn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SubmitDisposition {
+    Started,
+    Queued,
+    SteerPending,
+    SubturnPending,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1132,6 +1232,50 @@ struct AttachStateWire {
     replay_through_seq: u64,
     worker_generation: u64,
     authority_epoch: u64,
+}
+
+/// Only the raw-envelope fields needed for ordered queue forwarding are
+/// decoded. Additive envelope fields remain tolerated by serde.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RawEnvelopeWire {
+    seq: u64,
+    session_id: String,
+    payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum QueueEventPayloadWire {
+    #[serde(rename = "queue_changed")]
+    QueueChanged {
+        revision: u64,
+        change: QueueChangeWire,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum QueueChangeWire {
+    Enqueued { row: QueueRowWire },
+    Removed { id: String },
+    PromotedSteer { id: String },
+    Consumed { id: String },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct QueueEventEnvelopePayload {
+    seq: u64,
+    payload: QueueEventPayloadWire,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct SessionQueueChangedPayload {
+    session_id: String,
+    envelope: QueueEventEnvelopePayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1426,6 +1570,12 @@ impl ConnectionSnapshot {
             && self.grants(Capability::View)
             && self.features.contains(FEATURE_SESSION_LIST_WATCH_V1)
     }
+
+    fn can_watch_queue(&self) -> bool {
+        self.connected
+            && self.grants(Capability::Control)
+            && self.features.contains(FEATURE_QUEUE_CONTROL_V1)
+    }
 }
 
 #[cfg(unix)]
@@ -1464,10 +1614,33 @@ impl FeatureGate {
 struct Subscription {
     app: AppHandle,
     revision_gate: RevisionGate,
+    queue_cursor: u64,
+    queue_attachment_id: Option<String>,
+    queue_attach_pending: bool,
+    queue_watch_waiters: Vec<QueueWatchReply>,
+}
+
+#[cfg(unix)]
+impl Subscription {
+    fn new(app: AppHandle, session_id: &str) -> Self {
+        Self {
+            app,
+            revision_gate: RevisionGate::default(),
+            queue_cursor: super::haider_bridge_head_seq(session_id)
+                .and_then(|head| u64::try_from(head).ok())
+                .unwrap_or(0),
+            queue_attachment_id: None,
+            queue_attach_pending: false,
+            queue_watch_waiters: Vec::new(),
+        }
+    }
 }
 
 #[cfg(unix)]
 type RpcReply = oneshot::Sender<Option<Result<ResponseBody, String>>>;
+
+#[cfg(unix)]
+type QueueWatchReply = oneshot::Sender<Result<(), QueueCommandError>>;
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
@@ -1475,6 +1648,7 @@ enum RpcErrorStyle {
     Detailed,
     Public,
     Code,
+    Passthrough,
 }
 
 #[cfg(unix)]
@@ -1488,11 +1662,16 @@ enum ActorCommand {
     RosterAttach {
         app: AppHandle,
     },
+    QueueAttach {
+        app: AppHandle,
+        session_id: String,
+        reply: QueueWatchReply,
+    },
     RpcRequest {
         body: RequestBody,
         capability: Capability,
         features: FeatureGate,
-        public_errors: bool,
+        error_style: RpcErrorStyle,
         reply: RpcReply,
     },
     MenuAnswer {
@@ -1787,13 +1966,356 @@ pub(crate) async fn session_roster_snapshot_rpc() -> Option<Result<Vec<Value>, S
     None
 }
 
+impl QueueCommandError {
+    fn unsupported() -> Self {
+        Self {
+            code: "unsupported".to_string(),
+            message: format!(
+                "The daemon does not advertise {FEATURE_QUEUE_CONTROL_V1}."
+            ),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "unavailable".to_string(),
+            message: message.into(),
+            retryable: true,
+            data: None,
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.into(),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn from_daemon(code: String, message: String, retryable: bool, data: Option<Value>) -> Self {
+        Self {
+            code,
+            message,
+            retryable,
+            data,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn queue_preflight(connection: &ConnectionSnapshot) -> Result<(), QueueCommandError> {
+    if !connection.connected {
+        return Err(QueueCommandError::unavailable(
+            "The Haider RPC connection is unavailable.",
+        ));
+    }
+    if !connection.features.contains(FEATURE_QUEUE_CONTROL_V1) {
+        return Err(QueueCommandError::unsupported());
+    }
+    if !connection.grants(Capability::View) {
+        return Err(QueueCommandError::from_daemon(
+            "capability_denied".to_string(),
+            "The current Haider RPC connection cannot read queues.".to_string(),
+            false,
+            None,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn queue_watch_preflight(connection: &ConnectionSnapshot) -> Result<(), QueueCommandError> {
+    if !connection.connected {
+        return Err(QueueCommandError::unavailable(
+            "The Haider RPC connection is unavailable for a live queue watch.",
+        ));
+    }
+    if !connection.features.contains(FEATURE_QUEUE_CONTROL_V1) {
+        return Err(QueueCommandError::unsupported());
+    }
+    if !connection.grants(Capability::Control) {
+        return Err(QueueCommandError::from_daemon(
+            "capability_denied".to_string(),
+            "The current Haider RPC connection cannot establish the live queue watch required for an authoritative snapshot.".to_string(),
+            false,
+            None,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn queue_preflight_current() -> Result<(), QueueCommandError> {
+    let handle = actor_handle();
+    let mut connection = handle.connection.subscribe();
+    if !connection.borrow().connected {
+        let _ = tokio::time::timeout(FEATURE_SNIFF_TIMEOUT, async {
+            while connection.changed().await.is_ok() {
+                if connection.borrow().connected {
+                    break;
+                }
+            }
+        })
+        .await;
+    }
+    let result = queue_preflight(&connection.borrow());
+    result
+}
+
+#[cfg(unix)]
+async fn queue_provider_session_id(session_id: String) -> Result<String, QueueCommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        super::session_provider_session_id_blocking(&session_id)
+    })
+    .await
+    .map_err(|error| {
+        QueueCommandError::unavailable(format!("Queue session lookup failed: {error}"))
+    })?
+    .map_err(|error| QueueCommandError::protocol(format!("Queue session lookup failed: {error}")))
+}
+
+#[cfg(unix)]
+async fn queue_watch_start(app: AppHandle, session_id: String) -> Result<(), QueueCommandError> {
+    let (reply, answer) = oneshot::channel();
+    actor_handle()
+        .commands
+        .send(ActorCommand::QueueAttach {
+            app,
+            session_id,
+            reply,
+        })
+        .map_err(|_| QueueCommandError::unavailable("The queue watch actor is unavailable."))?;
+    match tokio::time::timeout(COMMAND_REPLY_TIMEOUT, answer).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(QueueCommandError::unavailable(
+            "The queue watch actor dropped its readiness confirmation.",
+        )),
+        Err(_) => Err(QueueCommandError::unavailable(
+            "The live queue watch did not confirm readiness in time.",
+        )),
+    }
+}
+
+#[cfg(unix)]
+async fn queue_request(
+    body: RequestBody,
+    capability: Capability,
+) -> Result<ResponseBody, QueueCommandError> {
+    match rpc_request_with_feature_gate(
+        body,
+        capability,
+        FeatureGate::all(BTreeSet::from([FEATURE_QUEUE_CONTROL_V1.to_string()])),
+        RpcErrorStyle::Passthrough,
+    )
+    .await
+    {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) if error.starts_with("missing_feature:") => {
+            Err(QueueCommandError::unsupported())
+        }
+        Some(Err(error)) if error == "capability_denied" => Err(QueueCommandError::from_daemon(
+            error,
+            "The current Haider RPC connection lacks the required capability.".to_string(),
+            false,
+            None,
+        )),
+        Some(Err(error)) => Err(QueueCommandError::unavailable(error)),
+        None => Err(QueueCommandError::unavailable(
+            "The queue RPC request did not receive a response.",
+        )),
+    }
+}
+
+fn queue_list_response(body: ResponseBody) -> Result<QueueListResult, QueueCommandError> {
+    match body {
+        ResponseBody::QueueList {
+            session_id,
+            revision,
+            rows,
+        } => Ok(QueueListResult {
+            session_id,
+            revision,
+            rows,
+        }),
+        response => Err(queue_response_error(
+            response,
+            "queue.list response method mismatch",
+        )),
+    }
+}
+
+fn queue_list_result(
+    response: Result<ResponseBody, QueueCommandError>,
+) -> Result<QueueListResult, QueueCommandError> {
+    queue_list_response(response?)
+}
+
+#[cfg(unix)]
+async fn queue_list_with_watch<W, L>(
+    watch: W,
+    list: L,
+) -> Result<QueueListResult, QueueCommandError>
+where
+    W: Future<Output = Result<(), QueueCommandError>>,
+    L: Future<Output = Result<ResponseBody, QueueCommandError>>,
+{
+    /* Neither response owns authority alone. Awaiting both makes attach-first
+       and list-first delivery equivalent while the webview listener buffers
+       any deltas that race the snapshot. */
+    let (watch_result, list_result) = tokio::join!(watch, list);
+    watch_result?;
+    queue_list_result(list_result)
+}
+
+fn queue_mutation_response(
+    body: ResponseBody,
+    promote_steer: bool,
+) -> Result<QueueMutationResult, QueueCommandError> {
+    let mismatch = if promote_steer {
+        "queue.promote_steer response method mismatch"
+    } else {
+        "queue.remove response method mismatch"
+    };
+    let (session_id, id, revision) = match body {
+        ResponseBody::QueueRemove {
+            session_id,
+            id,
+            revision,
+        } if !promote_steer => (session_id, id, revision),
+        ResponseBody::QueuePromoteSteer {
+            session_id,
+            id,
+            revision,
+        } if promote_steer => (session_id, id, revision),
+        response => return Err(queue_response_error(response, mismatch)),
+    };
+    Ok(QueueMutationResult {
+        session_id,
+        id,
+        revision,
+    })
+}
+
+fn queue_response_error(body: ResponseBody, mismatch: &'static str) -> QueueCommandError {
+    match body {
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => QueueCommandError::from_daemon(code, message, retryable, data),
+        _ => QueueCommandError::protocol(mismatch),
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn queue_list(
+    app: AppHandle,
+    session_id: String,
+) -> Result<QueueListResult, QueueCommandError> {
+    #[cfg(unix)]
+    {
+        queue_preflight_current().await?;
+        let provider_session_id = queue_provider_session_id(session_id).await?;
+        return queue_list_with_watch(
+            queue_watch_start(app, provider_session_id.clone()),
+            queue_request(
+                RequestBody::QueueList {
+                    session_id: provider_session_id,
+                },
+                Capability::View,
+            ),
+        )
+        .await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, session_id);
+        Err(QueueCommandError::unsupported())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn queue_remove(
+    app: AppHandle,
+    session_id: String,
+    id: String,
+    revision: u64,
+) -> Result<QueueMutationResult, QueueCommandError> {
+    #[cfg(unix)]
+    {
+        queue_preflight_current().await?;
+        let provider_session_id = queue_provider_session_id(session_id).await?;
+        queue_watch_start(app, provider_session_id.clone()).await?;
+        return queue_mutation_response(
+            queue_request(
+                RequestBody::QueueRemove {
+                    session_id: provider_session_id,
+                    id,
+                    revision,
+                },
+                Capability::Control,
+            )
+            .await?,
+            false,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, session_id, id, revision);
+        Err(QueueCommandError::unsupported())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn queue_promote_steer(
+    app: AppHandle,
+    session_id: String,
+    id: String,
+    revision: u64,
+) -> Result<QueueMutationResult, QueueCommandError> {
+    #[cfg(unix)]
+    {
+        queue_preflight_current().await?;
+        let provider_session_id = queue_provider_session_id(session_id).await?;
+        queue_watch_start(app, provider_session_id.clone()).await?;
+        return queue_mutation_response(
+            queue_request(
+                RequestBody::QueuePromoteSteer {
+                    session_id: provider_session_id,
+                    id,
+                    revision,
+                },
+                Capability::Control,
+            )
+            .await?,
+            true,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, session_id, id, revision);
+        Err(QueueCommandError::unsupported())
+    }
+}
+
 #[cfg(unix)]
 async fn rpc_request(
     body: RequestBody,
     capability: Capability,
     features: BTreeSet<String>,
 ) -> Option<Result<ResponseBody, String>> {
-    rpc_request_with_feature_gate(body, capability, FeatureGate::all(features), false).await
+    rpc_request_with_feature_gate(
+        body,
+        capability,
+        FeatureGate::all(features),
+        RpcErrorStyle::Detailed,
+    )
+    .await
 }
 
 #[cfg(unix)]
@@ -1801,7 +2323,7 @@ async fn rpc_request_with_feature_gate(
     body: RequestBody,
     capability: Capability,
     features: FeatureGate,
-    public_errors: bool,
+    error_style: RpcErrorStyle,
 ) -> Option<Result<ResponseBody, String>> {
     let (reply, answer) = oneshot::channel();
     actor_handle()
@@ -1810,7 +2332,7 @@ async fn rpc_request_with_feature_gate(
             body,
             capability,
             features,
-            public_errors,
+            error_style,
             reply,
         })
         .ok()?;
@@ -1854,7 +2376,14 @@ async fn command_request(
         capability,
         failure_code,
     )?;
-    match rpc_request_with_feature_gate(body, capability, command_feature_gate(), true).await {
+    match rpc_request_with_feature_gate(
+        body,
+        capability,
+        command_feature_gate(),
+        RpcErrorStyle::Public,
+    )
+    .await
+    {
         Some(Ok(response)) => Ok(response),
         Some(Err(error)) if error.starts_with("missing_feature:") => {
             Err(HAIDER_COMMAND_FEATURE_MISSING.to_string())
@@ -2092,7 +2621,7 @@ async fn account_request(
     capability: Capability,
     features: FeatureGate,
 ) -> Result<ResponseBody, String> {
-    match rpc_request_with_feature_gate(body, capability, features, true).await {
+    match rpc_request_with_feature_gate(body, capability, features, RpcErrorStyle::Public).await {
         Some(Ok(response)) => Ok(response),
         Some(Err(error)) => Err(account_error(error)),
         None => Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string()),
@@ -2165,7 +2694,7 @@ pub async fn account_list(provider: Option<String>) -> Result<AccountListResult,
             RequestBody::AccountList { provider },
             Capability::View,
             account_feature_gate(&[FEATURE_ACCOUNT_MANAGEMENT_V1]),
-            true,
+            RpcErrorStyle::Public,
         )
         .await
         {
@@ -2209,7 +2738,7 @@ pub(crate) async fn provider_list_rpc(
             RequestBody::ProviderList { provider },
             Capability::View,
             FeatureGate::all(BTreeSet::from([FEATURE_PROVIDER_MANAGEMENT_V1.to_string()])),
-            true,
+            RpcErrorStyle::Public,
         )
         .await
         {
@@ -2244,7 +2773,7 @@ pub(crate) async fn usage_report_rpc() -> Result<UsageReportResult, String> {
             RequestBody::UsageReport {},
             Capability::View,
             FeatureGate::all(BTreeSet::from([FEATURE_USAGE_REPORT_V1.to_string()])),
-            true,
+            RpcErrorStyle::Public,
         )
         .await
         {
@@ -2489,7 +3018,7 @@ pub async fn account_oauth_import_sources() -> Result<Option<Vec<Value>>, String
             RequestBody::AccountOauthImportSources,
             Capability::View,
             account_feature_gate(&[FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1]),
-            true,
+            RpcErrorStyle::Public,
         )
         .await
         {
@@ -2956,13 +3485,26 @@ async fn config_request(
 }
 
 #[cfg(unix)]
-fn resident_turn_submit_features() -> BTreeSet<String> {
-    BTreeSet::from([FEATURE_RESIDENT_TURN_SUBMIT_V1.to_string()])
+fn resident_turn_submit_features(explicit_mode: bool) -> BTreeSet<String> {
+    let mut features = BTreeSet::from([FEATURE_RESIDENT_TURN_SUBMIT_V1.to_string()]);
+    if explicit_mode {
+        features.insert(FEATURE_QUEUE_CONTROL_V1.to_string());
+    }
+    features
 }
 
 #[cfg(unix)]
-async fn resident_turn_submit_request(body: RequestBody) -> Result<Option<ResponseBody>, String> {
-    match rpc_request(body, Capability::Control, resident_turn_submit_features()).await {
+async fn resident_turn_submit_request(
+    body: RequestBody,
+    explicit_mode: bool,
+) -> Result<Option<ResponseBody>, String> {
+    match rpc_request(
+        body,
+        Capability::Control,
+        resident_turn_submit_features(explicit_mode),
+    )
+    .await
+    {
         Some(Ok(response)) => Ok(Some(response)),
         Some(Err(error)) => Err(error),
         None => Ok(None),
@@ -2994,7 +3536,7 @@ async fn session_needs_input_request(body: RequestBody) -> Result<Option<Respons
         body,
         Capability::Control,
         FeatureGate::all(session_needs_input_features()),
-        true,
+        RpcErrorStyle::Public,
     )
     .await
     {
@@ -3041,11 +3583,18 @@ async fn config_session_summary(
 }
 
 #[cfg(unix)]
-async fn resident_turn_submit_session_summary(session_id: &str) -> Result<Option<Value>, String> {
+async fn resident_turn_submit_session_summary(
+    session_id: &str,
+    explicit_mode: bool,
+) -> Result<Option<Value>, String> {
     let mut cursor = None;
     loop {
         let Some(response) =
-            resident_turn_submit_request(RequestBody::SessionList { cursor, limit: 256 }).await?
+            resident_turn_submit_request(
+                RequestBody::SessionList { cursor, limit: 256 },
+                explicit_mode,
+            )
+            .await?
         else {
             return Ok(None);
         };
@@ -4164,18 +4713,24 @@ pub async fn session_answer_menu(
 async fn resident_turn_submit_rpc_inner(
     session_id: String,
     prompt: String,
+    mode: DeliveryMode,
+    explicit_mode: bool,
 ) -> Result<Option<ResidentTurnSubmit>, String> {
-    let Some(summary) = resident_turn_submit_session_summary(&session_id).await? else {
+    let Some(summary) = resident_turn_submit_session_summary(&session_id, explicit_mode).await?
+    else {
         return Ok(None);
     };
     let head_seq = config_u64(summary.get("head_seq"))
         .ok_or_else(|| "session summary head_seq was missing".to_string())?;
-    let Some(response) = resident_turn_submit_request(RequestBody::SessionAttach {
-        session_id: session_id.clone(),
-        after_seq: head_seq,
-        mode: AttachMode::Control,
-        sealed_replay: false,
-    })
+    let Some(response) = resident_turn_submit_request(
+        RequestBody::SessionAttach {
+            session_id: session_id.clone(),
+            after_seq: head_seq,
+            mode: AttachMode::Control,
+            sealed_replay: false,
+        },
+        explicit_mode,
+    )
     .await?
     else {
         return Ok(None);
@@ -4188,19 +4743,25 @@ async fn resident_turn_submit_rpc_inner(
         return Err("session.attach response method mismatch".to_string());
     };
     if attach_state.session_id != session_id {
-        let _ = resident_turn_submit_request(RequestBody::SessionDetach { attachment_id }).await;
+        let _ = resident_turn_submit_request(
+            RequestBody::SessionDetach { attachment_id },
+            explicit_mode,
+        )
+        .await;
         return Err("session.attach response session mismatch".to_string());
     }
 
     let submit = async {
-        let Some(response) = resident_turn_submit_request(RequestBody::TurnSubmitFromCli {
-            command_id: resident_turn_submit_command_id(),
-            session_id: session_id.clone(),
-            worker_generation: attach_state.worker_generation,
-            text: prompt,
-            attachments: Vec::new(),
-            mode: DeliveryMode::Queue,
-        })
+        let Some(response) = resident_turn_submit_request(
+            resident_turn_submit_body(
+                resident_turn_submit_command_id(),
+                session_id.clone(),
+                attach_state.worker_generation,
+                prompt,
+                mode,
+            ),
+            explicit_mode,
+        )
         .await?
         else {
             return Ok(None);
@@ -4210,10 +4771,13 @@ async fn resident_turn_submit_rpc_inner(
                 session_id: accepted_session,
                 run_id,
                 accepted_seq,
+                worker_generation: _,
+                disposition,
             } if accepted_session == session_id => Ok(Some(ResidentTurnSubmit {
                 session_id: accepted_session,
                 run_id,
                 accepted_seq,
+                disposition,
             })),
             ResponseBody::TurnSubmit { .. } => {
                 Err("turn.submit response session mismatch".to_string())
@@ -4223,8 +4787,29 @@ async fn resident_turn_submit_rpc_inner(
     }
     .await;
 
-    let _ = resident_turn_submit_request(RequestBody::SessionDetach { attachment_id }).await;
+    let _ = resident_turn_submit_request(
+        RequestBody::SessionDetach { attachment_id },
+        explicit_mode,
+    )
+    .await;
     submit
+}
+
+fn resident_turn_submit_body(
+    command_id: String,
+    session_id: String,
+    worker_generation: u64,
+    text: String,
+    mode: DeliveryMode,
+) -> RequestBody {
+    RequestBody::TurnSubmitFromCli {
+        command_id,
+        session_id,
+        worker_generation,
+        text,
+        attachments: Vec::new(),
+        mode,
+    }
 }
 
 /// Submits a text-only follow-up turn through the daemon-owned resident
@@ -4233,7 +4818,8 @@ async fn resident_turn_submit_rpc_inner(
 pub(crate) async fn resident_turn_submit_rpc(
     session_id: String,
     prompt: String,
-    attachments: Vec<String>,
+    attachments: &[String],
+    mode: Option<DeliveryMode>,
 ) -> Option<Result<ResidentTurnSubmit, String>> {
     #[cfg(unix)]
     {
@@ -4243,7 +4829,15 @@ pub(crate) async fn resident_turn_submit_rpc(
         {
             return None;
         }
-        return match resident_turn_submit_rpc_inner(session_id, prompt).await {
+        let explicit_mode = mode.is_some();
+        return match resident_turn_submit_rpc_inner(
+            session_id,
+            prompt,
+            mode.unwrap_or(DeliveryMode::Queue),
+            explicit_mode,
+        )
+        .await
+        {
             Ok(Some(receipt)) => Some(Ok(receipt)),
             Ok(None) => None,
             Err(error) => Some(Err(error)),
@@ -4251,7 +4845,7 @@ pub(crate) async fn resident_turn_submit_rpc(
     }
     #[cfg(not(unix))]
     {
-        let _ = (session_id, prompt, attachments);
+        let _ = (session_id, prompt, attachments, mode);
         None
     }
 }
@@ -4569,6 +5163,19 @@ fn apply_disconnected_command(
     match command {
         ActorCommand::ReconnectNow => {}
         ActorCommand::RosterAttach { app } => *roster_app = Some(app),
+        ActorCommand::QueueAttach {
+            app,
+            session_id,
+            reply,
+        } => {
+            subscriptions
+                .entry(session_id.clone())
+                .and_modify(|subscription| subscription.app = app.clone())
+                .or_insert_with(|| Subscription::new(app, &session_id));
+            let _ = reply.send(Err(QueueCommandError::unavailable(
+                "The Haider RPC connection disconnected before the live queue watch could attach.",
+            )));
+        }
         ActorCommand::RpcRequest { reply, .. } => {
             let _ = reply.send(None);
         }
@@ -4581,12 +5188,9 @@ fn apply_disconnected_command(
             reply,
         } => {
             subscriptions
-                .entry(session_id)
+                .entry(session_id.clone())
                 .and_modify(|subscription| subscription.app = app.clone())
-                .or_insert_with(|| Subscription {
-                    app,
-                    revision_gate: RevisionGate::default(),
-                });
+                .or_insert_with(|| Subscription::new(app, &session_id));
             let _ = reply.send(SurfaceCommandStatus::inactive(true));
         }
         ActorCommand::Detach { session_id, reply } => {
@@ -4617,8 +5221,32 @@ async fn run_connected(
     let mut ping_nonce = 1_u64;
     let mut unacked_pings: VecDeque<(u64, Instant)> = VecDeque::new();
     let mut pending_requests: HashMap<String, PendingRpcRequest> = HashMap::new();
+    let mut pending_queue_attaches: HashMap<String, String> = HashMap::new();
     let mut decoder = StreamingFrameDecoder::default();
     let mut scratch = [0_u8; 16 * 1024];
+
+    for subscription in subscriptions.values_mut() {
+        subscription.queue_attachment_id = None;
+        subscription.queue_attach_pending = false;
+    }
+    if connection.can_watch_queue() {
+        for session_id in subscriptions.keys().cloned().collect::<Vec<_>>() {
+            if send_queue_watch(
+                stream,
+                connection.frame_limit,
+                encoding,
+                next_request,
+                subscriptions,
+                &mut pending_queue_attaches,
+                session_id,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
+    }
 
     loop {
         let frame = match decoder.next(connection.frame_limit, encoding) {
@@ -4636,6 +5264,7 @@ async fn run_connected(
                             last_published_revision,
                             roster_app,
                             &mut pending_requests,
+                            &mut pending_queue_attaches,
                             next_request,
                         ).await;
                         if !keep_connection {
@@ -4679,6 +5308,10 @@ async fn run_connected(
         // timers; it was already read from the socket and must be kept.
         match frame {
             WireFrame::Response { request_id, body } => {
+                if let Some(session_id) = pending_queue_attaches.remove(&request_id) {
+                    finish_queue_watch(subscriptions, session_id, body);
+                    continue;
+                }
                 if let ResponseBody::SessionSurfaceWatching {
                     session_id,
                     input,
@@ -4706,6 +5339,28 @@ async fn run_connected(
                 status,
             } => {
                 emit_surface(subscriptions, &connection, session_id, input, status);
+            }
+            WireFrame::Event {
+                attachment_id,
+                session_id,
+                envelope,
+            } => {
+                if !handle_queue_event(
+                    subscriptions,
+                    attachment_id,
+                    session_id,
+                    envelope,
+                ) {
+                    return;
+                }
+            }
+            WireFrame::Lagged {
+                attachment_id,
+                last_queued_seq: _,
+            } => {
+                if emit_queue_stream_gap(subscriptions, &attachment_id) {
+                    return;
+                }
             }
             WireFrame::HaiderCodePlanStatus {
                 provider,
@@ -4788,6 +5443,7 @@ async fn apply_connected_command(
     last_published_revision: &mut HashMap<String, u64>,
     roster_app: &mut Option<AppHandle>,
     pending_requests: &mut HashMap<String, PendingRpcRequest>,
+    pending_queue_attaches: &mut HashMap<String, String>,
     next_request: &mut u64,
 ) -> bool {
     match command {
@@ -4803,11 +5459,64 @@ async fn apply_connected_command(
             ROSTER_WATCH_ACTIVE.store(false, Ordering::Release);
             written
         }
+        ActorCommand::QueueAttach {
+            app,
+            session_id,
+            reply,
+        } => {
+            subscriptions
+                .entry(session_id.clone())
+                .and_modify(|subscription| subscription.app = app.clone())
+                .or_insert_with(|| Subscription::new(app, &session_id));
+
+            if let Err(error) = queue_watch_preflight(connection) {
+                let _ = reply.send(Err(error));
+                return true;
+            }
+
+            let needs_write = {
+                let subscription = subscriptions
+                    .get_mut(&session_id)
+                    .expect("queue subscription was just installed");
+                if subscription.queue_attachment_id.is_some() {
+                    let _ = reply.send(Ok(()));
+                    return true;
+                }
+                subscription.queue_watch_waiters.push(reply);
+                !subscription.queue_attach_pending
+            };
+            if !needs_write {
+                return true;
+            }
+
+            match send_queue_watch(
+                stream,
+                connection.frame_limit,
+                encoding,
+                next_request,
+                subscriptions,
+                pending_queue_attaches,
+                session_id.clone(),
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    finish_queue_watch_waiters(
+                        subscriptions.get_mut(&session_id),
+                        Err(QueueCommandError::unavailable(format!(
+                            "Unable to write the live queue watch request: {error}"
+                        ))),
+                    );
+                    false
+                }
+            }
+        }
         ActorCommand::RpcRequest {
             body,
             capability,
             features,
-            public_errors,
+            error_style,
             reply,
         } => {
             if !connection.grants(capability) {
@@ -4835,11 +5544,6 @@ async fn apply_connected_command(
                 let _ = reply.send(None);
                 return false;
             }
-            let error_style = if public_errors {
-                RpcErrorStyle::Public
-            } else {
-                RpcErrorStyle::Detailed
-            };
             pending_requests.insert(request_id, (reply, error_style));
             true
         }
@@ -4893,10 +5597,7 @@ async fn apply_connected_command(
             subscriptions
                 .entry(session_id.clone())
                 .and_modify(|subscription| subscription.app = app.clone())
-                .or_insert_with(|| Subscription {
-                    app,
-                    revision_gate: RevisionGate::default(),
-                });
+                .or_insert_with(|| Subscription::new(app, &session_id));
             let active = connection.can_watch_surfaces();
             let written = !active
                 || send_surface_watch(
@@ -4904,18 +5605,42 @@ async fn apply_connected_command(
                     connection.frame_limit,
                     encoding,
                     next_request,
-                    session_id,
+                    session_id.clone(),
                 )
                 .await
                 .is_ok();
+            let queue_written = if written
+                && connection.can_watch_queue()
+                && subscriptions
+                    .get(&session_id)
+                    .is_some_and(|subscription| {
+                        subscription.queue_attachment_id.is_none()
+                            && !subscription.queue_attach_pending
+                    })
+            {
+                send_queue_watch(
+                    stream,
+                    connection.frame_limit,
+                    encoding,
+                    next_request,
+                    subscriptions,
+                    pending_queue_attaches,
+                    session_id,
+                )
+                .await
+                .is_ok()
+            } else {
+                true
+            };
             let _ = reply.send(SurfaceCommandStatus::from_connection(
                 connection, active, written,
             ));
-            written
+            written && queue_written
         }
         ActorCommand::Detach { session_id, reply } => {
             subscriptions.remove(&session_id);
-            let had_daemon_watch = connection.can_watch_surfaces();
+            let had_daemon_watch =
+                connection.can_watch_surfaces() || connection.can_watch_queue();
             let _ = reply.send(SurfaceCommandStatus::from_connection(
                 connection,
                 had_daemon_watch,
@@ -5043,6 +5768,7 @@ fn resident_binding_snapshot_for_frame(
 #[cfg(unix)]
 fn response_result(body: ResponseBody, error_style: RpcErrorStyle) -> Result<ResponseBody, String> {
     match body {
+        response if matches!(error_style, RpcErrorStyle::Passthrough) => Ok(response),
         ResponseBody::Error { code, .. } if matches!(error_style, RpcErrorStyle::Code) => Err(code),
         ResponseBody::Error { code, data, .. } if matches!(error_style, RpcErrorStyle::Public) => {
             Err(public_rpc_error(code, data))
@@ -5079,6 +5805,221 @@ fn public_rpc_error(code: String, data: Option<Value>) -> String {
     code
 }
 
+fn parse_queue_changed_payload_owned(
+    envelope_seq: u64,
+    payload: Value,
+) -> Result<Option<QueueEventPayloadWire>, String> {
+    if payload.get("type").and_then(Value::as_str).is_none() {
+        return Ok(None);
+    }
+    let delta: QueueEventPayloadWire = serde_json::from_value(payload)
+        .map_err(|error| format!("invalid QueueChanged payload: {error}"))?;
+    let QueueEventPayloadWire::QueueChanged { revision, change } = &delta else {
+        return Ok(None);
+    };
+    if *revision != envelope_seq {
+        return Err(format!(
+            "QueueChanged revision {} did not match envelope sequence {envelope_seq}",
+            revision
+        ));
+    }
+    match change {
+        QueueChangeWire::Enqueued { row } => {
+            if row.id.is_empty() || row.ordinal == 0 {
+                return Err("QueueChanged enqueued row had an invalid id or ordinal".to_string());
+            }
+        }
+        QueueChangeWire::Removed { id }
+        | QueueChangeWire::PromotedSteer { id }
+        | QueueChangeWire::Consumed { id } => {
+            if id.is_empty() {
+                return Err("QueueChanged removal had an empty id".to_string());
+            }
+        }
+        QueueChangeWire::Unknown => {
+            return Err("QueueChanged carried an unknown change kind".to_string());
+        }
+    }
+    Ok(Some(delta))
+}
+
+#[cfg(test)]
+fn parse_queue_changed_payload(
+    envelope_seq: u64,
+    payload: &Value,
+) -> Result<Option<QueueEventPayloadWire>, String> {
+    parse_queue_changed_payload_owned(envelope_seq, payload.clone())
+}
+
+#[cfg(unix)]
+fn emit_queue_watch_failure_for_session(
+    subscription: &Subscription,
+    session_id: &str,
+    reason: &str,
+    gap: bool,
+) {
+    let _ = subscription.app.emit(
+        SESSION_QUEUE_CHANGED_EVENT,
+        serde_json::json!({
+            "session_id": session_id,
+            "watch_failed": !gap,
+            "gap": gap,
+            "type": if gap { "lagged" } else { "queue_watch_failed" },
+            "reason": reason,
+        }),
+    );
+}
+
+#[cfg(unix)]
+fn finish_queue_watch_waiters(
+    subscription: Option<&mut Subscription>,
+    result: Result<(), QueueCommandError>,
+) {
+    let Some(subscription) = subscription else {
+        return;
+    };
+    for reply in subscription.queue_watch_waiters.drain(..) {
+        let _ = reply.send(result.clone());
+    }
+}
+
+#[cfg(unix)]
+fn finish_queue_watch(
+    subscriptions: &mut HashMap<String, Subscription>,
+    expected_session_id: String,
+    body: ResponseBody,
+) {
+    let Some(subscription) = subscriptions.get_mut(&expected_session_id) else {
+        return;
+    };
+    subscription.queue_attach_pending = false;
+    match body {
+        ResponseBody::SessionAttach {
+            attachment_id,
+            attach_state,
+        } if attach_state.session_id == expected_session_id => {
+            subscription.queue_cursor = subscription
+                .queue_cursor
+                .max(attach_state.requested_after_seq);
+            subscription.queue_attachment_id = Some(attachment_id);
+            finish_queue_watch_waiters(Some(subscription), Ok(()));
+        }
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => {
+            eprintln!(
+                "[ade-rpc] queue watch failed for {expected_session_id}: {message}"
+            );
+            emit_queue_watch_failure_for_session(
+                subscription,
+                &expected_session_id,
+                &message,
+                false,
+            );
+            finish_queue_watch_waiters(
+                Some(subscription),
+                Err(QueueCommandError::from_daemon(
+                    code, message, retryable, data,
+                )),
+            );
+        }
+        _ => {
+            let reason = "session.attach returned a malformed queue watch response";
+            eprintln!("[ade-rpc] {reason} for {expected_session_id}");
+            emit_queue_watch_failure_for_session(
+                subscription,
+                &expected_session_id,
+                reason,
+                false,
+            );
+            finish_queue_watch_waiters(
+                Some(subscription),
+                Err(QueueCommandError::protocol(reason)),
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn handle_queue_event(
+    subscriptions: &mut HashMap<String, Subscription>,
+    attachment_id: String,
+    frame_session_id: String,
+    envelope: RawEnvelopeWire,
+) -> bool {
+    let Some((expected_session_id, subscription)) =
+        subscriptions.iter_mut().find(|(_, subscription)| {
+            subscription.queue_attachment_id.as_deref() == Some(attachment_id.as_str())
+        })
+    else {
+        return true;
+    };
+    if frame_session_id.as_str() != expected_session_id.as_str()
+        || envelope.session_id.as_str() != expected_session_id.as_str()
+    {
+        let reason = "queue event session did not match its attachment";
+        eprintln!("[ade-rpc] dropping malformed QueueChanged: {reason}");
+        emit_queue_watch_failure_for_session(subscription, &expected_session_id, reason, false);
+        return true;
+    }
+    if envelope.seq <= subscription.queue_cursor {
+        return true;
+    }
+    if envelope.seq != subscription.queue_cursor.saturating_add(1) {
+        let reason = format!(
+            "queue watch sequence gap after {} before {}",
+            subscription.queue_cursor, envelope.seq
+        );
+        eprintln!("[ade-rpc] {reason}");
+        emit_queue_watch_failure_for_session(subscription, &expected_session_id, &reason, true);
+        return false;
+    }
+
+    let parsed = parse_queue_changed_payload_owned(envelope.seq, envelope.payload);
+    subscription.queue_cursor = envelope.seq;
+    match parsed {
+        Ok(Some(payload)) => {
+            let _ = subscription.app.emit(
+                SESSION_QUEUE_CHANGED_EVENT,
+                SessionQueueChangedPayload {
+                    session_id: frame_session_id,
+                    envelope: QueueEventEnvelopePayload {
+                        seq: envelope.seq,
+                        payload,
+                    },
+                },
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("[ade-rpc] dropping malformed QueueChanged: {error}");
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+fn emit_queue_stream_gap(
+    subscriptions: &HashMap<String, Subscription>,
+    attachment_id: &str,
+) -> bool {
+    let Some((session_id, subscription)) = subscriptions.iter().find(|(_, subscription)| {
+        subscription.queue_attachment_id.as_deref() == Some(attachment_id)
+    }) else {
+        return false;
+    };
+    emit_queue_watch_failure_for_session(
+        subscription,
+        session_id,
+        "The daemon dropped the session queue attachment.",
+        true,
+    );
+    true
+}
+
 #[cfg(unix)]
 async fn send_roster_watch(
     stream: &mut UnixStream,
@@ -5091,6 +6032,40 @@ async fn send_roster_watch(
         body: RequestBody::SessionListWatch {},
     };
     write_frame(stream, &request, frame_limit, encoding).await
+}
+
+#[cfg(unix)]
+async fn send_queue_watch(
+    stream: &mut UnixStream,
+    frame_limit: usize,
+    encoding: WireEncoding,
+    next_request: &mut u64,
+    subscriptions: &mut HashMap<String, Subscription>,
+    pending_queue_attaches: &mut HashMap<String, String>,
+    session_id: String,
+) -> std::io::Result<()> {
+    let Some(after_seq) = subscriptions
+        .get(&session_id)
+        .map(|subscription| subscription.queue_cursor)
+    else {
+        return Ok(());
+    };
+    let request_id = request_id(next_request);
+    let request = WireFrame::Request {
+        request_id: request_id.clone(),
+        body: RequestBody::SessionAttach {
+            session_id: session_id.clone(),
+            after_seq,
+            mode: AttachMode::Control,
+            sealed_replay: false,
+        },
+    };
+    write_frame(stream, &request, frame_limit, encoding).await?;
+    if let Some(subscription) = subscriptions.get_mut(&session_id) {
+        subscription.queue_attach_pending = true;
+    }
+    pending_queue_attaches.insert(request_id, session_id);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -5174,6 +6149,8 @@ fn wire_frame_kind(frame: &WireFrame) -> &'static str {
         WireFrame::Welcome(_) => "welcome",
         WireFrame::Request { .. } => "request",
         WireFrame::Response { .. } => "response",
+        WireFrame::Event { .. } => "event",
+        WireFrame::AttachCaughtUp { .. } => "attach_caught_up",
         WireFrame::SessionRosterDelta { .. } => "session_roster_delta",
         WireFrame::SessionSurfaceDelta { .. } => "session_surface_delta",
         WireFrame::HaiderCodePlanStatus { .. } => "haider_code_plan_status",
@@ -5181,6 +6158,7 @@ fn wire_frame_kind(frame: &WireFrame) -> &'static str {
         WireFrame::MenuAnswer { .. } => "menu_answer",
         WireFrame::Ping { .. } => "ping",
         WireFrame::Pong { .. } => "pong",
+        WireFrame::Lagged { .. } => "lagged",
         WireFrame::ProtocolError(_) => "protocol_error",
         WireFrame::Unknown => "unknown",
     }
@@ -6026,22 +7004,22 @@ mod tests {
     }
 
     #[test]
-    fn resident_turn_submit_frame_matches_reference_json_bytes() {
+    fn resident_turn_submit_selected_mode_reaches_reference_wire() {
+        // Harness source: crates/haider-rpc/src/frame.rs:1966-1978 at 0a68109.
         let submit = WireFrame::Request {
             request_id: "req-resident".to_owned(),
-            body: RequestBody::TurnSubmitFromCli {
-                command_id: "diffforge-resident-turn-test".to_owned(),
-                session_id: "session-1".to_owned(),
-                worker_generation: 7,
-                text: "continue the work".to_owned(),
-                attachments: Vec::new(),
-                mode: DeliveryMode::Queue,
-            },
+            body: resident_turn_submit_body(
+                "diffforge-resident-turn-test".to_owned(),
+                "session-1".to_owned(),
+                7,
+                "continue the work".to_owned(),
+                DeliveryMode::Subturn,
+            ),
         };
         let framed = encode_framed(&submit, DEFAULT_FRAME_LIMIT).expect("encode resident submit");
         assert_eq!(
             std::str::from_utf8(&framed[4..]).expect("resident submit JSON"),
-            r#"{"v":1,"kind":"request","request_id":"req-resident","body":{"method":"turn.submit_from_cli","command_id":"diffforge-resident-turn-test","session_id":"session-1","worker_generation":7,"text":"continue the work","attachments":[],"mode":"queue"}}"#
+            r#"{"v":1,"kind":"request","request_id":"req-resident","body":{"method":"turn.submit_from_cli","command_id":"diffforge-resident-turn-test","session_id":"session-1","worker_generation":7,"text":"continue the work","attachments":[],"mode":"subturn"}}"#
         );
         assert_eq!(
             u32::from_be_bytes(framed[..4].try_into().expect("resident submit prefix")) as usize,
@@ -6051,6 +7029,365 @@ mod tests {
             decode_body(&framed[4..], DEFAULT_FRAME_LIMIT).expect("decode resident submit"),
             submit
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resident_turn_submit_features_require_queue_control_only_for_explicit_modes() {
+        assert_eq!(
+            resident_turn_submit_features(false),
+            BTreeSet::from([FEATURE_RESIDENT_TURN_SUBMIT_V1.to_string()]),
+            "implicit legacy submissions must not require queue_control_v1",
+        );
+        assert_eq!(
+            resident_turn_submit_features(true),
+            BTreeSet::from([
+                FEATURE_QUEUE_CONTROL_V1.to_string(),
+                FEATURE_RESIDENT_TURN_SUBMIT_V1.to_string(),
+            ]),
+            "explicit resident submissions require both feature contracts",
+        );
+    }
+
+    #[test]
+    fn queue_control_request_and_success_response_frames_match_reference_json() {
+        // RequestBody queue shapes: crates/haider-rpc/src/frame.rs:1995-2014
+        // at harness commit 0a68109.
+        let request = |request_id: &str, body| WireFrame::Request {
+            request_id: request_id.to_string(),
+            body,
+        };
+        let cases = [
+            (
+                request(
+                    "req-list",
+                    RequestBody::QueueList {
+                        session_id: "session-1".to_string(),
+                    },
+                ),
+                r#"{"v":1,"kind":"request","request_id":"req-list","body":{"method":"queue.list","session_id":"session-1"}}"#,
+            ),
+            (
+                request(
+                    "req-remove",
+                    RequestBody::QueueRemove {
+                        session_id: "session-1".to_string(),
+                        id: "user-queued-1".to_string(),
+                        revision: 31,
+                    },
+                ),
+                r#"{"v":1,"kind":"request","request_id":"req-remove","body":{"method":"queue.remove","session_id":"session-1","id":"user-queued-1","revision":31}}"#,
+            ),
+            (
+                request(
+                    "req-promote",
+                    RequestBody::QueuePromoteSteer {
+                        session_id: "session-1".to_string(),
+                        id: "user-queued-2".to_string(),
+                        revision: 33,
+                    },
+                ),
+                r#"{"v":1,"kind":"request","request_id":"req-promote","body":{"method":"queue.promote_steer","session_id":"session-1","id":"user-queued-2","revision":33}}"#,
+            ),
+        ];
+        for (frame, expected) in cases {
+            let encoded = encode_framed(&frame, DEFAULT_FRAME_LIMIT).expect("encode queue request");
+            assert_eq!(
+                std::str::from_utf8(&encoded[4..]).expect("queue request JSON"),
+                expected
+            );
+            assert_eq!(
+                decode_body(&encoded[4..], DEFAULT_FRAME_LIMIT).expect("decode queue request"),
+                frame
+            );
+        }
+
+        // ResponseBody queue shapes: crates/haider-rpc/src/frame.rs:2455-2475.
+        let list_json = br#"{"v":1,"kind":"response","request_id":"req-list","body":{"method":"queue.list","session_id":"session-1","revision":31,"rows":[{"id":"user-queued-1","text":"  keep this text\nverbatim  ","mode":"queue","ordinal":1,"created_at_ms":1753500000000}]}}"#;
+        let list_frame = decode_body(list_json, DEFAULT_FRAME_LIMIT).expect("decode queue.list");
+        let WireFrame::Response { body, .. } = list_frame.clone()
+        else {
+            panic!("expected queue.list response");
+        };
+        assert_eq!(
+            &encode_framed(&list_frame, DEFAULT_FRAME_LIMIT)
+                .expect("re-encode queue.list")[4..],
+            list_json
+        );
+        let snapshot = queue_list_response(body).expect("authoritative list");
+        assert_eq!(snapshot.session_id, "session-1");
+        assert_eq!(snapshot.revision, 31);
+        assert_eq!(snapshot.rows[0].text, "  keep this text\nverbatim  ");
+
+        for (json, expected_id, expected_revision, promote) in [
+            (
+                br#"{"v":1,"kind":"response","request_id":"req-remove","body":{"method":"queue.remove","session_id":"session-1","id":"user-queued-1","revision":33}}"#
+                    .as_slice(),
+                "user-queued-1",
+                33,
+                false,
+            ),
+            (
+                br#"{"v":1,"kind":"response","request_id":"req-promote","body":{"method":"queue.promote_steer","session_id":"session-1","id":"user-queued-2","revision":36}}"#
+                    .as_slice(),
+                "user-queued-2",
+                36,
+                true,
+            ),
+        ] {
+            let frame = decode_body(json, DEFAULT_FRAME_LIMIT).expect("decode queue mutation");
+            assert_eq!(
+                &encode_framed(&frame, DEFAULT_FRAME_LIMIT)
+                    .expect("re-encode queue mutation")[4..],
+                json
+            );
+            let WireFrame::Response { body, .. } = frame else {
+                panic!("expected queue mutation response");
+            };
+            let receipt = queue_mutation_response(body, promote).expect("queue mutation receipt");
+            assert_eq!(receipt.id, expected_id);
+            assert_eq!(receipt.revision, expected_revision);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_feature_absence_is_unsupported_never_an_empty_list() {
+        let connection = ConnectionSnapshot {
+            connected: true,
+            capabilities_granted: BTreeSet::from([Capability::View, Capability::Control]),
+            ..ConnectionSnapshot::default()
+        };
+        let response = queue_preflight(&connection).map(|()| ResponseBody::QueueList {
+            session_id: "session-1".to_string(),
+            revision: 0,
+            rows: Vec::new(),
+        });
+        let error = queue_list_result(response).expect_err("absence is not an empty queue");
+        assert_eq!(error.code, "unsupported");
+        assert!(error.message.contains(FEATURE_QUEUE_CONTROL_V1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn view_only_queue_snapshot_is_rejected_without_live_authority() {
+        let connection = ConnectionSnapshot {
+            connected: true,
+            capabilities_granted: BTreeSet::from([Capability::View]),
+            features: BTreeSet::from([FEATURE_QUEUE_CONTROL_V1.to_string()]),
+            ..ConnectionSnapshot::default()
+        };
+        queue_preflight(&connection).expect("View may read queue.list");
+        let watch = queue_watch_preflight(&connection);
+        let result = queue_list_with_watch(
+            async move { watch },
+            async {
+                Ok(ResponseBody::QueueList {
+                    session_id: "session-1".to_string(),
+                    revision: 31,
+                    rows: Vec::new(),
+                })
+            },
+        )
+        .await
+        .expect_err("an empty list without a live watch is not authoritative");
+        assert_eq!(result.code, "capability_denied");
+        assert!(result.message.contains("live queue watch"));
+        assert!(!result.retryable);
+    }
+
+    #[cfg(unix)]
+    async fn queue_snapshot_in_response_order(attach_first: bool) -> QueueListResult {
+        let (watch_tx, watch_rx) = oneshot::channel();
+        let (list_tx, list_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            queue_list_with_watch(
+                async { watch_rx.await.expect("watch response sender") },
+                async { list_rx.await.expect("list response sender") },
+            )
+            .await
+        });
+
+        let list = Ok(ResponseBody::QueueList {
+            session_id: "session-1".to_string(),
+            revision: 31,
+            rows: vec![QueueRowWire {
+                id: "held-1".to_string(),
+                text: "verbatim".to_string(),
+                mode: DeliveryMode::Queue,
+                ordinal: 1,
+                created_at_ms: 1_753_500_000_000,
+            }],
+        });
+        if attach_first {
+            watch_tx.send(Ok(())).expect("send watch readiness");
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished(), "watch alone must not publish authority");
+            list_tx.send(list).expect("send list response");
+        } else {
+            list_tx.send(list).expect("send list response");
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished(), "list alone must not publish authority");
+            watch_tx.send(Ok(())).expect("send watch readiness");
+        }
+        task.await
+            .expect("queue authority task")
+            .expect("watch-backed queue snapshot")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_first_and_list_first_converge_to_the_same_authoritative_snapshot() {
+        let attach_first = queue_snapshot_in_response_order(true).await;
+        let list_first = queue_snapshot_in_response_order(false).await;
+        assert_eq!(attach_first, list_first);
+        assert_eq!(attach_first.revision, 31);
+        assert_eq!(attach_first.rows[0].id, "held-1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_list_source_wires_watch_readiness_into_snapshot_authority() {
+        let source = include_str!("haider_rpc_ade.rs");
+        let queue_list_source = source
+            .split_once("pub async fn queue_list(")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once("#[tauri::command").map(|(body, _)| body))
+            .expect("queue_list source body");
+        assert!(
+            queue_list_source.contains("queue_list_with_watch("),
+            "queue.list must use the watch-backed authority coordinator",
+        );
+        assert!(
+            queue_list_source.contains("queue_watch_start(app, provider_session_id.clone())"),
+            "queue.list must establish the live watch before returning authority",
+        );
+    }
+
+    #[test]
+    fn failed_queue_list_carries_daemon_reason_never_empty() {
+        let error = queue_list_result(Ok(ResponseBody::Error {
+            code: "store_unavailable".to_string(),
+            message: "queue journal could not be read".to_string(),
+            retryable: true,
+            data: None,
+        }))
+        .expect_err("a failed list has no queue snapshot");
+        assert_eq!(error.code, "store_unavailable");
+        assert_eq!(error.message, "queue journal could not be read");
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn revision_conflict_remains_typed_through_tauri_error_shape() {
+        // Response error carrier: crates/haider-rpc/src/frame.rs:2970-2991;
+        // typed conflict: frame.rs:3023-3031,3089-3094 (commit 0a68109).
+        let error = queue_mutation_response(
+            ResponseBody::Error {
+                code: "revision_conflict".to_string(),
+                message: "queue revision changed".to_string(),
+                retryable: true,
+                data: Some(serde_json::json!({
+                    "kind": "revision_conflict",
+                    "expected_revision": 31,
+                    "current_revision": 40,
+                })),
+            },
+            false,
+        )
+        .expect_err("stale mutation must be rejected");
+        assert_eq!(
+            serde_json::to_value(error).expect("serialize Tauri rejection"),
+            serde_json::json!({
+                "code": "revision_conflict",
+                "message": "queue revision changed",
+                "retryable": true,
+                "data": {
+                    "kind": "revision_conflict",
+                    "expected_revision": 31,
+                    "current_revision": 40,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn queue_changed_requires_complete_typed_payload_before_forwarding() {
+        // Session event carrier: crates/haider-rpc/src/frame.rs:3255-3275;
+        // QueueDelta: crates/haider-protocol/src/queue.rs:7-49 (commit 0a68109).
+        let event = br#"{"v":1,"kind":"event","attachment_id":"attachment-1","session_id":"session-1","envelope":{"schema_version":1,"event_id":"queue-change-31","seq":31,"session_id":"session-1","device_id":"daemon","authority_epoch":2,"worker_generation":7,"committed_at_ms":1753500000001,"render":{"ui":true,"durable":true,"prompt":"omit"},"payload":{"type":"queue_changed","revision":31,"change":{"kind":"enqueued","row":{"id":"user-queued-1","text":"  keep this text\nverbatim  ","mode":"steer","ordinal":1,"created_at_ms":1753500000000}}}}}"#;
+        let WireFrame::Event {
+            attachment_id,
+            session_id,
+            envelope,
+        } = decode_body(event, DEFAULT_FRAME_LIMIT).expect("decode session event frame")
+        else {
+            panic!("expected Event frame");
+        };
+        assert_eq!(attachment_id, "attachment-1");
+        assert_eq!(session_id, "session-1");
+        assert_eq!(envelope.session_id, "session-1");
+        let decoded = parse_queue_changed_payload(envelope.seq, &envelope.payload)
+            .expect("complete delta decodes")
+            .expect("QueueChanged is forwardable");
+        assert_eq!(
+            serde_json::to_value(decoded).expect("encode forwarded delta"),
+            serde_json::json!({
+                "type": "queue_changed",
+                "revision": 31,
+                "change": {
+                    "kind": "enqueued",
+                    "row": {
+                        "id": "user-queued-1",
+                        "text": "  keep this text\nverbatim  ",
+                        "mode": "steer",
+                        "ordinal": 1,
+                        "created_at_ms": 1_753_500_000_000_u64,
+                    }
+                }
+            })
+        );
+
+        for malformed in [
+            serde_json::json!({
+                "type": "queue_changed",
+                "change": {"kind": "removed", "id": "user-queued-1"}
+            }),
+            serde_json::json!({
+                "type": "queue_changed",
+                "revision": 30,
+                "change": {"kind": "removed", "id": "user-queued-1"}
+            }),
+            serde_json::json!({
+                "type": "queue_changed",
+                "revision": 31,
+                "change": {"kind": "removed", "id": ""}
+            }),
+        ] {
+            assert!(
+                parse_queue_changed_payload(31, &malformed).is_err(),
+                "malformed QueueChanged must be dropped: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_submit_response_preserves_typed_disposition() {
+        // Harness source: crates/haider-rpc/src/frame.rs:2636-2647 and
+        // SubmitDisposition at frame.rs:2999-3010 (commit 0a68109).
+        let response = br#"{"v":1,"kind":"response","request_id":"req-submit","body":{"method":"turn.submit","session_id":"session-1","run_id":"run-1","accepted_seq":31,"worker_generation":7,"disposition":"steer_pending"}}"#;
+        assert!(matches!(
+            decode_body(response, DEFAULT_FRAME_LIMIT).expect("decode turn.submit receipt"),
+            WireFrame::Response {
+                body: ResponseBody::TurnSubmit {
+                    session_id,
+                    accepted_seq: 31,
+                    disposition: SubmitDisposition::SteerPending,
+                    ..
+                },
+                ..
+            } if session_id == "session-1"
+        ));
     }
 
     #[test]
@@ -6908,7 +8245,7 @@ mod tests {
                 },
                 capability: Capability::View,
                 features: FeatureGate::all(config_features(&[])),
-                public_errors: false,
+                error_style: RpcErrorStyle::Detailed,
                 reply,
             },
             &mut subscriptions,

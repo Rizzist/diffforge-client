@@ -1,6 +1,11 @@
+import {
+  isDeliveryMode,
+  normalizeDeliveryMode,
+  tauriResponseBody,
+} from "./sessionSubmit.js";
+
 export const FEATURE_QUEUE_CONTROL_V1 = "queue_control_v1";
 
-const DELIVERY_MODES = new Set(["queue", "steer", "subturn"]);
 const REMOVING_CHANGES = new Set(["removed", "promoted_steer", "consumed"]);
 
 function safeRevision(value) {
@@ -15,22 +20,16 @@ function reasonText(value, fallback) {
   return fallback;
 }
 
-function withRuntime(state, fields = {}) {
-  return {
-    ...state,
-    listInFlight: fields.listInFlight ?? state.listInFlight ?? false,
-    bufferedDeltas: fields.bufferedDeltas ?? state.bufferedDeltas ?? [],
-  };
-}
-
+/* `bufferedDeltas` is also the list-flight marker: null while idle, an array
+   while queue.list is pending. That keeps the buffer and its lifecycle from
+   becoming two independently mutable pieces of state. */
 export function unsupportedQueueState() {
   return {
     kind: "unsupported",
     revision: null,
     rows: [],
     reason: "",
-    listInFlight: false,
-    bufferedDeltas: [],
+    bufferedDeltas: null,
   };
 }
 
@@ -40,13 +39,34 @@ export function unknownQueueState(reason = "Queue state has not been loaded.") {
     revision: null,
     rows: [],
     reason: reasonText(reason, "Queue state is unknown."),
-    listInFlight: false,
-    bufferedDeltas: [],
+    bufferedDeltas: null,
   };
 }
 
+export function queueControlAvailable(features) {
+  return Array.isArray(features) && features.includes(FEATURE_QUEUE_CONTROL_V1);
+}
+
+/* Production submit authority, kept pure so the feature-to-payload seam is
+   testable as one decision. An absent feature produces an absent wire field,
+   not a normalized Queue request. */
+export function effectiveSessionDeliveryMode(features, requestedMode) {
+  return queueControlAvailable(features)
+    ? normalizeDeliveryMode(requestedMode)
+    : undefined;
+}
+
+/* The delivery-mode chip and its callback are one gated composer prop. An
+   empty object is deliberately spread at the real render site when the bit
+   is absent, so SessionComposer receives no callback and renders no chip. */
+export function sessionComposerDeliveryModeProps(features, onDeliveryModeChange) {
+  return queueControlAvailable(features) && typeof onDeliveryModeChange === "function"
+    ? { onDeliveryModeChange }
+    : {};
+}
+
 export function queueStateForFeatures(features) {
-  return Array.isArray(features) && features.includes(FEATURE_QUEUE_CONTROL_V1)
+  return queueControlAvailable(features)
     ? unknownQueueState()
     : unsupportedQueueState();
 }
@@ -55,7 +75,7 @@ function normalizeQueueRow(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (typeof value.id !== "string" || !value.id) return null;
   if (typeof value.text !== "string") return null;
-  if (!DELIVERY_MODES.has(value.mode)) return null;
+  if (!isDeliveryMode(value.mode)) return null;
   if (!Number.isSafeInteger(value.ordinal) || value.ordinal < 1) return null;
   if (!Number.isSafeInteger(value.created_at_ms) || value.created_at_ms < 0) return null;
   return {
@@ -109,17 +129,13 @@ function authoritativeState(revision, rows) {
     revision,
     rows,
     reason: "",
-    listInFlight: false,
-    bufferedDeltas: [],
+    bufferedDeltas: null,
   };
 }
 
 export function queueListStarted(state) {
-  if (state?.kind === "unsupported" || state?.listInFlight) return state;
-  return withRuntime(state || unknownQueueState(), {
-    listInFlight: true,
-    bufferedDeltas: [],
-  });
+  if (state?.kind === "unsupported" || Array.isArray(state?.bufferedDeltas)) return state;
+  return { ...(state || unknownQueueState()), bufferedDeltas: [] };
 }
 
 export function queueListFailed(state, reason) {
@@ -217,8 +233,8 @@ export function applyQueueDelta(state, delta, {
       relist: true,
     };
   }
-  if (state?.listInFlight) {
-    const buffered = state.bufferedDeltas || [];
+  if (Array.isArray(state?.bufferedDeltas)) {
+    const buffered = state.bufferedDeltas;
     const lastRevision = buffered.length
       ? buffered[buffered.length - 1].revision
       : safeRevision(state.revision);
@@ -226,7 +242,7 @@ export function applyQueueDelta(state, delta, {
       return { state, outcome: "stale", relist: false };
     }
     return {
-      state: withRuntime(state, { bufferedDeltas: [...buffered, normalized] }),
+      state: { ...state, bufferedDeltas: [...buffered, normalized] },
       outcome: "buffered",
       relist: false,
     };
@@ -265,13 +281,8 @@ export function queuePresentation(state) {
   }
 }
 
-function responseBody(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  return value.body && typeof value.body === "object" ? value.body : value;
-}
-
 export function revisionConflictData(error) {
-  const body = responseBody(error);
+  const body = tauriResponseBody(error);
   const data = body?.data;
   if (body?.code !== "revision_conflict"
     || !data
@@ -299,7 +310,7 @@ export function createQueueInvokeBoundary(invokeCommand) {
 }
 
 function applyMutationReceipt(state, action, id, response) {
-  const body = responseBody(response);
+  const body = tauriResponseBody(response);
   const revision = safeRevision(body?.revision);
   if (revision == null || body?.id !== id) {
     return unknownQueueState(`Malformed queue.${action} response.`);
@@ -334,7 +345,6 @@ export async function mutateQueueRowWithRetry({
 
   let working = state;
   let attempts = 0;
-  let retries = 0;
   while (true) {
     attempts += 1;
     try {
@@ -371,10 +381,9 @@ export async function mutateQueueRowWithRetry({
       if (working.kind !== "rows" || !working.rows.some((row) => row.id === id)) {
         return { status: "gone", state: working, attempts };
       }
-      if (retries >= maxRetries) {
+      if (attempts - 1 >= maxRetries) {
         return { status: "conflict", state: working, attempts, error };
       }
-      retries += 1;
     }
   }
 }

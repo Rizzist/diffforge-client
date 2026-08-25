@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   applyQueueDelta,
   createQueueInvokeBoundary,
+  effectiveSessionDeliveryMode,
   FEATURE_QUEUE_CONTROL_V1,
   mutateQueueRowWithRetry,
   queueListFailed,
@@ -26,6 +27,23 @@ function install(rows = [row("held-1", 1)], revision = 31) {
   return queueListSucceeded(initial, { revision, rows }).state;
 }
 
+test("queue_control_v1 alone authorizes a delivery mode for the submit payload", () => {
+  assert.equal(
+    effectiveSessionDeliveryMode([], "steer"),
+    undefined,
+    "a selected mode is absent on the wire when the feature bit is absent",
+  );
+  assert.equal(
+    effectiveSessionDeliveryMode([FEATURE_QUEUE_CONTROL_V1], "steer"),
+    "steer",
+  );
+  assert.equal(
+    effectiveSessionDeliveryMode([FEATURE_QUEUE_CONTROL_V1], "future-mode"),
+    "queue",
+    "advertised mode support still normalizes unknown selections",
+  );
+});
+
 test("unsupported never renders as empty", () => {
   const state = queueStateForFeatures([]);
   assert.equal(state.kind, "unsupported");
@@ -46,6 +64,18 @@ test("a failed list is unknown with its reason, never empty", () => {
   assert.equal(state.reason, "daemon unavailable");
   assert.equal(presentation.empty, false);
   assert.equal(presentation.kind, "unknown");
+});
+
+test("a view-only queue rejection is unknown-with-reason, never a frozen empty snapshot", () => {
+  const listing = queueListStarted(queueStateForFeatures([FEATURE_QUEUE_CONTROL_V1]));
+  const state = queueListFailed(listing, {
+    code: "capability_denied",
+    message: "A live queue watch requires Control capability.",
+  });
+  assert.equal(state.kind, "unknown");
+  assert.equal(state.reason, "A live queue watch requires Control capability.");
+  assert.deepEqual(state.rows, []);
+  assert.equal(queuePresentation(state).empty, false);
 });
 
 test("only a valid successful empty list establishes empty", () => {
@@ -213,4 +243,46 @@ test("conflict re-list skips retry when the stable id is already gone", async ()
   assert.equal(result.status, "gone");
   assert.deepEqual(calls.map(([kind]) => kind), ["promote", "list"]);
   assert.equal(result.state.kind, "empty");
+});
+
+test("conflict retries stop exactly at maxRetries with the last authoritative list", async () => {
+  let mutationCalls = 0;
+  let listCalls = 0;
+  const boundary = {
+    remove: async ({ revision }) => {
+      mutationCalls += 1;
+      if (mutationCalls === 5) {
+        return { session_id: "session-1", id: "held-1", revision: revision + 1 };
+      }
+      throw {
+        code: "revision_conflict",
+        data: {
+          kind: "revision_conflict",
+          expected_revision: revision,
+          current_revision: revision + 1,
+        },
+      };
+    },
+    list: async () => {
+      listCalls += 1;
+      return { revision: 31 + listCalls, rows: [row("held-1", 1)] };
+    },
+  };
+
+  const result = await mutateQueueRowWithRetry({
+    boundary,
+    sessionId: "session-1",
+    id: "held-1",
+    action: "remove",
+    state: install(),
+    maxRetries: 1,
+  });
+
+  assert.equal(result.status, "conflict", "the fifth mutation must be unreachable");
+  assert.equal(result.attempts, 2, "one initial mutation plus one retry");
+  assert.equal(mutationCalls, 2, "mutation count must stop at maxRetries + 1");
+  assert.equal(listCalls, 2, "each typed conflict refreshes the terminal state once");
+  assert.equal(result.state.kind, "rows");
+  assert.equal(result.state.revision, 33, "terminal conflict returns the last authoritative list");
+  assert.deepEqual(result.state.rows.map((entry) => entry.id), ["held-1"]);
 });

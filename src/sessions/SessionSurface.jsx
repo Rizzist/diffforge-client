@@ -73,12 +73,15 @@ import SessionQueuePanel from "./SessionQueuePanel.jsx";
 import {
   applyQueueDelta,
   createQueueInvokeBoundary,
+  effectiveSessionDeliveryMode,
   FEATURE_QUEUE_CONTROL_V1,
   mutateQueueRowWithRetry,
+  queueControlAvailable,
   queueListFailed,
   queueListStarted,
   queueListSucceeded,
   queueStateForFeatures,
+  sessionComposerDeliveryModeProps,
 } from "./queueViewModel.js";
 import {
   normalizeDeliveryMode,
@@ -335,7 +338,7 @@ export default function SessionSurface({
   const commandText = composerTexts[commandContextId] || "";
   const slashInputActive = commandText.startsWith("/") && !commandText.includes("\n");
   const commandDoorAvailable = rpcFeatures.includes(COMMAND_DOOR_FEATURE);
-  const queueDoorAvailable = rpcFeatures.includes(FEATURE_QUEUE_CONTROL_V1);
+  const queueDoorAvailable = queueControlAvailable(rpcFeatures);
   const activeQueueSession = sessions.find((row) => row.id === activeSessionId) || null;
   const activeQueueSessionId = activeQueueSession?.id || "";
   const activeQueueProviderId = activeQueueSession?.provider_session_id || "";
@@ -449,31 +452,17 @@ export default function SessionSurface({
         return;
       }
       if (eventSession !== activeQueueSessionId && eventSession !== activeQueueProviderId) return;
-      if (payload.watch_failed === true || payload.watch_state === "failed") {
+      if (payload.watch_failed === true) {
         commitQueueState((current) => queueListFailed(
           current,
           payload.reason || "The session queue watch failed.",
         ));
         return;
       }
-      const envelope = payload.envelope && typeof payload.envelope === "object"
-        ? payload.envelope
-        : payload;
-      const delta = payload.delta
-        || payload.queue_delta
-        || envelope.payload
-        || payload.payload
-        || payload;
-      const envelopeSeq = Number.isSafeInteger(envelope.seq)
-        ? envelope.seq
-        : Number.isSafeInteger(payload.seq)
-          ? payload.seq
-          : null;
-      const applied = applyQueueDelta(queueStateRef.current, delta, {
-        envelopeSeq,
-        streamGap: payload.gap === true
-          || payload.kind === "lagged"
-          || payload.type === "lagged",
+      const envelope = payload.envelope;
+      const applied = applyQueueDelta(queueStateRef.current, envelope?.payload, {
+        envelopeSeq: envelope?.seq,
+        streamGap: payload.gap === true,
       });
       commitQueueState(applied.state);
       if (applied.relist) void relist();
@@ -1393,14 +1382,12 @@ export default function SessionSurface({
        that cannot honour it would render "Steer" while performing a plain
        queued send — a fabricated affordance. Absent the bit, the mode is
        not merely hidden: it is not sent. */
-    const deliveryMode = queueDoorAvailable
-      ? normalizeDeliveryMode(requestedMode)
-      : "queue";
+    const deliveryMode = effectiveSessionDeliveryMode(rpcFeatures, requestedMode);
     const send = () => submitSessionPrompt(invoke, {
       sessionId: session.id,
       prompt,
       attachments: attachments || [],
-      mode: deliveryMode,
+      ...(deliveryMode === undefined ? {} : { mode: deliveryMode }),
     });
     const accept = (result) => {
       recordSubmissionConfirmation(session.id, result, prompt);
@@ -1465,6 +1452,7 @@ export default function SessionSurface({
     onShellWarm,
     publishMirror,
     recordSubmissionConfirmation,
+    rpcFeatures,
     setComposerPastesFor,
     setComposerText,
     setModeFor,
@@ -1961,12 +1949,13 @@ export default function SessionSurface({
                       mirrorAttachments={mirrorAttachments[session.id] || []}
                       onAttachmentsChange={(next) => handleAttachmentsChange(session, next)}
                       onMirrorType={(text) => publishMirror(session, text)}
-                      onDeliveryModeChange={queueDoorAvailable
-                        ? (deliveryMode) => setComposerDeliveryModes((current) => ({
+                      {...sessionComposerDeliveryModeProps(
+                        rpcFeatures,
+                        (deliveryMode) => setComposerDeliveryModes((current) => ({
                           ...current,
                           [session.id]: normalizeDeliveryMode(deliveryMode),
-                        }))
-                        : undefined}
+                        })),
+                      )}
                       onSubmit={(prompt, attachments, deliveryMode) => (
                         submitIntoSession(session, prompt, attachments, deliveryMode)
                       )}

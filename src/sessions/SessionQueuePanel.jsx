@@ -4,12 +4,7 @@ import { Delete } from "@styled-icons/material-rounded/Delete";
 import { MoreHoriz } from "@styled-icons/material-rounded/MoreHoriz";
 
 import { queuePresentation } from "./queueViewModel.js";
-
-function modeLabel(mode) {
-  if (mode === "steer") return "Steer";
-  if (mode === "subturn") return "Subturn";
-  return "Queue";
-}
+import { deliveryModePresentation } from "./sessionSubmit.js";
 
 function createdLabel(value) {
   const date = new Date(value);
@@ -17,6 +12,10 @@ function createdLabel(value) {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+function queueDetailsLabel(row) {
+  return `#${row.ordinal} · ${deliveryModePresentation(row.mode).label} · ${createdLabel(row.created_at_ms)}`;
 }
 
 /* The persistent portion of this panel is only a projection of queue.list +
@@ -107,9 +106,7 @@ export default function SessionQueuePanel({
                   </QueueIconButton>
                 </QueueActions>
                 {detailsFor === row.id && (
-                  <QueueDetails>
-                    #{row.ordinal} · {modeLabel(row.mode)} · {createdLabel(row.created_at_ms)}
-                  </QueueDetails>
+                  <QueueDetails>{queueDetailsLabel(row)}</QueueDetails>
                 )}
               </QueueRow>
             );

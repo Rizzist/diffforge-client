@@ -65,3 +65,21 @@ test("an old void Tauri response stays disposition-unknown", async () => {
   assert.equal(result.disposition, "unknown");
   assert.equal(result.label, "Accepted");
 });
+
+test("submit boundary omits mode when queue_control_v1 did not authorize one", async () => {
+  const calls = [];
+  await submitSessionPrompt(async (command, args) => {
+    calls.push([command, args]);
+    return undefined;
+  }, {
+    sessionId: "session-1",
+    prompt: "hello",
+  });
+
+  assert.deepEqual(calls, [["session_submit_prompt", {
+    session_id: "session-1",
+    prompt: "hello",
+    attachments: null,
+  }]], "legacy payload must not contain a mode key");
+  assert.equal(Object.hasOwn(calls[0][1], "mode"), false);
+});

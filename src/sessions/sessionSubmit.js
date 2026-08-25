@@ -16,16 +16,30 @@ export const DELIVERY_MODES = Object.freeze([
   }),
 ]);
 
-const DELIVERY_MODE_VALUES = new Set(DELIVERY_MODES.map((mode) => mode.value));
-const SUBMIT_DISPOSITIONS = new Set([
-  "started",
-  "queued",
-  "steer_pending",
-  "subturn_pending",
-]);
+const DELIVERY_MODE_PRESENTATIONS = new Map(
+  DELIVERY_MODES.map((mode) => [mode.value, mode]),
+);
+const SUBMIT_DISPOSITION_PRESENTATIONS = Object.freeze({
+  started: { label: "Started", detail: "The turn started." },
+  queued: { label: "Queued", detail: "Held until the active turn finishes." },
+  steer_pending: { label: "Steer pending", detail: "Waiting for a safe delivery boundary." },
+  subturn_pending: { label: "Subturn pending", detail: "Scheduled as a separate subturn." },
+  unknown: {
+    label: "Accepted",
+    detail: "The daemon did not publish this submission's disposition.",
+  },
+});
+
+export function isDeliveryMode(value) {
+  return DELIVERY_MODE_PRESENTATIONS.has(value);
+}
 
 export function normalizeDeliveryMode(value) {
-  return DELIVERY_MODE_VALUES.has(value) ? value : "queue";
+  return isDeliveryMode(value) ? value : "queue";
+}
+
+export function deliveryModePresentation(value) {
+  return DELIVERY_MODE_PRESENTATIONS.get(normalizeDeliveryMode(value));
 }
 
 /* SubmitDisposition is unknown-tolerant on the wire. An absent or future
@@ -33,30 +47,15 @@ export function normalizeDeliveryMode(value) {
    disposition was not. It must never be promoted to `started` from the
    selected delivery mode or from local run state. */
 export function normalizeSubmitDisposition(value) {
-  return SUBMIT_DISPOSITIONS.has(value) ? value : "unknown";
+  return Object.hasOwn(SUBMIT_DISPOSITION_PRESENTATIONS, value) ? value : "unknown";
 }
 
 export function submitDispositionPresentation(value) {
   const disposition = normalizeSubmitDisposition(value);
-  switch (disposition) {
-    case "started":
-      return { disposition, label: "Started", detail: "The turn started." };
-    case "queued":
-      return { disposition, label: "Queued", detail: "Held until the active turn finishes." };
-    case "steer_pending":
-      return { disposition, label: "Steer pending", detail: "Waiting for a safe delivery boundary." };
-    case "subturn_pending":
-      return { disposition, label: "Subturn pending", detail: "Scheduled as a separate subturn." };
-    default:
-      return {
-        disposition: "unknown",
-        label: "Accepted",
-        detail: "The daemon did not publish this submission's disposition.",
-      };
-  }
+  return { disposition, ...SUBMIT_DISPOSITION_PRESENTATIONS[disposition] };
 }
 
-function receiptBody(value) {
+export function tauriResponseBody(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (value.body && typeof value.body === "object" && !Array.isArray(value.body)) {
     return value.body;
@@ -71,16 +70,19 @@ export async function submitSessionPrompt(invokeCommand, {
   sessionId,
   prompt,
   attachments = [],
-  mode = "queue",
+  mode,
 }) {
-  const deliveryMode = normalizeDeliveryMode(mode);
+  /* An omitted mode is compatibility-significant: it is the legacy submit
+     shape used when queue_control_v1 is absent. Never turn absence into an
+     explicit Queue request at this boundary. */
+  const deliveryMode = mode == null ? undefined : normalizeDeliveryMode(mode);
   const response = await invokeCommand("session_submit_prompt", {
     session_id: sessionId,
     prompt,
     attachments: attachments.length ? attachments : null,
-    mode: deliveryMode,
+    ...(deliveryMode === undefined ? {} : { mode: deliveryMode }),
   });
-  const receipt = receiptBody(response);
+  const receipt = tauriResponseBody(response);
   const presentation = submitDispositionPresentation(receipt?.disposition);
   return {
     ...presentation,

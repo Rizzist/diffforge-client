@@ -19,11 +19,128 @@ struct HaiderRunAccepted {
     head_seq: i64,
 }
 
-struct HaiderRunSubmitRequest {
-    row: SessionRow,
-    prompt: String,
-    attachments: Vec<String>,
-    config: Option<RunConfig>,
+mod haider_run_submit {
+    use super::{haider_rpc_ade, RunConfig, SessionRow};
+
+    /* The raw request is opaque outside this module so the production route
+    cannot erase or replace `mode` after the Tauri boundary has prepared it. */
+    #[derive(Debug)]
+    pub(super) struct Request {
+        row: SessionRow,
+        prompt: String,
+        attachments: Vec<String>,
+        config: Option<RunConfig>,
+        mode: Option<haider_rpc_ade::DeliveryMode>,
+    }
+
+    /* There is deliberately no `mode` field in this type. The only constructor
+    consumes a Request and refuses every explicit delivery mode. */
+    #[derive(Debug)]
+    pub(super) struct CliSubmit {
+        row: SessionRow,
+        prompt: String,
+        attachments: Vec<String>,
+        config: Option<RunConfig>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum CliSubmitRefusal {
+        ExplicitDeliveryMode(haider_rpc_ade::DeliveryMode),
+    }
+
+    impl std::fmt::Display for CliSubmitRefusal {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ExplicitDeliveryMode(_) => formatter.write_str(
+                    "haider_run_delivery_mode_unavailable: `haider run --session` has no delivery-mode argument",
+                ),
+            }
+        }
+    }
+
+    impl Request {
+        pub(super) fn new(
+            row: SessionRow,
+            prompt: String,
+            attachments: Vec<String>,
+            config: Option<RunConfig>,
+            mode: Option<haider_rpc_ade::DeliveryMode>,
+        ) -> Self {
+            Self {
+                row,
+                prompt,
+                attachments,
+                config,
+                mode,
+            }
+        }
+
+        pub(super) fn row(&self) -> &SessionRow {
+            &self.row
+        }
+
+        pub(super) fn prompt(&self) -> &str {
+            &self.prompt
+        }
+
+        pub(super) fn attachments(&self) -> &[String] {
+            &self.attachments
+        }
+
+        pub(super) fn config(&self) -> Option<&RunConfig> {
+            self.config.as_ref()
+        }
+
+        pub(super) fn mode(&self) -> Option<haider_rpc_ade::DeliveryMode> {
+            self.mode
+        }
+
+        fn into_cli_submit(self) -> Result<CliSubmit, CliSubmitRefusal> {
+            let Self {
+                row,
+                prompt,
+                attachments,
+                config,
+                mode,
+            } = self;
+            match mode {
+                Some(mode) => Err(CliSubmitRefusal::ExplicitDeliveryMode(mode)),
+                None => Ok(CliSubmit {
+                    row,
+                    prompt,
+                    attachments,
+                    config,
+                }),
+            }
+        }
+    }
+
+    impl CliSubmit {
+        pub(super) fn into_parts(self) -> (SessionRow, String, Vec<String>, Option<RunConfig>) {
+            (self.row, self.prompt, self.attachments, self.config)
+        }
+    }
+
+    /* This is the production handoff used by the Tauri command. The consumer
+    cannot run, and therefore cannot receive a CLI witness, on refusal. */
+    pub(super) fn enter_cli_submit<T>(
+        submit: Request,
+        consume: impl FnOnce(CliSubmit) -> T,
+    ) -> Result<T, CliSubmitRefusal> {
+        submit.into_cli_submit().map(consume)
+    }
+}
+
+use haider_run_submit::{
+    enter_cli_submit as haider_run_enter_cli_submit, CliSubmit as HaiderRunCliSubmit,
+    CliSubmitRefusal as HaiderRunCliSubmitRefusal, Request as HaiderRunSubmitRequest,
+};
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct SessionSubmitReceipt {
+    session_id: String,
+    accepted_seq: u64,
+    disposition: haider_rpc_ade::SubmitDisposition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +148,18 @@ enum HaiderRunSubmitRoute {
     RejectUnbound,
     ResidentRpc,
     Spawn,
+}
+
+#[derive(Debug)]
+enum HaiderRunCliSpawn {
+    Start {
+        local_session_id: String,
+        prompt: String,
+        cwd: PathBuf,
+        attachments: Vec<String>,
+        config: Option<RunConfig>,
+    },
+    SessionSubmit(HaiderRunCliSubmit),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -478,14 +607,30 @@ fn haider_run_update_session(
 
 fn haider_run_spawn(
     app: AppHandle,
-    local_session_id: String,
-    provider_session_id: Option<String>,
-    prompt: String,
-    cwd: PathBuf,
-    attachments: Vec<String>,
-    config: Option<RunConfig>,
+    spawn: HaiderRunCliSpawn,
     binding_sender: Option<std::sync::mpsc::SyncSender<Result<SessionRow, String>>>,
 ) -> Result<(), String> {
+    let (local_session_id, provider_session_id, prompt, cwd, attachments, config) = match spawn {
+        HaiderRunCliSpawn::Start {
+            local_session_id,
+            prompt,
+            cwd,
+            attachments,
+            config,
+        } => (local_session_id, None, prompt, cwd, attachments, config),
+        HaiderRunCliSpawn::SessionSubmit(submit) => {
+            let (row, prompt, attachments, config) = submit.into_parts();
+            let cwd = haider_run_working_directory(&row);
+            (
+                row.id,
+                Some(row.provider_session_id),
+                prompt,
+                cwd,
+                attachments,
+                config,
+            )
+        }
+    };
     if haider_run_is_active(&local_session_id)? {
         return Err("A Haider run is already active for this session.".to_string());
     }
@@ -724,12 +869,13 @@ async fn session_start_with_prompt(
         let (binding_sender, binding_receiver) = std::sync::mpsc::sync_channel(1);
         if let Err(error) = haider_run_spawn(
             app.clone(),
-            created.id.clone(),
-            None,
-            prompt.clone(),
-            cwd,
-            attachments.clone().unwrap_or_default(),
-            config,
+            HaiderRunCliSpawn::Start {
+                local_session_id: created.id.clone(),
+                prompt: prompt.clone(),
+                cwd,
+                attachments: attachments.clone().unwrap_or_default(),
+                config,
+            },
             Some(binding_sender),
         ) {
             discard_created(&app);
@@ -765,6 +911,7 @@ fn haider_run_prepare_session_submit(
     prompt: String,
     attachments: Option<Vec<String>>,
     config: Option<RunConfig>,
+    mode: Option<haider_rpc_ade::DeliveryMode>,
 ) -> Result<HaiderRunSubmitRequest, String> {
     let prompt = haider_run_prompt(prompt)?;
     if let Some(config) = config.as_ref() {
@@ -784,12 +931,13 @@ fn haider_run_prepare_session_submit(
     if active {
         return Err("A Haider run is already active for this session.".to_string());
     }
-    Ok(HaiderRunSubmitRequest {
+    Ok(HaiderRunSubmitRequest::new(
         row,
         prompt,
-        attachments: attachments.unwrap_or_default(),
+        attachments.unwrap_or_default(),
         config,
-    })
+        mode,
+    ))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -799,62 +947,76 @@ async fn session_submit_prompt(
     prompt: String,
     attachments: Option<Vec<String>>,
     config: Option<RunConfig>,
-) -> Result<(), String> {
+    mode: Option<haider_rpc_ade::DeliveryMode>,
+) -> Result<Option<SessionSubmitReceipt>, String> {
     let submit = tauri::async_runtime::spawn_blocking(move || {
-        haider_run_prepare_session_submit(session_id, prompt, attachments, config)
+        haider_run_prepare_session_submit(session_id, prompt, attachments, config, mode)
     })
     .await
     .map_err(|error| format!("Session submit worker failed: {error}"))??;
 
     let try_resident = matches!(
-        haider_run_select_session_submit_route(true, true, &submit.attachments),
+        haider_run_select_session_submit_route(true, true, submit.attachments()),
         HaiderRunSubmitRoute::ResidentRpc
-    ) && !haider_run_config_has_overrides(submit.config.as_ref());
+    ) && !haider_run_config_has_overrides(submit.config());
     if try_resident {
-        if let Some(Ok(receipt)) = haider_rpc_ade::resident_turn_submit_rpc(
-            submit.row.provider_session_id.clone(),
-            submit.prompt.clone(),
-            submit.attachments.clone(),
+        match haider_rpc_ade::resident_turn_submit_rpc(
+            submit.row().provider_session_id.clone(),
+            submit.prompt().to_string(),
+            submit.attachments(),
+            submit.mode(),
         )
         .await
         {
-            if let Ok(head_seq) = i64::try_from(receipt.accepted_seq) {
-                haider_bridge_note_head_seq(&receipt.session_id, head_seq);
+            Some(Ok(receipt)) => {
+                if let Ok(head_seq) = i64::try_from(receipt.accepted_seq) {
+                    haider_bridge_note_head_seq(&receipt.session_id, head_seq);
+                }
+                return Ok(Some(SessionSubmitReceipt {
+                    session_id: receipt.session_id,
+                    accepted_seq: receipt.accepted_seq,
+                    disposition: receipt.disposition,
+                }));
             }
-            return Ok(());
+            Some(Err(error)) if submit.mode().is_some() => {
+                return Err(format!(
+                    "haider_run_delivery_mode_unavailable: resident submit failed: {error}"
+                ));
+            }
+            None if submit.mode().is_some() => {
+                return Err(
+                    "haider_run_delivery_mode_unavailable: the resident submit route cannot carry the requested mode"
+                        .to_string(),
+                );
+            }
+            Some(Err(_)) | None => {}
         }
     }
+
+    let local_session_id = submit.row().id.clone();
+    let spawn = haider_run_enter_cli_submit(submit, HaiderRunCliSpawn::SessionSubmit)
+        .map_err(|refusal: HaiderRunCliSubmitRefusal| refusal.to_string())?;
 
     tauri::async_runtime::spawn_blocking(move || {
         if !haider_run_supports_session() {
             return Err("haider_run_session_unsupported".to_string());
         }
-        let cwd = haider_run_working_directory(&submit.row);
         let (binding_sender, binding_receiver) = std::sync::mpsc::sync_channel(1);
-        if let Err(error) = haider_run_spawn(
-            app.clone(),
-            submit.row.id.clone(),
-            Some(submit.row.provider_session_id.clone()),
-            submit.prompt,
-            cwd,
-            submit.attachments,
-            submit.config,
-            Some(binding_sender),
-        ) {
+        if let Err(error) = haider_run_spawn(app.clone(), spawn, Some(binding_sender)) {
             return Err(error);
         }
         match binding_receiver.recv_timeout(HAIDER_RUN_BIND_TIMEOUT) {
-            Ok(Ok(_bound_row)) => Ok(()),
+            Ok(Ok(_bound_row)) => Ok(None),
             Ok(Err(error)) => {
-                haider_run_kill_active(&submit.row.id);
+                haider_run_kill_active(&local_session_id);
                 Err(error)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                haider_run_kill_active(&submit.row.id);
+                haider_run_kill_active(&local_session_id);
                 Err("Timed out waiting for Haider to accept the session prompt.".to_string())
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                haider_run_kill_active(&submit.row.id);
+                haider_run_kill_active(&local_session_id);
                 Err("Haider run ended before accepting the session prompt.".to_string())
             }
         }
@@ -1035,6 +1197,90 @@ mod haider_run_tests {
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn haider_run_test_submit_request(
+        mode: Option<haider_rpc_ade::DeliveryMode>,
+    ) -> HaiderRunSubmitRequest {
+        HaiderRunSubmitRequest::new(
+            SessionRow {
+                id: "local-session".to_string(),
+                slug: "local-session".to_string(),
+                dir: "/tmp/local-session".to_string(),
+                kind: "generated".to_string(),
+                provider_session_id: "provider-session".to_string(),
+                created_at_ms: 0,
+                first_user_message: String::new(),
+                harness: Value::Null,
+                pinned: false,
+                title_override: None,
+            },
+            "continue without losing payload".to_string(),
+            vec!["/tmp/submit-attachment.png".to_string()],
+            None,
+            mode,
+        )
+    }
+
+    #[test]
+    fn production_cli_entry_requires_a_mode_free_witness() {
+        let spawn = haider_run_enter_cli_submit(
+            haider_run_test_submit_request(None),
+            HaiderRunCliSpawn::SessionSubmit,
+        )
+        .expect("a mode-free request may create the CLI witness");
+        let HaiderRunCliSpawn::SessionSubmit(submit) = spawn else {
+            panic!("the production consumer must preserve the session-submit route");
+        };
+        let (row, prompt, attachments, config) = submit.into_parts();
+        assert_eq!(row.id, "local-session");
+        assert_eq!(row.provider_session_id, "provider-session");
+        assert_eq!(prompt, "continue without losing payload");
+        assert_eq!(attachments, ["/tmp/submit-attachment.png"]);
+        assert_eq!(config, None);
+
+        for mode in [
+            haider_rpc_ade::DeliveryMode::Queue,
+            haider_rpc_ade::DeliveryMode::Steer,
+            haider_rpc_ade::DeliveryMode::Subturn,
+        ] {
+            let witness_received = std::cell::Cell::new(false);
+            let error =
+                haider_run_enter_cli_submit(haider_run_test_submit_request(Some(mode)), |submit| {
+                    witness_received.set(true);
+                    HaiderRunCliSpawn::SessionSubmit(submit)
+                })
+                .expect_err("an explicit mode must never create a CLI witness");
+            assert_eq!(error, HaiderRunCliSubmitRefusal::ExplicitDeliveryMode(mode));
+            assert!(!witness_received.get(), "no CliSubmit witness may exist");
+            assert!(error
+                .to_string()
+                .contains("haider_run_delivery_mode_unavailable"));
+            assert!(error.to_string().contains("no delivery-mode argument"));
+        }
+
+        let _spawn_requires_typed_input: fn(
+            AppHandle,
+            HaiderRunCliSpawn,
+            Option<std::sync::mpsc::SyncSender<Result<SessionRow, String>>>,
+        ) -> Result<(), String> = haider_run_spawn;
+    }
+
+    #[test]
+    fn session_submit_receipt_serializes_for_the_js_boundary() {
+        assert_eq!(
+            serde_json::to_value(SessionSubmitReceipt {
+                session_id: "session-1".to_string(),
+                accepted_seq: 31,
+                disposition: haider_rpc_ade::SubmitDisposition::Queued,
+            })
+            .expect("serialize accepted receipt"),
+            serde_json::json!({
+                "session_id": "session-1",
+                "accepted_seq": 31,
+                "disposition": "queued",
+            })
+        );
     }
 
     #[test]
