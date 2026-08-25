@@ -120,7 +120,6 @@ const MAX_TERMINAL_INPUT_TRANSPORT_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_TERMINAL_ACTIVITY_TRANSPORT_MESSAGE_BYTES: usize = 256 * 1024;
 const TERMINAL_INPUT_QUEUE_CAPACITY: usize = 1024;
 const TERMINAL_INPUT_QUEUE_IDLE_SECS: u64 = 30;
-const MAX_TERMINAL_START_AGENT_BATCH: usize = 32;
 const TERMINAL_PTY_POOL_TARGET: usize = 0;
 const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 // One display frame: under agent output floods the previous 6ms window still
@@ -1279,38 +1278,12 @@ struct TerminalInstance {
     // Prepared PTYs freeze their provider account at terminal_open. Deferred
     // and legacy starts must reuse this exact binding instead of sampling the
     // account that happens to be active when the later start command arrives.
-    launch_account_binding: Option<TerminalProviderLaunchAccountBinding>,
-    // Managed Codex panes run the stock TUI against a per-terminal local
-    // app-server gateway.  The gateway is deliberately separate from the PTY:
-    // terminal rendering/input remain native while structured JSON-RPC server
-    // requests can also be answered from the web dashboard.
-    codex_gateway: Arc<StdMutex<Option<TerminalCodexGatewayHandle>>>,
-    // Whether this pane was opened with the app-control orchestrator MCP. Kept
-    // so deferred/resume agent starts can re-inject app-control (and its
-    // auto-approval) the same way the initial open does.
-    app_control_mcp_requested: bool,
-}
-
-#[derive(Clone)]
-struct TerminalCodexGatewayHandle {
-    endpoint: String,
-    shutdown: Arc<StdMutex<Option<oneshot::Sender<()>>>>,
 }
 
 #[derive(Default)]
 struct TerminalOperationAdmissionState {
     active: usize,
     closing: bool,
-}
-
-impl TerminalCodexGatewayHandle {
-    fn shutdown(&self) {
-        if let Ok(mut shutdown) = self.shutdown.lock() {
-            if let Some(sender) = shutdown.take() {
-                let _ = sender.send(());
-            }
-        }
-    }
 }
 
 struct TerminalHeadlessOutputBuffer {
@@ -1687,8 +1660,7 @@ impl TerminalInstance {
         session_mode: TerminalSessionMode,
         metadata: TerminalInstanceMetadata,
         launch_metadata: TerminalLaunchRuntimeMetadata,
-        launch_account_binding: Option<TerminalProviderLaunchAccountBinding>,
-        app_control_mcp_requested: bool,
+        _app_control_mcp_requested: bool,
     ) -> (Self, Box<dyn Read + Send>) {
         let WarmPty {
             child,
@@ -1739,9 +1711,6 @@ impl TerminalInstance {
                 metadata,
                 runtime: Arc::new(StdMutex::new(initial_runtime)),
                 launch_metadata: Arc::new(StdMutex::new(launch_metadata)),
-                launch_account_binding,
-                codex_gateway: Arc::new(StdMutex::new(None)),
-                app_control_mcp_requested,
             },
             reader,
         )
@@ -2224,38 +2193,6 @@ struct TerminalOpenRequest {
     cols: Option<u16>,
     rows: Option<u16>,
     output_transport: Option<bool>,
-}
-
-#[derive(Deserialize, Clone)]
-struct TerminalStartAgentRequest {
-    pane_id: String,
-    instance_id: Option<u64>,
-    provider: String,
-    provider_session_id: Option<String>,
-    fork_from_provider_session_id: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-    speed: Option<String>,
-    permission_mode: Option<String>,
-}
-
-#[derive(Serialize)]
-struct TerminalStartAgentPaneResult {
-    pane_id: String,
-    instance_id: Option<u64>,
-    model: Option<String>,
-    model_source: Option<String>,
-    effective_provider_session_id: Option<String>,
-    started: bool,
-    skipped: bool,
-    message: String,
-}
-
-#[derive(Serialize)]
-struct TerminalStartAgentManyResult {
-    started: usize,
-    skipped: usize,
-    results: Vec<TerminalStartAgentPaneResult>,
 }
 
 #[derive(Serialize)]
@@ -2939,8 +2876,7 @@ include!("native_notifications.rs");
 include!("cloud_mcp.rs");
 include!("local_scripts.rs");
 include!("assets.rs");
-include!("agent_sessions.rs");
-include!("agent_chat_sync.rs");
+include!("removed_session_compat.rs");
 include!("terminals.rs");
 include!("swarm_runtime.rs");
 include!("orchestrator_pool.rs");
@@ -6299,21 +6235,11 @@ fn run_app(daemon: bool) {
             app_startup_settings_update,
             tray_click_settings_state,
             tray_click_settings_update,
-            agent_statuses,
-            opencode_list_models,
-            start_agent_login,
-            start_agent_account_login,
             agent_accounts_start_profile_login,
             agent_accounts_web_login_command,
             agent_accounts_cancel_profile_login,
             agent_accounts_bind_login_terminal,
             agent_accounts_reconcile_workspace_trust,
-            disconnect_agent,
-            install_agent,
-            update_agent,
-            retry_update_agent_as_administrator,
-            cancel_agent_update,
-            uninstall_agent,
             tools_check_cli_binaries,
             tools_run_cli_action,
             terminal_activity_snapshot,
@@ -6412,8 +6338,6 @@ fn run_app(daemon: bool) {
             video_panel_open,
             video_panel_focus,
             video_panel_close,
-            run_forge_prompt,
-            agent_thread_turn_start,
             save_todo_image_attachments,
             stage_chat_attachment_refs,
             save_todo_text_attachment,
@@ -6656,9 +6580,6 @@ fn run_app(daemon: bool) {
             diffforge_untrack_account_asset,
             diffforge_promote_untracked_asset,
             cloud_mcp_get_activity,
-            agent_thread_session_discover,
-            agent_thread_transcript,
-            agent_thread_transcript_watch,
             swarm_get_state,
             swarm_configure,
             swarm_member_restart,
@@ -6677,23 +6598,16 @@ fn run_app(daemon: bool) {
             terminal_provider_session_exists,
             terminal_open,
             terminal_record_provider_session,
-            terminal_start_agent,
-            terminal_start_agent_many,
             set_terminal_audio_input_target,
             set_terminal_audio_route_gate,
             terminal_write_to_audio_input_target,
             terminal_write,
-            terminal_control_automation_begin,
-            terminal_control_automation_end,
-            terminal_answer_agent_prompt_remote_command,
             terminal_ssh_connect,
-            terminal_request_fork,
             terminal_input_transport_endpoint,
             terminal_output_transport_endpoint,
             app_control_mcp_reply,
             terminal_capture_direct_prompt_todo,
             terminal_write_realtime,
-            terminal_refresh_theme,
             terminal_windows_pty_info,
             terminal_set_diagnostic_logging,
             terminal_diagnostic_log,

@@ -3,7 +3,6 @@ const HAIDER_BRIDGE_INITIAL_SYNC_DELAY: Duration = Duration::from_secs(3);
 const HAIDER_BRIDGE_FULL_RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const HAIDER_BRIDGE_WATCH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const HAIDER_BRIDGE_MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
-const HAIDER_BRIDGE_GHOST_MAX_AGE_MS: i64 = 10 * 60 * 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HaiderBridgeSession {
@@ -469,14 +468,27 @@ fn haider_bridge_session_matches_dir(session: &HaiderBridgeSession, row: &Sessio
         || haider_bridge_canonical_path(&directory.join("work")).is_some_and(|path| path == cwd)
 }
 
+fn haider_bridge_session_for_row<'a>(
+    sessions: &'a [HaiderBridgeSession],
+    row: &SessionRow,
+) -> Option<&'a HaiderBridgeSession> {
+    if row.provider_session_id.trim().is_empty() {
+        sessions
+            .iter()
+            .find(|session| haider_bridge_session_matches_dir(session, row))
+    } else {
+        sessions
+            .iter()
+            .find(|session| session.id == row.provider_session_id)
+    }
+}
+
 fn haider_bridge_reconcile_store_with_policy(
     policy: HaiderBridgeReconcilePolicy,
     roster: Option<&[HaiderBridgeSession]>,
     sessions: &[HaiderBridgeSession],
 ) -> Result<bool, String> {
-    if roster.is_some_and(<[HaiderBridgeSession]>::is_empty)
-        || (roster.is_none() && sessions.is_empty())
-    {
+    if roster.is_none() && sessions.is_empty() {
         return Ok(false);
     }
     let _write_guard = sessions_write_lock()
@@ -500,57 +512,45 @@ fn haider_bridge_reconcile_store_with_policy(
         .map_err(|error| format!("Unable to begin Haider reconciliation: {error}"))?;
     let mut changed = false;
 
-    let roster_ids = roster.map(|roster| {
-        roster
-            .iter()
-            .map(|session| session.id.as_str())
-            .collect::<HashSet<_>>()
-    });
-    let ghost_cutoff_ms = sessions_now_ms().saturating_sub(HAIDER_BRIDGE_GHOST_MAX_AGE_MS);
-    let mut kept_rows = Vec::with_capacity(rows.len());
-    for row in rows {
-        let prune = roster.is_some_and(|roster| {
-            let prune = if row.provider_session_id.trim().is_empty() {
-                row.created_at_ms < ghost_cutoff_ms
-                    && !roster
-                        .iter()
-                        .any(|session| haider_bridge_session_matches_dir(session, &row))
-            } else {
-                !roster_ids
-                    .as_ref()
-                    .is_some_and(|ids| ids.contains(row.provider_session_id.as_str()))
-            };
-            prune
-        });
-        if prune {
-            // Reconcile only removes the rail row; session directories stay intact.
-            transaction
-                .execute("DELETE FROM sessions WHERE id = ?1", [&row.id])
-                .map_err(|error| format!("Unable to prune stale Haider session: {error}"))?;
-            changed = true;
-        } else {
-            kept_rows.push(row);
-        }
-    }
-    let mut rows = kept_rows;
+    let mut rows = rows;
 
     for row in &mut rows {
-        let matched = if row.provider_session_id.trim().is_empty() {
-            sessions
-                .iter()
-                .find(|session| haider_bridge_session_matches_dir(session, row))
-        } else {
-            sessions
-                .iter()
-                .find(|session| session.id == row.provider_session_id)
-        };
-        let Some(session) = matched else {
+        let roster_match = roster.and_then(|roster| haider_bridge_session_for_row(roster, row));
+        let candidate_match = haider_bridge_session_for_row(sessions, row);
+        if roster.is_some() && roster_match.is_none() {
+            // A complete roster is the authority for surface membership,
+            // including the empty roster. The historical row and its opaque
+            // payload stay on disk; only its surface-membership bit changes.
+            if row.provenance == SessionProvenance::Haider && row.roster_visible {
+                transaction
+                    .execute(
+                        "UPDATE sessions SET roster_visible = 0 WHERE id = ?1",
+                        [&row.id],
+                    )
+                    .map_err(|error| {
+                        format!("Unable to hide absent Haider session: {error}")
+                    })?;
+                row.roster_visible = false;
+                changed = true;
+            }
+            continue;
+        }
+        let Some(session) = candidate_match.or(roster_match) else {
             continue;
         };
 
-        let replace_harness =
-            row.harness != session.harness && !policy.preserves_stored_harness(&row.harness);
+        let replace_harness = candidate_match.is_some()
+            && row.harness != session.harness
+            && !policy.preserves_stored_harness(&row.harness);
         let mut row_changed = replace_harness;
+        if row.provenance != SessionProvenance::Haider {
+            row.provenance = SessionProvenance::Haider;
+            row_changed = true;
+        }
+        if !row.roster_visible {
+            row.roster_visible = true;
+            row_changed = true;
+        }
         if row.dir.trim().is_empty() {
             if let Some(cwd) = haider_bridge_session_cwd(session) {
                 row.dir = cwd.to_string_lossy().into_owned();
@@ -572,8 +572,16 @@ fn haider_bridge_reconcile_store_with_policy(
 
         transaction
             .execute(
-                "UPDATE sessions SET provider_session_id = ?2, harness_json = ?3, dir = ?4 WHERE id = ?1",
-                rusqlite::params![row.id, row.provider_session_id, harness_json, row.dir],
+                "UPDATE sessions SET provider_session_id = ?2, harness_json = ?3, dir = ?4, \
+                    provenance = ?5, roster_visible = ?6 WHERE id = ?1",
+                rusqlite::params![
+                    row.id,
+                    row.provider_session_id,
+                    harness_json,
+                    row.dir,
+                    row.provenance.stored_value(),
+                    row.roster_visible,
+                ],
             )
             .map_err(|error| format!("Unable to reconcile Haider session: {error}"))?;
         changed = true;
@@ -603,8 +611,9 @@ fn haider_bridge_reconcile_store_with_policy(
             .execute(
                 "INSERT INTO sessions (
                     id, slug, dir, kind, provider_session_id, created_at_ms,
-                    pinned, title_locked, harness_json, first_user_message
-                 ) VALUES (?1, '', ?3, 'pinned', ?2, ?4, 0, NULL, ?5, '')",
+                    pinned, title_locked, harness_json, first_user_message,
+                    provenance, roster_visible
+                 ) VALUES (?1, '', ?3, 'pinned', ?2, ?4, 0, NULL, ?5, '', 'haider', 1)",
                 rusqlite::params![sessions_new_id(now_ms), session.id, dir, now_ms, harness_json],
             )
             .map_err(|error| format!("Unable to import Haider session: {error}"))?;

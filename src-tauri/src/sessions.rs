@@ -18,6 +18,41 @@ struct SessionRow {
     // override outside harness_json lets every bridge write remain verbatim;
     // the frontend still receives title_locked as a boolean.
     title_override: Option<String>,
+    // This is ADE's explicit authority marker. Values other than `haider`
+    // remain readable but are deliberately not attributed to any harness.
+    provenance: SessionProvenance,
+    // A row can stay recoverable on disk after it leaves the daemon's
+    // authoritative roster. Only a complete roster may clear this bit.
+    roster_visible: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionProvenance {
+    Haider,
+    Unknown,
+}
+
+impl SessionProvenance {
+    fn from_stored(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("haider") => Self::Haider,
+            _ => Self::Unknown,
+        }
+    }
+
+    const fn stored_value(self) -> Option<&'static str> {
+        match self {
+            Self::Haider => Some("haider"),
+            Self::Unknown => None,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Haider => "haider",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 fn sessions_harness_object(row: &SessionRow) -> Option<&serde_json::Map<String, Value>> {
@@ -263,6 +298,21 @@ impl SessionRow {
             "title_locked".to_string(),
             Value::Bool(self.title_override.is_some()),
         );
+        object.insert(
+            "session_provenance".to_string(),
+            Value::String(self.provenance.label().to_string()),
+        );
+        object.insert(
+            "session_availability".to_string(),
+            Value::String(
+                if self.provenance == SessionProvenance::Haider && self.roster_visible {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+                .to_string(),
+            ),
+        );
         Value::Object(object)
     }
 }
@@ -475,7 +525,9 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
                 pinned INTEGER NOT NULL DEFAULT 0,
                 title_locked TEXT,
                 harness_json TEXT NOT NULL DEFAULT '{}',
-                first_user_message TEXT NOT NULL DEFAULT ''
+                first_user_message TEXT NOT NULL DEFAULT '',
+                provenance TEXT,
+                roster_visible INTEGER NOT NULL DEFAULT 0
              );",
         )
         .map_err(|error| format!("Unable to initialize sessions SQLite store: {error}"))?;
@@ -498,11 +550,24 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
         "worker_generation",
         "needs_input_json",
     ];
-    if columns.contains("harness_json")
+    let current_schema = columns.contains("harness_json")
         && retired_columns
             .iter()
-            .all(|column| !columns.contains(*column))
-    {
+            .all(|column| !columns.contains(*column));
+    if current_schema {
+        if !columns.contains("provenance") {
+            connection
+                .execute("ALTER TABLE sessions ADD COLUMN provenance TEXT", [])
+                .map_err(|error| format!("Unable to add session provenance: {error}"))?;
+        }
+        if !columns.contains("roster_visible") {
+            connection
+                .execute(
+                    "ALTER TABLE sessions ADD COLUMN roster_visible INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|error| format!("Unable to add session roster visibility: {error}"))?;
+        }
         return Ok(());
     }
 
@@ -637,16 +702,19 @@ fn sessions_initialize_database(connection: &mut rusqlite::Connection) -> Result
                 pinned INTEGER NOT NULL DEFAULT 0,
                 title_locked TEXT,
                 harness_json TEXT NOT NULL DEFAULT '{}',
-                first_user_message TEXT NOT NULL DEFAULT ''
+                first_user_message TEXT NOT NULL DEFAULT '',
+                provenance TEXT,
+                roster_visible INTEGER NOT NULL DEFAULT 0
              );
              INSERT INTO sessions_harness_migration (
                 id, slug, dir, kind, provider_session_id, created_at_ms,
-                pinned, title_locked, harness_json, first_user_message
+                pinned, title_locked, harness_json, first_user_message,
+                provenance, roster_visible
              )
              SELECT id, slug, dir, kind, provider_session_id, created_at_ms,
                     pinned,
                     CASE WHEN title_locked != 0 THEN title ELSE NULL END,
-                    harness_json, first_user_message
+                    harness_json, first_user_message, NULL, 0
              FROM sessions;
              DROP TABLE sessions;
              ALTER TABLE sessions_harness_migration RENAME TO sessions;",
@@ -684,11 +752,13 @@ fn sessions_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> 
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_else(|| json!({})),
         first_user_message: row.get(9)?,
+        provenance: SessionProvenance::from_stored(row.get::<_, Option<String>>(10)?.as_deref()),
+        roster_visible: row.get(11)?,
     })
 }
 
 const SESSIONS_SELECT_COLUMNS: &str =
-    "id, slug, dir, kind, provider_session_id, created_at_ms, pinned, title_locked, harness_json, first_user_message";
+    "id, slug, dir, kind, provider_session_id, created_at_ms, pinned, title_locked, harness_json, first_user_message, provenance, roster_visible";
 
 fn sessions_row_by_id(connection: &rusqlite::Connection, id: &str) -> Result<SessionRow, String> {
     let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions WHERE id = ?1");
@@ -745,7 +815,10 @@ fn session_store_needs_input_blocking(
 
 fn sessions_list_blocking() -> Result<Vec<SessionRow>, String> {
     let connection = sessions_open_database()?;
-    let query = format!("SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions");
+    let query = format!(
+        "SELECT {SESSIONS_SELECT_COLUMNS} FROM sessions \
+         WHERE provenance = 'haider' AND roster_visible != 0"
+    );
     let mut statement = connection
         .prepare(&query)
         .map_err(|error| format!("Unable to prepare sessions list: {error}"))?;
@@ -808,6 +881,11 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
         }),
         pinned: false,
         title_override: None,
+        provenance: SessionProvenance::Haider,
+        // Creation is only an ADE-side staging operation. Haider has not yet
+        // published a provider session id, so the rail must not present this
+        // row as an authoritative session.
+        roster_visible: false,
     };
     let harness_json = serde_json::to_string(&row.harness)
         .map_err(|error| format!("Unable to encode new session harness payload: {error}"))?;
@@ -816,8 +894,9 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
         .execute(
             "INSERT INTO sessions (
                 id, slug, dir, kind, provider_session_id, created_at_ms,
-                pinned, title_locked, harness_json, first_user_message
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                pinned, title_locked, harness_json, first_user_message,
+                provenance, roster_visible
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 row.id,
                 row.slug,
@@ -829,6 +908,8 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
                 row.title_override,
                 harness_json,
                 row.first_user_message,
+                row.provenance.stored_value(),
+                row.roster_visible,
             ],
         )
         .map_err(|error| format!("Unable to store session: {error}"))?;
@@ -836,6 +917,13 @@ fn session_create_blocking(args: SessionCreateArgs) -> Result<SessionRow, String
 }
 
 fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String> {
+    session_update_blocking_with_authority(args, false)
+}
+
+fn session_update_blocking_with_authority(
+    args: SessionUpdateArgs,
+    authoritative_haider_binding: bool,
+) -> Result<SessionRow, String> {
     let _write_guard = sessions_write_lock()
         .lock()
         .map_err(|_| "Sessions write lock is unavailable.".to_string())?;
@@ -854,6 +942,15 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
     }
     if let Some(provider_session_id) = args.provider_session_id {
         row.provider_session_id = provider_session_id;
+        // Only the Haider run binding path may grant surface membership.
+        // The public metadata update command cannot fabricate authority by
+        // supplying a plausible provider session id.
+        if authoritative_haider_binding
+            && row.provenance == SessionProvenance::Haider
+            && !row.provider_session_id.trim().is_empty()
+        {
+            row.roster_visible = true;
+        }
     }
     if let Some(first_user_message) = args.first_user_message {
         let should_reslug = row.kind == "generated"
@@ -883,7 +980,8 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
         .execute(
             "UPDATE sessions SET
                 slug = ?2, dir = ?3, kind = ?4, provider_session_id = ?5,
-                first_user_message = ?6, harness_json = ?7
+                first_user_message = ?6, harness_json = ?7,
+                provenance = ?8, roster_visible = ?9
              WHERE id = ?1",
             rusqlite::params![
                 row.id,
@@ -893,6 +991,8 @@ fn session_update_blocking(args: SessionUpdateArgs) -> Result<SessionRow, String
                 row.provider_session_id,
                 row.first_user_message,
                 harness_json,
+                row.provenance.stored_value(),
+                row.roster_visible,
             ],
         )
         .map_err(|error| format!("Unable to update session: {error}"))?;
@@ -1071,6 +1171,8 @@ mod sessions_tests {
             }),
             pinned: false,
             title_override: None,
+            provenance: SessionProvenance::Haider,
+            roster_visible: true,
         }
     }
 
@@ -1080,8 +1182,9 @@ mod sessions_tests {
             .execute(
                 "INSERT INTO sessions (
                     id, slug, dir, kind, provider_session_id, created_at_ms,
-                    pinned, title_locked, harness_json, first_user_message
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    pinned, title_locked, harness_json, first_user_message,
+                    provenance, roster_visible
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     row.id,
                     row.slug,
@@ -1093,6 +1196,8 @@ mod sessions_tests {
                     row.title_override,
                     harness_json,
                     row.first_user_message,
+                    row.provenance.stored_value(),
+                    row.roster_visible,
                 ],
             )
             .unwrap();
@@ -1129,6 +1234,116 @@ mod sessions_tests {
         let provider = &row.serialized_value()["provider"];
         assert_eq!(provider, &Value::Null);
         assert_ne!(provider, "haider");
+    }
+
+    #[test]
+    fn unattributable_stored_row_is_hidden_without_deletion() {
+        let _storage = process_test_storage_isolation(stringify!(unattributable_stored_row_is_hidden_without_deletion));
+        let _lock = process_test_env_lock();
+        let directory = sessions_test_directory("unknown-provenance");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let mut row = sessions_test_row("unknown-provenance", Path::new(""), "pinned");
+        row.provenance = SessionProvenance::Unknown;
+        sessions_test_insert_row(&connection, &row);
+        drop(connection);
+
+        assert!(sessions_list_blocking().unwrap().is_empty());
+        let connection = sessions_open_database().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                    [&row.id],
+                    |stored| stored.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(sessions_row_by_id(&connection, &row.id).is_ok());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn local_creation_and_metadata_update_cannot_fabricate_haider_membership() {
+        let _storage = process_test_storage_isolation(stringify!(local_creation_and_metadata_update_cannot_fabricate_haider_membership));
+        let _lock = process_test_env_lock();
+        let directory = sessions_test_directory("local-staging");
+        let pinned_directory = directory.join("workspace");
+        fs::create_dir_all(&pinned_directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+
+        let created = session_create_blocking(SessionCreateArgs {
+            title: Some("Local staging".to_string()),
+            pinned_dir: Some(pinned_directory.to_string_lossy().into_owned()),
+        })
+        .unwrap();
+        assert_eq!(created.provenance, SessionProvenance::Haider);
+        assert!(!created.roster_visible);
+        assert!(sessions_list_blocking().unwrap().is_empty());
+
+        let locally_updated = session_update_blocking(SessionUpdateArgs {
+            id: created.id.clone(),
+            title: None,
+            provider_session_id: Some("plausible-local-id".to_string()),
+            first_user_message: None,
+        })
+        .unwrap();
+        assert!(!locally_updated.roster_visible);
+        assert!(sessions_list_blocking().unwrap().is_empty());
+
+        let bound = session_update_blocking_with_authority(
+            SessionUpdateArgs {
+                id: created.id,
+                title: None,
+                provider_session_id: Some("daemon-published-id".to_string()),
+                first_user_message: None,
+            },
+            true,
+        )
+        .unwrap();
+        assert!(bound.roster_visible);
+        assert_eq!(sessions_list_blocking().unwrap().len(), 1);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_provenance_value_deserializes_as_unknown_and_unavailable() {
+        let _storage = process_test_storage_isolation(stringify!(legacy_provenance_value_deserializes_as_unknown_and_unavailable));
+        let _lock = process_test_env_lock();
+        let directory = sessions_test_directory("legacy-provenance");
+        fs::create_dir_all(&directory).unwrap();
+        let _data_guard = set_sessions_env(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &directory);
+        let connection = sessions_open_database().unwrap();
+        let row = sessions_test_row("legacy-provenance", Path::new(""), "pinned");
+        sessions_test_insert_row(&connection, &row);
+        connection
+            .execute(
+                "UPDATE sessions SET provenance = 'codex_jsonl' WHERE id = ?1",
+                [&row.id],
+            )
+            .unwrap();
+
+        let decoded = sessions_row_by_id(&connection, &row.id).unwrap();
+        let rendered = decoded.serialized_value();
+        assert_eq!(decoded.provenance, SessionProvenance::Unknown);
+        assert_eq!(rendered["session_provenance"], "unknown");
+        assert_eq!(rendered["session_availability"], "unavailable");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT provenance FROM sessions WHERE id = ?1",
+                    [&row.id],
+                    |stored| stored.get::<_, String>(0),
+                )
+                .unwrap(),
+            "codex_jsonl"
+        );
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1228,6 +1443,8 @@ mod sessions_tests {
                 "title_locked",
                 "harness_json",
                 "first_user_message",
+                "provenance",
+                "roster_visible",
             ]
             .into_iter()
             .map(str::to_string)
@@ -1252,6 +1469,8 @@ mod sessions_tests {
             .as_object()
             .is_some_and(|object| object.contains_key("run_id")));
         assert_eq!(row_json["worker_generation"], Value::Null);
+        assert_eq!(row_json["session_provenance"], "unknown");
+        assert_eq!(row_json["session_availability"], "unavailable");
         assert!(!row.pinned);
         assert!(row.title_override.is_none());
 
@@ -1651,7 +1870,8 @@ mod sessions_tests {
         drop(connection);
 
         // An unchanged complete fallback roster is still maintenance
-        // evidence. A ghost introduced after the first cycle must be pruned.
+        // evidence. An unattributed row introduced after the first cycle is
+        // hidden, but its historical payload remains recoverable.
         let connection = sessions_open_database().unwrap();
         let ghost = sessions_test_row("fallback-ghost", Path::new(""), "pinned");
         sessions_test_insert_row(&connection, &ghost);
@@ -1663,14 +1883,19 @@ mod sessions_tests {
         )
         .unwrap());
         let connection = sessions_open_database().unwrap();
-        assert!(sessions_row_by_id(&connection, &ghost.id).is_err());
+        let stored_ghost = sessions_row_by_id(&connection, &ghost.id).unwrap();
+        assert!(!stored_ghost.roster_visible);
+        assert!(sessions_list_blocking()
+            .unwrap()
+            .iter()
+            .all(|row| row.id != ghost.id));
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn haider_bridge_live_cli_sync_still_prunes_ghosts() {
-        let _storage = process_test_storage_isolation(stringify!(haider_bridge_live_cli_sync_still_prunes_ghosts));
+    fn haider_bridge_live_cli_sync_hides_ghosts_without_deleting_them() {
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_live_cli_sync_hides_ghosts_without_deleting_them));
         let _lock = process_test_env_lock();
         let directory = sessions_test_directory("live-cli-prune");
         fs::create_dir_all(&directory).unwrap();
@@ -1696,7 +1921,9 @@ mod sessions_tests {
         .unwrap());
 
         let connection = sessions_open_database().unwrap();
-        assert!(sessions_row_by_id(&connection, &ghost.id).is_err());
+        assert!(!sessions_row_by_id(&connection, &ghost.id)
+            .unwrap()
+            .roster_visible);
         let stored = sessions_row_by_id(&connection, &kept.id).unwrap();
         assert!(stored.harness.get("agent_metrics").is_some());
         assert!(stored.harness.get("footprint").is_none());
@@ -1705,8 +1932,8 @@ mod sessions_tests {
     }
 
     #[test]
-    fn haider_bridge_empty_roster_does_not_prune() {
-        let _storage = process_test_storage_isolation(stringify!(haider_bridge_empty_roster_does_not_prune));
+    fn haider_bridge_empty_roster_renders_empty_without_deleting_local_rows() {
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_empty_roster_renders_empty_without_deleting_local_rows));
         let _lock = process_test_env_lock();
         let directory = sessions_test_directory("empty-roster");
         let session_directory = directory.join("kept-session");
@@ -1717,9 +1944,11 @@ mod sessions_tests {
         sessions_test_insert_row(&connection, &row);
         drop(connection);
 
-        assert!(!haider_bridge_reconcile(&[]).unwrap());
+        assert!(haider_bridge_reconcile(&[]).unwrap());
+        assert!(sessions_list_blocking().unwrap().is_empty());
         let connection = sessions_open_database().unwrap();
-        assert!(sessions_row_by_id(&connection, "kept").is_ok());
+        let stored = sessions_row_by_id(&connection, "kept").unwrap();
+        assert!(!stored.roster_visible);
         assert!(session_directory.exists());
         drop(connection);
 
@@ -1990,8 +2219,8 @@ mod sessions_tests {
     }
 
     #[test]
-    fn haider_bridge_ghost_prune_observes_age_guard() {
-        let _storage = process_test_storage_isolation(stringify!(haider_bridge_ghost_prune_observes_age_guard));
+    fn haider_bridge_complete_roster_hides_unbound_rows_without_deleting_them() {
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_complete_roster_hides_unbound_rows_without_deleting_them));
         let _lock = process_test_env_lock();
         let directory = sessions_test_directory("ghost-age");
         fs::create_dir_all(&directory).unwrap();
@@ -1999,7 +2228,7 @@ mod sessions_tests {
         let connection = sessions_open_database().unwrap();
         let mut old = sessions_test_row("old-ghost", Path::new(""), "pinned");
         old.provider_session_id.clear();
-        old.created_at_ms = sessions_now_ms().saturating_sub(HAIDER_BRIDGE_GHOST_MAX_AGE_MS + 1);
+        old.created_at_ms = 1;
         let mut young = sessions_test_row("young-draft", Path::new(""), "pinned");
         young.provider_session_id.clear();
         young.created_at_ms = sessions_now_ms().saturating_sub(60_000);
@@ -2009,16 +2238,16 @@ mod sessions_tests {
 
         assert!(haider_bridge_reconcile(&[haider_bridge_test_roster("live")]).unwrap());
         let connection = sessions_open_database().unwrap();
-        assert!(sessions_row_by_id(&connection, "old-ghost").is_err());
-        assert!(sessions_row_by_id(&connection, "young-draft").is_ok());
+        assert!(!sessions_row_by_id(&connection, "old-ghost").unwrap().roster_visible);
+        assert!(!sessions_row_by_id(&connection, "young-draft").unwrap().roster_visible);
         drop(connection);
 
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn haider_bridge_absent_id_prune_keeps_directory() {
-        let _storage = process_test_storage_isolation(stringify!(haider_bridge_absent_id_prune_keeps_directory));
+    fn haider_bridge_absent_id_is_hidden_and_keeps_row_and_directory() {
+        let _storage = process_test_storage_isolation(stringify!(haider_bridge_absent_id_is_hidden_and_keeps_row_and_directory));
         let _lock = process_test_env_lock();
         let directory = sessions_test_directory("absent-id");
         let session_directory = directory.join("generated-session");
@@ -2032,7 +2261,7 @@ mod sessions_tests {
 
         assert!(haider_bridge_reconcile(&[haider_bridge_test_roster("live")]).unwrap());
         let connection = sessions_open_database().unwrap();
-        assert!(sessions_row_by_id(&connection, "absent").is_err());
+        assert!(!sessions_row_by_id(&connection, "absent").unwrap().roster_visible);
         assert_eq!(
             fs::read(session_directory.join("marker.txt")).unwrap(),
             b"keep"

@@ -173,6 +173,10 @@ export function getTerminalAgentKind(agentId) {
     return "codex";
   }
 
+  if (normalizedAgentId.includes("haider")) {
+    return "haider";
+  }
+
   return "agent";
 }
 
@@ -487,66 +491,6 @@ export function getClaudeResizeDuplicateRepaintDecision() {
   };
 }
 
-export function getClaudeResumeExitMessage({
-  agentId = "",
-  exitCode = null,
-  output = "",
-  providerSessionId = "",
-} = {}) {
-  if (
-    String(agentId || "").trim().toLowerCase() !== "claude"
-    || !String(providerSessionId || "").trim()
-    || Number(exitCode) === 0
-  ) {
-    return "";
-  }
-  const visibleOutput = stripLiveViewControlSequences(String(output || ""));
-  if (!/\bNo conversation found(?:\s+with\s+session\s+ID)?\b/i.test(visibleOutput)) {
-    return "";
-  }
-  return "This Claude session was created on another device and isn't available to resume here.";
-}
-
-export function extractNativeSessionIdFromOutput(agentId, text) {
-  const output = stripLiveViewControlSequences(text);
-  if (
-    /\b(?:No saved session|No conversation found|Invalid session ID|Terminal Exited|Process ended)\b/i
-      .test(output)
-  ) {
-    return "";
-  }
-  const patterns = agentId === "codex"
-    ? [
-      /\bcodex(?:\.cmd|\.exe)?\s+resume\s+([0-9a-fA-F-]{8,}|[^\s"'`]+)/i,
-      /\bresume\s+([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\b/i,
-      /\bsession\s+id\s*[:=]\s*([0-9a-zA-Z_-]{8,})/i,
-      /\bsession[_-]?id\s*["']?\s*[:=]\s*["']?([0-9a-zA-Z_-]{8,})/i,
-      /"type"\s*:\s*"session_meta"[\s\S]{0,240}?"payload"\s*:\s*\{[\s\S]{0,240}?"id"\s*:\s*"([^"]{8,})"/i,
-      /"session_id"\s*:\s*"([^"]{8,})"/i,
-      /"sessionId"\s*:\s*"([^"]{8,})"/i,
-    ]
-    : agentId === "claude"
-      ? [
-        /\bclaude(?:\.cmd|\.exe)?\s+--resume\s+([^\s"'`]+)/i,
-        /\bsession\s+id\s*[:=]\s*([0-9a-zA-Z_-]{8,})/i,
-      ]
-      : agentId === "opencode"
-        ? [
-          /\bopencode(?:\.cmd|\.exe)?\s+(?:--session|-s)\s+(ses_[0-9a-zA-Z_-]{8,})/i,
-          /\bsession\s+id\s*[:=]\s*(ses_[0-9a-zA-Z_-]{8,})/i,
-        ]
-        : [];
-
-  for (const pattern of patterns) {
-    const match = output.match(pattern);
-    const sessionId = String(match?.[1] || "").trim();
-    if (sessionId) {
-      return sessionId;
-    }
-  }
-
-  return "";
-}
 
 export const terminalKeyboardTargetMatches = (paneId, instanceId) => (
   activeTerminalKeyboardTarget?.pane_id === paneId

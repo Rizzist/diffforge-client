@@ -3149,14 +3149,12 @@ async fn swarm_open_member(
 ) -> Result<TerminalOpenResult, String> {
     let terminal_state = app.state::<TerminalState>();
     let cloud_mcp_state = app.state::<CloudMcpState>();
-    let app_control_mcp_state = app.state::<AppControlMcpState>();
     let model = (!spec.model.trim().is_empty()).then(|| spec.model.clone());
     let output_channel = Channel::new(|_body: InvokeResponseBody| Ok(()));
     terminal_open(
         app.clone(),
         terminal_state,
         cloud_mcp_state,
-        app_control_mcp_state,
         TerminalOpenRequest {
             pane_id: spec.pane_id.clone(),
             instance_id: None,

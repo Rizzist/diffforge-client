@@ -19753,256 +19753,25 @@ export default function App() {
     }
   }, [refreshAudioModelStatus]);
 
-  const connectAgent = useCallback(async (provider) => {
-    setAgentStatusState("checking");
-    setAgentStatusError("");
-    setAgentActionResults((results) => {
-      const nextResults = { ...results };
-      delete nextResults[provider];
-      return nextResults;
-    });
-
-    try {
-      await invoke("start_agent_login", { provider });
-      setAgentStatusState("idle");
+  const noteLegacyHarnessUnavailable = useCallback((provider) => {
+    const message = "DiffForge only supports Haider; legacy CLI management is unavailable.";
+    setAgentStatusError(message);
+    if (provider) {
       setAgentActionResults((results) => ({
         ...results,
-        [provider]: {
-          tone: "neutral",
-          message: "Opened login in a terminal.",
-        },
-      }));
-    } catch (error) {
-      setAgentStatusState("error");
-      setAgentStatusError(getErrorMessage(error, "Unable to open terminal CLI login."));
-    }
-  }, []);
-
-  const disconnectAgent = useCallback(async (provider) => {
-    setAgentDisconnectState((state) => ({ ...state, [provider]: "disconnecting" }));
-    setAgentStatusError("");
-    setAgentActionResults((results) => {
-      const nextResults = { ...results };
-      delete nextResults[provider];
-      return nextResults;
-    });
-
-    try {
-      const result = await invoke("disconnect_agent", { provider });
-      setAgentActionResults((results) => ({
-        ...results,
-        [provider]: {
-          tone: "warning",
-          message: result?.message || `${result?.label || "Terminal CLI"} disconnected from this machine.`,
-        },
-      }));
-      const nextStatuses = agentStatuses.map((agent) => (
-        agent.id === provider
-          ? {
-            ...agent,
-            authenticated: false,
-            auth_message: result?.message || `${agent.label} disconnected from this machine.`,
-          }
-          : agent
-      ));
-      agentStatusesRef.current = nextStatuses;
-      setAgentStatuses(nextStatuses);
-    } catch (error) {
-      setAgentActionResults((results) => ({
-        ...results,
-        [provider]: {
-          tone: "warning",
-          message: getErrorMessage(error, "Unable to disconnect terminal CLI."),
-        },
-      }));
-    } finally {
-      setAgentDisconnectState((state) => ({ ...state, [provider]: "idle" }));
-    }
-  }, [agentStatuses]);
-
-  const installAgentWithNpm = useCallback(async (provider) => {
-    setAgentInstallState((state) => ({ ...state, [provider]: "installing" }));
-    setAgentStatusError("");
-    setAgentInstallResults((results) => {
-      const nextResults = { ...results };
-      delete nextResults[provider];
-      return nextResults;
-    });
-
-    try {
-      const result = await invoke("install_agent", { provider });
-      setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source: "npm" } }));
-    } catch (error) {
-      const message = getErrorMessage(error, "Unable to install terminal CLI.");
-      setAgentInstallResults((results) => ({
-        ...results,
-        [provider]: {
-          source: "npm",
-          ok: false,
-          installed: false,
-          updated: false,
-          permission_denied: agentUpdateMessageLooksPermissionDenied(message),
-          error_kind: "invoke_error",
-          failed_stage: "installing",
-          installed_version: "",
-          message,
-        },
-      }));
-    } finally {
-      setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
-    }
-  }, []);
-
-  const runManualAgentUpdate = useCallback(async (provider, command = "update_agent") => {
-    manualAgentUpdateProvidersRef.current.add(provider);
-    setAgentInstallState((state) => ({ ...state, [provider]: "updating" }));
-    setAgentStatusError("");
-    setAgentInstallResults((results) => {
-      const nextResults = { ...results };
-      delete nextResults[provider];
-      return nextResults;
-    });
-    setAgentUpdateProgress((current) => {
-      const next = { ...current };
-      delete next[provider];
-      return next;
-    });
-
-    try {
-      const result = await invoke(command, { provider });
-      setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source: "npm-update" } }));
-    } catch (error) {
-      const message = getErrorMessage(error, "Unable to update terminal CLI.");
-      setAgentInstallResults((results) => ({
-        ...results,
-        [provider]: {
-          source: "npm-update",
-          ok: false,
-          installed: false,
-          updated: false,
-          permission_denied: agentUpdateMessageLooksPermissionDenied(message),
-          error_kind: "invoke_error",
-          failed_stage: "installing",
-          installed_version: "",
-          message,
-        },
-      }));
-    } finally {
-      manualAgentUpdateProvidersRef.current.delete(provider);
-      const queueTimeoutId = agentUpdateQueueTimeoutsRef.current.get(provider);
-      if (queueTimeoutId) {
-        window.clearTimeout(queueTimeoutId);
-        agentUpdateQueueTimeoutsRef.current.delete(provider);
-      }
-      setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
-    }
-  }, []);
-
-  const updateAgentWithNpm = useCallback((provider) => (
-    runManualAgentUpdate(provider, "update_agent")
-  ), [runManualAgentUpdate]);
-
-  const retryAgentUpdateAsAdministrator = useCallback((provider) => (
-    runManualAgentUpdate(provider, "retry_update_agent_as_administrator")
-  ), [runManualAgentUpdate]);
-
-  const cancelManualAgentUpdate = useCallback((provider) => {
-    const queueTimeoutId = agentUpdateQueueTimeoutsRef.current.get(provider);
-    if (queueTimeoutId) {
-      window.clearTimeout(queueTimeoutId);
-      agentUpdateQueueTimeoutsRef.current.delete(provider);
-    }
-    const message = "Update cancelled while waiting for active terminals to close.";
-    setAgentUpdateProgress((current) => ({
-      ...current,
-      [provider]: {
-        ...(current[provider] || { provider }),
-        stage: "failed",
-        failed_stage: "queued",
-        error_reason: message,
-      },
-    }));
-    setAgentInstallResults((current) => ({
-      ...current,
-      [provider]: {
-        source: "npm-update",
-        ok: false,
-        installed: false,
-        updated: false,
-        permission_denied: false,
-        error_kind: "cancelled",
-        failed_stage: "queued",
-        installed_version: "",
-        message,
-      },
-    }));
-    setAgentInstallState((current) => ({ ...current, [provider]: "idle" }));
-    void invoke("cancel_agent_update", { provider }).catch((error) => {
-      const cancelMessage = getErrorMessage(error, "Unable to cancel the queued update.");
-      setAgentInstallResults((current) => ({
-        ...current,
-        [provider]: {
-          ...(current[provider] || {}),
-          ok: false,
-          error_kind: "cancel_failed",
-          message: cancelMessage,
-        },
-      }));
-    });
-  }, []);
-
-  const openAgentNativeInstaller = useCallback(async (agent) => {
-    const guide = AGENT_INSTALL_GUIDES[agent.id] || {};
-    const nativeInstallUrl = agent.native_install_url || guide.native_install_url;
-
-    if (!nativeInstallUrl) {
-      setAgentInstallResults((results) => ({
-        ...results,
-        [agent.id]: {
-          source: "native",
-          ok: false,
-          installed: false,
-          permission_denied: false,
-          error_kind: "configuration_error",
-          message: "Native installer page is not configured.",
-        },
-      }));
-      return;
-    }
-
-    try {
-      await withTimeout(
-        openUrl(nativeInstallUrl),
-        OPEN_BROWSER_TIMEOUT_MS,
-        "Unable to open native installer page.",
-      );
-      setAgentInstallResults((results) => ({
-        ...results,
-        [agent.id]: {
-          source: "native",
-          ok: true,
-          installed: false,
-          permission_denied: false,
-          message: `Opened ${agent.native_install_label || guide.native_install_label}.`,
-        },
-      }));
-    } catch (error) {
-      setAgentInstallResults((results) => ({
-        ...results,
-        [agent.id]: {
-          source: "native",
-          ok: false,
-          installed: false,
-          permission_denied: false,
-          error_kind: "open_failed",
-          message: getErrorMessage(error, "Unable to open native installer page."),
-        },
+        [provider]: { tone: "warning", message },
       }));
     }
   }, []);
-
-
-
+  const connectAgent = noteLegacyHarnessUnavailable;
+  const disconnectAgent = noteLegacyHarnessUnavailable;
+  const installAgentWithNpm = noteLegacyHarnessUnavailable;
+  const updateAgentWithNpm = noteLegacyHarnessUnavailable;
+  const retryAgentUpdateAsAdministrator = noteLegacyHarnessUnavailable;
+  const cancelManualAgentUpdate = noteLegacyHarnessUnavailable;
+  const openAgentNativeInstaller = useCallback((agent) => {
+    noteLegacyHarnessUnavailable(agent?.id || "");
+  }, [noteLegacyHarnessUnavailable]);
 
   const openCreateLoopspacePanel = useCallback(() => {
     enterLoopspacesMode("loopspace_create_panel");
@@ -21389,27 +21158,12 @@ export default function App() {
         }
 
         if (["agent_install", "install_agent", "agent_update", "update_agent"].includes(kind)) {
-          const provider = normalizeManagedAgentProviderId(field(event, [
-            "provider", "agent_provider", "agent_id", "target_agent_id",
-          ]));
-          if (!provider) {
-            await recordStatus(event, "failed", "A supported agent provider is required.", details);
-            return;
-          }
-          const updating = kind === "agent_update" || kind === "update_agent";
-          setAgentInstallState((state) => ({ ...state, [provider]: updating ? "updating" : "installing" }));
-          try {
-            const result = await invoke(updating ? "update_agent" : "install_agent", { provider });
-            setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, remote: true } }));
-            const ok = updating ? agentUpdateResultSucceeded(result) : Boolean(result?.ok && result?.installed);
-            await recordStatus(event, ok ? "completed" : "failed", result?.message || (ok ? "Agent package updated." : "Agent package action failed."), {
-              ...details,
-              agent_id: provider,
-              result,
-            });
-          } finally {
-            setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
-          }
+          await recordStatus(
+            event,
+            "failed",
+            "DiffForge does not install or update harness CLIs; use the Haider daemon.",
+            { ...details, reason: "legacy_harness_management_removed" },
+          );
           return;
         }
 

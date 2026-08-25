@@ -7,10 +7,6 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import {
-  getAgentLaunchDefault,
-  resolveAgentLaunchDefaultForModel,
-} from "../../agents/agentLaunchDefaults.js";
-import {
   collapseFunctionalRepoPathToCoreRepoPath,
   createCoreRepoNameDisplayMasker,
 } from "../coreRepoNameDisplay";
@@ -18,7 +14,6 @@ import {
   TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL,
   TERMINAL_WINDOW_CONTROL_EVENT,
   TERMINAL_WINDOW_CONTROL_FONT_SIZE,
-  TERMINAL_WINDOW_CONTROL_FORK,
   TERMINAL_WINDOW_CONTROL_FULLSCREEN,
   TERMINAL_WINDOW_CONTROL_RESTART_AS,
   TERMINAL_WINDOW_CONTROL_SPLIT_HORIZONTAL,
@@ -45,22 +40,10 @@ import {
   terminalSessionRestartClearedResult,
   terminalSessionRestartReadyRequest,
 } from "../terminalSessionRestart.js";
+import { terminalHarnessPresentation } from "../terminalHarnessAvailability.js";
 import { createTerminalOutputWorkerSession } from "./terminalOutputWorkerClient.js";
 import { SshClientPicker } from "../../ssh/SshClientPicker.jsx";
 import { guardXtermDuringPushToTalk } from "../xtermPushToTalkGuard.js";
-import {
-  REMOTE_PERMISSION_CONFIG_REQUEST_EVENT,
-  REMOTE_PERMISSION_CONFIG_RESULT_EVENT,
-  REMOTE_PERMISSION_CONFIG_SOURCE,
-  claudePermissionModeFromText,
-  claudePermissionTargetAvailableInCycle,
-  codexPermissionPickerOpen,
-  codexPermissionPostSelectionState,
-  cyclePermissionModeWithBestEffortRestore,
-  findCodexPermissionPickerTarget,
-  normalizePermissionModeForProvider,
-  opencodeAgentModeFromText,
-} from "../permissionModeAutomation.js";
 import {
   GlobalStyle,
   AppFrame,
@@ -366,7 +349,6 @@ import {
   ButtonFolderIcon,
   ButtonLogoutIcon,
   ButtonSettingsIcon,
-  ButtonForgeIcon,
   ButtonCodeIcon,
   ButtonBotIcon,
   ButtonKeyIcon,
@@ -471,7 +453,6 @@ import {
   TERMINAL_INPUT_BATCH_MS,
   TERMINAL_INPUT_EVENT,
   TERMINAL_INPUT_ERROR_EVENT,
-  TERMINAL_FORK_REQUESTED_EVENT,
   TERMINAL_INPUT_HOT_EVENT,
   TERMINAL_MAX_COLS,
   TERMINAL_MAX_ROWS,
@@ -530,8 +511,6 @@ import {
   createCodexResizeGateState,
   createCodexSlashMenuCloseCleanupState,
   createSlashCommandDiagnosticState,
-  getClaudeResumeExitMessage,
-  extractNativeSessionIdFromOutput,
   findTerminalViewportAnchorMatch,
   getClaudeResizeDuplicateRepaintDecision,
   getCodexResizeLiveTailCleanupPlan,
@@ -655,50 +634,6 @@ function terminalInputDataIsSubmit(value) {
     || text.includes(TERMINAL_ENTER_SEQUENCE_MOD1);
 }
 
-const WORKSPACE_THREAD_MODEL_CHANGE_CONFIRM_TIMEOUT_MS = 15_000;
-const WORKSPACE_THREAD_MODEL_CHANGE_CONFIRM_POLL_MS = 250;
-
-function getWorkspaceThreadObservedModelChange(workspaceThreads, {
-  agent_id: agentId,
-  thread_id: threadId,
-  workspace_id: workspaceId,
-} = {}) {
-  const safeWorkspaceId = String(workspaceId || "").trim();
-  const safeThreadId = String(threadId || "").trim();
-  const safeAgentId = getTerminalAgentKind(agentId);
-  const observedThread = workspaceThreads?.[safeWorkspaceId]?.threads?.[safeThreadId] || null;
-  const providerBinding = getWorkspaceThreadProviderBinding(observedThread, safeAgentId);
-  return {
-    model: String(
-      providerBinding?.model_id
-        || providerBinding?.model
-        || providerBinding?.active_model
-        || "",
-    ).trim(),
-    model_source: String(providerBinding?.model_source || "").trim(),
-    modelUpdatedAt: String(providerBinding?.modelUpdatedAt || "").trim(),
-    provider_session_id: String(providerBinding?.native_session_id || "").trim(),
-  };
-}
-
-function workspaceThreadModelChangeMatchesObservation(observation, {
-  initialObservation,
-  model,
-  requireFreshObservation = false,
-} = {}) {
-  const requestedModel = String(model || "").trim();
-  if (!requestedModel || observation?.model !== requestedModel) {
-    return false;
-  }
-  if (!requireFreshObservation) {
-    return true;
-  }
-  return Boolean(
-    observation.modelUpdatedAt
-      && observation.modelUpdatedAt !== String(initialObservation?.modelUpdatedAt || "").trim(),
-  );
-}
-
 const TERMINAL_INPUT_TRANSPORT_BUFFERED_LIMIT_BYTES = 512 * 1024;
 const TERMINAL_INPUT_TRANSPORT_QUEUE_LIMIT = 4096;
 const TERMINAL_INPUT_TRANSPORT_RETRY_MS = 4;
@@ -762,7 +697,6 @@ const PENDING_PROMPT_SUBMIT_SYNC_SETTLE_MS = 120;
 const PENDING_PROMPT_SUBMIT_OBSERVE_TIMEOUT_MS = 3000;
 const PENDING_PROMPT_SUBMIT_RETRY_TIMEOUT_MS = 6000;
 const PENDING_PROMPT_SUBMIT_FALLBACK_ACCEPT_GRACE_MS = 700;
-const PENDING_PROMPT_SUBMIT_OBSERVED_ACCEPT_GRACE_MS = 1800;
 
 function normalizeAppControlTerminalWorkspaceId(value) {
   return String(value || "").trim().toLowerCase();
@@ -1153,11 +1087,6 @@ function readTerminalImageFile(file) {
   });
 }
 
-function extractCodexMissingSavedSessionId(value) {
-  const match = String(value || "").match(/No saved session found with ID\s+([0-9a-fA-F-]{16,})/i);
-  return String(match?.[1] || "").trim();
-}
-
 function formatSavedTerminalImageAttachments(images, startIndex = 0) {
   return (Array.isArray(images) ? images : [])
     .map((image, index) => {
@@ -1262,9 +1191,6 @@ let terminalRendererAttachFrameRemaining = TERMINAL_RENDERER_ATTACH_MAX_PER_FRAM
 const SHELL_LAUNCHER_MODE_TERMINAL = "generic";
 const SHELL_LAUNCHER_AGENT_OPTIONS = Object.freeze([
   { id: SHELL_LAUNCHER_MODE_TERMINAL, label: "Terminal", command: "" },
-  { id: "codex", label: "Codex", command: "codex" },
-  { id: "claude", label: "Claude Code", command: "claude" },
-  { id: "opencode", label: "OpenCode", command: "opencode" },
 ]);
 const SHELL_LAUNCHER_AGENT_IDS = new Set(SHELL_LAUNCHER_AGENT_OPTIONS.map((option) => option.id));
 const SHELL_LAUNCHER_AGENT_COMMAND_DELAY_MS = 950;
@@ -1418,15 +1344,6 @@ function normalizeShellLauncherAgentId(value) {
   const normalized = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
   if (normalized === "terminal" || normalized === "shell" || normalized === "generic") {
     return SHELL_LAUNCHER_MODE_TERMINAL;
-  }
-  if (normalized === "claude" || normalized === "claude-code" || normalized === "claudecode") {
-    return "claude";
-  }
-  if (normalized === "opencode" || normalized === "open-code" || normalized === "opencode-ai" || normalized === "open-code-ai") {
-    return "opencode";
-  }
-  if (normalized === "codex" || normalized === "openai-codex") {
-    return "codex";
   }
   return SHELL_LAUNCHER_MODE_TERMINAL;
 }
@@ -1692,19 +1609,9 @@ function isTerminalPromptObservedTimeout(error) {
     .includes("Timed out waiting for the prompt to be observed in the terminal");
 }
 
-function getPendingPromptSubmitAttemptSequences(agentKind, isGenericTerminal = false, options = {}) {
+function getPendingPromptSubmitAttemptSequences(agentKind, isGenericTerminal = false) {
   const primary = getTerminalSubmitSequence(agentKind, isGenericTerminal);
-  const sequences = [];
-  if (options.preferCarriageReturn && getTerminalAgentKind(agentKind) === "codex") {
-    sequences.push("\r");
-  }
-  if (primary) {
-    sequences.push(primary);
-  }
-  if (getTerminalAgentKind(agentKind) === "codex" && primary !== "\r") {
-    sequences.push("\r");
-  }
-  return [...new Set(sequences)];
+  return primary ? [primary] : [];
 }
 
 function waitForPendingPromptSubmitSettle(delayMs = PENDING_PROMPT_SUBMIT_SYNC_SETTLE_MS) {
@@ -1834,500 +1741,6 @@ function defaultTerminalSessionModeForRole(roleId, _isPrewarm = false) {
     return TERMINAL_SESSION_MODE_FREE;
   }
   return TERMINAL_SESSION_MODE_GENERAL;
-}
-
-const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
-
-/* Self-contained stale-account chip: each pane is stamped (Rust-side) with
-   the agent account profile it spawned under. When the active profile for
-   its agent kind changes, the pane keeps working on its old account — this
-   chip just says so, and that a restart adopts the new one. Never forced. */
-// Top-right overlay on the terminal surface that lists the subagents this
-// coding agent has spawned — one compact row per subagent, live status dot +
-// label. Polls the lightweight terminal_subagents_snapshot command (scoped to
-// this exact pane; see the Rust extraction fix). Only Claude Code and Codex
-// surface subagent lifecycle; OpenCode returns empty, so the overlay hides
-// itself. Not in the button rail — floats over the surface, non-interactive.
-function terminalSubagentStatusColor(status) {
-  const value = String(status || "").toLowerCase();
-  if (value === "done" || value === "completed") {
-    return "rgba(74, 222, 128, 0.95)"; // green — finished
-  }
-  if (value === "failed" || value === "error") {
-    return "rgba(248, 113, 113, 0.95)"; // red — failed
-  }
-  if (value === "awaiting_instruction" || value === "blocked") {
-    return "rgba(251, 191, 36, 0.97)"; // amber — waiting on input
-  }
-  return "rgba(96, 165, 250, 0.97)"; // blue — running/active
-}
-
-// A finished subagent keeps its green dot visible for the linger window,
-// then fades out and leaves the overlay instead of staying forever.
-const TERMINAL_SUBAGENT_DONE_LINGER_MS = 5000;
-const TERMINAL_SUBAGENT_DONE_FADE_MS = 420;
-
-function terminalSubagentIsDone(status) {
-  const value = String(status || "").toLowerCase();
-  return value === "done" || value === "completed";
-}
-
-function terminalSubagentRowId(sub, index) {
-  return String(sub?.id || `${sub?.label || sub?.agent_type || "subagent"}-${index}`);
-}
-
-function terminalSubagentClockLabel(ms) {
-  if (!ms) {
-    return "";
-  }
-  try {
-    return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  } catch {
-    return "";
-  }
-}
-
-function TerminalSubagentOverlay({ pane_id: paneId, agent_kind: agentKind }) {
-  const [subagents, setSubagents] = useState([]);
-  // Tick state bumped at linger/fade boundaries so finished rows leave on
-  // their own schedule instead of waiting for the next poll.
-  const [, setFadeTickMs] = useState(0);
-  const doneAtMsRef = useRef(new Map());
-  // Row id whose detail popover is open; null when closed. Auto-closes when
-  // the row leaves the visible set (fade-out or snapshot drop).
-  const [openSubagentId, setOpenSubagentId] = useState(null);
-
-  useEffect(() => {
-    const kind = String(agentKind || "").toLowerCase();
-    const supported = kind.includes("claude") || kind.includes("codex");
-    const safePaneId = String(paneId || "").trim();
-    if (!supported || !safePaneId) {
-      setSubagents([]);
-      return undefined;
-    }
-    let cancelled = false;
-    const poll = () => {
-      invoke("terminal_subagents_snapshot", { paneId: safePaneId })
-        .then((rows) => {
-          if (!cancelled) {
-            setSubagents(Array.isArray(rows) ? rows : []);
-          }
-        })
-        .catch(() => {});
-    };
-    poll();
-    const interval = window.setInterval(poll, 2500);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [agentKind, paneId]);
-
-  // Stamp when each subagent is first seen done, prune stamps for rows that
-  // resumed or disappeared, and schedule a re-render at the next linger/fade
-  // boundary among the stamped rows.
-  useEffect(() => {
-    const stamps = doneAtMsRef.current;
-    const seen = new Set();
-    const now = Date.now();
-    subagents.forEach((sub, index) => {
-      const id = terminalSubagentRowId(sub, index);
-      seen.add(id);
-      if (terminalSubagentIsDone(sub.status)) {
-        if (!stamps.has(id)) {
-          stamps.set(id, now);
-        }
-      } else {
-        stamps.delete(id);
-      }
-    });
-    Array.from(stamps.keys()).forEach((id) => {
-      if (!seen.has(id)) {
-        stamps.delete(id);
-      }
-    });
-    let nextBoundaryDelay = Infinity;
-    stamps.forEach((doneAtMs) => {
-      const fadeAt = doneAtMs + TERMINAL_SUBAGENT_DONE_LINGER_MS;
-      const removeAt = fadeAt + TERMINAL_SUBAGENT_DONE_FADE_MS;
-      const boundary = fadeAt > now ? fadeAt : removeAt > now ? removeAt : 0;
-      if (boundary) {
-        nextBoundaryDelay = Math.min(nextBoundaryDelay, boundary - now);
-      }
-    });
-    if (!Number.isFinite(nextBoundaryDelay)) {
-      return undefined;
-    }
-    const timeoutId = window.setTimeout(() => {
-      setFadeTickMs(Date.now());
-    }, Math.max(30, nextBoundaryDelay));
-    return () => window.clearTimeout(timeoutId);
-  });
-
-  const nowMs = Date.now();
-  const visibleSubagents = [];
-  subagents.forEach((sub, index) => {
-    const id = terminalSubagentRowId(sub, index);
-    const doneAtMs = doneAtMsRef.current.get(id) || 0;
-    const doneForMs = doneAtMs ? nowMs - doneAtMs : 0;
-    if (doneAtMs && doneForMs >= TERMINAL_SUBAGENT_DONE_LINGER_MS + TERMINAL_SUBAGENT_DONE_FADE_MS) {
-      return;
-    }
-    visibleSubagents.push({
-      fading: Boolean(doneAtMs) && doneForMs >= TERMINAL_SUBAGENT_DONE_LINGER_MS,
-      id,
-      sub,
-    });
-  });
-
-  if (!visibleSubagents.length) {
-    if (openSubagentId !== null) {
-      setOpenSubagentId(null);
-    }
-    return null;
-  }
-  if (openSubagentId && !visibleSubagents.some(({ id }) => id === openSubagentId)) {
-    setOpenSubagentId(null);
-  }
-  const openEntry = openSubagentId
-    ? visibleSubagents.find(({ id }) => id === openSubagentId) || null
-    : null;
-
-  return (
-    <div
-      aria-label="Subagents"
-      style={{
-        position: "absolute",
-        top: 8,
-        right: 8,
-        zIndex: 24,
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "flex-end",
-        gap: 3,
-        maxWidth: 240,
-        pointerEvents: "none",
-      }}
-    >
-      {visibleSubagents.slice(0, 8).map(({ fading, id, sub }) => {
-        const label =
-          String(sub.label || sub.agent_type || sub.description || "subagent").trim() || "subagent";
-        const status = String(sub.status || "").toLowerCase();
-        const done = terminalSubagentIsDone(status);
-        const running = !done && status !== "failed";
-        const color = terminalSubagentStatusColor(status);
-        return (
-          <button
-            key={id}
-            type="button"
-            data-terminal-control="true"
-            aria-expanded={openSubagentId === id}
-            onClick={(event) => {
-              // Rows are the interactive exception inside a click-through
-              // overlay: keep the click from focusing/steering the tile.
-              event.stopPropagation();
-              setOpenSubagentId((current) => (current === id ? null : id));
-            }}
-            title={`${label}${sub.description ? ` — ${sub.description}` : ""} · ${status || "running"}`}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 6,
-              maxWidth: "100%",
-              padding: "3px 9px",
-              borderRadius: 999,
-              fontSize: 10,
-              fontWeight: 650,
-              color: "rgba(226, 232, 240, 0.94)",
-              background: openSubagentId === id ? "rgba(30, 41, 59, 0.92)" : "rgba(15, 23, 42, 0.74)",
-              border: openSubagentId === id
-                ? "1px solid rgba(148, 163, 184, 0.48)"
-                : "1px solid rgba(148, 163, 184, 0.24)",
-              backdropFilter: "blur(6px)",
-              WebkitBackdropFilter: "blur(6px)",
-              whiteSpace: "nowrap",
-              opacity: fading ? 0 : running || done ? 1 : 0.62,
-              transition: `opacity ${TERMINAL_SUBAGENT_DONE_FADE_MS}ms ease`,
-              pointerEvents: "auto",
-              cursor: "pointer",
-              font: "inherit",
-              textAlign: "left",
-            }}
-          >
-            <span
-              aria-hidden="true"
-              style={{
-                width: 6,
-                height: 6,
-                borderRadius: 999,
-                flex: "0 0 auto",
-                background: color,
-                boxShadow: running ? `0 0 5px ${color}` : "none",
-              }}
-            />
-            {/* line-height above 1 keeps glyph descenders (g/p/y) inside the
-                clipped ellipsis box — line-height:1 visibly chopped them. */}
-            <span
-              style={{
-                minWidth: 0,
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                lineHeight: 1.35,
-              }}
-            >
-              {label}
-            </span>
-          </button>
-        );
-      })}
-      {openEntry ? (
-        <div
-          data-terminal-control="true"
-          role="dialog"
-          aria-label="Subagent details"
-          onClick={(event) => event.stopPropagation()}
-          style={{
-            marginTop: 4,
-            width: 280,
-            maxWidth: "68vw",
-            padding: "10px 12px",
-            borderRadius: 10,
-            fontSize: 11,
-            lineHeight: 1.45,
-            color: "rgba(226, 232, 240, 0.96)",
-            background: "rgba(10, 16, 28, 0.94)",
-            border: "1px solid rgba(148, 163, 184, 0.32)",
-            boxShadow: "0 10px 28px rgba(0, 0, 0, 0.45)",
-            backdropFilter: "blur(10px)",
-            WebkitBackdropFilter: "blur(10px)",
-            pointerEvents: "auto",
-            cursor: "default",
-            userSelect: "text",
-            WebkitUserSelect: "text",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-            <span
-              aria-hidden="true"
-              style={{
-                width: 7,
-                height: 7,
-                borderRadius: 999,
-                flex: "0 0 auto",
-                background: terminalSubagentStatusColor(String(openEntry.sub.status || "").toLowerCase()),
-              }}
-            />
-            <span style={{ fontWeight: 700, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {String(openEntry.sub.label || openEntry.sub.agent_type || "subagent").trim() || "subagent"}
-            </span>
-            <span style={{ marginLeft: "auto", opacity: 0.75, flex: "0 0 auto" }}>
-              {String(openEntry.sub.status || "running").toLowerCase()}
-            </span>
-            <button
-              type="button"
-              data-terminal-control="true"
-              aria-label="Close subagent details"
-              onClick={(event) => {
-                event.stopPropagation();
-                setOpenSubagentId(null);
-              }}
-              style={{
-                flex: "0 0 auto",
-                border: "none",
-                background: "transparent",
-                color: "rgba(148, 163, 184, 0.9)",
-                cursor: "pointer",
-                fontSize: 13,
-                lineHeight: 1,
-                padding: "0 2px",
-              }}
-            >
-              ×
-            </button>
-          </div>
-          {openEntry.sub.agent_type ? (
-            <div style={{ opacity: 0.85, marginBottom: 4 }}>type: {String(openEntry.sub.agent_type)}</div>
-          ) : null}
-          {openEntry.sub.description ? (
-            <div style={{ marginBottom: 4, wordBreak: "break-word" }}>{String(openEntry.sub.description)}</div>
-          ) : null}
-          {openEntry.sub.last_message ? (
-            <div
-              style={{
-                marginBottom: 4,
-                opacity: 0.85,
-                wordBreak: "break-word",
-                display: "-webkit-box",
-                WebkitLineClamp: 4,
-                WebkitBoxOrient: "vertical",
-                overflow: "hidden",
-              }}
-            >
-              {String(openEntry.sub.last_message)}
-            </div>
-          ) : null}
-          <div style={{ opacity: 0.7, marginBottom: openEntry.sub.transcript_path || openEntry.sub.agent_transcript_path ? 4 : 0 }}>
-            {[
-              openEntry.sub.started_at_ms ? `started ${terminalSubagentClockLabel(openEntry.sub.started_at_ms)}` : "",
-              openEntry.sub.finished_at_ms ? `finished ${terminalSubagentClockLabel(openEntry.sub.finished_at_ms)}` : "",
-              openEntry.sub.updated_at_ms ? `updated ${terminalSubagentClockLabel(openEntry.sub.updated_at_ms)}` : "",
-            ]
-              .filter(Boolean)
-              .join(" · ")}
-          </div>
-          {[
-            ["transcript", openEntry.sub.agent_transcript_path],
-            ["caller transcript", openEntry.sub.transcript_path],
-          ]
-            .filter(([, path]) => String(path || "").trim())
-            .map(([kind, path]) => (
-              <div
-                key={kind}
-                title={String(path)}
-                style={{
-                  opacity: 0.65,
-                  fontSize: 10,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  direction: "rtl",
-                  textAlign: "left",
-                }}
-              >
-                {kind}: {String(path)}
-              </div>
-            ))}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function TerminalAccountStaleChip({ pane_id: paneId, agent_kind: agentKind }) {
-  const [status, setStatus] = useState(null);
-
-  useEffect(() => {
-    const kind = String(agentKind || "").toLowerCase().includes("claude")
-      ? "claude"
-      : String(agentKind || "").toLowerCase().includes("codex")
-        ? "codex"
-        : String(agentKind || "").toLowerCase().includes("opencode") ? "opencode" : "";
-    const safePaneId = String(paneId || "").trim();
-    if (!kind || !safePaneId) {
-      setStatus(null);
-      return undefined;
-    }
-    let cancelled = false;
-    let unlisten = null;
-    const check = () => {
-      invoke("agent_accounts_pane_profiles").then((state) => {
-        if (cancelled) {
-          return;
-        }
-        const stamp = state?.panes?.[safePaneId];
-        const active = state?.active?.[kind];
-        if (!stamp || !active?.profile_id) {
-          setStatus(null);
-          return;
-        }
-        const auth = state?.auth?.[kind]?.[stamp.profile_id];
-        if (auth?.needs_login) {
-          setStatus({
-            kind,
-            mode: "needs-login",
-            profile_id: String(stamp.profile_id || ""),
-            label: String(stamp.profile_label || "account"),
-            message: String(auth.message || "Sign in again for this account"),
-          });
-          return;
-        }
-        const profileChanged = String(stamp.profile_id || "") !== String(active.profile_id);
-        const authChanged = !profileChanged
-          && Boolean(active.auth_revision)
-          && String(stamp.auth_revision || "") !== String(active.auth_revision);
-        if (profileChanged || authChanged) {
-          setStatus({ mode: "stale", label: String(active.profile_label || "new account") });
-        } else {
-          setStatus(null);
-        }
-      }).catch(() => {});
-    };
-    check();
-    const interval = window.setInterval(check, 6000);
-    listen(AGENT_ACCOUNTS_CHANGED_EVENT, check).then((next) => {
-      if (cancelled) {
-        next();
-        return;
-      }
-      unlisten = next;
-    }).catch(() => {});
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-      if (unlisten) {
-        unlisten();
-      }
-    };
-  }, [agentKind, paneId]);
-
-  if (!status) {
-    return null;
-  }
-
-  const sharedStyle = {
-    alignItems: "center",
-    borderRadius: 999,
-    display: "inline-flex",
-    flex: "0 0 auto",
-    fontSize: 10,
-    fontWeight: 750,
-    gap: 4,
-    lineHeight: 1,
-    padding: "3px 8px",
-    whiteSpace: "nowrap",
-  };
-
-  if (status.mode === "needs-login") {
-    return (
-      <button
-        onClick={() => {
-          invoke("agent_accounts_start_profile_login", {
-            agent_kind: status.kind,
-            profile_id: status.profile_id,
-          }).catch(() => {});
-        }}
-        style={{
-          ...sharedStyle,
-          background: "rgba(251, 146, 60, 0.16)",
-          border: "1px solid rgba(251, 146, 60, 0.52)",
-          color: "rgba(254, 215, 170, 0.95)",
-          cursor: "pointer",
-        }}
-        title={status.message}
-        type="button"
-      >
-        {`↻ login ${status.label}`}
-      </button>
-    );
-  }
-
-  return (
-    <span
-      style={{
-        ...sharedStyle,
-        background: "rgba(251, 146, 60, 0.14)",
-        border: "1px solid rgba(251, 146, 60, 0.45)",
-        color: "rgba(254, 215, 170, 0.95)",
-      }}
-      title={`Account switched to “${status.label}”. This terminal still uses the account it started with — close and relaunch it to use the new one.`}
-    >
-      {`↻ ${status.label}`}
-    </span>
-  );
-}
-
-function getTerminalStartupDefaultLaunch(agentKind, agentLaunchDefaults = null) {
-  return getAgentLaunchDefault(agentKind, agentLaunchDefaults);
 }
 
 function cleanTerminalUrlLink(value) {
@@ -2610,7 +2023,6 @@ function WorkspaceTerminal({
   agent,
   agentLaunchEpoch = 0,
   agentLaunchAlert = null,
-  agentLaunchDefaults = null,
   agentLaunchReady = true,
   agent_statuses: agentStatuses,
   agentStatusError,
@@ -2777,17 +2189,11 @@ function WorkspaceTerminal({
   const blankStartupProbeCountRef = useRef(0);
   const terminalClosingRef = useRef(false);
   const terminalExplicitCloseEpochRef = useRef(0);
-  const terminalThemeRefreshTimerRef = useRef(0);
-  const lastTerminalThemeRefreshKeyRef = useRef("");
   const preserveCoordinationOnNextCleanupRef = useRef(false);
   const preserveCoordinationOnNextOpenRef = useRef(false);
   const forceFreshSessionOnNextOpenRef = useRef(false);
   const providerSessionOverrideOnNextOpenRef = useRef("");
   const forkFromProviderSessionOnNextOpenRef = useRef("");
-  // opencode's Bun runtime segfaults mid-session (bun.report crashes); the
-  // budget survives pane restarts so a crash loop degrades to the normal
-  // exited overlay instead of respawning forever.
-  const crashAutoRestartRef = useRef({ attempts: 0 });
   const forkTerminalActionRef = useRef(null);
   const canRequestForkTerminalRef = useRef(false);
   const parkedPromptRef = useRef(null);
@@ -2898,6 +2304,8 @@ function WorkspaceTerminal({
   const terminalThreadSlotKey = thread?.slot_key
     || String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
+  const harnessPresentation = terminalHarnessPresentation(paneAgentId);
+  const persistedHarnessUnavailable = harnessPresentation.availability === "unavailable";
   const terminalUsesActivityHooks = !isGenericTerminal && terminalAgentUsesActivityHooks(terminalAgentKind);
   const terminalThreadActivityStatus = terminalUsesActivityHooks ? "starting" : "idle";
   const terminalThreadIdRef = useRef(terminalThreadId);
@@ -3256,9 +2664,7 @@ function WorkspaceTerminal({
       ).trim();
       const submittedByActivityHook = promptSource === "activity_hook_user_prompt_submit"
         || promptSource === "cli_hook_user_prompt_submit";
-      const submittedByCodexInputGate = listenerState.terminal_agent_kind === "codex"
-        && promptSource === "observed_input_gate";
-      if (listenerState.terminalUsesActivityHooks && !submittedByActivityHook && !submittedByCodexInputGate) {
+      if (listenerState.terminalUsesActivityHooks && !submittedByActivityHook) {
         logTerminalStatus("frontend.terminal_cli.prompt_submitted_event_ignored", listenerState.getTerminalCliStatusLogBase?.({
           instance_id: payload.instance_id || "",
           pane_id: payloadPaneId,
@@ -3569,70 +2975,6 @@ function WorkspaceTerminal({
     : isGenericTerminal
       ? "Shell terminal"
       : "Agent terminal";
-  const scheduleOpenCodeTerminalThemeRefresh = useCallback((themeId = getCurrentForgeThemeId()) => {
-    if (isGenericTerminal || terminalAgentKind !== "opencode") {
-      return;
-    }
-
-    const instanceId = terminalInstanceIdRef.current || 0;
-    if (!paneId || !instanceId) {
-      return;
-    }
-
-    const refreshKey = `${paneId}:${instanceId}:${themeId || ""}`;
-    if (lastTerminalThemeRefreshKeyRef.current === refreshKey) {
-      return;
-    }
-    lastTerminalThemeRefreshKeyRef.current = refreshKey;
-
-    if (terminalThemeRefreshTimerRef.current) {
-      window.clearTimeout(terminalThemeRefreshTimerRef.current);
-    }
-    terminalThemeRefreshTimerRef.current = window.setTimeout(() => {
-      terminalThemeRefreshTimerRef.current = 0;
-      invoke("terminal_refresh_theme", {
-        pane_id: paneId,
-        instance_id: instanceId,
-      }).catch((error) => {
-        logTerminalDiagnosticEvent("frontend.opencode_theme_refresh.error", {
-          agent_id: terminalAgentKind,
-          instance_id: instanceId,
-          message: error?.message || String(error || ""),
-          pane_id: paneId,
-          terminal_index: terminalIndex,
-          themeId: themeId || "",
-          workspace_id: workspace?.id || "",
-        });
-      });
-    }, 120);
-  }, [isGenericTerminal, paneId, terminalAgentKind, terminalIndex, workspace?.id]);
-  useEffect(() => {
-    if (isGenericTerminal || terminalAgentKind !== "opencode") {
-      return undefined;
-    }
-    if (typeof document === "undefined" || typeof MutationObserver === "undefined") {
-      return undefined;
-    }
-
-    const root = document.documentElement;
-    const refresh = () => {
-      scheduleOpenCodeTerminalThemeRefresh(root?.dataset?.forgeTheme || "");
-    };
-    const observer = new MutationObserver((mutations) => {
-      if (mutations.some((mutation) => mutation.attributeName === "data-forge-theme")) {
-        refresh();
-      }
-    });
-    observer.observe(root, { attributes: true, attributeFilter: ["data-forge-theme"] });
-    refresh();
-    return () => {
-      observer.disconnect();
-      if (terminalThemeRefreshTimerRef.current) {
-        window.clearTimeout(terminalThemeRefreshTimerRef.current);
-        terminalThemeRefreshTimerRef.current = 0;
-      }
-    };
-  }, [isGenericTerminal, scheduleOpenCodeTerminalThemeRefresh, terminalAgentKind]);
   useEffect(() => {
     terminalThreadIdRef.current = terminalThreadId;
     terminalThreadSlotKeyRef.current = terminalThreadSlotKey;
@@ -4527,43 +3869,6 @@ function WorkspaceTerminal({
     workspaceThreads,
   ]);
 
-  const reloadTerminalWithProviderSession = useCallback(({
-    agent_id: agentId,
-    provider_session_id: providerSessionId,
-    reason = "provider_turn_completed",
-    thread_id: threadId,
-  }) => {
-    const nextProviderSessionId = String(providerSessionId || "").trim();
-    if (
-      !nextProviderSessionId
-      || isGenericTerminal
-      || terminalClosed
-      || terminalClosingRef.current
-    ) {
-      return;
-    }
-
-    providerSessionOverrideOnNextOpenRef.current = nextProviderSessionId;
-    preserveCoordinationOnNextCleanupRef.current = true;
-    preserveCoordinationOnNextOpenRef.current = true;
-    logThreadBridgeDiagnostic("frontend.provider_turn.reload_terminal_session", {
-      agent_id: getTerminalAgentKind(agentId),
-      pane_id: paneId,
-      providerSessionPresent: true,
-      reason,
-      terminal_index: terminalIndex,
-      thread_id: threadId || terminalThreadIdRef.current || "",
-      workspace_id: workspace?.id || "",
-    });
-    setRestartKey((current) => current + 1);
-  }, [
-    isGenericTerminal,
-    paneId,
-    terminalClosed,
-    terminalIndex,
-    workspace?.id,
-  ]);
-
   const queueClipboardImagesForCurrentTerminal = useCallback((event, surface = "tui_terminal") => {
     const imageFiles = getTerminalClipboardImageFiles(event?.clipboardData);
     const clipboardText = String(event?.clipboardData?.getData?.("text/plain") || "");
@@ -4660,227 +3965,6 @@ function WorkspaceTerminal({
     terminalAgentKind,
     terminalIndex,
     workspace?.id,
-  ]);
-
-  const runWorkspaceThreadProviderTurn = useCallback(async ({
-    agent_id: agentId,
-    binding,
-    message,
-    model,
-    pending_prompt_id: pendingPromptId = "",
-    provider_session_id: providerSessionId = "",
-    repo_path: repoPath = "",
-    syncTerminalAfterTurn = true,
-    terminal_index: targetTerminalIndex,
-    thread_id: threadId,
-    workspace: targetWorkspace,
-    workspace_id: targetWorkspaceId,
-  }) => {
-    const text = String(message || "").trim();
-    const safeAgentId = getTerminalAgentKind(agentId);
-    const safeThreadId = String(threadId || "").trim();
-    const safeWorkspaceId = String(targetWorkspaceId || targetWorkspace?.id || workspace?.id || "").trim();
-    const safeRepoPath = String(repoPath || workingDirectory || "").trim();
-    const modelId = String(model || "").trim();
-    const previousProviderSessionId = String(providerSessionId || "").trim();
-    const instanceId = binding?.instance_id || terminalInstanceIdRef.current || undefined;
-    const lifecyclePaneId = binding?.pane_id || paneId;
-    const lifecycleTerminalIndex = targetTerminalIndex ?? binding?.terminal_index ?? terminalIndex;
-    const startedAt = new Date().toISOString();
-    const userMessageId = pendingPromptId || createThreadProjectionToken("message-user");
-    const turnId = `turn-${userMessageId}`;
-    const assistantMessageId = createThreadProjectionToken("message-assistant");
-
-    if (!text || !safeThreadId || !safeWorkspaceId || !safeRepoPath) {
-      throw new Error("Unable to start the provider turn for this thread.");
-    }
-
-    logThreadBridgeDiagnostic("frontend.provider_turn.start", {
-      agent_id: safeAgentId,
-      instance_id: instanceId || "",
-      modelIdPresent: Boolean(modelId),
-      pane_id: lifecyclePaneId,
-      pending_prompt_id: pendingPromptId,
-      providerSessionPresent: Boolean(previousProviderSessionId),
-      repoPathPresent: Boolean(safeRepoPath),
-      terminal_index: lifecycleTerminalIndex,
-      thread_id: safeThreadId,
-      userMessageLength: text.length,
-      workspace_id: safeWorkspaceId,
-    });
-    onThreadTerminalLifecycle?.({
-      activity_status: "thinking",
-      agent_id: safeAgentId,
-      instance_id: instanceId,
-      ...getTerminalNativeRailStateFields("thinking"),
-      pane_id: lifecyclePaneId,
-      status: "active",
-      terminal_index: lifecycleTerminalIndex,
-      thread_id: safeThreadId,
-      type: "agent-output",
-      workspace_id: safeWorkspaceId,
-    });
-    onThreadTerminalLifecycle?.({
-      agent_id: safeAgentId,
-      clear_pending_prompt: false,
-      instance_id: instanceId,
-      model: modelId,
-      model_source: modelId ? "provider-api" : "",
-      native_session_id: previousProviderSessionId,
-      native_session_kind: previousProviderSessionId ? "session" : "",
-      native_session_source: previousProviderSessionId ? "provider-api" : "",
-      ...getTerminalNativeRailStateFields("thinking"),
-      pane_id: lifecyclePaneId,
-      pending_prompt_id: pendingPromptId,
-      projection_events: buildProviderTurnStartProjectionEvents({
-        agent_id: safeAgentId,
-        started_at: startedAt,
-        text,
-        turn_id: turnId,
-        userMessageId,
-      }),
-      provider_session_id: previousProviderSessionId,
-      repo_path: safeRepoPath,
-      status: "active",
-      terminal_index: lifecycleTerminalIndex,
-      thread_id: safeThreadId,
-      type: "provider-turn-started",
-      workspace_id: safeWorkspaceId,
-      workspace_name: targetWorkspace?.name || workspace?.name || "",
-    });
-
-    try {
-      const result = await invoke("agent_thread_turn_start", {
-        request: {
-          agent_id: safeAgentId,
-          model: modelId || null,
-          prompt: text,
-          provider_session_id: previousProviderSessionId || null,
-          working_directory: safeRepoPath,
-        },
-      });
-      const completedAt = new Date().toISOString();
-      const nextProviderSessionId = String(
-        result?.provider_session_id || previousProviderSessionId || "",
-      ).trim();
-      const output = String(result?.output || "").trim();
-
-      logThreadBridgeDiagnostic("frontend.provider_turn.completed", {
-        agent_id: safeAgentId,
-        instance_id: instanceId || "",
-        outputLength: output.length,
-        pane_id: lifecyclePaneId,
-        pending_prompt_id: pendingPromptId,
-        providerSessionPresent: Boolean(nextProviderSessionId),
-        terminal_index: lifecycleTerminalIndex,
-        thread_id: safeThreadId,
-        workspace_id: safeWorkspaceId,
-      });
-      if (nextProviderSessionId) {
-        onThreadTerminalLifecycle?.({
-          agent_id: safeAgentId,
-          instance_id: instanceId,
-          native_session_id: nextProviderSessionId,
-          native_session_kind: "session",
-          native_session_source: "provider-api",
-          pane_id: lifecyclePaneId,
-          provider_session_id: nextProviderSessionId,
-          terminal_index: lifecycleTerminalIndex,
-          thread_id: safeThreadId,
-          type: "provider-session",
-          workspace_id: safeWorkspaceId,
-        });
-      }
-      onThreadTerminalLifecycle?.({
-        agent_id: safeAgentId,
-        instance_id: instanceId,
-        model: result?.model || modelId,
-        model_source: modelId ? "provider-api" : "",
-        native_session_id: nextProviderSessionId,
-        native_session_kind: nextProviderSessionId ? "session" : "",
-        native_session_source: nextProviderSessionId ? "provider-api" : "",
-        pane_id: lifecyclePaneId,
-        pending_prompt_id: pendingPromptId,
-        projection_events: buildProviderTurnProjectionEvents({
-          agent_id: safeAgentId,
-          assistant_message_id: assistantMessageId,
-          completed_at: completedAt,
-          output: output || result?.output || "",
-          started_at: startedAt,
-          text,
-          turn_id: turnId,
-          userMessageId,
-        }),
-        provider_session_id: nextProviderSessionId,
-        repo_path: safeRepoPath,
-        status: "active",
-        terminal_index: lifecycleTerminalIndex,
-        thread_id: safeThreadId,
-        type: "provider-turn-completed",
-        workspace_id: safeWorkspaceId,
-        workspace_name: targetWorkspace?.name || workspace?.name || "",
-      });
-      if (syncTerminalAfterTurn && nextProviderSessionId) {
-        reloadTerminalWithProviderSession({
-          agent_id: safeAgentId,
-          provider_session_id: nextProviderSessionId,
-          reason: previousProviderSessionId
-            ? "provider_turn_reload_existing_session"
-            : "provider_turn_reload_created_session",
-          thread_id: safeThreadId,
-        });
-      }
-
-      return result;
-    } catch (error) {
-      const messageText = getErrorMessage(error, "Unable to send message through the provider session.");
-      logThreadBridgeDiagnostic("frontend.provider_turn.error", {
-        agent_id: safeAgentId,
-        instance_id: instanceId || "",
-        message: messageText,
-        pane_id: lifecyclePaneId,
-        pending_prompt_id: pendingPromptId,
-        terminal_index: lifecycleTerminalIndex,
-        thread_id: safeThreadId,
-        workspace_id: safeWorkspaceId,
-      });
-      onThreadTerminalLifecycle?.({
-        agent_id: safeAgentId,
-        instance_id: instanceId,
-        pane_id: lifecyclePaneId,
-        pending_prompt_id: pendingPromptId,
-        projection_events: buildProviderTurnErrorProjectionEvents({
-          agent_id: safeAgentId,
-          completed_at: new Date().toISOString(),
-          error: messageText,
-          turn_id: turnId,
-          userMessageId,
-        }),
-        status: "error",
-        terminal_index: lifecycleTerminalIndex,
-        thread_id: safeThreadId,
-        type: "provider-turn-error",
-        workspace_id: safeWorkspaceId,
-      });
-      if (pendingPromptId) {
-        onThreadTerminalLifecycle?.({
-          error: messageText,
-          pending_prompt_id: pendingPromptId,
-          thread_id: safeThreadId,
-          type: "pending-prompt-error",
-          workspace_id: safeWorkspaceId,
-        });
-      }
-      throw error;
-    }
-  }, [
-    reloadTerminalWithProviderSession,
-    onThreadTerminalLifecycle,
-    paneId,
-    terminalIndex,
-    workingDirectory,
-    workspace?.id,
-    workspace?.name,
   ]);
 
   const submitWorkspaceThreadMessage = useCallback(async ({ message, model, thread: targetThread, workspace: targetWorkspace }) => {
@@ -5421,7 +4505,7 @@ function WorkspaceTerminal({
         workspace_id: workspaceId,
       });
     }
-    if (terminalAgentUsesActivityHooks(agentId) && getTerminalAgentKind(agentId) !== "codex") {
+    if (terminalAgentUsesActivityHooks(agentId)) {
       logThreadBridgeDiagnostic("frontend.thread_submit.hook_managed_start_deferred", {
         agent_id: agentId,
         bindingInstanceId: binding.instance_id,
@@ -5523,18 +4607,17 @@ function WorkspaceTerminal({
     workspace?.name,
     workspaceThreads,
   ]);
-  const createWorkspaceThreadChat = useCallback(async ({ agent_id: agentId, message, model, workspace: targetWorkspace }) => {
+  const createWorkspaceThreadChat = useCallback(async ({ agent_id: agentId, message, workspace: targetWorkspace }) => {
     const text = String(message || "").trim();
     const nextAgentId = getTerminalAgentKind(agentId);
     const targetWorkspaceId = targetWorkspace?.id || workspace?.id || "";
-    const requestedModel = String(model || "").trim();
 
     if (!text) {
       throw new Error("Write a message before starting a chat.");
     }
 
-    if (!["codex", "claude", "opencode"].includes(nextAgentId)) {
-      throw new Error("Choose a coding agent before starting a chat.");
+    if (nextAgentId !== "haider") {
+      throw new Error("Only Haider can start an agent chat.");
     }
 
     if (!workspace?.id || targetWorkspaceId !== workspace.id) {
@@ -5548,7 +4631,6 @@ function WorkspaceTerminal({
     const result = onCreateWorkspaceThreadTerminal({
       agent_id: nextAgentId,
       message: text,
-      model: requestedModel,
       sourcePaneId: paneId,
       sourceTerminalIndex: terminalIndex,
       workspace: targetWorkspace || workspace,
@@ -5563,268 +4645,6 @@ function WorkspaceTerminal({
     terminalIndex,
     workspace,
   ]);
-  const changeWorkspaceThreadModel = useCallback(async ({
-    model,
-    thread: targetThread,
-    thinking_power: requestedThinkingPower,
-    thinkingPowerSource: requestedThinkingPowerSource,
-  }) => {
-    const nextModel = String(model || "").trim();
-    const {
-      agent_id: agentId,
-      binding,
-      latestThread,
-    } = getWorkspaceThreadTerminalTarget({
-      fallbackWorkspace: workspace,
-      targetThread,
-      terminal_agent_kind: terminalAgentKind,
-      workspaceThreads,
-    });
-    const modelWorkspaceId = latestThread?.workspace_id || targetThread?.workspace_id || workspace?.id || "";
-    const modelWorkspaceEntry = modelWorkspaceId ? workspaceThreads?.[modelWorkspaceId] : null;
-    const modelTerminalSnapshot = Object.values(modelWorkspaceEntry?.terminals || {})
-      .map((terminal) => ({
-        agent_id: terminal?.agent_id || "",
-        instance_id: terminal?.instance_id || "",
-        pane_id: terminal?.pane_id || "",
-        status: terminal?.status || "",
-        terminal_index: terminal?.terminal_index ?? "",
-        thread_id: terminal?.thread_id || "",
-      }))
-      .slice(0, 16);
-    const modelThreadSnapshot = Object.values(modelWorkspaceEntry?.threads || {})
-      .filter((entryThread) => entryThread?.terminal_binding || entryThread?.id === latestThread?.id)
-      .map((entryThread) => ({
-        activity_status: entryThread?.activity_status || "",
-        current_agent: entryThread?.current_agent || "",
-        id: entryThread?.id || "",
-        latestTurnState: entryThread?.latest_turn?.state || "",
-        providerModel: getWorkspaceThreadProviderBinding(
-          entryThread,
-          getTerminalAgentKind(entryThread?.current_agent || agentId),
-        )?.model_id || "",
-        terminalBindingInstanceId: entryThread?.terminal_binding?.instance_id || "",
-        terminalBindingPaneId: entryThread?.terminal_binding?.pane_id || "",
-        terminal_index: entryThread?.terminal_index ?? "",
-      }))
-      .slice(0, 16);
-    const requestedCodexThinkingPower = String(requestedThinkingPower || "").trim().toLowerCase();
-    const validCodexThinkingPowers = new Set(["low", "medium", "high", "xhigh"]);
-    const thinkingPower = agentId === "codex"
-      ? (
-        validCodexThinkingPowers.has(requestedCodexThinkingPower)
-          ? requestedCodexThinkingPower
-          : nextModel.toLowerCase().includes("spark")
-            ? "high"
-            : "medium"
-      )
-      : "";
-    const thinkingPowerSource = agentId === "codex"
-      ? (
-        validCodexThinkingPowers.has(requestedCodexThinkingPower)
-          ? requestedThinkingPowerSource || "thread_detail"
-          : "terminal_default_inference"
-      )
-      : "not_configured";
-    const requestIncludesThinkingPower = Boolean(agentId === "codex" && thinkingPower);
-    logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_received", {
-      agent_id: agentId,
-      bindingInstanceId: binding?.instance_id || "",
-      bindingPaneId: binding?.pane_id || "",
-      hasModel: Boolean(nextModel),
-      modelTerminalSnapshot,
-      modelThreadSnapshot,
-      model: nextModel,
-      requestIncludesThinkingPower,
-      thinking_power: thinkingPower,
-      thinkingPowerSource,
-      thread_id: latestThread?.id || targetThread?.id || "",
-      workspace_id: latestThread?.workspace_id || targetThread?.workspace_id || workspace?.id || "",
-    });
-    if (!nextModel || !binding?.pane_id || !binding?.instance_id || !latestThread?.id) {
-      logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_error", {
-        agent_id: agentId,
-        hasBinding: Boolean(binding?.pane_id && binding?.instance_id),
-        hasLatestThread: Boolean(latestThread?.id),
-        hasModel: Boolean(nextModel),
-        message: "No active terminal is bound to this thread.",
-        model: nextModel,
-        reason: !nextModel ? "missing_model" : !latestThread?.id ? "missing_thread" : "missing_live_terminal_binding",
-        thread_id: latestThread?.id || targetThread?.id || "",
-        workspace_id: latestThread?.workspace_id || targetThread?.workspace_id || workspace?.id || "",
-      });
-      throw new Error("No active terminal is bound to this thread.");
-    }
-
-    if (
-      nextModel.length > 120
-      || !nextModel.split("").every((character) => /[A-Za-z0-9._:/-]/.test(character))
-    ) {
-      logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_error", {
-        agent_id: agentId,
-        message: "Model id is invalid.",
-        model: nextModel,
-        reason: "invalid_model_id",
-        thread_id: latestThread.id,
-        workspace_id: latestThread.workspace_id || workspace?.id || "",
-      });
-      throw new Error("Model id is invalid.");
-    }
-
-    const command = agentId === "codex" && thinkingPower
-      ? `/model ${nextModel} ${thinkingPower}`
-      : `/model ${nextModel}`;
-    const initialModelObservation = getWorkspaceThreadObservedModelChange(workspaceThreadsLatestRef.current, {
-      agent_id: agentId,
-      thread_id: latestThread.id,
-      workspace_id: latestThread.workspace_id || workspace?.id || "",
-    });
-    logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_write_start", {
-      agent_id: agentId,
-      bindingInstanceId: binding.instance_id,
-      bindingPaneId: binding.pane_id,
-      commandLength: command.length,
-      model: nextModel,
-      modelTerminalSnapshot,
-      modelThreadSnapshot,
-      observedModel: initialModelObservation.model,
-      observedModelSource: initialModelObservation.model_source,
-      observedModelUpdatedAt: initialModelObservation.modelUpdatedAt,
-      requestIncludesThinkingPower,
-      thinking_power: thinkingPower,
-      thinkingPowerSource,
-      thread_id: latestThread.id,
-      workspace_id: latestThread.workspace_id || workspace?.id || "",
-    });
-    dispatchTerminalControlUiSuppression({
-      agent_id: agentId,
-      instance_id: binding.instance_id,
-      model: nextModel,
-      pane_id: binding.pane_id,
-      reason: "model-change",
-      terminal_index: latestThread.terminal_index ?? binding.terminal_index,
-      thread_id: latestThread.id,
-      workspace_id: latestThread.workspace_id || workspace?.id || "",
-    });
-    try {
-      await invoke("terminal_write", {
-        data: buildTerminalSubmittedInput(command, agentId),
-        instance_id: binding.instance_id,
-        pane_id: binding.pane_id,
-        prompt_event_source: "model-change",
-        thread_id: latestThread.id,
-      });
-    } catch (error) {
-      logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_write_error", {
-        agent_id: agentId,
-        bindingInstanceId: binding.instance_id,
-        bindingPaneId: binding.pane_id,
-        message: error?.message || String(error || ""),
-        model: nextModel,
-        requestIncludesThinkingPower,
-        thinking_power: thinkingPower,
-        thinkingPowerSource,
-        thread_id: latestThread.id,
-        workspace_id: latestThread.workspace_id || workspace?.id || "",
-      });
-      throw error;
-    }
-    logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_write_done", {
-      agent_id: agentId,
-      bindingInstanceId: binding.instance_id,
-      bindingPaneId: binding.pane_id,
-      model: nextModel,
-      requestIncludesThinkingPower,
-      thinking_power: thinkingPower,
-      thinkingPowerSource,
-      thread_id: latestThread.id,
-      workspace_id: latestThread.workspace_id || workspace?.id || "",
-    });
-    const waitStartedAt = Date.now();
-    const confirmationFields = {
-      agent_id: agentId,
-      bindingInstanceId: binding.instance_id,
-      bindingPaneId: binding.pane_id,
-      initialObservedModel: initialModelObservation.model,
-      initialObservedModelSource: initialModelObservation.model_source,
-      initialObservedModelUpdatedAt: initialModelObservation.modelUpdatedAt,
-      model: nextModel,
-      requestIncludesThinkingPower,
-      terminal_index: latestThread.terminal_index ?? binding.terminal_index,
-      thinking_power: thinkingPower,
-      thinkingPowerSource,
-      thread_id: latestThread.id,
-      timeout_ms: WORKSPACE_THREAD_MODEL_CHANGE_CONFIRM_TIMEOUT_MS,
-      workspace_id: latestThread.workspace_id || workspace?.id || "",
-    };
-    logBigViewSyncDiagnosticEvent("bigview.model_change.confirm_wait_start", confirmationFields);
-    let confirmedObservation = null;
-    try {
-      confirmedObservation = await new Promise((resolve, reject) => {
-        const checkObservedModel = () => {
-          const observation = getWorkspaceThreadObservedModelChange(workspaceThreadsLatestRef.current, {
-            agent_id: agentId,
-            thread_id: latestThread.id,
-            workspace_id: latestThread.workspace_id || workspace?.id || "",
-          });
-          if (workspaceThreadModelChangeMatchesObservation(observation, {
-            initialObservation: initialModelObservation,
-            model: nextModel,
-          })) {
-            resolve(observation);
-            return;
-          }
-          if (Date.now() - waitStartedAt >= WORKSPACE_THREAD_MODEL_CHANGE_CONFIRM_TIMEOUT_MS) {
-            reject(new Error("Model change was written to the terminal but was not confirmed by session history yet."));
-            return;
-          }
-          window.setTimeout(checkObservedModel, WORKSPACE_THREAD_MODEL_CHANGE_CONFIRM_POLL_MS);
-        };
-        window.setTimeout(checkObservedModel, 0);
-      });
-    } catch (error) {
-      const latestObservation = getWorkspaceThreadObservedModelChange(workspaceThreadsLatestRef.current, {
-        agent_id: agentId,
-        thread_id: latestThread.id,
-        workspace_id: latestThread.workspace_id || workspace?.id || "",
-      });
-      logBigViewSyncDiagnosticEvent("bigview.model_change.confirm_timeout", {
-        ...confirmationFields,
-        elapsed_ms: Date.now() - waitStartedAt,
-        message: error?.message || String(error || ""),
-        observedModel: latestObservation.model,
-        observedModelSource: latestObservation.model_source,
-        observedModelUpdatedAt: latestObservation.modelUpdatedAt,
-      });
-      throw error;
-    }
-    logBigViewSyncDiagnosticEvent("bigview.model_change.confirmed", {
-      ...confirmationFields,
-      elapsed_ms: Date.now() - waitStartedAt,
-      observedModel: confirmedObservation.model,
-      observedModelSource: confirmedObservation.model_source,
-      observedModelUpdatedAt: confirmedObservation.modelUpdatedAt,
-      providerSessionPresent: Boolean(confirmedObservation.provider_session_id),
-    });
-  }, [terminalAgentKind, workspace, workspaceThreads]);
-  const changeWorkspaceThreadAgent = useCallback(async ({ agent_id: agentId, thread: targetThread, workspace: targetWorkspace }) => {
-    const nextAgentId = getTerminalAgentKind(agentId);
-    const targetTerminalIndex = Number.parseInt(
-      targetThread?.terminal_index ?? targetThread?.terminal_binding?.terminal_index,
-      10,
-    );
-    if (!targetThread?.id || !targetThread?.workspace_id || !Number.isInteger(targetTerminalIndex)) {
-      throw new Error("This thread is not attached to a workspace terminal slot.");
-    }
-
-    onChangeTerminalRole?.({
-      role: nextAgentId,
-      source: "thread_agent_switch",
-      terminal_index: targetTerminalIndex,
-      thread_id: targetThread.id,
-      workspace_id: targetThread.workspace_id || targetWorkspace?.id || workspace?.id || "",
-    });
-  }, [onChangeTerminalRole, workspace?.id]);
   const handleThreadsViewActiveThreadChange = useCallback((selection = {}) => {
     threadsViewSelectedThreadRef.current = selection?.thread
       ? selection
@@ -6101,7 +4921,7 @@ function WorkspaceTerminal({
     if (
       !targetWorkspaceId
       || !Number.isInteger(targetTerminalIndex)
-      || !["codex", "claude", "opencode"].includes(nextAgentId)
+      || nextAgentId !== "haider"
     ) {
       return "";
     }
@@ -6402,7 +5222,7 @@ function WorkspaceTerminal({
   }, []);
 
   useEffect(() => {
-    if (!agent) {
+    if (!agent || persistedHarnessUnavailable) {
       startAgentInPrewarmedTerminalRef.current = null;
       preserveCoordinationOnNextCleanupRef.current = false;
       preserveCoordinationOnNextOpenRef.current = false;
@@ -6410,7 +5230,9 @@ function WorkspaceTerminal({
       setTerminalState("blocked");
       setTerminalError("");
       setTerminalStatus({
-        detail: "No terminal agent is configured.",
+        detail: persistedHarnessUnavailable
+          ? harnessPresentation.reason
+          : "No terminal agent is configured.",
         title: "Terminal Blocked",
         visible: true,
       });
@@ -6505,32 +5327,14 @@ function WorkspaceTerminal({
     let startupThreadProviderSessionId = sessionOpenBindingForThisStart.provider_session_id;
     const requestedStartupProviderSessionIdForThisStart = startupThreadProviderSessionId;
     let providerSessionMissingForThisStart = false;
-    const startupDefaultLaunch = isGenericTerminal
-      ? { effort: "", model: "", speed: "" }
-      : getTerminalStartupDefaultLaunch(terminalAgentKind, agentLaunchDefaults);
-    const startupDefaultModel = startupDefaultLaunch.model || "";
-    const startupProviderSessionSuppressesDefaultModel = Boolean(
-      startupThreadProviderSessionId
-        && terminalAgentKind === "opencode"
-        && !threadProviderModel,
-    );
     let startupThreadProviderModel = isGenericTerminal
       ? ""
-      : threadProviderModel || (startupProviderSessionSuppressesDefaultModel ? "" : startupDefaultModel);
+      : String(threadProviderModel || "").trim();
     let startupThreadProviderModelSource = threadProviderModel
       ? "session-restore"
-      : startupThreadProviderModel
-        ? "settings-default"
-        : "";
-    let startupThreadProviderLaunch = startupThreadProviderModel
-      ? resolveAgentLaunchDefaultForModel(
-        terminalAgentKind,
-        agentLaunchDefaults,
-        startupThreadProviderModel,
-      )
-      : { effort: "", speed: "" };
-    let startupThreadProviderEffort = startupThreadProviderLaunch.effort || "";
-    let startupThreadProviderSpeed = startupThreadProviderLaunch.speed || "";
+      : "";
+    let startupThreadProviderEffort = "";
+    let startupThreadProviderSpeed = "";
     const startupPermissionMode = isGenericTerminal ? "" : String(permissionMode || "").trim();
     const startupThreadId = terminalThreadIdRef.current;
     let startupSlotKey = forceFreshSessionForThisStart
@@ -6580,7 +5384,6 @@ function WorkspaceTerminal({
       restartKeyChanged: previousStartupSnapshot.restartKey !== undefined
         && previousStartupSnapshot.restartKey !== restartKey,
       startupSlotKey,
-      startupDefaultModel: startupDefaultModel || "",
       startupThreadProviderEffort: startupThreadProviderEffort || "",
       startupThreadId: startupThreadId || "",
       startupThreadProviderModelSource,
@@ -6600,7 +5403,6 @@ function WorkspaceTerminal({
       pane_id: paneId,
       providerSessionOverridePresent: Boolean(providerSessionOverrideForThisStart),
       restartKey,
-      startupDefaultModel: startupDefaultModel || "",
       startupThreadProviderEffort: startupThreadProviderEffort || "",
       startupThreadId: startupThreadId || "",
       startupThreadProviderModel: startupThreadProviderModel || "",
@@ -6892,9 +5694,8 @@ function WorkspaceTerminal({
       fontSize: terminalFontSizeRef.current,
       lineHeight: 1.0,
       macOptionIsMeta: true,
-      // Codex keeps cwd/status text on the live cursor row; do not let narrow resizes reflow stale worktree cells.
-      // Plain shells are the opposite: the cursor row is the prompt/input line and only the shell's WINCH redraw
-      // repaints it, so it must reflow with the rest of the buffer or resizes leave a stale gap in the input line.
+      // Plain shells need the cursor row to reflow with the rest of the buffer
+      // so a WINCH redraw does not leave a stale gap in the input line.
       reflowCursorLine: isGenericTerminal,
       scrollSensitivity: 1,
       scrollOnEraseInDisplay: false,
@@ -6906,66 +5707,7 @@ function WorkspaceTerminal({
     xtermRef.current = terminal;
     const detachPushToTalkGuard = guardXtermDuringPushToTalk(terminal);
 
-    let providerSessionCaptureBuffer = "";
-    let providerSessionErrorBuffer = "";
-    let providerSessionCaptureMissesLogged = 0;
-    const startupCapturedProviderSessionId = terminalAgentKind === "opencode"
-      && startupThreadProviderSessionId
-      && !startupThreadProviderSessionId.startsWith("ses_")
-      ? ""
-      : startupThreadProviderSessionId || "";
-    let capturedProviderSessionId = startupCapturedProviderSessionId;
-    let invalidProviderSessionEmitted = false;
-    const emitInvalidProviderSession = (sessionId, message, source = "terminal-output") => {
-      const invalidSessionId = String(sessionId || "").trim();
-      if (
-        invalidProviderSessionEmitted
-        || isDisposed
-        || isGenericTerminal
-        || terminalAgentKind !== "codex"
-        || !invalidSessionId
-        || (startupThreadProviderSessionId && invalidSessionId !== startupThreadProviderSessionId)
-      ) {
-        return false;
-      }
-
-      invalidProviderSessionEmitted = true;
-      capturedProviderSessionId = "";
-      providerSessionCaptureBuffer = "";
-      const threadId = terminalThreadIdRef.current || startupThreadId || "";
-      const errorMessage = String(
-        message || `Codex saved session ${invalidSessionId} is not available locally.`,
-      );
-      logThreadBridgeDiagnostic("frontend.thread_provider_session.invalid_resume", {
-        agent_id: terminalAgentKind,
-        error: errorMessage,
-        instance_id: terminalInstanceId,
-        nativeSessionIdPresent: true,
-        pane_id: paneId,
-        source,
-        startupThreadProviderSessionPresent: Boolean(startupThreadProviderSessionId),
-        terminal_index: terminalIndex,
-        thread_id: threadId,
-        workspace_id: workspace?.id || "",
-      });
-      onThreadTerminalLifecycle?.({
-        agent_id: terminalAgentKind,
-        error: errorMessage,
-        instance_id: terminalInstanceId,
-        native_session_id: invalidSessionId,
-        native_session_kind: "session",
-        native_session_source: source,
-        pane_id: paneId,
-        provider_session_id: invalidSessionId,
-        session_id: invalidSessionId,
-        status: "error",
-        terminal_index: terminalIndex,
-        thread_id: threadId,
-        type: "provider-session-invalid",
-        workspace_id: workspace?.id || "",
-      });
-      return true;
-    };
+    const capturedProviderSessionId = startupThreadProviderSessionId || "";
     let codingAgentInputReadyEmitted = false;
     let codingAgentInputReadyEmissionKey = "";
     const emitCodingAgentInputReady = (source = "timer", options = {}) => {
@@ -11570,17 +10312,10 @@ function WorkspaceTerminal({
             forceFreshSessionForThisStart = true;
             preserveCoordinationForThisStart = false;
             startupThreadProviderSessionId = "";
-            startupThreadProviderModel = isGenericTerminal ? "" : startupDefaultModel;
-            startupThreadProviderModelSource = startupThreadProviderModel ? "settings-default" : "";
-            startupThreadProviderLaunch = startupThreadProviderModel
-              ? resolveAgentLaunchDefaultForModel(
-                terminalAgentKind,
-                agentLaunchDefaults,
-                startupThreadProviderModel,
-              )
-              : { effort: "", speed: "" };
-            startupThreadProviderEffort = startupThreadProviderLaunch.effort || "";
-            startupThreadProviderSpeed = startupThreadProviderLaunch.speed || "";
+            startupThreadProviderModel = "";
+            startupThreadProviderModelSource = "";
+            startupThreadProviderEffort = "";
+            startupThreadProviderSpeed = "";
             startupSlotKey = String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
             terminalThreadSlotKeyRef.current = startupSlotKey;
             setTerminalLaunchInfo(null);
@@ -11604,10 +10339,7 @@ function WorkspaceTerminal({
         const outputDisplayMasker = createCoreRepoNameDisplayMasker({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
         });
-        const outputSessionInspectionEnabled = !isGenericTerminal;
-        const outputTextDecoder = outputSessionInspectionEnabled
-          ? new TextDecoder("utf-8", { fatal: false })
-          : null;
+        const outputSessionInspectionEnabled = false;
         let terminalSubmittedInputHasText = false;
         let terminalSubmittedInputText = "";
         let terminalSubmittedComposerState = createTerminalComposerState();
@@ -11796,93 +10528,6 @@ function WorkspaceTerminal({
           const isFirstOutputChunk = !sawFirstOutput;
           outputChunks += sourceChunks;
           outputBytes += terminalData.byteLength;
-          const shouldInspectTerminalText = outputSessionInspectionEnabled && (
-            isFirstOutputChunk
-            || (!capturedProviderSessionId && terminalThreadIdRef.current && outputChunks <= 80)
-            || (
-              terminalAgentKind === "claude"
-              && startupThreadProviderSessionId
-              && outputChunks <= 80
-            )
-          );
-          const visibleTerminalText = shouldInspectTerminalText
-            ? String(payload.inspection_text || "")
-            : "";
-          if (visibleTerminalText) {
-            providerSessionErrorBuffer = `${providerSessionErrorBuffer}${visibleTerminalText}`.slice(-2000);
-            const missingSavedSessionId = extractCodexMissingSavedSessionId(providerSessionErrorBuffer);
-            if (missingSavedSessionId) {
-              emitInvalidProviderSession(
-                missingSavedSessionId,
-                providerSessionErrorBuffer,
-                "codex-resume-output",
-              );
-            }
-            if (!capturedProviderSessionId && terminalThreadIdRef.current) {
-              providerSessionCaptureBuffer = `${providerSessionCaptureBuffer}${visibleTerminalText}`.slice(-2400);
-              const nativeSessionId = extractNativeSessionIdFromOutput(
-                terminalAgentKind,
-                providerSessionCaptureBuffer,
-              );
-              if (nativeSessionId) {
-                capturedProviderSessionId = nativeSessionId;
-                logThreadBridgeDiagnostic("frontend.thread_provider_session.capture", {
-                  agent_id: terminalAgentKind,
-                  bufferLength: providerSessionCaptureBuffer.length,
-                  instance_id: terminalInstanceId,
-                  nativeSessionIdPresent: true,
-                  pane_id: paneId,
-                  terminal_index: terminalIndex,
-                  thread_id: terminalThreadIdRef.current || "",
-                  workspace_id: workspace?.id || "",
-                });
-                onThreadTerminalLifecycle?.({
-                  agent_id: terminalAgentKind,
-                  instance_id: terminalInstanceId,
-                  native_session_id: nativeSessionId,
-                  native_session_kind: "session",
-                  native_session_source: "terminal-output",
-                  pane_id: paneId,
-                  provider_session_id: nativeSessionId,
-                  terminal_index: terminalIndex,
-                  thread_id: terminalThreadIdRef.current,
-                  type: "provider-session",
-                  workspace_id: workspace?.id || "",
-                });
-                invoke("terminal_record_provider_session", {
-                  request: {
-                    pane_id: paneId,
-                    instance_id: terminalInstanceId,
-                    provider_session_id: nativeSessionId,
-                    source: "terminal-output",
-                  },
-                }).catch((error) => {
-                  logThreadBridgeDiagnostic("frontend.thread_provider_session.record_error", {
-                    agent_id: terminalAgentKind,
-                    instance_id: terminalInstanceId,
-                    message: error?.message || String(error || ""),
-                    pane_id: paneId,
-                    terminal_index: terminalIndex,
-                    thread_id: terminalThreadIdRef.current || "",
-                    workspace_id: workspace?.id || "",
-                  });
-                });
-              } else if (providerSessionCaptureMissesLogged < 8 && providerSessionCaptureBuffer.trim()) {
-                providerSessionCaptureMissesLogged += 1;
-                logThreadBridgeDiagnostic("frontend.thread_provider_session.capture_miss", {
-                  agent_id: terminalAgentKind,
-                  bufferLength: providerSessionCaptureBuffer.length,
-                  instance_id: terminalInstanceId,
-                  pane_id: paneId,
-                  preview: sanitizeTerminalDiagnosticText(providerSessionCaptureBuffer, 200),
-                  terminal_index: terminalIndex,
-                  thread_id: terminalThreadIdRef.current || "",
-                  workspace_id: workspace?.id || "",
-                });
-              }
-            }
-          }
-
           const estimatedVisibleChars = Number.isFinite(payload.visible_chars)
             ? payload.visible_chars
             : getTerminalOutputVisibleByteEstimate(terminalData, 1);
@@ -11999,19 +10644,7 @@ function WorkspaceTerminal({
           }
 
           const isFirstOutputChunk = !sawFirstOutput;
-          const shouldInspectTerminalText = outputSessionInspectionEnabled && (
-            isFirstOutputChunk
-            || (!capturedProviderSessionId && terminalThreadIdRef.current && outputChunks <= 80)
-            || (
-              terminalAgentKind === "claude"
-              && startupThreadProviderSessionId
-              && outputChunks <= 80
-            )
-          );
-          const inspectionText = shouldInspectTerminalText
-            ? stripLiveViewControlSequences(outputTextDecoder.decode(terminalData, { stream: true }))
-            : "";
-
+          const inspectionText = "";
           processPreparedTerminalOutput({
             chunk_started_at: chunkStartedAt,
             data: terminalData,
@@ -12173,68 +10806,12 @@ function WorkspaceTerminal({
             && !isDisposed
           ) {
             hasOpenPty = false;
-            // opencode's Bun runtime segfaults mid-session (bun.report panics),
-            // killing the PTY with a crash exit. Resume the same provider
-            // session instead of stranding the pane on the exited overlay.
-            // Only sessions that reached "running" qualify — a launch-time
-            // crash falls through to the overlay so resume failures can never
-            // loop — and a stable run must precede each budget refill.
-            const runningUptimeMs = terminalRunningSinceRef.current > 0
-              ? performance.now() - terminalRunningSinceRef.current
-              : 0;
-            if (runningUptimeMs > 120000) {
-              crashAutoRestartRef.current.attempts = 0;
-            }
-            const crashRestartSessionId = String(
-              capturedProviderSessionId || startupThreadProviderSessionId || "",
-            ).trim();
-            if (
-              terminalAgentKind === "opencode"
-              && event.payload.exit_code !== 0
-              && crashRestartSessionId
-              && runningUptimeMs > 0
-              && !terminalClosingRef.current
-              && crashAutoRestartRef.current.attempts < 3
-            ) {
-              crashAutoRestartRef.current.attempts += 1;
-              logThreadBridgeDiagnostic("frontend.terminal_crash_auto_restart", {
-                agent_id: terminalAgentKind,
-                attempt: crashAutoRestartRef.current.attempts,
-                exit_code: event.payload.exit_code ?? null,
-                instance_id: terminalInstanceId,
-                pane_id: paneId,
-                runningUptimeMs: Math.round(runningUptimeMs),
-                terminal_index: terminalIndex,
-                thread_id: terminalThreadIdRef.current || "",
-                workspace_id: workspace?.id || "",
-              });
-              setPaneStage(
-                "starting",
-                "Restarting Terminal",
-                "opencode crashed — resuming the session.",
-              );
-              reloadTerminalWithProviderSession({
-                agent_id: terminalAgentKind,
-                provider_session_id: crashRestartSessionId,
-                reason: "opencode_crash_auto_restart",
-                thread_id: terminalThreadIdRef.current || "",
-              });
-              return;
-            }
-            const claudeResumeExitMessage = getClaudeResumeExitMessage({
-              agentId: terminalAgentKind,
-              exitCode: event.payload.exit_code,
-              output: providerSessionErrorBuffer,
-              providerSessionId: startupThreadProviderSessionId,
-            });
             setPaneStage(
               "exited",
-              claudeResumeExitMessage ? "Claude Session Unavailable" : "Terminal Exited",
-              claudeResumeExitMessage || (
-                event.payload.exit_code == null
-                  ? "Process ended."
-                  : `Process exited with code ${event.payload.exit_code}.`
-              ),
+              "Terminal Exited",
+              event.payload.exit_code == null
+                ? "Process ended."
+                : `Process exited with code ${event.payload.exit_code}.`,
             );
             onThreadTerminalLifecycle?.({
               instance_id: terminalInstanceId,
@@ -12672,7 +11249,7 @@ function WorkspaceTerminal({
               pane_id: paneId,
               instance_id: terminalInstanceId,
               data,
-              app_fork_enabled: canRequestForkTerminalRef.current === true && hasOpenPty,
+              app_fork_enabled: false,
               prompt_event_id: promptEventId || undefined,
               prompt_event_revision: Number.isFinite(promptEventRevision) ? promptEventRevision : undefined,
               prompt_event_source: promptEventSource || undefined,
@@ -13028,30 +11605,6 @@ function WorkspaceTerminal({
             Number(activeBuffer?.viewportY || 0),
           );
         };
-        const getTerminalBufferOutputMark = () => {
-          const activeBuffer = terminal?.buffer?.active;
-          if (!activeBuffer) {
-            return 0;
-          }
-          return Math.max(0, Number(activeBuffer.length || 0));
-        };
-        const getTerminalBufferTextSince = (startLine, maxRows = 80) => {
-          const activeBuffer = terminal?.buffer?.active;
-          if (!activeBuffer) {
-            return "";
-          }
-          const lineCount = Number(activeBuffer.length || 0);
-          if (!lineCount) {
-            return "";
-          }
-          const safeStartLine = Math.max(0, Number(startLine) || 0);
-          if (safeStartLine >= lineCount) {
-            return "";
-          }
-          const rowLimit = Math.max(1, Math.min(160, Number(maxRows) || 80));
-          const firstLine = Math.max(safeStartLine, lineCount - rowLimit);
-          return getTerminalBufferText(activeBuffer, Math.max(1, lineCount - firstLine), firstLine);
-        };
         const getTerminalControlUiPromptSnapshot = () => {
           const tailText = getTerminalBufferTailText(12);
           const viewportText = getTerminalViewportText(12);
@@ -13063,309 +11616,6 @@ function WorkspaceTerminal({
             viewportText,
           };
         };
-        const waitForRemotePermissionConfigSettle = (delayMs = 150) => (
-          new Promise((resolve) => {
-            window.setTimeout(resolve, Math.max(0, Number(delayMs) || 0));
-          })
-        );
-        const remotePermissionConfigSnapshot = () => {
-          const rows = Math.max(12, Math.min(80, Number(terminal?.rows || 24) || 24));
-          return {
-            tailText: getTerminalBufferTailText(rows),
-            viewportText: getTerminalViewportText(rows),
-          };
-        };
-        const remotePermissionConfigText = () => {
-          const snapshot = remotePermissionConfigSnapshot();
-          return [snapshot.viewportText, snapshot.tailText].filter(Boolean).join("\n");
-        };
-        const remotePermissionConfigViewportText = () => (
-          remotePermissionConfigSnapshot().viewportText || ""
-        );
-        const remotePermissionConfigFreshTextSince = (startLine, maxRows = 80) => (
-          getTerminalBufferTextSince(startLine, maxRows)
-        );
-        const writeRemotePermissionConfigInput = async (data) => {
-          await invoke("terminal_write", {
-            data,
-            instance_id: terminalInstanceIdRef.current || terminalInstanceId || undefined,
-            pane_id: paneId,
-            prompt_event_source: REMOTE_PERMISSION_CONFIG_SOURCE,
-            thread_id: terminalThreadIdRef.current || startupThreadId || undefined,
-          });
-        };
-        const sendRemotePermissionConfigResult = (detail, result) => {
-          window.dispatchEvent(new CustomEvent(REMOTE_PERMISSION_CONFIG_RESULT_EVENT, {
-            detail: {
-              command_id: detail.command_id || "",
-              permission_mode: detail.permission_mode || "",
-              permission_request_id: detail.permission_request_id || "",
-              provider: detail.provider || terminalAgentKind,
-              targetPaneId: detail.targetPaneId || detail.pane_id || paneId,
-              ...result,
-            },
-          }));
-        };
-        const remotePermissionConfigRequestMatchesPane = (detail = {}) => {
-          const requestedPaneId = String(detail.targetPaneId || detail.pane_id || detail.terminal_id || "").trim();
-          if (requestedPaneId && requestedPaneId !== paneId) {
-            return false;
-          }
-          const requestedWorkspaceId = String(detail.workspace_id || "").trim();
-          if (requestedWorkspaceId && requestedWorkspaceId !== String(workspace?.id || "").trim()) {
-            return false;
-          }
-          const requestedThreadId = String(detail.target_thread_id || detail.thread_id || "").trim();
-          if (requestedThreadId && requestedThreadId !== String(terminalThreadIdRef.current || startupThreadId || "").trim()) {
-            return false;
-          }
-          const requestedInstanceId = Number.parseInt(detail.instance_id || detail.terminal_instance_id || 0, 10);
-          if (
-            Number.isInteger(requestedInstanceId)
-            && requestedInstanceId > 0
-            && requestedInstanceId !== Number(terminalInstanceIdRef.current || terminalInstanceId || 0)
-          ) {
-            return false;
-          }
-          const requestedTerminalIndex = Number.parseInt(detail.target_terminal_index ?? detail.terminal_index ?? "", 10);
-          return !Number.isInteger(requestedTerminalIndex) || requestedTerminalIndex === terminalIndex;
-        };
-        const waitForCodexPermissionPicker = async (permissionMode, outputMark) => {
-          const startedAt = Date.now();
-          let latestMatch = findCodexPermissionPickerTarget(
-            remotePermissionConfigFreshTextSince(outputMark, 80),
-            permissionMode,
-          );
-          while (!latestMatch.found && !latestMatch.ambiguous && Date.now() - startedAt < 2_000) {
-            await waitForRemotePermissionConfigSettle(120);
-            latestMatch = findCodexPermissionPickerTarget(
-              remotePermissionConfigFreshTextSince(outputMark, 80),
-              permissionMode,
-            );
-          }
-          return latestMatch;
-        };
-        const waitForCodexPermissionStatus = async (permissionMode) => {
-          const statusOutputMark = getTerminalBufferOutputMark();
-          await writeRemotePermissionConfigInput("\u0015/status\r");
-          const startedAt = Date.now();
-          let statusText = remotePermissionConfigFreshTextSince(statusOutputMark, 80);
-          let freshOutputObserved = Boolean(statusText.trim());
-          let latestState = codexPermissionPostSelectionState(statusText, permissionMode);
-          while (
-            (!freshOutputObserved || !latestState.matched)
-            && !latestState.errorRows.length
-            && Date.now() - startedAt < 2_000
-          ) {
-            await waitForRemotePermissionConfigSettle(160);
-            statusText = remotePermissionConfigFreshTextSince(statusOutputMark, 80);
-            freshOutputObserved = Boolean(statusText.trim());
-            latestState = codexPermissionPostSelectionState(statusText, permissionMode);
-          }
-          return {
-            ...latestState,
-            statusChanged: freshOutputObserved,
-          };
-        };
-        const applyCodexRemotePermissionConfig = async (permissionMode) => {
-          const targetMode = normalizePermissionModeForProvider("codex", permissionMode);
-          const pickerOutputMark = getTerminalBufferOutputMark();
-          await writeRemotePermissionConfigInput("\u0015/permissions\r");
-          const picker = await waitForCodexPermissionPicker(targetMode, pickerOutputMark);
-          if (!picker.found) {
-            await writeRemotePermissionConfigInput("\x1b");
-            throw new Error(
-              picker.rows.length
-                ? `Codex permission mode ${targetMode} was not visible. Saw: ${picker.rows.join(", ")}.`
-                : "Codex permission picker did not show available modes.",
-            );
-          }
-          if (picker.arrowDownCount > 0) {
-            await writeRemotePermissionConfigInput("\x1b[B".repeat(picker.arrowDownCount));
-            await waitForRemotePermissionConfigSettle(80);
-          }
-          await writeRemotePermissionConfigInput("\r");
-          await waitForRemotePermissionConfigSettle(260);
-          const postText = remotePermissionConfigViewportText();
-          if (codexPermissionPickerOpen(postText)) {
-            await writeRemotePermissionConfigInput("\x1b");
-            throw new Error(`Codex permission picker stayed open after selecting ${picker.label}.`);
-          }
-          const statusState = await waitForCodexPermissionStatus(targetMode);
-          if (statusState.errorRows.length) {
-            throw new Error(`Codex permission status reported an error after selecting ${picker.label}: ${statusState.errorRows.join(" ")}`);
-          }
-          if (!statusState.statusChanged) {
-            throw new Error(`Unable to confirm Codex permission mode ${targetMode}; /status output did not update.`);
-          }
-          if (!statusState.matched) {
-            throw new Error(
-              `Unable to confirm Codex permission mode ${targetMode}. Saw status: ${statusState.evidenceRows.join(" ") || "none"}.`,
-            );
-          }
-          return {
-            applied: true,
-            evidenceRows: statusState.evidenceRows,
-            labelsSeen: picker.rows,
-            message: `Permission mode changed to ${targetMode}.`,
-            permission_mode: targetMode,
-          };
-        };
-        const applyClaudeRemotePermissionConfig = async (permissionMode) => {
-          const targetMode = normalizePermissionModeForProvider("claude", permissionMode);
-          await writeRemotePermissionConfigInput("\u0015");
-          await waitForRemotePermissionConfigSettle(80);
-          let currentMode = claudePermissionModeFromText(remotePermissionConfigViewportText());
-          const originalMode = currentMode;
-          if (!originalMode) {
-            await writeRemotePermissionConfigInput("\x1b");
-            throw new Error("Unable to determine Claude's original permission mode; no mode keys were sent. Seen modes: none.");
-          }
-          if (currentMode === targetMode) {
-            return {
-              applied: true,
-              message: `Permission mode already ${targetMode}.`,
-              permission_mode: targetMode,
-              seenModes: [currentMode],
-            };
-          }
-          const maxCycleSteps = 8;
-          const cycleClaudePermissionMode = async () => {
-            await writeRemotePermissionConfigInput("\x1b[Z");
-            await waitForRemotePermissionConfigSettle(180);
-            currentMode = claudePermissionModeFromText(remotePermissionConfigViewportText());
-            return currentMode;
-          };
-          const cycleResult = await cyclePermissionModeWithBestEffortRestore({
-            cycleMode: cycleClaudePermissionMode,
-            maxCycleSteps,
-            originalMode,
-            target_mode: targetMode,
-          });
-          currentMode = cycleResult.currentMode;
-          if (cycleResult.applied) {
-            return {
-              applied: true,
-              message: `Permission mode changed to ${targetMode}.`,
-              permission_mode: targetMode,
-              seenModes: cycleResult.seenModes,
-            };
-          }
-          await writeRemotePermissionConfigInput("\x1b").catch(() => {});
-          const restartMessage = `Claude permission mode ${targetMode} requires restart with --permission-mode ${targetMode}.`;
-          const restoreError = cycleResult.restoreError
-            ? getErrorMessage(cycleResult.restoreError, "restore write failed")
-            : "";
-          const seenMessage = `Seen modes: ${cycleResult.seenModes.join(", ") || "none"}. Original mode: ${originalMode}. Current mode: ${currentMode || "unknown"}. Restore: ${cycleResult.restored ? "restored" : `failed${restoreError ? ` (${restoreError})` : ""}`}.`;
-          if (cycleResult.cycleError) {
-            throw new Error(`${getErrorMessage(cycleResult.cycleError, restartMessage)} ${seenMessage}`);
-          }
-          if (!claudePermissionTargetAvailableInCycle(targetMode, cycleResult.seenModes)) {
-            throw new Error(`${restartMessage} ${seenMessage}`);
-          }
-          throw new Error(`${restartMessage} ${seenMessage}`);
-        };
-        const applyOpenCodeRemotePermissionConfig = async (permissionMode) => {
-          const targetMode = normalizePermissionModeForProvider("opencode", permissionMode);
-          await writeRemotePermissionConfigInput("\u0015");
-          await waitForRemotePermissionConfigSettle(80);
-          let currentMode = opencodeAgentModeFromText(remotePermissionConfigViewportText());
-          const originalMode = currentMode;
-          if (!originalMode) {
-            await writeRemotePermissionConfigInput("\x1b");
-            throw new Error("Unable to determine OpenCode's original agent mode; no mode keys were sent. Seen agents: none.");
-          }
-          if (currentMode === targetMode) {
-            return {
-              applied: true,
-              message: `Permission mode already ${targetMode}.`,
-              permission_mode: targetMode,
-              seenModes: [currentMode],
-            };
-          }
-          const maxCycleSteps = 8;
-          const cycleOpenCodeAgentMode = async () => {
-            await writeRemotePermissionConfigInput("\t");
-            await waitForRemotePermissionConfigSettle(180);
-            currentMode = opencodeAgentModeFromText(remotePermissionConfigViewportText());
-            return currentMode;
-          };
-          const cycleResult = await cyclePermissionModeWithBestEffortRestore({
-            cycleMode: cycleOpenCodeAgentMode,
-            maxCycleSteps,
-            originalMode,
-            target_mode: targetMode,
-          });
-          currentMode = cycleResult.currentMode;
-          if (cycleResult.applied) {
-            return {
-              applied: true,
-              message: `Permission mode changed to ${targetMode}.`,
-              permission_mode: targetMode,
-              seenModes: cycleResult.seenModes,
-            };
-          }
-          await writeRemotePermissionConfigInput("\x1b").catch(() => {});
-          const restoreError = cycleResult.restoreError
-            ? getErrorMessage(cycleResult.restoreError, "restore write failed")
-            : "";
-          const seenMessage = `Seen agents: ${cycleResult.seenModes.join(", ") || "none"}. Original agent: ${originalMode}. Current agent: ${currentMode || "unknown"}. Restore: ${cycleResult.restored ? "restored" : `failed${restoreError ? ` (${restoreError})` : ""}`}.`;
-          if (cycleResult.cycleError) {
-            throw new Error(`${getErrorMessage(cycleResult.cycleError, `OpenCode agent ${targetMode} cycle failed.`)} ${seenMessage}`);
-          }
-          throw new Error(`OpenCode agent ${targetMode} was not reachable by Tab cycle. ${seenMessage}`);
-        };
-        const applyRemotePermissionConfig = async (detail = {}) => {
-          const provider = normalizePermissionModeForProvider("opencode", detail.provider || terminalAgentKind) === "opencode"
-            ? "opencode"
-            : getTerminalAgentKind(detail.provider || terminalAgentKind);
-          const permissionMode = normalizePermissionModeForProvider(provider, detail.permission_mode);
-          if (!permissionMode) {
-            throw new Error("Remote permission configuration did not include a supported permission_mode.");
-          }
-          if (provider === "codex") {
-            return applyCodexRemotePermissionConfig(permissionMode);
-          }
-          if (provider === "claude") {
-            return applyClaudeRemotePermissionConfig(permissionMode);
-          }
-          if (provider === "opencode") {
-            return applyOpenCodeRemotePermissionConfig(permissionMode);
-          }
-          throw new Error("Remote permission configuration requires provider codex, claude, or opencode.");
-        };
-        const handleRemotePermissionConfigRequest = (event) => {
-          const detail = event?.detail && typeof event.detail === "object" ? event.detail : {};
-          if (!remotePermissionConfigRequestMatchesPane(detail)) {
-            return;
-          }
-          void (async () => {
-            try {
-              const result = await applyRemotePermissionConfig(detail);
-              sendRemotePermissionConfigResult(detail, {
-                ok: true,
-                status: "applied",
-                ...result,
-              });
-            } catch (error) {
-              sendRemotePermissionConfigResult(detail, {
-                error: getErrorMessage(error, "Unable to apply permission mode."),
-                ok: false,
-                status: "failed",
-              });
-            }
-          })();
-        };
-        window.addEventListener(
-          REMOTE_PERMISSION_CONFIG_REQUEST_EVENT,
-          handleRemotePermissionConfigRequest,
-        );
-        disposables.push(() => {
-          window.removeEventListener(
-            REMOTE_PERMISSION_CONFIG_REQUEST_EVENT,
-            handleRemotePermissionConfigRequest,
-          );
-        });
         const getTerminalDomInputSnapshot = () => {
           const textarea = container?.querySelector?.("textarea");
           const activeElement = typeof document !== "undefined" ? document.activeElement : null;
@@ -14033,30 +12283,12 @@ function WorkspaceTerminal({
               syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
             }
             const promptTextAtSubmit = submitPromptResolution.prompt_text;
-            const submittedTerminalCommand = String(promptTextAtSubmit || "").trim().toLowerCase();
             const isControlHistoryPrompt = isTerminalControlHistoryPrompt(promptTextAtSubmit);
-            const isAppForkCommandSubmit = Boolean(
-              terminalSubmittedInputHasText
-              && submittedTerminalCommand === "fork"
-              && !isGenericTerminal
-              && canRequestForkTerminalRef.current,
-            );
             const shouldSuppressSubmitLifecycle = Boolean(
               isControlHistoryPrompt
               || isControlViewportPrompt
               || isControlSuppressedScreenSubmit
-              || isAppForkCommandSubmit
             );
-            if (isAppForkCommandSubmit) {
-              logBigViewSyncDiagnosticEvent("tui.text.fork_command_defer_to_backend", {
-                agent_id: terminalAgentKind,
-                instance_id: terminalInstanceId,
-                pane_id: paneId,
-                terminal_index: terminalIndex,
-                thread_id: terminalThreadIdRef.current || "",
-                workspace_id: workspace?.id || "",
-              });
-            }
             if (
               terminalSubmittedInputHasText
               && promptTextAtSubmit
@@ -14148,9 +12380,7 @@ function WorkspaceTerminal({
                 instance_id: terminalInstanceId,
                 pane_id: paneId,
                 promptResolutionSource: submitPromptResolution.source,
-                reason: isAppForkCommandSubmit
-                  ? "app_fork_command"
-                  : isControlViewportPrompt
+                reason: isControlViewportPrompt
                   ? "control_viewport_prompt"
                   : isControlSuppressedScreenSubmit
                     ? "control_ui_suppressed_screen_reconciled"
@@ -14283,7 +12513,6 @@ function WorkspaceTerminal({
               });
               const writePromise = writeBufferedTerminalInput(submitData, "submit", promptMetadata);
               let submittedWaiter = null;
-              let codexConfirmedStartDispatched = false;
               Promise.resolve(bridge.submittedWaiterReady)
                 .then((resolvedSubmittedWaiter) => {
                   submittedWaiter = resolvedSubmittedWaiter;
@@ -14336,59 +12565,6 @@ function WorkspaceTerminal({
                         thread_id: bridge.thread_id,
                         workspace_id: bridge.workspace_id,
                       });
-                      if (terminalUsesActivityHooks && terminalAgentKind === "codex") {
-                        const providerTurnStartProjectionEvents = buildProviderTurnStartProjectionEvents({
-                          agent_id: terminalAgentKind,
-                          includeUserMessage: false,
-                          source: "terminal-confirmed",
-                          started_at: bridge.started_at,
-                          text: bridge.prompt_event_text,
-                          turn_id: bridge.turn_id,
-                          userMessageId: bridge.prompt_event_id,
-                        });
-                        codexConfirmedStartDispatched = true;
-                        onThreadTerminalLifecycle?.({
-                          activity_status: "thinking",
-                          agent_id: terminalAgentKind,
-                          instance_id: terminalInstanceId,
-                          pane_id: paneId,
-                          status: "active",
-                          terminal_index: terminalIndex,
-                          thread_id: bridge.thread_id,
-                          type: "agent-output",
-                          workspace_id: bridge.workspace_id,
-                        });
-                        onThreadTerminalLifecycle?.({
-                          agent_id: terminalAgentKind,
-                          clear_pending_prompt: false,
-                          instance_id: terminalInstanceId,
-                          native_session_id: "",
-                          native_session_kind: "",
-                          native_session_source: "",
-                          pane_id: paneId,
-                          pending_prompt_id: bridge.prompt_event_id,
-                          projection_events: providerTurnStartProjectionEvents,
-                          provider_session_id: "",
-                          repo_path: workingDirectory || "",
-                          status: "active",
-                          terminal_index: terminalIndex,
-                          thread_id: bridge.thread_id,
-                          type: "provider-turn-started",
-                          workspace_id: bridge.workspace_id,
-                          workspace_name: workspace?.name || "",
-                        });
-                        logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_codex_start", {
-                          agent_id: terminalAgentKind,
-                          instance_id: terminalInstanceId,
-                          pane_id: paneId,
-                          prompt_event_id: bridge.prompt_event_id,
-                          prompt_source: submittedPayload?.prompt_source || "",
-                          reason: "terminal_submit_observed",
-                          terminal_index: terminalIndex,
-                          thread_id: bridge.thread_id,
-                          workspace_id: bridge.workspace_id,
-                        });
-                      }
                       return bridge.acceptedWaiter.promise.catch((acceptanceError) => {
                         logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_acceptance_missed", {
                           agent_id: terminalAgentKind,
@@ -14416,27 +12592,7 @@ function WorkspaceTerminal({
                         thread_id: bridge.thread_id,
                         workspace_id: bridge.workspace_id,
                       });
-                      if (codexConfirmedStartDispatched) {
-                        if (acceptedProviderSessionId) {
-                          onThreadTerminalLifecycle?.({
-                            agent_id: terminalAgentKind,
-                            instance_id: terminalInstanceId,
-                            native_session_id: acceptedProviderSessionId,
-                            native_session_kind: "session",
-                            native_session_source: "terminal-confirmed:session-accepted",
-                            pane_id: paneId,
-                            pending_prompt_id: bridge.prompt_event_id,
-                            provider_session_id: acceptedProviderSessionId,
-                            repo_path: workingDirectory || "",
-                            status: "active",
-                            terminal_index: terminalIndex,
-                            thread_id: bridge.thread_id,
-                            type: "provider-session",
-                            workspace_id: bridge.workspace_id,
-                            workspace_name: workspace?.name || "",
-                          });
-                        }
-                      } else if (terminalUsesActivityHooks) {
+                      if (terminalUsesActivityHooks) {
                         logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_hook_managed_start_deferred", {
                           acceptedMatchedBy: acceptedDetail?.matched_by || "",
                           agent_id: terminalAgentKind,
@@ -15266,110 +13422,6 @@ function WorkspaceTerminal({
 
         focusTerminalKeyboardInput();
 
-        const shouldWriteStartupModelRestore = false;
-        if (
-          startupThreadProviderModel
-          && startupThreadProviderSessionId
-          && !isGenericTerminal
-          && !shouldPrewarmShell
-          && shouldWriteStartupModelRestore
-        ) {
-          const restoreModelCommand = `/model ${startupThreadProviderModel}`;
-          logBigViewSyncDiagnosticEvent("bigview.model_restore.terminal_write_scheduled", {
-            agent_id: terminalAgentKind,
-            commandLength: restoreModelCommand.length,
-            delay_ms: 650,
-            instance_id: terminalInstanceId,
-            model: startupThreadProviderModel,
-            pane_id: paneId,
-            providerSessionIdPresent: Boolean(startupThreadProviderSessionId),
-            startupThreadId: startupThreadId || "",
-            terminal_index: terminalIndex,
-            workspace_id: workspace?.id || "",
-          });
-          window.setTimeout(() => {
-            if (isDisposed) {
-              logBigViewSyncDiagnosticEvent("bigview.model_restore.terminal_write_skip", {
-                agent_id: terminalAgentKind,
-                instance_id: terminalInstanceId,
-                model: startupThreadProviderModel,
-                pane_id: paneId,
-                reason: "disposed",
-                startupThreadId: startupThreadId || "",
-                terminal_index: terminalIndex,
-                workspace_id: workspace?.id || "",
-              });
-              return;
-            }
-
-            logBigViewSyncDiagnosticEvent("bigview.model_restore.terminal_write_start", {
-              agent_id: terminalAgentKind,
-              commandLength: restoreModelCommand.length,
-              instance_id: terminalInstanceId,
-              model: startupThreadProviderModel,
-              pane_id: paneId,
-              startupThreadId: startupThreadId || "",
-              terminal_index: terminalIndex,
-              workspace_id: workspace?.id || "",
-            });
-            dispatchTerminalControlUiSuppression({
-              agent_id: terminalAgentKind,
-              instance_id: terminalInstanceId,
-              model: startupThreadProviderModel,
-              pane_id: paneId,
-              reason: "startup-model-restore",
-              terminal_index: terminalIndex,
-              thread_id: startupThreadId || "",
-              workspace_id: workspace?.id || "",
-            });
-            invoke("terminal_write", {
-              data: buildTerminalSubmittedInput(restoreModelCommand, terminalAgentKind, isGenericTerminal),
-              instance_id: terminalInstanceId,
-              pane_id: paneId,
-              prompt_event_source: "startup-model-restore",
-              thread_id: startupThreadId || "",
-            }).then(() => {
-              logBigViewSyncDiagnosticEvent("bigview.model_restore.terminal_write_done", {
-                agent_id: terminalAgentKind,
-                instance_id: terminalInstanceId,
-                model: startupThreadProviderModel,
-                pane_id: paneId,
-                startupThreadId: startupThreadId || "",
-                terminal_index: terminalIndex,
-                workspace_id: workspace?.id || "",
-              });
-            }).catch((error) => {
-              logBigViewSyncDiagnosticEvent("bigview.model_restore.terminal_write_error", {
-                agent_id: terminalAgentKind,
-                instance_id: terminalInstanceId,
-                message: error?.message || String(error || ""),
-                model: startupThreadProviderModel,
-                pane_id: paneId,
-                startupThreadId: startupThreadId || "",
-                terminal_index: terminalIndex,
-                workspace_id: workspace?.id || "",
-              });
-            });
-          }, 650);
-        } else {
-          logBigViewSyncDiagnosticEvent("bigview.model_restore.terminal_write_skip", {
-            agent_id: terminalAgentKind,
-            hasModel: Boolean(startupThreadProviderModel),
-            hasProviderSession: Boolean(startupThreadProviderSessionId),
-            isGenericTerminal,
-            pane_id: paneId,
-            reason: !startupThreadProviderModel
-              ? "missing_model"
-              : !startupThreadProviderSessionId
-                ? "missing_provider_session"
-                : isGenericTerminal
-                  ? "generic_terminal"
-                  : shouldPrewarmShell
-                    ? "prewarm_shell"
-                    : "startup_model_restore_disabled",
-            shouldPrewarmShell,
-            startupThreadId: startupThreadId || "",
-            terminal_index: terminalIndex,
             workspace_id: workspace?.id || "",
           });
         }
@@ -15397,14 +13449,6 @@ function WorkspaceTerminal({
         }
         if (!isDisposed) {
           const errorMessage = getErrorMessage(error, `Unable to launch ${agent.label}.`);
-          const missingSavedSessionId = extractCodexMissingSavedSessionId(errorMessage);
-          if (missingSavedSessionId) {
-            emitInvalidProviderSession(
-              missingSavedSessionId,
-              errorMessage,
-              "terminal-open-error",
-            );
-          }
           setPaneStage("error", "Terminal Launch Failed", errorMessage);
           setTerminalError(errorMessage);
           onThreadTerminalLifecycle?.({
@@ -15515,6 +13559,7 @@ function WorkspaceTerminal({
   }, [
     appControlTerminalSurface,
     paneId,
+    persistedHarnessUnavailable,
     restartKey,
     terminalClosed,
     terminalIndex,
@@ -15840,7 +13885,6 @@ function WorkspaceTerminal({
           const submitSequences = getPendingPromptSubmitAttemptSequences(
             terminalAgentKind,
             isGenericTerminal,
-            { preferCarriageReturn: appControlTerminalSurface },
           );
           let activeSubmitWaiter = null;
           let directTodoCaptureSettled = false;
@@ -16063,47 +14107,6 @@ function WorkspaceTerminal({
                   acceptedDetailFromRace = submitOutcome.detail;
                 } else if (submitOutcome.kind === "submitted") {
                   observedSubmit = true;
-                  const hasFallback = attemptIndex < submitSequences.length - 1;
-                  if (
-                    hasFallback
-                    && getTerminalAgentKind(terminalAgentKind) === "codex"
-                    && submitSequence !== "\r"
-                  ) {
-                    const acceptedAfterObservedSubmit = await Promise.race([
-                      acceptedPromise,
-                      waitForPendingPromptSubmitSettle(PENDING_PROMPT_SUBMIT_OBSERVED_ACCEPT_GRACE_MS)
-                        .then(() => ({ kind: "pending" })),
-                    ]);
-                    if (acceptedAfterObservedSubmit.kind === "accepted") {
-                      acceptedDetailFromRace = acceptedAfterObservedSubmit.detail;
-                    } else {
-                      const latestDraft = String(threadComposerDraftsRef.current.get(pendingSyncKey) || "").trim();
-                      if (latestDraft === promptText) {
-                        observedSubmit = false;
-                        observedSubmitRetried = true;
-                        logTerminalStatus("frontend.pending_prompt.submit_observed_retry", {
-                          ...pendingPromptLogFields,
-                          attempt: attemptIndex + 1,
-                          instance_id: currentInstanceId,
-                          reason: "codex_primary_submit_observed_without_acceptance",
-                          thread_id: currentThreadId,
-                        });
-                        logThreadBridgeDiagnostic("frontend.pending_prompt.submit_observed_retry", {
-                          agent_id: terminalAgentKind,
-                          attempt: attemptIndex + 1,
-                          delivery_mode: effectiveDeliveryMode,
-                          instance_id: currentInstanceId,
-                          pane_id: paneId,
-                          prompt_id: promptId,
-                          reason: "codex_primary_submit_observed_without_acceptance",
-                          terminal_index: terminalIndex,
-                          thread_id: currentThreadId,
-                          workspace_id: workspace?.id || thread?.workspace_id || "",
-                        });
-                        continue;
-                      }
-                    }
-                  }
                 }
                 break;
               } catch (submitError) {
@@ -16256,9 +14259,7 @@ function WorkspaceTerminal({
               allowEnterRetry: !observedSubmitRetried,
               logPrefix: "frontend.pending_prompt",
               prompt_id: promptId,
-              submitSequence: getTerminalAgentKind(terminalAgentKind) === "codex"
-                ? submitSequences[submitSequences.length - 1] || getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal)
-                : submitSequences[0] || getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal),
+              submitSequence: submitSequences[0] || getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal),
               thread_id: currentThreadId,
               workspace_id: workspace?.id || thread?.workspace_id || "",
             });
@@ -16366,7 +14367,7 @@ function WorkspaceTerminal({
               thread_id: currentThreadId,
             });
           }
-          if (useTerminalConfirmedDelivery && terminalUsesActivityHooks && terminalAgentKind !== "codex") {
+          if (useTerminalConfirmedDelivery && terminalUsesActivityHooks) {
             logThreadBridgeDiagnostic("frontend.pending_prompt.hook_managed_start_deferred", {
               agent_id: terminalAgentKind,
               delivery_mode: effectiveDeliveryMode,
@@ -17640,23 +15641,6 @@ function WorkspaceTerminal({
     && (terminalHorizontalSplitAllowed || terminalVerticalSplitAllowed);
   const canSplitTerminalHorizontally = canSplitTerminal && terminalHorizontalSplitAllowed;
   const canSplitTerminalVertically = canSplitTerminal && terminalVerticalSplitAllowed;
-  const forkSourceProviderSessionId = String(threadProviderSessionId || "").trim();
-  const canRequestForkTerminal = !threadsViewActive
-    && !isGenericTerminal
-    && !terminalClosed
-    && !terminalClosing
-    && typeof onForkTerminal === "function"
-    && terminalCount < normalizedTerminalSplitLimit;
-  const canForkTerminal = canRequestForkTerminal && terminalState === "running";
-  const forkTerminalTitle = isGenericTerminal
-    ? "Shell terminals do not have provider sessions to fork"
-    : threadsViewActive
-      ? "Exit threads view to fork"
-      : terminalCount >= normalizedTerminalSplitLimit
-        ? "Terminal limit reached"
-        : terminalState === "running"
-          ? "Fork this session"
-          : "Terminal must be running to fork";
   const canOpenTerminalUiView = !threadsViewActive
     && !terminalClosed
     && !terminalClosing
@@ -17794,225 +15778,6 @@ function WorkspaceTerminal({
 	    terminalClosing,
 	    terminalIndex,
 	  ]);
-	  const forkTerminalHere = useCallback((providerSessionIdOverride = "") => {
-    const sourceProviderSessionId = String(
-      providerSessionIdOverride || forkSourceProviderSessionId || "",
-    ).trim();
-    if (!canRequestForkTerminal || !sourceProviderSessionId) {
-      return;
-    }
-
-    const currentThreadId = terminalThreadIdRef.current || thread?.id || "";
-    const result = onForkTerminal?.({
-      agent_id: terminalAgentKind,
-      fork_from_provider_session_id: sourceProviderSessionId,
-      model: threadProviderModel,
-      pane_id: paneId,
-      provider_session_id: sourceProviderSessionId,
-      role: terminalAgentKind,
-      session_title: thread?.session_name || thread?.title || "Original session",
-      source: "terminal_fork_original",
-      sourceWindowBreakoutHosted: windowBreakoutHosted,
-      terminal_index: terminalIndex,
-      thread_id: currentThreadId,
-      workspace_id: workspace?.id || "",
-    });
-
-    if (!result) {
-      return;
-    }
-
-    setRestartRoleMenuOpen(false);
-    setTerminalClosed(false);
-    setTerminalClosing(false);
-    terminalClosingRef.current = false;
-    preserveCoordinationOnNextCleanupRef.current = false;
-    preserveCoordinationOnNextOpenRef.current = false;
-    forceFreshSessionOnNextOpenRef.current = false;
-    providerSessionOverrideOnNextOpenRef.current = "";
-    forkFromProviderSessionOnNextOpenRef.current = sourceProviderSessionId;
-    resetTerminalReadinessForEpoch({
-      activity_status: "idle",
-      agent_id: terminalAgentKind,
-      instance_id: 0,
-      reason: "terminal_fork_here",
-      thread_id: currentThreadId,
-    });
-    onThreadTerminalLifecycle?.({
-      activity_status: "idle",
-      agent_id: terminalAgentKind,
-      command_phase: "starting",
-      fork_from_provider_session_id: sourceProviderSessionId,
-      input_ready: false,
-      instance_id: terminalInstanceIdRef.current || undefined,
-      native_session_id: "",
-      native_session_id_cleared: true,
-      native_session_kind: "",
-      native_session_source: "",
-      pane_id: paneId,
-      provider_session_id: "",
-      provider_session_id_cleared: true,
-      status: "starting",
-      status_truth: "running",
-      terminal_index: terminalIndex,
-      terminal_work_state: "running",
-      thread_id: currentThreadId,
-      type: "opened",
-      workspace_id: workspace?.id || "",
-    });
-    logThreadBridgeDiagnostic("frontend.terminal_fork_here", {
-      agent_id: terminalAgentKind,
-      pane_id: paneId,
-      providerSessionPresent: true,
-      sourceWindowBreakoutHosted: windowBreakoutHosted,
-      terminal_index: terminalIndex,
-      thread_id: currentThreadId,
-      workspace_id: workspace?.id || "",
-    });
-    setTerminalState("starting");
-    setTerminalError("");
-    setTerminalLaunchInfo(null);
-    setParkedPrompt(null);
-    parkedPromptRef.current = null;
-    setTerminalStatus({
-      detail: "Starting a fork from the current provider session.",
-      title: "Forking Session",
-      visible: true,
-    });
-    setRestartKey((key) => key + 1);
-  }, [
-    canRequestForkTerminal,
-    forkSourceProviderSessionId,
-    onForkTerminal,
-    onThreadTerminalLifecycle,
-    paneId,
-    terminalAgentKind,
-    terminalIndex,
-    thread?.id,
-    thread?.session_name,
-    thread?.title,
-    threadProviderModel,
-    windowBreakoutHosted,
-    workspace?.id,
-  ]);
-  const requestForkTerminal = useCallback(() => {
-    if (!canForkTerminal) {
-      return;
-    }
-
-    const currentInstanceId = terminalInstanceIdRef.current || 0;
-    invoke("terminal_request_fork", {
-      pane_id: paneId,
-      instance_id: currentInstanceId || undefined,
-    })
-      .then(() => {
-        logBigViewSyncDiagnosticEvent("tui.text.fork_button_backend_requested", {
-          agent_id: terminalAgentKind,
-          instance_id: currentInstanceId,
-          pane_id: paneId,
-          terminal_index: terminalIndex,
-          thread_id: terminalThreadIdRef.current || "",
-          workspace_id: workspace?.id || "",
-        });
-      })
-      .catch((error) => {
-        setTerminalError(getErrorMessage(error, "Unable to fork this session right now."));
-        logBigViewSyncDiagnosticEvent("tui.text.fork_button_backend_error", {
-          agent_id: terminalAgentKind,
-          instance_id: currentInstanceId,
-          message: error?.message || String(error || ""),
-          pane_id: paneId,
-          terminal_index: terminalIndex,
-          thread_id: terminalThreadIdRef.current || "",
-          workspace_id: workspace?.id || "",
-        });
-      });
-  }, [
-    canForkTerminal,
-    paneId,
-    terminalAgentKind,
-    terminalIndex,
-    workspace?.id,
-  ]);
-  useEffect(() => {
-    canRequestForkTerminalRef.current = canRequestForkTerminal;
-    forkTerminalActionRef.current = forkTerminalHere;
-  }, [
-    canRequestForkTerminal,
-    forkTerminalHere,
-  ]);
-  useEffect(() => {
-    if (!paneId) {
-      return undefined;
-    }
-
-    let disposed = false;
-    let unlisten = () => {};
-    listen(TERMINAL_FORK_REQUESTED_EVENT, (event) => {
-      if (disposed) {
-        return;
-      }
-
-      const payload = event.payload || {};
-      if (String(payload.pane_id || "") !== paneId) {
-        return;
-      }
-
-      const eventInstanceId = Number(payload.instance_id || 0);
-      const currentInstanceId = Number(terminalInstanceIdRef.current || 0);
-      if (eventInstanceId && currentInstanceId && eventInstanceId !== currentInstanceId) {
-        return;
-      }
-
-      const providerSessionId = String(payload.provider_session_id || "").trim();
-      if (
-        !canRequestForkTerminalRef.current
-        || !providerSessionId
-        || typeof forkTerminalActionRef.current !== "function"
-      ) {
-        setTerminalError("Unable to fork this session right now.");
-        logBigViewSyncDiagnosticEvent("tui.text.fork_command_backend_unavailable", {
-          agent_id: terminalAgentKind,
-          instance_id: currentInstanceId,
-          pane_id: paneId,
-          providerSessionPresent: Boolean(providerSessionId),
-          terminal_index: terminalIndex,
-          thread_id: terminalThreadIdRef.current || "",
-          workspace_id: workspace?.id || "",
-        });
-        return;
-      }
-
-      logBigViewSyncDiagnosticEvent("tui.text.fork_command_backend_event", {
-        agent_id: terminalAgentKind,
-        instance_id: currentInstanceId,
-        pane_id: paneId,
-        providerSessionPresent: Boolean(payload.provider_session_id),
-        terminal_index: terminalIndex,
-        thread_id: terminalThreadIdRef.current || "",
-        workspace_id: workspace?.id || "",
-      });
-      forkTerminalActionRef.current(providerSessionId);
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
-
-    return () => {
-      disposed = true;
-      unlisten();
-    };
-  }, [
-    paneId,
-    terminalAgentKind,
-    terminalIndex,
-    workspace?.id,
-  ]);
   const toggleTerminalFullscreen = useCallback(() => {
     if (terminalClosed || terminalClosing) {
       return;
@@ -18088,7 +15853,7 @@ function WorkspaceTerminal({
       agent_kind: terminalAgentKind,
       agent_label: terminalRailAgentLabel,
       agentTitle: terminalRailAgentTitle,
-      canFork: canForkTerminal,
+      canFork: false,
       canOpenUiView: canOpenTerminalUiView,
       canSplit: canSplitTerminal,
       color_slot: getTerminalAgentColorSlot(terminalIndex),
@@ -18155,9 +15920,6 @@ function WorkspaceTerminal({
         case TERMINAL_WINDOW_CONTROL_FONT_SIZE:
           setTerminalFontSizeFromWindow(event.payload?.font_size);
           break;
-        case TERMINAL_WINDOW_CONTROL_FORK:
-          requestForkTerminal();
-          break;
         case TERMINAL_WINDOW_CONTROL_RESTART_AS:
           restartTerminalAs(String(event.payload?.role_id || "") || undefined);
           break;
@@ -18195,7 +15957,6 @@ function WorkspaceTerminal({
   }, [
     closeTerminal,
     paneId,
-    requestForkTerminal,
     restartTerminalAs,
     setTerminalFontSizeFromWindow,
     splitTerminalHorizontal,
@@ -18205,26 +15966,28 @@ function WorkspaceTerminal({
     windowBreakoutHosted,
   ]);
 
-  if (!agent) {
+  if (!agent || persistedHarnessUnavailable) {
     return (
       <TerminalWorkspaceSurface>
         <TerminalEmptyPanel>
           <TerminalEmptyCopy>
             <PanelKicker>Terminal readiness</PanelKicker>
-            <PanelHeading>Install and connect Codex, Claude Code, or OpenCode</PanelHeading>
+            <PanelHeading>
+              {persistedHarnessUnavailable
+                ? `${harnessPresentation.label} is unavailable`
+                : "Connect Haider to open an agent terminal"}
+            </PanelHeading>
             <PageSubline>
-              The workspace opens a live local PTY only after a provider CLI is installed and authenticated.
+              {persistedHarnessUnavailable
+                ? harnessPresentation.reason
+                : "The ordinary shell remains available; Haider readiness comes from its daemon."}
             </PageSubline>
           </TerminalEmptyCopy>
           <TerminalAgentList>
             {getAgentStatusSummary(agentStatuses).map((status) => (
               <TerminalAgentRow data-tone={getAgentTone(status)} key={status.id}>
                 <AgentIcon data-tone={getAgentTone(status)}>
-                  {status.id === "codex" || status.id === "opencode" ? (
-                    <ButtonCodeIcon aria-hidden="true" />
-                  ) : (
-                    <ButtonBotIcon aria-hidden="true" />
-                  )}
+                  <ButtonBotIcon aria-hidden="true" />
                 </AgentIcon>
                 <div>
                   <strong>{status.label}</strong>
@@ -18420,7 +16183,6 @@ function WorkspaceTerminal({
                   )}
                 </TerminalRemotePresenceGroup>
               )}
-              <TerminalAccountStaleChip agent_kind={terminalAgentKind} pane_id={paneId} />
             </>
           )}
         </TerminalRailIdentity>
@@ -18516,15 +16278,6 @@ function WorkspaceTerminal({
             type="button"
           >
             <ButtonFontPlusIcon aria-hidden="true" />
-          </TerminalRestartButton>
-          <TerminalRestartButton
-            aria-label="Fork terminal session"
-            disabled={!canForkTerminal}
-            onClick={requestForkTerminal}
-            title={forkTerminalTitle}
-            type="button"
-          >
-            <ButtonForgeIcon aria-hidden="true" />
           </TerminalRestartButton>
           {(!terminalChromeDocked || terminalSplitModeId !== "both") && (
             <>
@@ -18639,7 +16392,6 @@ function WorkspaceTerminal({
         ) : (
           <>
             {xtermSurface}
-            <TerminalSubagentOverlay agent_kind={terminalAgentKind} pane_id={paneId} />
             {shellLauncherUiViewShouldRender && (
               <TerminalInlineUiView
                 aria-hidden={terminalUiViewActive ? undefined : "true"}
@@ -18877,7 +16629,6 @@ function WorkspaceTerminal({
                   density="compact"
                   onCreateChat={createWorkspaceThreadChat}
                   onDraftInput={syncWorkspaceThreadComposerInput}
-                  onSelectModel={changeWorkspaceThreadModel}
                   onSubmitMessage={submitWorkspaceThreadMessage}
                   thread={thread}
                   todoDropActive={todoDropActive}
@@ -19045,7 +16796,6 @@ function WorkspaceTerminal({
               onCreateChat={createWorkspaceThreadChat}
               onArchiveThread={onArchiveWorkspaceThread}
               onDraftInput={syncWorkspaceThreadComposerInput}
-              onSelectModel={changeWorkspaceThreadModel}
               onSelectThread={onSelectWorkspaceThread}
               onSubmitMessage={submitWorkspaceThreadMessage}
               onTogglePinnedThread={onToggleWorkspaceThreadPinned}

@@ -2419,8 +2419,7 @@ function ToolsWorkspaceView({
     setCliState((current) => (current === "ready" ? "refreshing" : "loading"));
     setCliError("");
     try {
-      const statuses = await invoke("agent_statuses");
-      const list = Array.isArray(statuses) ? statuses : [];
+      const list = [];
       setCliStatuses(list);
       setCliState("ready");
       let checks = {};
@@ -3319,32 +3318,6 @@ function ToolsWorkspaceView({
     return ok;
   }, [invalidateDocumentDraftPersist, persistSkillsLibrary, saveSkillsLibraryLocal, selectedSkill, skillEditor, skillsLibrary.skills]);
 
-  const runCliAction = useCallback(async (provider, action) => {
-    const key = `${provider}:${action}`;
-    setCliBusy((current) => ({ ...current, [provider]: action }));
-    setCliMessage("");
-    setCliError("");
-    try {
-      const command = action === "install"
-        ? "install_agent"
-        : action === "update"
-          ? "update_agent"
-          : "uninstall_agent";
-      const result = await invoke(command, { provider });
-      setCliMessage(text(result?.message, `${action} finished.`));
-      await refreshCliStatuses();
-    } catch (error) {
-      setCliError(getErrorMessage(error, `Unable to ${action} ${provider}.`));
-    } finally {
-      setCliBusy((current) => {
-        const next = { ...current };
-        if (next[provider] === action) delete next[provider];
-        return next;
-      });
-      void key;
-    }
-  }, [refreshCliStatuses]);
-
   const runCatalogAction = useCallback(async (entry, action) => {
     const target = cliInstallManager(entry);
     if (!target) {
@@ -3381,30 +3354,6 @@ function ToolsWorkspaceView({
   // catalog merged, installed entries first, filtered by the search query.
   const cliRows = useMemo(() => {
     const query = text(catalogQuery).toLowerCase();
-    const agentRows = (Array.isArray(cliStatuses) ? cliStatuses : []).map((status) => {
-      const provider = text(status?.provider || status?.id);
-      const label = text(status?.label, provider);
-      const progress = agentUpdateProgressFields(status);
-      return {
-        busyAction: cliBusy[provider] || "",
-        icon: null,
-        id: `agent:${provider}`,
-        installed: Boolean(status?.installed),
-        kind: "agent",
-        label,
-        manageable: true,
-        provider,
-        searchText: `${label} ${provider}`.toLowerCase(),
-        sub: "coding agent",
-        update_available: Boolean(status?.npm_update_available),
-        updateErrorReason: progress.update_error_reason,
-        updateFailedStage: progress.update_failed_stage,
-        updateStage: progress.update_stage,
-        updateStageSeq: progress.update_stage_seq,
-        updateToVersion: progress.update_to_version,
-        version: text(status?.version),
-      };
-    });
     const catalogRows = CLI_CATALOG.map((entry) => ({
       busyAction: catalogBusy[entry.id] || "",
       entry,
@@ -3424,21 +3373,19 @@ function ToolsWorkspaceView({
       updateToVersion: "",
       version: "",
     }));
-    return [...agentRows, ...catalogRows]
+    return catalogRows
       .filter((row) => !query || row.searchText.includes(query))
       .sort((a, b) => {
         if (a.installed !== b.installed) return a.installed ? -1 : 1;
         return a.label.localeCompare(b.label);
       });
-  }, [catalogBusy, catalogChecks, catalogQuery, cliBusy, cliStatuses]);
+  }, [catalogBusy, catalogChecks, catalogQuery]);
 
   const handleCliRowAction = useCallback((row, action) => {
-    if (row.kind === "agent") {
-      void runCliAction(row.provider, action);
-    } else if (row.entry) {
+    if (row.entry) {
       void runCatalogAction(row.entry, action);
     }
-  }, [runCatalogAction, runCliAction]);
+  }, [runCatalogAction]);
 
   const pendingSkillCount = useMemo(
     () => skillsLibrary.skills.filter((skill) => !documentIsFolderRow(skill) && skill?.pending_push === true).length,

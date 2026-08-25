@@ -142,15 +142,8 @@ function CliProfilesSection() {
 
   const beginLogin = useCallback((kind) => {
     if (pendingRef.current) return;
-    setError("");
-    holdPending(kind);
-    invoke("start_agent_account_login", { provider: kind })
-      .catch((failure) => {
-        pendingRef.current = "";
-        setPendingKind("");
-        setError(String(failure?.message || failure || "Unable to open the login terminal."));
-      });
-  }, [holdPending]);
+    setError(`${kind} CLI login is unavailable; add or import the account through Haider.`);
+  }, []);
 
   const beginProfileLogin = useCallback((kind, profileId) => {
     if (pendingRef.current) return;

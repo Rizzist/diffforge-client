@@ -16,11 +16,11 @@ import {
   terminalSessionRestartResultIsSuccessful,
 } from "./terminalSessionRestart.js";
 
-test("canonical restart role wins over conflicting legacy target_agent_id", () => {
+test("canonical Haider restart role wins over a stale legacy target_agent_id", () => {
   assert.equal(resolveTerminalSessionRestartRole({
-    role: "claude",
+    role: "haider",
     target_agent_id: "codex",
-  }), "claude");
+  }), "haider");
   assert.equal(resolveTerminalSessionRestartRole({
     target_agent_id: "terminal",
   }), "generic");
@@ -262,10 +262,10 @@ test("an unavailable existence probe stays unknown", async () => {
   });
 });
 
-test("prepared agent start binds only the session the backend actually resumed", () => {
+test("prepared Haider start binds only the session the backend actually resumed", () => {
   assert.deepEqual(resolveTerminalStartedSessionBinding({
     paneResult: { effective_provider_session_id: null, started: true },
-    provider: "claude",
+    provider: "haider",
     requestedProviderSessionId: "missing-session",
   }), {
     provider_session_id: "",
@@ -273,7 +273,7 @@ test("prepared agent start binds only the session the backend actually resumed",
   });
   assert.deepEqual(resolveTerminalStartedSessionBinding({
     paneResult: { effective_provider_session_id: "present-session", started: true },
-    provider: "claude",
+    provider: "haider",
     requestedProviderSessionId: "present-session",
   }), {
     provider_session_id: "present-session",
@@ -283,12 +283,11 @@ test("prepared agent start binds only the session the backend actually resumed",
 
 test("restart menu splits the current role only when a provider session exists", () => {
   const roleOptions = [
-    { id: "claude", label: "Claude Code" },
-    { id: "codex", label: "Codex" },
+    { id: "haider", label: "Haider" },
     { id: "generic", label: "Terminal" },
   ];
   const withSession = getTerminalRestartMenuActions(roleOptions, {
-    currentRoleId: "claude",
+    currentRoleId: "haider",
     hasProviderSession: true,
   });
 
@@ -297,19 +296,17 @@ test("restart menu splits the current role only when a provider session exists",
     action.label,
     action.fresh_session,
   ]), [
-    ["claude:with-session", "Restart with session", false],
-    ["claude:fresh", "Restart fresh", true],
-    ["codex:restart", "Codex", true],
+    ["haider:with-session", "Restart with session", false],
+    ["haider:fresh", "Restart fresh", true],
     ["generic:restart", "Terminal", true],
   ]);
 
   const withoutSession = getTerminalRestartMenuActions(roleOptions, {
-    currentRoleId: "claude",
+    currentRoleId: "haider",
     hasProviderSession: false,
   });
   assert.deepEqual(withoutSession.map((action) => action.label), [
     "Restart",
-    "Codex",
     "Terminal",
   ]);
 });
@@ -333,7 +330,7 @@ test("cleared queued restart is a successful superseded terminal result", () => 
     mode: "restart_when_idle",
     pane_id: "pane-1",
     restart_intent_seq: 9,
-    target_role: "codex",
+    target_role: "haider",
   }, {
     terminal_index: 0,
     workspace_id: "workspace-1",
@@ -353,7 +350,7 @@ test("queued restart-with-session re-entry preserves its resume binding", () => 
     launch_epoch: "pane-1:17",
     pane_id: "pane-1",
     provider_session_id: "provider-session-a",
-    target_role: "codex",
+    target_role: "haider",
   }, {
     terminal_index: 0,
     workspace_id: "workspace-1",
@@ -366,7 +363,7 @@ test("queued restart-with-session re-entry preserves its resume binding", () => 
     mode: "restart_now",
     pane_id: "pane-1",
     provider_session_id: "provider-session-a",
-    role: "codex",
+    role: "haider",
     terminal_index: 0,
     workspace_id: "workspace-1",
   });

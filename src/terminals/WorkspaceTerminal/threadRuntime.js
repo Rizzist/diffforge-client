@@ -1251,7 +1251,6 @@ export function buildProviderTurnErrorProjectionEvents({
 
 export const TERMINAL_PROMPT_ACCEPT_RETRY_DELAYS_MS = [1000];
 export const TERMINAL_PROMPT_ACCEPT_TIMEOUT_MS = 20000;
-export const TERMINAL_CODEX_PROMPT_ACCEPT_TIMEOUT_MS = 75000;
 
 function getPositiveTimeoutMs(value) {
   const numericValue = Number(value);
@@ -1268,9 +1267,7 @@ export function getWorkspaceThreadPromptAcceptedTimeoutMs(agentId = "", timeoutM
     return explicitTimeoutMs;
   }
 
-  return getTerminalAgentKind(agentId) === "codex"
-    ? TERMINAL_CODEX_PROMPT_ACCEPT_TIMEOUT_MS
-    : TERMINAL_PROMPT_ACCEPT_TIMEOUT_MS;
+  return TERMINAL_PROMPT_ACCEPT_TIMEOUT_MS;
 }
 
 function delayThreadBridgeMs(delayMs) {
@@ -1557,7 +1554,7 @@ export function createWorkspaceThreadPromptAcceptedWaiter({
       prompt_id: safePromptId,
       thread_id: safeThreadId,
       timeout_ms: acceptanceTimeoutMs,
-      timeoutPolicy: safeAgentId === "codex" ? "codex-late-transcript" : "default",
+      timeoutPolicy: "default",
       workspace_id: safeWorkspaceId,
     });
     timeoutId = window.setTimeout(() => {
@@ -1836,10 +1833,8 @@ export const TODO_DROP_OVERLAY_LABEL_STYLE = {
 };
 export const TERMINAL_SCROLLBAR_PLATFORM = "native";
 export const TERMINAL_ROLE_SWITCH_OPTIONS = [
-  { id: "codex", label: "Codex"},
-  { id: "claude", label: "Claude Code" },
+  { id: "haider", label: "Haider" },
   { id: "generic", label: "Terminal" },
-  { id: "opencode", label: "OpenCode" },
 ];
 export const TERMINAL_CONTROL_SELECTOR = "[data-terminal-control='true']";
 // Slot sizes snap immediately (the fullscreen open/close motion is
@@ -1982,11 +1977,7 @@ export function getTerminalSubmitSequence(agentKind, isGenericTerminal = false) 
   if (isGenericTerminal) {
     return "";
   }
-
-  if (getTerminalAgentKind(agentKind) === "codex") {
-    return TERMINAL_ENTER_SEQUENCE;
-  }
-
+  void agentKind;
   return "\r";
 }
 
@@ -2060,11 +2051,7 @@ export function getAgentStatusSummary(agentStatuses) {
     return [];
   }
 
-  const codex = agentStatuses.find((agent) => agent.id === "codex");
-  const claude = agentStatuses.find((agent) => agent.id === "claude");
-  const opencode = agentStatuses.find((agent) => agent.id === "opencode");
-
-  return [codex, claude, opencode].filter(Boolean);
+  return agentStatuses.filter((agent) => agent.id === "haider");
 }
 
 export function getTerminalRoleSwitchOptions(agentStatuses) {

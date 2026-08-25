@@ -65213,7 +65213,6 @@ mod cloud_mcp_tests {
                 TerminalSessionMode::General,
                 metadata,
                 TerminalLaunchRuntimeMetadata::default(),
-                None,
                 false,
             );
             let terminals = Arc::new(RwLock::new(HashMap::from([(

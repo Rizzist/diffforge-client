@@ -408,7 +408,6 @@ async fn orchestrator_pool_spawn_entry(
         app.clone(),
         app.state::<TerminalState>(),
         app.state::<CloudMcpState>(),
-        app.state::<AppControlMcpState>(),
         request,
         output_channel,
     )

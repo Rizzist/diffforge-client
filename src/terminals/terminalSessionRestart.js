@@ -19,9 +19,7 @@ export function normalizeTerminalSessionRestartRole(value) {
     .trim()
     .toLowerCase()
     .replace(/[\s_]+/g, "-");
-  if (["codex", "claude", "opencode"].includes(normalized)) {
-    return normalized;
-  }
+  if (normalized === "haider") return normalized;
   if (["generic", "terminal", "shell", "plain-shell"].includes(normalized)) {
     return "generic";
   }
@@ -149,17 +147,13 @@ export function resolveTerminalStartedSessionBinding({
   const effectiveSessionId = String(
     paneResult?.effective_provider_session_id || "",
   ).trim();
-  const suppressOpenCodeAliasSession = String(provider || "").trim().toLowerCase() === "opencode"
-    && requestedSessionId
-    && !requestedSessionId.startsWith("ses_");
-  const providerSessionId = forkSessionId || suppressOpenCodeAliasSession
+  const providerSessionId = forkSessionId
     ? ""
     : backendReportedEffectiveSession
       ? effectiveSessionId
       : requestedSessionId;
   const providerSessionIdCleared = Boolean(
     forkSessionId
-      || suppressOpenCodeAliasSession
       || (requestedSessionId && backendReportedEffectiveSession && !effectiveSessionId),
   );
 

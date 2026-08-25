@@ -2196,25 +2196,14 @@ export default function SwarmWorkspacePane({
     applyMembers(specs, undefined, next);
   }, [applyMembers, members]);
 
-  // Contract §v1.4: the backend caches `opencode models` output for 5 minutes,
-  // so refetching on every menu open is cheap and self-heals stale lists.
-  const loadOpencodeModels = useCallback(async (forceRefresh = false) => {
-    setOpencodeModels((current) => (current.status === "loading" ? current : { ...current, status: "loading" }));
-    try {
-      const result = await invoke("opencode_list_models", { force_refresh: forceRefresh });
-      if (!mountedRef.current) {
-        return;
-      }
+  const loadOpencodeModels = useCallback(async () => {
+    if (mountedRef.current) {
       setOpencodeModels({
-        status: "ready",
-        models: Array.isArray(result?.models) ? result.models.map(String) : [],
-        source: String(result?.source || ""),
-        error: String(result?.error || ""),
+        status: "error",
+        models: [],
+        source: "unavailable",
+        error: "OpenCode is not a supported harness.",
       });
-    } catch (caught) {
-      if (mountedRef.current) {
-        setOpencodeModels({ status: "error", models: [], source: "error", error: invokeErrorMessage(caught) });
-      }
     }
   }, []);
 

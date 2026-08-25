@@ -8,30 +8,7 @@ import {
   terminalPromptIsLocalSlashCommand,
   terminalPromptSubmittedPayloadIsAuthoritative,
 } from "./terminalPromptSubmission.js";
-import {
-  extractNativeSessionIdFromOutput,
-  getClaudeResumeExitMessage,
-} from "./WorkspaceTerminal/terminalCore.js";
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-test("Claude missing-conversation exit explains the cross-device resume failure", () => {
-  assert.equal(
-    getClaudeResumeExitMessage({
-      agentId: "claude",
-      exitCode: 1,
-      output: "No conversation found with session ID: 8b11443c-1111-4222-8333-123456789abc",
-      providerSessionId: "8b11443c-1111-4222-8333-123456789abc",
-    }),
-    "This Claude session was created on another device and isn't available to resume here.",
-  );
-  assert.equal(getClaudeResumeExitMessage({
-    agentId: "codex",
-    exitCode: 1,
-    output: "No conversation found",
-    providerSessionId: "codex-session",
-  }), "");
-});
 
 test("observed input gate submit is authoritative only when the prompt matches", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
@@ -129,50 +106,6 @@ test("backend todo queue submit remains authoritative", () => {
     prompt_match: true,
     prompt_source: "todo_queue_backend_submit",
   }), true);
-});
-
-test("codex native session id parser accepts session metadata output", () => {
-  assert.equal(
-    extractNativeSessionIdFromOutput(
-      "codex",
-      "Session ID: sess_0123456789abcdef",
-    ),
-    "sess_0123456789abcdef",
-  );
-
-  assert.equal(
-    extractNativeSessionIdFromOutput(
-      "codex",
-      '{"type":"session_meta","payload":{"id":"codex-native-session-abcdef12"}}',
-    ),
-    "codex-native-session-abcdef12",
-  );
-
-  assert.equal(
-    extractNativeSessionIdFromOutput(
-      "codex",
-      '{"sessionId":"codexSessionId_12345678"}',
-    ),
-    "codexSessionId_12345678",
-  );
-});
-
-test("opencode native session parser only accepts native ses ids", () => {
-  assert.equal(
-    extractNativeSessionIdFromOutput(
-      "opencode",
-      "opencode --session ses_0f32849b3ffeGn2tL6DnSIUCsZ",
-    ),
-    "ses_0f32849b3ffeGn2tL6DnSIUCsZ",
-  );
-
-  assert.equal(
-    extractNativeSessionIdFromOutput(
-      "opencode",
-      "opencode --session 019f0cd7-1347-7273-b20f-e959c3772a01",
-    ),
-    "",
-  );
 });
 
 test("panel agent prompt submit keeps agent mode open and drives shared activity", async () => {

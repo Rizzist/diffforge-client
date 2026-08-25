@@ -595,12 +595,15 @@ fn haider_run_update_session(
     provider_session_id: Option<String>,
     first_user_message: Option<String>,
 ) -> Result<SessionRow, String> {
-    let row = session_update_blocking(SessionUpdateArgs {
-        id: session_id.to_string(),
-        title: None,
-        provider_session_id,
-        first_user_message,
-    })?;
+    let row = session_update_blocking_with_authority(
+        SessionUpdateArgs {
+            id: session_id.to_string(),
+            title: None,
+            provider_session_id,
+            first_user_message,
+        },
+        true,
+    )?;
     sessions_emit_changed(app);
     Ok(row)
 }
@@ -1214,6 +1217,8 @@ mod haider_run_tests {
                 harness: Value::Null,
                 pinned: false,
                 title_override: None,
+                provenance: SessionProvenance::Haider,
+                roster_visible: true,
             },
             "continue without losing payload".to_string(),
             vec!["/tmp/submit-attachment.png".to_string()],
