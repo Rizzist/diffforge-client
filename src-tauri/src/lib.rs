@@ -2860,6 +2860,9 @@ include!("sessions.rs");
 // Spaces persist next to sessions in sessions.sqlite; the include boundary is
 // pinned by tests/spaces.rs, which compiles the same file around a stub path.
 include!("spaces.rs");
+// ADE presentation intent shares sessions.sqlite without crossing the crate-root
+// sessions_database_path boundary; tests/workspace_view.rs pins this include shape.
+include!("workspace_view.rs");
 include!("haider_bridge.rs");
 include!("haider_projection.rs");
 mod haider_rpc_ade;
@@ -6192,6 +6195,12 @@ fn run_app(daemon: bool) {
             space_delete,
             space_save_layout,
             space_get,
+            workspace_view_get,
+            workspace_view_save,
+            breakout_list,
+            breakout_upsert,
+            breakout_remove,
+            breakout_clear_missing,
             session_projection_window,
             session_projection_trajectory,
             session_projection_ensure,
