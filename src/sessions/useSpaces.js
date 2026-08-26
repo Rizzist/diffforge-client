@@ -7,6 +7,7 @@ import {
   focusSpaceLeaf,
   serializeSpaceLayout,
   setSpaceActiveTab,
+  spaceLeafById,
 } from "./spacesModel.js";
 import {
   createSpaceLayoutSaver,
@@ -59,6 +60,49 @@ function normalizeSpaceEntry(entry) {
     status,
     reason: status === "divergent" ? String(entry?.reason || "") : null,
   };
+}
+
+/* Read-only boot resolution for a native leaf window. This deliberately uses
+   the same strict canonical decode/reconciliation as ordinary space entry but
+   never publishes or activates the space. The child host repeats space_get
+   and remains the final authority; this result only supplies S3's required
+   provisional session id/title for creating the coordinate-addressed window. */
+export function resolveSpaceLeafBreakoutRecord(record, leafIdValue, roster) {
+  const leafId = String(leafIdValue || "").trim();
+  if (!leafId) return { error: "The restored leaf id is missing.", ok: false };
+  const entered = enterSpaceState(record, roster);
+  if (!entered.ok) {
+    return { error: entered.error?.message || "The saved space layout is unavailable.", ok: false };
+  }
+  const leaf = spaceLeafById(entered.state, leafId);
+  if (!leaf) {
+    return { error: `The saved space layout no longer contains leaf “${leafId}”.`, ok: false };
+  }
+  return {
+    ok: true,
+    sessionId: leaf.sessionRef,
+    viewKind: leaf.viewKind,
+  };
+}
+
+export async function readSpaceLeafBreakoutRestoreTarget({
+  leafId,
+  readSpace,
+  roster,
+  spaceId,
+} = {}) {
+  if (!spaceId || typeof readSpace !== "function") {
+    return { error: "The restored space id is missing.", ok: false };
+  }
+  try {
+    const record = await readSpace(spaceId);
+    return resolveSpaceLeafBreakoutRecord(record, leafId, roster);
+  } catch (error) {
+    return {
+      error: String(error?.message || error || "The saved space layout is unavailable."),
+      ok: false,
+    };
+  }
 }
 
 /* Space entry is an intent stream, not merely an async read. Tokens advance
@@ -278,6 +322,16 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
     [enterSpace],
   );
 
+  const resolveSpaceLeafBreakoutAtBoot = useCallback(
+    ({ leafId, spaceId }) => readSpaceLeafBreakoutRestoreTarget({
+      leafId,
+      readSpace: (nextSpaceId) => invoke("space_get", { space_id: nextSpaceId }),
+      roster: rosterRef.current,
+      spaceId,
+    }),
+    [],
+  );
+
   /* The one mutation door. Model op errors surface as text — the state the
      user saw stays exactly what it was. */
   const mutateSpace = useCallback((op, rosterOverride = null) => {
@@ -479,6 +533,7 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
     railScope,
     refreshSpaces,
     renameSpace,
+    resolveSpaceLeafBreakoutAtBoot,
     restoreActiveSpaceAtBoot,
     revealConfirmedSession,
     revealSession,

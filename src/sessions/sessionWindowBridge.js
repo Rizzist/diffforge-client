@@ -373,6 +373,448 @@ export function createSessionWindowIncarnationGuard() {
   });
 }
 
+function monitorWorkArea(monitor) {
+  const area = monitor?.workArea || monitor;
+  const x = Number(area?.position?.x);
+  const y = Number(area?.position?.y);
+  const width = Number(area?.size?.width);
+  const height = Number(area?.size?.height);
+  if (![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) {
+    return null;
+  }
+  return {
+    bottom: y + height,
+    height,
+    left: x,
+    name: text(monitor?.name),
+    right: x + width,
+    top: y,
+    width,
+  };
+}
+
+function rectangleIntersectionArea(left, right) {
+  const width = Math.max(0, Math.min(left.right, right.right) - Math.max(left.left, right.left));
+  const height = Math.max(0, Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top));
+  return width * height;
+}
+
+/**
+ * Decode future persisted geometry at the JS trust boundary and constrain it
+ * to a display that exists now. Invalid/unplaceable geometry deliberately
+ * returns null so the native S3 path uses its safe default cascade.
+ */
+export function clampBreakoutRestoreGeometry(geometryJson, monitors = []) {
+  if (typeof geometryJson !== "string" || !geometryJson) return null;
+  let geometry;
+  try {
+    geometry = JSON.parse(geometryJson);
+  } catch {
+    return null;
+  }
+  if (!geometry || typeof geometry !== "object" || Array.isArray(geometry)) return null;
+  const allowedKeys = new Set([
+    "display", "fullscreen", "height", "maximized", "width", "x", "y",
+  ]);
+  if (Object.keys(geometry).some((key) => !allowedKeys.has(key))) return null;
+  const width = Number(geometry.width);
+  const height = Number(geometry.height);
+  if (!Number.isSafeInteger(width) || width <= 0
+    || !Number.isSafeInteger(height) || height <= 0) {
+    return null;
+  }
+  const hasX = Object.hasOwn(geometry, "x");
+  const hasY = Object.hasOwn(geometry, "y");
+  if (hasX !== hasY
+    || (hasX && (!Number.isSafeInteger(geometry.x) || !Number.isSafeInteger(geometry.y)))
+    || (Object.hasOwn(geometry, "display")
+      && (typeof geometry.display !== "string" || !geometry.display.trim()))
+    || (Object.hasOwn(geometry, "maximized") && typeof geometry.maximized !== "boolean")
+    || (Object.hasOwn(geometry, "fullscreen") && typeof geometry.fullscreen !== "boolean")) {
+    return null;
+  }
+  const workAreas = Array.isArray(monitors) ? monitors.map(monitorWorkArea).filter(Boolean) : [];
+  if (!workAreas.length) return null;
+
+  const requestedX = hasX ? geometry.x : null;
+  const requestedY = hasY ? geometry.y : null;
+  const hasPosition = hasX && hasY;
+  const requestedRect = hasPosition ? {
+    bottom: requestedY + height,
+    left: requestedX,
+    right: requestedX + width,
+    top: requestedY,
+  } : null;
+  const namedDisplay = text(geometry.display);
+  const namedArea = namedDisplay
+    ? workAreas.find((area) => area.name === namedDisplay) || null
+    : null;
+  const intersectingArea = requestedRect
+    ? workAreas.reduce((best, area) => {
+      const intersection = rectangleIntersectionArea(requestedRect, area);
+      return !best || intersection > best.intersection ? { area, intersection } : best;
+    }, null)
+    : null;
+  const workArea = namedArea
+    || (intersectingArea?.intersection > 0 ? intersectingArea.area : null)
+    || workAreas[0];
+
+  const clampedWidth = Math.round(Math.min(Math.max(width, 520), workArea.width, 2600));
+  const clampedHeight = Math.round(Math.min(Math.max(height, 420), workArea.height, 1800));
+  const result = {
+    height: clampedHeight,
+    width: clampedWidth,
+  };
+  if (hasPosition) {
+    result.x = Math.round(Math.min(
+      Math.max(requestedX, workArea.left),
+      Math.max(workArea.left, workArea.right - clampedWidth),
+    ));
+    result.y = Math.round(Math.min(
+      Math.max(requestedY, workArea.top),
+      Math.max(workArea.top, workArea.bottom - clampedHeight),
+    ));
+  }
+  if (geometry.maximized === true) result.maximized = true;
+  if (geometry.fullscreen === true) result.fullscreen = true;
+  return result;
+}
+
+/** Pure restore decision: validate coordinates, retain placeholders, and
+ * collapse duplicated durable rows by logical native-window identity. */
+export function decideBreakoutRestoreReopens(records, profileIdValue) {
+  const profileId = text(profileIdValue);
+  if (!profileId || !Array.isArray(records)) return [];
+  const seen = new Set();
+  const reopens = [];
+  records.forEach((record) => {
+    const identity = breakoutIdentity(record);
+    if (!identity || identity.profileId !== profileId) return;
+    const key = breakoutIdentityFingerprint(identity);
+    if (seen.has(key)) return;
+    seen.add(key);
+    reopens.push(identity.kind === BREAKOUT_KIND_SESSION ? {
+      geometryJson: typeof record.geometry_json === "string" ? record.geometry_json : null,
+      kind: identity.kind,
+      sessionRef: identity.sessionRef,
+      viewStateJson: typeof record.view_state_json === "string" ? record.view_state_json : null,
+    } : {
+      geometryJson: typeof record.geometry_json === "string" ? record.geometry_json : null,
+      kind: identity.kind,
+      leafId: identity.leafId,
+      spaceId: identity.spaceId,
+      viewStateJson: typeof record.view_state_json === "string" ? record.view_state_json : null,
+    });
+  });
+  return reopens;
+}
+
+export function breakoutRestoreShouldArm({ current, reopenComplete } = {}) {
+  return current === true && reopenComplete === true;
+}
+
+/**
+ * Step 4 completion is an edge, not a profile-level boolean. Invalidating the
+ * gate synchronously makes an older completion unusable even before React has
+ * committed the state update that clears its public token. Each completion
+ * can be claimed by Step 6 exactly once.
+ */
+export function createBreakoutHydrationRestoreGate() {
+  let generation = 0;
+  let currentToken = null;
+  let claimedToken = null;
+  return Object.freeze({
+    claim(token, expectedProfileId) {
+      const profileId = text(expectedProfileId);
+      if (!profileId
+        || token !== currentToken
+        || token?.generation !== generation
+        || token?.profileId !== profileId
+        || claimedToken === token) {
+        return false;
+      }
+      claimedToken = token;
+      return true;
+    },
+    complete(value = {}) {
+      const profileId = text(value.profileId || value.profile_id);
+      if (!profileId) return null;
+      const revision = value.revision ?? null;
+      if (currentToken) {
+        return currentToken.profileId === profileId && currentToken.revision === revision
+          ? currentToken
+          : null;
+      }
+      const token = Object.freeze({
+        generation,
+        profileId,
+        revision,
+      });
+      currentToken = token;
+      claimedToken = null;
+      return token;
+    },
+    invalidate() {
+      generation += 1;
+      currentToken = null;
+      claimedToken = null;
+      return generation;
+    },
+  });
+}
+
+function sessionWindowNativeIdentity(payload = {}) {
+  const spaceId = text(payload.space_id || payload.spaceId);
+  const leafId = text(payload.leaf_id || payload.leafId);
+  if (spaceId && leafId) return `space:${spaceId}\nleaf:${leafId}`;
+  const sessionId = text(payload.session_id || payload.sessionId);
+  return sessionId ? `session:${sessionId}` : "";
+}
+
+/**
+ * The JS-to-native production boundary retains the stable label returned for
+ * a logical coordinate. Later opens first ask native to focus that label and
+ * create only after native positively reports it absent. Per-identity
+ * serialization also closes the double-click race before the first label is
+ * cached; Rust's own create-or-focus decision remains the final backstop.
+ */
+export function createSessionWindowNativeBoundary({ invokeCommand } = {}) {
+  const labelsByIdentity = new Map();
+  const pendingByIdentity = new Map();
+  const forget = (labelValue) => {
+    const label = text(labelValue);
+    if (!label) return;
+    labelsByIdentity.forEach((knownLabel, identity) => {
+      if (knownLabel === label) labelsByIdentity.delete(identity);
+    });
+  };
+  const focus = (label) => invokeCommand?.("session_window_focus", { label });
+  const open = (payload = {}) => {
+    const identity = sessionWindowNativeIdentity(payload);
+    if (!identity || typeof invokeCommand !== "function") {
+      return Promise.resolve(invokeCommand?.("session_window_open", payload));
+    }
+    const previous = pendingByIdentity.get(identity) || Promise.resolve();
+    let pending;
+    pending = previous.catch(() => {}).then(async () => {
+      const knownLabel = labelsByIdentity.get(identity);
+      if (knownLabel) {
+        let exists = null;
+        try {
+          exists = await focus(knownLabel);
+        } catch {
+          exists = null;
+        }
+        if (exists === true) return { label: knownLabel, reused: true };
+        labelsByIdentity.delete(identity);
+      }
+      const result = await invokeCommand("session_window_open", payload);
+      const label = text(result?.label);
+      if (label) labelsByIdentity.set(identity, label);
+      return result;
+    });
+    pendingByIdentity.set(identity, pending);
+    return pending.finally(() => {
+      if (pendingByIdentity.get(identity) === pending) pendingByIdentity.delete(identity);
+    });
+  };
+  return Object.freeze({
+    close(label) {
+      forget(label);
+      return invokeCommand?.("session_window_close", { label });
+    },
+    focus,
+    forget,
+    open,
+  });
+}
+
+/**
+ * Serialize profile restore generations. A new generation first invalidates
+ * an in-flight predecessor; it then waits for that predecessor to close any
+ * just-created orphan before issuing its own native opens.
+ */
+export function createBreakoutRestoreCoordinator() {
+  let generation = 0;
+  let tail = Promise.resolve();
+  const restore = (options = {}) => {
+    const profileId = text(options.profileId || options.profile_id);
+    const claimedGeneration = generation + 1;
+    generation = claimedGeneration;
+    const isCurrent = () => generation === claimedGeneration;
+    const previous = tail;
+    const run = (async () => {
+      await previous.catch(() => {});
+      if (!profileId || !isCurrent()) return { armed: false, opened: 0, status: "stale" };
+      let records;
+      let status = "restored";
+      try {
+        records = await options.listBreakouts(profileId);
+      } catch (error) {
+        status = "unreadable";
+        records = [];
+        options.onError?.(error);
+      }
+      if (!isCurrent()) return { armed: false, opened: 0, status: "stale" };
+
+      const reopens = decideBreakoutRestoreReopens(records, profileId);
+      let opened = 0;
+      for (const reopen of reopens) {
+        if (!isCurrent()) return { armed: false, opened, status: "stale" };
+        try {
+          const label = await options.openBreakout?.(reopen, { isCurrent });
+          if (label && !isCurrent()) {
+            try {
+              await options.closeBreakout?.(label);
+            } catch (error) {
+              options.onError?.(error);
+            }
+            return { armed: false, opened, status: "stale" };
+          }
+          if (label) opened += 1;
+        } catch (error) {
+          options.onError?.(error);
+        }
+      }
+      const reopenComplete = isCurrent();
+      if (breakoutRestoreShouldArm({ current: isCurrent(), reopenComplete })) {
+        try {
+          options.armPersistence?.({ profileId });
+          return { armed: true, opened, status };
+        } catch (error) {
+          options.onError?.(error);
+        }
+      }
+      return { armed: false, opened, status: isCurrent() ? status : "stale" };
+    })();
+    tail = run.catch(() => undefined);
+    return run;
+  };
+  return Object.freeze({
+    cancel() {
+      generation += 1;
+    },
+    restore,
+  });
+}
+
+/**
+ * Production Step-6 boundary: claim the exact fresh Step-4 completion and
+ * wire every durable/native command used by restore in one importable path.
+ * `removeBreakout` is intentionally exposed to the coordinator but is never
+ * used merely because breakout_list was unreadable.
+ */
+export function restoreBreakoutWindowsAtProductionBoundary({
+  armPersistence,
+  closeBreakout,
+  coordinator,
+  hydrationGate,
+  hydrationToken,
+  invokeCommand,
+  onError,
+  openBreakout,
+  profileId,
+} = {}) {
+  if (!hydrationGate?.claim?.(hydrationToken, profileId)) {
+    return Promise.resolve({ armed: false, opened: 0, status: "gated" });
+  }
+  return coordinator.restore({
+    armPersistence,
+    closeBreakout: closeBreakout
+      || ((label) => invokeCommand("session_window_close", { label })),
+    listBreakouts: (currentProfileId) => invokeCommand("breakout_list", {
+      profile_id: currentProfileId,
+    }),
+    onError,
+    openBreakout,
+    profileId,
+    removeBreakout: (id) => invokeCommand("breakout_remove", {
+      id,
+      profile_id: profileId,
+    }),
+  });
+}
+
+/**
+ * One native S3 open/focus path for user opens and boot reopens. Persistence
+ * is announced synchronously after native creation (and is therefore dropped
+ * by the unarmed restore gate), while generation checks cover the entire open
+ * await. A stale result is actively closed instead of becoming an orphan.
+ */
+export async function openTrackedSessionWindowNative({
+  applyNativeGeometry,
+  closeNative,
+  geometry = null,
+  guard,
+  isCurrent = () => true,
+  nativeExists,
+  openNative,
+  persistOpen,
+  removeTracked,
+  track,
+} = {}) {
+  if (typeof openNative !== "function" || typeof isCurrent !== "function") return "";
+  if (!isCurrent()) return "";
+  const result = await openNative(geometry);
+  const label = text(result?.label);
+  if (!label) return "";
+  const ownsCreatedWindow = result?.reused !== true;
+  let staleCloseStarted = false;
+  const closeIfStale = async () => {
+    if (isCurrent()) return false;
+    if (ownsCreatedWindow && !staleCloseStarted && typeof closeNative === "function") {
+      staleCloseStarted = true;
+      try {
+        await closeNative(label);
+      } catch {
+        // The native window may already have completed its own close.
+      }
+    }
+    return true;
+  };
+
+  let claimedIncarnation = null;
+  await startBreakoutOpenBeforeNativeCheck({
+    persistOpen: () => persistOpen?.({ label, result }),
+    trackAfterNativeCheck: async () => {
+      if (await closeIfStale()) return null;
+      if (geometry && typeof applyNativeGeometry === "function") {
+        try {
+          await applyNativeGeometry(label, geometry);
+        } catch {
+          // A rejected placement falls back to the already-safe native frame.
+        }
+      }
+      if (await closeIfStale()) return null;
+      claimedIncarnation = await trackSessionWindowAfterNativeCheck({
+        guard,
+        label,
+        nativeExists,
+        remove: (incarnationValue) => removeTracked?.({
+          incarnation: incarnationValue,
+          label,
+        }),
+        track: (incarnationValue) => track?.({
+          incarnation: incarnationValue,
+          label,
+          result,
+        }),
+      });
+      return claimedIncarnation;
+    },
+  });
+
+  if (await closeIfStale()) {
+    if (claimedIncarnation != null
+      && guard?.invalidate?.(label, claimedIncarnation)
+      && typeof removeTracked === "function") {
+      removeTracked({ incarnation: claimedIncarnation, label });
+    }
+    return "";
+  }
+  return label;
+}
+
 /* Claim the next incarnation before the asynchronous native-existence check.
    `track` must still check guard.isCurrent inside any deferred state updater;
    the callback receives the claimed token so production and tests share that

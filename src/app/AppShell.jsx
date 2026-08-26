@@ -6,7 +6,9 @@ import {
   currentMonitor,
   getCurrentWindow,
   PhysicalPosition,
+  PhysicalSize,
 } from "@tauri-apps/api/window";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "@xterm/xterm/css/xterm.css";
@@ -48,8 +50,13 @@ import {
 } from "../sessions/sessionsRosterBootstrap.js";
 import { spaceWindowLeaves } from "../sessions/spacesModel.js";
 import {
+  clampBreakoutRestoreGeometry,
+  createBreakoutHydrationRestoreGate,
   createBreakoutWindowPersistence,
+  createBreakoutRestoreCoordinator,
+  createSessionWindowNativeBoundary,
   createSessionWindowIncarnationGuard,
+  openTrackedSessionWindowNative,
   removeSessionWindowBreakout,
   reconcileSessionWindowDestroyed,
   returnSessionWindowToSpaceLeaf,
@@ -59,8 +66,7 @@ import {
   SESSION_WINDOW_CONTROL_RETURN,
   SESSION_WINDOW_REFRESH_EVENT,
   sessionWindowControlEndsBreakout,
-  startBreakoutOpenBeforeNativeCheck,
-  trackSessionWindowAfterNativeCheck,
+  restoreBreakoutWindowsAtProductionBoundary,
   trackSessionWindowBreakout,
   trackSessionWindowStateIfCurrent,
 } from "../sessions/sessionWindowBridge.js";
@@ -166,6 +172,21 @@ export function createRosterGatedSessionWindowCallback({
     sessionOrId,
     sessionsById,
   });
+}
+
+async function applyRestoredSessionWindowGeometry(label, geometry) {
+  if (!label || !geometry) return;
+  const appWindow = await WebviewWindow.getByLabel(label);
+  if (!appWindow) return;
+  await appWindow.setSize(new PhysicalSize(geometry.width, geometry.height));
+  if (Number.isSafeInteger(geometry.x) && Number.isSafeInteger(geometry.y)) {
+    await appWindow.setPosition(new PhysicalPosition(geometry.x, geometry.y));
+  }
+  if (geometry.fullscreen === true) {
+    await appWindow.setFullscreen(true);
+  } else if (geometry.maximized === true) {
+    await appWindow.maximize();
+  }
 }
 
 function RestoredSessionAvailabilityCard({ sessionRef, presentation, onClose }) {
@@ -18557,18 +18578,40 @@ export default function App() {
   if (!sessionsRosterGateRef.current) {
     sessionsRosterGateRef.current = createSessionsRosterGate();
   }
+  const [workspaceViewHydrationCompletion, setWorkspaceViewHydrationCompletion] = useState(null);
+  const breakoutHydrationGateRef = useRef(null);
+  if (!breakoutHydrationGateRef.current) {
+    breakoutHydrationGateRef.current = createBreakoutHydrationRestoreGate();
+  }
+  const breakoutHydrationGate = breakoutHydrationGateRef.current;
   /* Presentation intent is persisted only after startup restore arms this
      saver with the restored profile/revision. Keeping the saver unarmed here
      prevents pre-restore React state from overwriting the native snapshot. */
   const workspaceViewSaverRef = useRef(null);
   if (!workspaceViewSaverRef.current) {
-    workspaceViewSaverRef.current = createWorkspaceViewSaver({
+    const saver = createWorkspaceViewSaver({
       debounceMs: 200,
       save: (payload) => invoke("workspace_view_save", payload),
       onError: (error) => {
         console.error("Failed to persist workspace view.", error);
       },
     });
+    const armAfterHydrationCommit = saver.arm.bind(saver);
+    const disarmBeforeHydration = saver.disarm.bind(saver);
+    saver.arm = (restored) => {
+      armAfterHydrationCommit(restored);
+      /* This is Step 4's completion edge: its restore hook calls saver.arm
+         only from the post-hydration commit effect, after awaited space_get. */
+      setWorkspaceViewHydrationCompletion(breakoutHydrationGate.complete(restored));
+    };
+    saver.disarm = () => {
+      /* Invalidate synchronously: a same-commit Step-6 effect may still hold
+         the previous React state value, but it cannot claim this old token. */
+      breakoutHydrationGate.invalidate();
+      setWorkspaceViewHydrationCompletion(null);
+      disarmBeforeHydration();
+    };
+    workspaceViewSaverRef.current = saver;
   }
   /* Breakout persistence is deliberately a separate restore gate. It remains
      unarmed in Step 5; Step 6 will list/restore the exact reachable profile,
@@ -18846,6 +18889,7 @@ export default function App() {
     flushSaves: flushSpaceSaves,
     focusLeaf: focusSpaceLeafOp,
     removeWindowBreakout: removeSpaceWindowBreakoutOp,
+    resolveSpaceLeafBreakoutAtBoot,
     restoreActiveSpaceAtBoot,
     trackWindowBreakout: trackSpaceWindowBreakoutOp,
   } = spacesApi;
@@ -21516,6 +21560,18 @@ export default function App() {
     sessionWindowIncarnationGuardRef.current = createSessionWindowIncarnationGuard();
   }
   const sessionWindowIncarnationGuard = sessionWindowIncarnationGuardRef.current;
+  const breakoutRestoreCoordinatorRef = useRef(null);
+  if (breakoutRestoreCoordinatorRef.current == null) {
+    breakoutRestoreCoordinatorRef.current = createBreakoutRestoreCoordinator();
+  }
+  const breakoutRestoreCoordinator = breakoutRestoreCoordinatorRef.current;
+  const sessionWindowNativeBoundaryRef = useRef(null);
+  if (sessionWindowNativeBoundaryRef.current == null) {
+    sessionWindowNativeBoundaryRef.current = createSessionWindowNativeBoundary({
+      invokeCommand: invoke,
+    });
+  }
+  const sessionWindowNativeBoundary = sessionWindowNativeBoundaryRef.current;
   useEffect(() => {
     sessionWindowBreakoutsRef.current = sessionWindowBreakouts;
   }, [sessionWindowBreakouts]);
@@ -21539,116 +21595,54 @@ export default function App() {
     removeSpaceWindowBreakoutOp(payload);
   }, [removeSpaceWindowBreakoutOp]);
 
-  const openSessionWindow = useMemo(() => createRosterGatedSessionWindowCallback({
-    roster: sessionsRoster,
-    sessionsById: workspaceSessionsById,
-    openWindow: async ({ sessionId, title }) => {
-      try {
-        const result = await invoke("session_window_open", {
-          height: 760,
+  const invokeSessionBreakoutWindow = useCallback(async (target) => {
+    const sessionId = String(target?.sessionId || "").trim();
+    if (!sessionId) return "";
+    const title = String(target?.title || sessionId).trim() || sessionId;
+    try {
+      return await openTrackedSessionWindowNative({
+        applyNativeGeometry: applyRestoredSessionWindowGeometry,
+        closeNative: sessionWindowNativeBoundary.close,
+        geometry: target?.geometry || null,
+        guard: sessionWindowIncarnationGuard,
+        isCurrent: target?.isCurrent,
+        nativeExists: sessionWindowNativeBoundary.focus,
+        openNative: (geometry) => sessionWindowNativeBoundary.open({
+          height: geometry?.height || 760,
           leaf_id: null,
           session_id: sessionId,
           space_id: null,
           theme: activeAppTheme,
           title,
-          width: 960,
-        });
-        const label = String(result?.label || "");
-        await startBreakoutOpenBeforeNativeCheck({
-          persistOpen: () => breakoutWindowPersistence.persistSessionOpen({
-            profileId: workspaceViewProfileId,
-            sessionRef: sessionId,
-            windowId: label,
-          }),
-          trackAfterNativeCheck: () => trackSessionWindowAfterNativeCheck({
-            guard: sessionWindowIncarnationGuard,
-            label,
-            nativeExists: (candidateLabel) => invoke("session_window_focus", {
-              label: candidateLabel,
-            }),
-            remove: () => removeTrackedSessionWindowByLabel(label),
-            track: (claimedIncarnation) => {
-              setSessionWindowBreakouts((current) => trackSessionWindowStateIfCurrent({
-                current,
-                isCurrent: () => sessionWindowIncarnationGuard.isCurrent(
-                  label,
-                  claimedIncarnation,
-                ),
-                track: (latest) => {
-                  const next = trackSessionWindowBreakout(latest, {
-                    ...result,
-                    incarnation: claimedIncarnation,
-                  }, {
-                    id: sessionId,
-                    title,
-                  });
-                  sessionWindowBreakoutsRef.current = next;
-                  return next;
-                },
-              }));
-            },
-          }),
-        });
-        return label;
-      } catch {
-        return "";
-      }
-    },
-  }), [
-    activeAppTheme,
-    breakoutWindowPersistence,
-    removeTrackedSessionWindowByLabel,
-    sessionWindowIncarnationGuard,
-    sessionsRoster,
-    workspaceViewProfileId,
-    workspaceSessionsById,
-  ]);
-
-  const invokeSpaceLeafWindow = useCallback(async (target) => {
-    const sessionId = String(target?.sessionId || "").trim();
-    const spaceId = String(target?.spaceId || "").trim();
-    const leafId = String(target?.leafId || "").trim();
-    if (!sessionId || !spaceId || !leafId) return "";
-    const title = String(target?.title || sessionId).trim() || sessionId;
-    try {
-      const result = await invoke("session_window_open", {
-        height: 760,
-        leaf_id: leafId,
-        session_id: sessionId,
-        space_id: spaceId,
-        theme: activeAppTheme,
-        title,
-        width: 960,
-      });
-      const label = String(result?.label || "");
-      await startBreakoutOpenBeforeNativeCheck({
-        persistOpen: () => breakoutWindowPersistence.persistSpaceLeafOpen({
-          leafId,
+          width: geometry?.width || 960,
+        }),
+        persistOpen: ({ label }) => breakoutWindowPersistence.persistSessionOpen({
           profileId: workspaceViewProfileId,
-          spaceId,
+          sessionRef: sessionId,
           windowId: label,
         }),
-        trackAfterNativeCheck: () => trackSessionWindowAfterNativeCheck({
-          guard: sessionWindowIncarnationGuard,
-          label,
-          nativeExists: (candidateLabel) => invoke("session_window_focus", {
-            label: candidateLabel,
-          }),
-          remove: () => removeTrackedSessionWindowByLabel(label),
-          track: (claimedIncarnation) => {
-            trackSpaceWindowBreakoutOp({
-              ...result,
-              incarnation: claimedIncarnation,
-            }, {
-              leafId,
-              sessionId,
-              spaceId,
-              title,
-            }, () => sessionWindowIncarnationGuard.isCurrent(label, claimedIncarnation));
-          },
-        }),
+        removeTracked: ({ label }) => removeTrackedSessionWindowByLabel(label),
+        track: ({ incarnation: claimedIncarnation, label, result }) => {
+          setSessionWindowBreakouts((current) => trackSessionWindowStateIfCurrent({
+            current,
+            isCurrent: () => sessionWindowIncarnationGuard.isCurrent(
+              label,
+              claimedIncarnation,
+            ),
+            track: (latest) => {
+              const next = trackSessionWindowBreakout(latest, {
+                ...result,
+                incarnation: claimedIncarnation,
+              }, {
+                id: sessionId,
+                title,
+              });
+              sessionWindowBreakoutsRef.current = next;
+              return next;
+            },
+          }));
+        },
       });
-      return label;
     } catch {
       return "";
     }
@@ -21657,6 +21651,71 @@ export default function App() {
     breakoutWindowPersistence,
     removeTrackedSessionWindowByLabel,
     sessionWindowIncarnationGuard,
+    sessionWindowNativeBoundary,
+    workspaceViewProfileId,
+  ]);
+
+  const openSessionWindow = useMemo(() => createRosterGatedSessionWindowCallback({
+    roster: sessionsRoster,
+    sessionsById: workspaceSessionsById,
+    openWindow: ({ sessionId, title }) => invokeSessionBreakoutWindow({ sessionId, title }),
+  }), [invokeSessionBreakoutWindow, sessionsRoster, workspaceSessionsById]);
+
+  const invokeSpaceLeafWindow = useCallback(async (target) => {
+    const spaceId = String(target?.spaceId || "").trim();
+    const leafId = String(target?.leafId || "").trim();
+    if (!spaceId || !leafId) return "";
+    /* session_window_open requires a session id even though its native leaf
+       identity and child authority use (space, leaf). A missing/deleted leaf
+       therefore gets an inert creation argument; the host never treats it as
+       a live ref and independently renders the space_get placeholder. */
+    const sessionId = String(target?.sessionId || "restored-space-leaf").trim();
+    const title = String(target?.title || sessionId).trim() || sessionId;
+    try {
+      return await openTrackedSessionWindowNative({
+        applyNativeGeometry: applyRestoredSessionWindowGeometry,
+        closeNative: sessionWindowNativeBoundary.close,
+        geometry: target?.geometry || null,
+        guard: sessionWindowIncarnationGuard,
+        isCurrent: target?.isCurrent,
+        nativeExists: sessionWindowNativeBoundary.focus,
+        openNative: (geometry) => sessionWindowNativeBoundary.open({
+          height: geometry?.height || 760,
+          leaf_id: leafId,
+          session_id: sessionId,
+          space_id: spaceId,
+          theme: activeAppTheme,
+          title,
+          width: geometry?.width || 960,
+        }),
+        persistOpen: ({ label }) => breakoutWindowPersistence.persistSpaceLeafOpen({
+          leafId,
+          profileId: workspaceViewProfileId,
+          spaceId,
+          windowId: label,
+        }),
+        removeTracked: ({ label }) => removeTrackedSessionWindowByLabel(label),
+        track: ({ incarnation: claimedIncarnation, label, result }) => {
+          trackSpaceWindowBreakoutOp({
+            ...result,
+            incarnation: claimedIncarnation,
+          }, {
+            leafId,
+            sessionId,
+            spaceId,
+            title,
+          }, () => sessionWindowIncarnationGuard.isCurrent(label, claimedIncarnation));
+        },
+      });
+    } catch {
+      return "";
+    }
+  }, [
+    activeAppTheme,
+    breakoutWindowPersistence,
+    removeTrackedSessionWindowByLabel,
+    sessionWindowIncarnationGuard,
+    sessionWindowNativeBoundary,
     trackSpaceWindowBreakoutOp,
     workspaceViewProfileId,
   ]);
@@ -21689,6 +21748,120 @@ export default function App() {
     spacesApi.spaceState,
   ]);
 
+  const breakoutRestoreRuntimeRef = useRef(null);
+  breakoutRestoreRuntimeRef.current = {
+    invokeSessionBreakoutWindow,
+    invokeSpaceLeafWindow,
+    resolveSpaceLeafBreakoutAtBoot,
+    roster: sessionsRoster,
+    sessionsById: workspaceSessionsById,
+  };
+
+  /* A profile transition fences native work before ordinary effects run and
+     keeps Step 5's durable stream closed until this profile's post-hydration
+     reopen sequence reaches its terminal state. */
+  useLayoutEffect(() => {
+    breakoutHydrationGate.invalidate();
+    setWorkspaceViewHydrationCompletion(null);
+    breakoutRestoreCoordinator.cancel();
+    breakoutWindowPersistence.disarm();
+    return () => {
+      breakoutRestoreCoordinator.cancel();
+      breakoutWindowPersistence.disarm();
+    };
+  }, [
+    authState,
+    breakoutHydrationGate,
+    breakoutRestoreCoordinator,
+    breakoutWindowPersistence,
+    workspaceViewBarrierRevision,
+    workspaceViewProfileId,
+  ]);
+
+  useEffect(() => {
+    const completion = workspaceViewHydrationCompletion;
+    if (authState !== "authenticated"
+      || !completion
+      || !workspaceViewProfileId
+      || completion.profileId !== workspaceViewProfileId) {
+      return undefined;
+    }
+    let monitorsPromise = null;
+    const restoredGeometry = async (geometryJson) => {
+      if (!geometryJson) return null;
+      if (!monitorsPromise) {
+        monitorsPromise = availableMonitors().catch(() => []);
+      }
+      return clampBreakoutRestoreGeometry(geometryJson, await monitorsPromise);
+    };
+    void restoreBreakoutWindowsAtProductionBoundary({
+      armPersistence: ({ profileId }) => {
+        breakoutWindowPersistence.arm({ profileId });
+      },
+      closeBreakout: sessionWindowNativeBoundary.close,
+      coordinator: breakoutRestoreCoordinator,
+      hydrationGate: breakoutHydrationGate,
+      hydrationToken: completion,
+      invokeCommand: invoke,
+      onError: (error) => {
+        console.error("Unable to restore breakout windows.", error);
+      },
+      openBreakout: async (reopen, { isCurrent }) => {
+        const runtime = breakoutRestoreRuntimeRef.current;
+        const geometry = await restoredGeometry(reopen.geometryJson);
+        if (!isCurrent() || !runtime) return "";
+        if (reopen.kind === "session") {
+          const session = runtime.roster.state === "reachable"
+            && runtime.roster.sessionRefs.includes(reopen.sessionRef)
+            ? runtime.sessionsById.get(reopen.sessionRef)
+            : null;
+          return runtime.invokeSessionBreakoutWindow({
+            geometry,
+            isCurrent,
+            sessionId: reopen.sessionRef,
+            title: session?.title || reopen.sessionRef,
+          });
+        }
+
+        /* Non-active spaces are intentionally read here as well as in the
+           child host. This supplies only the native command's provisional
+           session/title fields; deleted/divergent/missing leaves still open
+           with inert data and the host shows its typed placeholder. */
+        const resolved = await runtime.resolveSpaceLeafBreakoutAtBoot({
+          leafId: reopen.leafId,
+          spaceId: reopen.spaceId,
+        });
+        if (!isCurrent()) return "";
+        const sessionId = resolved?.ok ? resolved.sessionId : "";
+        const session = sessionId
+          && runtime.roster.state === "reachable"
+          && runtime.roster.sessionRefs.includes(sessionId)
+          ? runtime.sessionsById.get(sessionId)
+          : null;
+        return runtime.invokeSpaceLeafWindow({
+          geometry,
+          isCurrent,
+          leafId: reopen.leafId,
+          sessionId,
+          spaceId: reopen.spaceId,
+          title: session?.title || sessionId || "Unavailable space leaf",
+        });
+      },
+      profileId: workspaceViewProfileId,
+    });
+    return () => {
+      breakoutRestoreCoordinator.cancel();
+    };
+  }, [
+    authState,
+    breakoutHydrationGate,
+    breakoutRestoreCoordinator,
+    breakoutWindowPersistence,
+    sessionWindowNativeBoundary,
+    workspaceViewHydrationCompletion,
+    workspaceViewProfileId,
+  ]);
+
   useEffect(() => {
     let disposed = false;
     let unlisten = () => {};
@@ -21697,12 +21870,11 @@ export default function App() {
       const payload = event?.payload || {};
       const label = String(payload.window_id || payload.windowId || payload.label || "").trim();
       if (!label) return;
+      sessionWindowNativeBoundary.forget(label);
       void reconcileSessionWindowDestroyed({
         guard: sessionWindowIncarnationGuard,
         label,
-        nativeExists: (candidateLabel) => invoke("session_window_focus", {
-          label: candidateLabel,
-        }),
+        nativeExists: sessionWindowNativeBoundary.focus,
         removeDurable: () => breakoutWindowPersistence.persistExplicitClose({
           forgetWindow: true,
           payload,
@@ -21723,6 +21895,7 @@ export default function App() {
     breakoutWindowPersistence,
     removeTrackedSessionWindowByLabel,
     sessionWindowIncarnationGuard,
+    sessionWindowNativeBoundary,
     workspaceViewProfileId,
   ]);
 
