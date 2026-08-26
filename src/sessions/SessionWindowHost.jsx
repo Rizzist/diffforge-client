@@ -26,6 +26,12 @@ import {
 import { spaceLeafById } from "./spacesModel.js";
 import { listSessions } from "./sessionsModel.js";
 import {
+  createSessionsRosterGate,
+  HAIDER_ROSTER_BOOTSTRAP_CHANGED_EVENT,
+  HAIDER_ROSTER_BOOTSTRAP_REQUEST_EVENT,
+  reduceSessionsRosterGate,
+} from "./sessionsRosterBootstrap.js";
+import {
   applySessionSurfaceStatusEvent,
   surfaceStatusPillView,
 } from "./sessionStatus.js";
@@ -104,10 +110,12 @@ function unknownTarget(reason, scope = "session", sessionRef = "") {
 export function resolveSessionWindowLeafTarget({
   leafId,
   record,
+  roster,
   sessions = [],
   sessionsRead,
 } = {}) {
-  const entered = enterSpaceState(record, rosterFromSessionsRead(sessionsRead));
+  const authoritativeRoster = roster ?? rosterFromSessionsRead(sessionsRead);
+  const entered = enterSpaceState(record, authoritativeRoster);
   if (!entered.ok) return unknownTarget(entered.error.message, "leaf");
   const leaf = spaceLeafById(entered.state, leafId);
   if (!leaf) {
@@ -129,6 +137,125 @@ export function resolveSessionWindowLeafTarget({
     sessions,
     viewKind: leaf.viewKind,
   };
+}
+
+function projectedSessionsFromGate(gate) {
+  return gate?.read?.ok === true && Array.isArray(gate.read.rows)
+    ? gate.read.rows
+    : [];
+}
+
+function ordinarySessionTarget(params, gate) {
+  const sessions = projectedSessionsFromGate(gate);
+  const roster = gate?.roster;
+  const presentation = sessionWindowRosterPresentation({
+    reason: roster?.state === "unreachable" ? roster.reason : "",
+    rosterState: roster?.state === "reachable" ? "reachable" : "unreachable",
+    sessionId: params.sessionId,
+    sessions,
+  });
+  return {
+    ...presentation,
+    scope: "session",
+    sessionRef: params.sessionId,
+    sessions,
+    viewKind: presentation.mode === "live" ? "chat" : null,
+  };
+}
+
+/* A standalone webview owns its own bootstrap barrier. Its local sessions_list
+   projection is never consulted until native has published a complete daemon
+   roster, and every new barrier revision invalidates an in-flight local read.
+   Keeping this workflow outside React lets the production effect ordering be
+   driven behaviorally without weakening the fail-closed boundary. */
+export function createSessionWindowTargetAuthority({
+  params = {},
+  publishTarget = () => {},
+  readSessions = listSessions,
+  readSpace = (spaceId) => invoke("space_get", { space_id: spaceId }),
+} = {}) {
+  let gate = createSessionsRosterGate();
+  let sequence = 0;
+  let disposed = false;
+
+  const publishResolvedTarget = async (attempt, gateSnapshot) => {
+    const sessions = projectedSessionsFromGate(gateSnapshot);
+    let nextTarget;
+    if (!params.spaceId) {
+      nextTarget = ordinarySessionTarget(params, gateSnapshot);
+    } else {
+      let record;
+      try {
+        record = await readSpace(params.spaceId);
+      } catch (error) {
+        nextTarget = unknownTarget(
+          String(error?.message || error || "The saved space layout is unavailable."),
+          "leaf",
+        );
+      }
+      if (!nextTarget) {
+        nextTarget = resolveSessionWindowLeafTarget({
+          leafId: params.leafId,
+          record,
+          roster: gateSnapshot.roster,
+          sessions,
+        });
+      }
+    }
+    if (disposed || sequence !== attempt || gate !== gateSnapshot) return null;
+    publishTarget(nextTarget);
+    return nextTarget;
+  };
+
+  const refresh = async () => {
+    const attempt = sequence + 1;
+    sequence = attempt;
+    let gateSnapshot = gate;
+    if (gateSnapshot.barrier.state === "reachable") {
+      const { barrierRevision, confirmationRevision } = gateSnapshot;
+      let read;
+      try {
+        read = { ok: true, rows: await readSessions() };
+      } catch (error) {
+        read = { ok: false, error };
+      }
+      if (disposed || sequence !== attempt) return null;
+      gate = reduceSessionsRosterGate(gate, {
+        type: "sessions-read",
+        barrierRevision,
+        confirmationRevision,
+        read,
+      });
+      gateSnapshot = gate;
+    }
+    return publishResolvedTarget(attempt, gateSnapshot);
+  };
+
+  return Object.freeze({
+    activate() {
+      disposed = false;
+    },
+    currentGate: () => gate,
+    dispose() {
+      disposed = true;
+      sequence += 1;
+    },
+    publishBootstrap(value) {
+      gate = reduceSessionsRosterGate(gate, { type: "barrier", value });
+      return refresh();
+    },
+    refresh,
+  });
+}
+
+/* Defense in depth at the side-effect boundary: even a malformed non-live
+   target carrying a cached session row cannot reach surface_attach. */
+export function attachLiveSessionWindowTarget(target, attach) {
+  if (target?.mode !== "live" || typeof attach !== "function") return false;
+  const providerId = String(target.session?.provider_session_id || "").trim();
+  if (!providerId) return false;
+  Promise.resolve(attach(providerId)).catch(() => {});
+  return true;
 }
 
 export function sessionWindowTargetMessage(target, urlSessionRef = "") {
@@ -168,60 +295,17 @@ export default function SessionWindowHost() {
   const [pastedBlocks, setPastedBlocks] = useState([]);
   const [attachments, setAttachments] = useState([]);
   const editGenerationRef = useRef(0);
-  const readSequenceRef = useRef(0);
   const submitCommandFor = useMemo(() => createSpaceSessionSubmitFor(invoke), []);
+  const targetAuthority = useMemo(() => createSessionWindowTargetAuthority({
+    params,
+    publishTarget: setTarget,
+  }), [params]);
   const { isFullscreen, toggleFullscreen } = usePopoutWindowFullscreen(currentWindow);
 
-  const refreshTarget = useCallback(async () => {
-    const sequence = readSequenceRef.current + 1;
-    readSequenceRef.current = sequence;
-    let sessions = [];
-    let sessionsRead;
-    try {
-      sessions = await listSessions();
-      sessionsRead = { ok: true, rows: sessions };
-    } catch (error) {
-      sessionsRead = { ok: false, error };
-    }
-    if (readSequenceRef.current !== sequence) return;
-
-    if (!params.spaceId) {
-      const presentation = sessionWindowRosterPresentation({
-        reason: sessionsRead.ok ? "" : String(sessionsRead.error?.message || sessionsRead.error || ""),
-        rosterState: sessionsRead.ok ? "reachable" : "unreachable",
-        sessionId: params.sessionId,
-        sessions,
-      });
-      setTarget({
-        ...presentation,
-        scope: "session",
-        sessionRef: params.sessionId,
-        sessions,
-        viewKind: presentation.mode === "live" ? "chat" : null,
-      });
-      return;
-    }
-
-    let record;
-    try {
-      record = await invoke("space_get", { space_id: params.spaceId });
-    } catch (error) {
-      if (readSequenceRef.current === sequence) {
-        setTarget(unknownTarget(
-          String(error?.message || error || "The saved space layout is unavailable."),
-          "leaf",
-        ));
-      }
-      return;
-    }
-    if (readSequenceRef.current !== sequence) return;
-    setTarget(resolveSessionWindowLeafTarget({
-      leafId: params.leafId,
-      record,
-      sessions,
-      sessionsRead,
-    }));
-  }, [params.leafId, params.sessionId, params.spaceId]);
+  const refreshTarget = useCallback(
+    () => targetAuthority.refresh(),
+    [targetAuthority],
+  );
 
   useEffect(() => {
     document.documentElement.dataset.forgeTheme = theme;
@@ -235,23 +319,35 @@ export default function SessionWindowHost() {
   }, [theme]);
 
   useEffect(() => {
+    targetAuthority.activate();
     void refreshTarget();
     let disposed = false;
-    let unlisten = () => {};
-    listen(SESSION_WINDOW_REFRESH_EVENT, (event) => {
-      if (!disposed && sessionWindowShouldRefresh(params, event?.payload)) {
-        void refreshTarget();
-      }
+    const unlisteners = [];
+    void listen(SESSION_WINDOW_REFRESH_EVENT, (event) => {
+      if (!disposed && sessionWindowShouldRefresh(params, event?.payload)) void refreshTarget();
     }).then((stop) => {
       if (disposed) stop();
-      else unlisten = stop;
+      else unlisteners.push(stop);
+    }).catch(() => {});
+    void listen(HAIDER_ROSTER_BOOTSTRAP_CHANGED_EVENT, (event) => {
+      if (!disposed) void targetAuthority.publishBootstrap(event?.payload);
+    }).then((stop) => {
+      if (disposed) {
+        stop();
+        return;
+      }
+      unlisteners.push(stop);
+      /* Request only after this webview's listener is installed, otherwise a
+         synchronous current-state reply can be lost and cached rows might be
+         mistaken for the first authoritative answer. */
+      void emit(HAIDER_ROSTER_BOOTSTRAP_REQUEST_EVENT, {}).catch(() => {});
     }).catch(() => {});
     return () => {
       disposed = true;
-      readSequenceRef.current += 1;
-      unlisten();
+      targetAuthority.dispose();
+      unlisteners.forEach((unlisten) => unlisten());
     };
-  }, [params, refreshTarget]);
+  }, [params, refreshTarget, targetAuthority]);
 
   useEffect(() => {
     let disposed = false;
@@ -270,9 +366,11 @@ export default function SessionWindowHost() {
   }, [target.sessions]);
 
   useEffect(() => {
-    const providerId = String(target.session?.provider_session_id || "").trim();
-    if (providerId) void invoke("surface_attach", { session_id: providerId }).catch(() => {});
-  }, [target.session]);
+    attachLiveSessionWindowTarget(
+      target,
+      (providerId) => invoke("surface_attach", { session_id: providerId }),
+    );
+  }, [target]);
 
   const sendControl = useCallback((control) => {
     return emit(SESSION_WINDOW_CONTROL_EVENT, {

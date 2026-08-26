@@ -268,6 +268,16 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
     });
   }, [publishState]);
 
+  /* Startup restore is deliberately awaitable: AppShell must not arm the
+     workspace-view saver until space_get has passed the same strict canonical
+     validation/error pipeline as an ordinary rail entry. Keep this as a named
+     boot door instead of duplicating layout parsing or fire-and-forgetting a
+     changing prop. */
+  const restoreActiveSpaceAtBoot = useCallback(
+    (spaceId) => enterSpace(spaceId),
+    [enterSpace],
+  );
+
   /* The one mutation door. Model op errors surface as text — the state the
      user saw stays exactly what it was. */
   const mutateSpace = useCallback((op, rosterOverride = null) => {
@@ -469,6 +479,7 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
     railScope,
     refreshSpaces,
     renameSpace,
+    restoreActiveSpaceAtBoot,
     revealConfirmedSession,
     revealSession,
     saveError,

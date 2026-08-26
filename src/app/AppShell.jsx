@@ -73,6 +73,12 @@ import { resolveLoopspaceTodoTerminalSelectors } from "./loopspaceTodoDispatchTa
 import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
 import { createWorkspaceViewSaver } from "./workspaceViewPersistence.js";
 import {
+  reconcileWorkspaceOpenSessions,
+  selectWorkspaceRestoreTarget,
+  useWorkspaceViewRestoreEffects,
+  workspaceOpenSessionPresentation,
+} from "./workspaceViewRestore.js";
+import {
   cleanAgentLaunchModelId,
   getAgentLaunchDefault,
   getAgentLaunchEffortOptions,
@@ -113,6 +119,148 @@ import PaneErrorBoundary from "./PaneErrorBoundary.js";
 import { buildAccountLiveDeviceRows } from "../terminals/todoQueueDeviceSwitcher.js";
 
 const EMPTY_ARRAY = Object.freeze([]);
+
+/* Rail rows come from the local projection, so clicking one cannot itself
+   authorize a live breakout. Resolve the native open request through the
+   fresh-roster presentation first; non-live refs keep only their identity and
+   open into the standalone host's placeholder instead of forwarding stale row
+   metadata as though it were authoritative. */
+export async function openSessionWindowThroughRosterGate({
+  fallbackTitle = "",
+  openWindow,
+  roster,
+  sessionOrId,
+  sessionsById,
+} = {}) {
+  const sessionId = String(
+    typeof sessionOrId === "string" ? sessionOrId : sessionOrId?.id || "",
+  ).trim();
+  if (!sessionId || typeof openWindow !== "function") return "";
+  const entry = reconcileWorkspaceOpenSessions([sessionId], roster)[0];
+  const presentation = workspaceOpenSessionPresentation(entry, sessionsById);
+  const liveTitle = presentation.mode === "live"
+    ? String(presentation.session?.title || "").trim()
+    : "";
+  const title = liveTitle
+    || (presentation.mode === "live" ? String(fallbackTitle || "").trim() : "")
+    || sessionId;
+  return openWindow({ presentation, sessionId, title });
+}
+
+/* This is the callback shape handed to SessionsRail/SessionSurface. Keeping
+   the binding in a named production seam lets the rail -> native-open decision
+   run behaviorally in integration tests, rather than testing only the pure
+   presentation guard and inferring that React wired it correctly. */
+export function createRosterGatedSessionWindowCallback({
+  openWindow,
+  roster,
+  sessionsById,
+} = {}) {
+  return (sessionOrId, fallbackTitle = "") => openSessionWindowThroughRosterGate({
+    fallbackTitle,
+    openWindow,
+    roster,
+    sessionOrId,
+    sessionsById,
+  });
+}
+
+function RestoredSessionAvailabilityCard({ sessionRef, presentation, onClose }) {
+  const tombstone = presentation?.mode === "tombstone";
+  return (
+    <div
+      data-workspace-session-state={tombstone ? "tombstone" : "unknown"}
+      style={{
+        alignItems: "center",
+        display: "flex",
+        height: "100%",
+        justifyContent: "center",
+        minHeight: 0,
+        padding: 24,
+      }}
+    >
+      <div
+        role={tombstone ? "alert" : "status"}
+        style={{
+          background: "rgba(127, 127, 127, 0.08)",
+          border: "1px solid rgba(127, 127, 127, 0.24)",
+          borderRadius: 12,
+          display: "grid",
+          gap: 10,
+          maxWidth: 520,
+          padding: 20,
+        }}
+      >
+        <small style={{ fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+          {tombstone ? "tombstone" : "unknown"}
+        </small>
+        <strong>{tombstone ? "Session removed" : "Session availability unknown"}</strong>
+        <span>
+          {tombstone
+            ? `The fresh daemon roster no longer lists “${sessionRef}”. This tab is kept until you close it.`
+            : (presentation?.reason || "The fresh daemon roster is unavailable.")}
+        </span>
+        <button onClick={() => onClose?.(sessionRef)} style={{ justifySelf: "start" }} type="button">
+          Close tab
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function RestoredUnavailableSessionTabs({ activeSessionId, entries, onClose, onSelect }) {
+  if (!entries.length) return null;
+  return (
+    <div
+      aria-label="Unavailable restored session tabs"
+      style={{
+        bottom: 12,
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 6,
+        left: 12,
+        maxWidth: "calc(100% - 24px)",
+        position: "absolute",
+        zIndex: 12,
+      }}
+    >
+      {entries.map(({ entry, presentation }) => (
+        <div
+          data-active={entry.sessionRef === activeSessionId ? "true" : undefined}
+          data-workspace-session-tab-state={presentation.mode}
+          key={entry.sessionRef}
+          style={{
+            alignItems: "center",
+            backdropFilter: "blur(14px)",
+            background: "rgba(32, 34, 40, 0.88)",
+            border: "1px solid rgba(255, 255, 255, 0.16)",
+            borderRadius: 8,
+            color: "#f3f5f8",
+            display: "flex",
+            overflow: "hidden",
+          }}
+        >
+          <button
+            onClick={() => onSelect?.(entry.sessionRef)}
+            style={{ background: "transparent", border: 0, color: "inherit", padding: "7px 9px" }}
+            title={`${presentation.mode}: ${entry.sessionRef}`}
+            type="button"
+          >
+            {entry.sessionRef}
+          </button>
+          <button
+            aria-label={`Close restored session ${entry.sessionRef}`}
+            onClick={() => onClose?.(entry.sessionRef)}
+            style={{ background: "transparent", border: 0, color: "inherit", padding: "7px 8px" }}
+            type="button"
+          >
+            ×
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
 const EMPTY_OBJECT = Object.freeze({});
 
 function normalizeAccountToolTodoItem(item, workspaceId = "") {
@@ -18369,22 +18517,6 @@ export default function App() {
   // A draft is pure UI state: no store row, no directory, no process. The
   // first submitted prompt materializes it into a real harness session.
   const [sessionDraftOpen, setSessionDraftOpen] = useState(false);
-  const openSessions = useMemo(
-    () => openSessionIds
-      .map((id) => sessions.find((session) => session.id === id))
-      .filter(Boolean),
-    [openSessionIds, sessions],
-  );
-  const activeSession = useMemo(
-    () => sessions.find((session) => session.id === activeSessionId) || null,
-    [activeSessionId, sessions],
-  );
-  const activeSessionFileWorkspace = useMemo(() => (
-    activeSession
-      ? { id: activeSession.id, name: activeSession.title }
-      : null
-  ), [activeSession]);
-  const activeSessionFileRoot = sessionWorkingDirectory(activeSession);
   /* Warm shells: every session whose shell is currently MOUNTED. Opening a
      shell warms it and it STAYS warm — switching back is then instant, with
      no eviction guessing which one you meant to keep. The rail owns the off
@@ -18435,6 +18567,7 @@ export default function App() {
       },
     });
   }
+  const workspaceViewPendingTargetRef = useRef(null);
   const flushWorkspaceViewSave = useCallback(async () => {
     try {
       await workspaceViewSaverRef.current?.flush();
@@ -18445,6 +18578,53 @@ export default function App() {
   const [sessionsRoster, setSessionsRoster] = useState(
     () => sessionsRosterGateRef.current.roster,
   );
+  const sessionsRosterRef = useRef(sessionsRoster);
+  sessionsRosterRef.current = sessionsRoster;
+  /* The ordered open-set is durable presentation intent. Reconciliation adds
+     an honest verdict to every ref; it never maps through cached rows and
+     never drops tombstones/unknowns. Only the separate presentation guard may
+     hand an actually-live row to SessionSurface. */
+  const openSessionEntries = useMemo(
+    () => reconcileWorkspaceOpenSessions(openSessionIds, sessionsRoster),
+    [openSessionIds, sessionsRoster],
+  );
+  const workspaceSessionsById = useMemo(
+    () => new Map(sessions.map((session) => [session.id, session])),
+    [sessions],
+  );
+  const openSessionPresentations = useMemo(
+    () => openSessionEntries.map((entry) => ({
+      entry,
+      presentation: workspaceOpenSessionPresentation(entry, workspaceSessionsById),
+    })),
+    [openSessionEntries, workspaceSessionsById],
+  );
+  const openSessions = useMemo(
+    () => openSessionPresentations.flatMap(({ presentation }) => (
+      presentation.mode === "live" ? [presentation.session] : []
+    )),
+    [openSessionPresentations],
+  );
+  const unavailableOpenSessions = useMemo(
+    () => openSessionPresentations.filter(({ presentation }) => presentation.mode !== "live"),
+    [openSessionPresentations],
+  );
+  const activeOpenSession = openSessionPresentations.find(
+    ({ entry }) => entry.sessionRef === activeSessionId,
+  ) || null;
+  const activeOpenSessionPresentation = activeOpenSession?.presentation || null;
+  /* Downstream session consumers receive a value only after BOTH fresh-roster
+     liveness and the projected row are present. A cached row behind an
+     unknown/tombstone restore cannot leak into files, terminals, or attach. */
+  const activeSession = activeOpenSessionPresentation?.mode === "live"
+    ? activeOpenSessionPresentation.session
+    : null;
+  const activeSessionFileWorkspace = useMemo(() => (
+    activeSession
+      ? { id: activeSession.id, name: activeSession.title }
+      : null
+  ), [activeSession]);
+  const activeSessionFileRoot = sessionWorkingDirectory(activeSession);
   const publishSessionsRosterGate = useCallback((action) => {
     const next = reduceSessionsRosterGate(sessionsRosterGateRef.current, action);
     sessionsRosterGateRef.current = next;
@@ -18526,6 +18706,7 @@ export default function App() {
      daemon door when it lands (935/936 ask) — no local seen store. */
   const openMediaSession = useCallback((row) => {
     if (!row?.id) return;
+    workspaceViewPendingTargetRef.current = null;
     setSessionDraftOpen(false);
     setActiveSessionId("");
     setActiveMediaId(row.id);
@@ -18547,6 +18728,7 @@ export default function App() {
     if (!session?.id) {
       return;
     }
+    workspaceViewPendingTargetRef.current = null;
     setMediaDeckOpen(false);
     setSessionDraftOpen(false);
     setActiveSessionId(session.id);
@@ -18554,19 +18736,33 @@ export default function App() {
     showView(DEFAULT_WORKSPACE_VIEW);
   }, [showView]);
   const startNewSessionChat = useCallback(() => {
+    workspaceViewPendingTargetRef.current = null;
     setMediaDeckOpen(false);
     setSessionDraftOpen(true);
     setActiveSessionId("");
     showView(DEFAULT_WORKSPACE_VIEW);
   }, [showView]);
   const deselectSessionToHome = useCallback(() => {
+    workspaceViewPendingTargetRef.current = null;
     setMediaDeckOpen(false);
     setSessionDraftOpen(false);
     setActiveSessionId("");
   }, []);
+  const closeUnavailableSessionTab = useCallback((sessionRef) => {
+    const remaining = openSessionEntries.filter((entry) => entry.sessionRef !== sessionRef);
+    setOpenSessionIds(remaining.map((entry) => entry.sessionRef));
+    if (activeSessionId !== sessionRef) return;
+    const fallback = selectWorkspaceRestoreTarget(
+      { kind: "session", sessionRef },
+      remaining,
+    );
+    setSessionDraftOpen(false);
+    setActiveSessionId(fallback.kind === "session" ? fallback.sessionRef : "");
+  }, [activeSessionId, openSessionEntries]);
   /* New Media CREATES a media session and opens it; clicking while one is
      open falls back home (same toggle contract as New chat). */
   const toggleMediaDeck = useCallback(() => {
+    workspaceViewPendingTargetRef.current = null;
     if (mediaDeckOpen) {
       setActiveMediaId("");
       return;
@@ -18627,16 +18823,66 @@ export default function App() {
     flushSaves: flushSpaceSaves,
     focusLeaf: focusSpaceLeafOp,
     removeWindowBreakout: removeSpaceWindowBreakoutOp,
+    restoreActiveSpaceAtBoot,
     trackWindowBreakout: trackSpaceWindowBreakoutOp,
   } = spacesApi;
+  const selectUnavailableSessionTab = useCallback((sessionRef) => {
+    if (!sessionRef) return;
+    workspaceViewPendingTargetRef.current = null;
+    setMediaDeckOpen(false);
+    setSessionDraftOpen(false);
+    exitSpaceOp();
+    setActiveSessionId(sessionRef);
+    showView(DEFAULT_WORKSPACE_VIEW);
+  }, [exitSpaceOp, setMediaDeckOpen, showView]);
   const workspaceViewBarrier = sessionsRosterGateRef.current.barrier;
+  const workspaceViewBarrierRevision = sessionsRosterGateRef.current.barrierRevision;
   const workspaceViewProfileId = workspaceViewBarrier.state === "reachable"
     ? workspaceViewBarrier.profile_id
     : null;
-  useEffect(() => {
-    if (!workspaceViewProfileId) {
+
+  const applyWorkspaceViewHydration = useCallback(async (hydration) => {
+    setOpenSessionIds([...hydration.openSessionRefs]);
+    setMediaDeckOpen(false);
+    showView(DEFAULT_WORKSPACE_VIEW);
+
+    if (hydration.target.kind === "space") {
+      setSessionDraftOpen(false);
+      setActiveSessionId("");
+      await restoreActiveSpaceAtBoot(hydration.target.spaceId);
       return;
     }
+
+    if (hydration.target.kind === "home" && hydration.activeSpaceId) {
+      /* The only ordinary save shape with Home + active_space_id is a draft
+         over an entered space. Recreate the space underneath, while keeping
+         the draft/home layer as the visible primary target. */
+      setSessionDraftOpen(true);
+      setActiveSessionId("");
+      await restoreActiveSpaceAtBoot(hydration.activeSpaceId);
+      return;
+    }
+
+    exitSpaceOp();
+    setSessionDraftOpen(false);
+    setActiveSessionId(
+      hydration.target.kind === "session" ? hydration.target.sessionRef : "",
+    );
+  }, [exitSpaceOp, restoreActiveSpaceAtBoot, setMediaDeckOpen, showView]);
+
+  const readWorkspaceViewSnapshot = useCallback(
+    (profileId) => invoke("workspace_view_get", { profile_id: profileId }),
+    [],
+  );
+  const applyPendingWorkspaceViewTarget = useCallback((target) => {
+    setMediaDeckOpen(false);
+    setSessionDraftOpen(false);
+    setActiveSessionId(target.kind === "session" ? target.sessionRef : "");
+    showView(DEFAULT_WORKSPACE_VIEW);
+  }, [setMediaDeckOpen, showView]);
+
+  const scheduleWorkspaceViewIntent = useCallback(() => {
+    if (!workspaceViewProfileId) return;
     const activeSpaceId = typeof activeSpaceIdForShell === "string" && activeSpaceIdForShell
       ? activeSpaceIdForShell
       : null;
@@ -18659,6 +18905,22 @@ export default function App() {
     sessionDraftOpen,
     workspaceViewProfileId,
   ]);
+
+  useWorkspaceViewRestoreEffects({
+    applyHydration: applyWorkspaceViewHydration,
+    applyPendingTarget: applyPendingWorkspaceViewTarget,
+    authState,
+    barrierRef: sessionsRosterGateRef,
+    barrierRevision: workspaceViewBarrierRevision,
+    openSessionEntries,
+    pendingTargetRef: workspaceViewPendingTargetRef,
+    profileId: workspaceViewProfileId,
+    readSnapshot: readWorkspaceViewSnapshot,
+    rosterRef: sessionsRosterRef,
+    rosterState: sessionsRoster.state,
+    saver: workspaceViewSaverRef.current,
+    scheduleIntent: scheduleWorkspaceViewIntent,
+  });
   useEffect(() => {
     const flushOnPageHide = () => {
       void flushWorkspaceViewSave();
@@ -18676,6 +18938,7 @@ export default function App() {
     };
   }, [flushWorkspaceViewSave]);
   const enterSpaceFromRail = useCallback(async (spaceId, leafId = "") => {
+    workspaceViewPendingTargetRef.current = null;
     setMediaDeckOpen(false);
     setSessionDraftOpen(false);
     showView(DEFAULT_WORKSPACE_VIEW);
@@ -18694,6 +18957,7 @@ export default function App() {
     showView,
   ]);
   const createSpaceFromRail = useCallback((name) => {
+    workspaceViewPendingTargetRef.current = null;
     setMediaDeckOpen(false);
     setSessionDraftOpen(false);
     showView(DEFAULT_WORKSPACE_VIEW);
@@ -18703,6 +18967,7 @@ export default function App() {
     if (!session?.id) {
       return;
     }
+    workspaceViewPendingTargetRef.current = null;
     setMediaDeckOpen(false);
     setSessionDraftOpen(false);
     showView(DEFAULT_WORKSPACE_VIEW);
@@ -21251,61 +21516,60 @@ export default function App() {
     removeSpaceWindowBreakoutOp(payload);
   }, [removeSpaceWindowBreakoutOp]);
 
-  const openSessionWindow = useCallback(async (sessionOrId, fallbackTitle = "") => {
-    const sessionId = String(
-      typeof sessionOrId === "string" ? sessionOrId : sessionOrId?.id || "",
-    ).trim();
-    if (!sessionId) return "";
-    const title = String(
-      typeof sessionOrId === "string" ? fallbackTitle : sessionOrId?.title || fallbackTitle,
-    ).trim() || sessionId;
-    try {
-      const result = await invoke("session_window_open", {
-        height: 760,
-        leaf_id: null,
-        session_id: sessionId,
-        space_id: null,
-        theme: activeAppTheme,
-        title,
-        width: 960,
-      });
-      const label = String(result?.label || "");
-      await trackSessionWindowAfterNativeCheck({
-        guard: sessionWindowIncarnationGuard,
-        label,
-        nativeExists: (candidateLabel) => invoke("session_window_focus", {
-          label: candidateLabel,
-        }),
-        remove: () => removeTrackedSessionWindowByLabel(label),
-        track: (claimedIncarnation) => {
-          setSessionWindowBreakouts((current) => trackSessionWindowStateIfCurrent({
-            current,
-            isCurrent: () => sessionWindowIncarnationGuard.isCurrent(
-              label,
-              claimedIncarnation,
-            ),
-            track: (latest) => {
-              const next = trackSessionWindowBreakout(latest, {
-                ...result,
-                incarnation: claimedIncarnation,
-              }, {
-                id: sessionId,
-                title,
-              });
-              sessionWindowBreakoutsRef.current = next;
-              return next;
-            },
-          }));
-        },
-      });
-      return label;
-    } catch {
-      return "";
-    }
-  }, [
+  const openSessionWindow = useMemo(() => createRosterGatedSessionWindowCallback({
+    roster: sessionsRoster,
+    sessionsById: workspaceSessionsById,
+    openWindow: async ({ sessionId, title }) => {
+      try {
+        const result = await invoke("session_window_open", {
+          height: 760,
+          leaf_id: null,
+          session_id: sessionId,
+          space_id: null,
+          theme: activeAppTheme,
+          title,
+          width: 960,
+        });
+        const label = String(result?.label || "");
+        await trackSessionWindowAfterNativeCheck({
+          guard: sessionWindowIncarnationGuard,
+          label,
+          nativeExists: (candidateLabel) => invoke("session_window_focus", {
+            label: candidateLabel,
+          }),
+          remove: () => removeTrackedSessionWindowByLabel(label),
+          track: (claimedIncarnation) => {
+            setSessionWindowBreakouts((current) => trackSessionWindowStateIfCurrent({
+              current,
+              isCurrent: () => sessionWindowIncarnationGuard.isCurrent(
+                label,
+                claimedIncarnation,
+              ),
+              track: (latest) => {
+                const next = trackSessionWindowBreakout(latest, {
+                  ...result,
+                  incarnation: claimedIncarnation,
+                }, {
+                  id: sessionId,
+                  title,
+                });
+                sessionWindowBreakoutsRef.current = next;
+                return next;
+              },
+            }));
+          },
+        });
+        return label;
+      } catch {
+        return "";
+      }
+    },
+  }), [
     activeAppTheme,
     removeTrackedSessionWindowByLabel,
     sessionWindowIncarnationGuard,
+    sessionsRoster,
+    workspaceSessionsById,
   ]);
 
   const invokeSpaceLeafWindow = useCallback(async (target) => {
@@ -25295,25 +25559,43 @@ export default function App() {
                   )}
                   {!loopspacesModeActive && !mediaDeckOpen
                     && (!spacesApi.activeSpaceId || sessionDraftOpen) && (
-                    <SessionSurface
+                    activeSessionId && activeOpenSessionPresentation?.mode !== "live"
+                      ? (
+                        <RestoredSessionAvailabilityCard
+                          onClose={closeUnavailableSessionTab}
+                          presentation={activeOpenSessionPresentation}
+                          sessionRef={activeSessionId}
+                        />
+                      )
+                      : (
+                        <SessionSurface
+                          activeSessionId={activeSessionId}
+                          appThemeIsLight={activeAppTheme === APP_THEME_LIGHT}
+                          draftOpen={sessionDraftOpen}
+                          onDraftMaterialized={handleDraftMaterialized}
+                          onHeaderDragStart={handleTitleBarMouseDown}
+                          onOpenSession={openSessionFromRail}
+                          onPopOutSession={openSessionWindow}
+                          onResetToDraft={startNewSessionChat}
+                          onSessionsRefresh={refreshSessions}
+                          onShellWarm={markShellWarm}
+                          onSyncingChange={handleSessionHistorySyncing}
+                          shellPrefs={shellPrefs}
+                          onToggleTheme={() => updateAppTheme(
+                            activeAppTheme === APP_THEME_LIGHT ? APP_THEME_DARK : APP_THEME_LIGHT,
+                          )}
+                          openSessions={openSessions}
+                          planKey={String(planLabel || "free").toLowerCase()}
+                          sessions={sessions}
+                        />
+                      )
+                  )}
+                  {!loopspacesModeActive && !mediaDeckOpen && (
+                    <RestoredUnavailableSessionTabs
                       activeSessionId={activeSessionId}
-                      appThemeIsLight={activeAppTheme === APP_THEME_LIGHT}
-                      draftOpen={sessionDraftOpen}
-                      onDraftMaterialized={handleDraftMaterialized}
-                      onHeaderDragStart={handleTitleBarMouseDown}
-                      onOpenSession={openSessionFromRail}
-                      onPopOutSession={openSessionWindow}
-                      onResetToDraft={startNewSessionChat}
-                      onSessionsRefresh={refreshSessions}
-                      onShellWarm={markShellWarm}
-                      onSyncingChange={handleSessionHistorySyncing}
-                      shellPrefs={shellPrefs}
-                      onToggleTheme={() => updateAppTheme(
-                        activeAppTheme === APP_THEME_LIGHT ? APP_THEME_DARK : APP_THEME_LIGHT,
-                      )}
-                      openSessions={openSessions}
-                      planKey={String(planLabel || "free").toLowerCase()}
-                      sessions={sessions}
+                      entries={unavailableOpenSessions}
+                      onClose={closeUnavailableSessionTab}
+                      onSelect={selectUnavailableSessionTab}
                     />
                   )}
                 </WorkspaceViewPane>
