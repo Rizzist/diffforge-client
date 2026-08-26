@@ -39,7 +39,11 @@ import {
   modelGroupsFromLibrary,
   modelOptionCatalog,
 } from "./haiderClientContract.js";
-import { surfaceStatusLabel } from "./sessionStatus.js";
+import {
+  applySessionSurfaceStatusEvent,
+  surfaceRunStatusView,
+  surfaceStatusPillView,
+} from "./sessionStatus.js";
 import {
   SessionAvailabilityAffordance,
   sessionAvailabilityPresentation,
@@ -778,24 +782,16 @@ export default function SessionSurface({
     let unlisten = null;
     void listen("session-surface", (event) => {
       if (disposed) return;
-      const payload = event?.payload || {};
-      const local = sessions.find(
-        (row) => row.provider_session_id === payload.session_id,
+      /* status_segment_structured_v1: pass the untouched event into the
+         adapter. It preserves optional fields on a present status and removes
+         this session's entry when the whole status is absent (typed clear). */
+      const surfaceEvent = applySessionSurfaceStatusEvent(
+        event,
+        sessions,
+        setSurfaceStatus,
       );
-      if (!local) return;
-      if (payload.status?.line != null) {
-        /* status_segment_structured_v1: {state, detail} ride additively —
-           stored whole; consumers prefer them and fall back to parsing the
-           raw strip (pre-structured daemons). */
-        setSurfaceStatus((current) => ({
-          ...current,
-          [local.id]: {
-            line: payload.status.line,
-            state: payload.status.state || "",
-            detail: payload.status.detail || "",
-          },
-        }));
-      }
+      if (!surfaceEvent) return;
+      const { local, payload } = surfaceEvent;
       if (payload.input?.text != null) {
         /* input_mirror_v1, owner-aware (rev934 P1-1): our own accepted
            publish echoed back (revision AND text match) names our lane and
@@ -1648,24 +1644,16 @@ export default function SessionSurface({
       }
       setModeFor(session.id, viewMode);
     };
-    /* status_segment_v1: the pill mirrors the TUI's bottom-left strip
-       byte-for-byte when the daemon publishes it; state_raw and the buckets
-       are the fallbacks. */
-    /* status_segment_v1 publishes the TUI's ENTIRE bottom strip — byte-exact
-       is the wire contract, not the pill's: compact to the state word (full
-       line lives in the tooltip). Structured segment = 935 harness ask. */
-    const surfaceEntry = session && session.id !== "draft"
-      ? surfaceStatus[session.id] || null
-      : null;
-    const rawStatusLine = (surfaceEntry?.line || "").trim();
-    /* status_segment_structured_v1: {state, detail} skip the strip parser
-       entirely; the unicode compactor stays as the pre-structured fallback. */
-    const statusLine = session && session.id !== "draft"
-      ? surfaceStatusLabel(surfaceEntry, session)
-      : "";
+    /* status_segment_structured_v1: only state/detail can carry structured
+       authority. The raw line/local bucket remain useful presentation, with
+       provenance beside the rendered label instead of masquerading as it. */
     const availability = session && session.id !== "draft"
       ? sessionAvailabilityPresentation(session)
       : null;
+    const statusPillView = session && session.id !== "draft"
+      ? surfaceStatusPillView(surfaceStatus[session.id] || null, session, availability)
+      : null;
+    const statusLine = statusPillView?.label || "";
     return (
       <FloatingControls>
         {showToggle && session && (
@@ -1748,8 +1736,11 @@ export default function SessionSurface({
         {session && session.id !== "draft" && (
           <StatusPill
             data-session-availability={availability?.reason}
-            data-status={availability ? "unavailable" : session.status}
-            title={availability?.detail || rawStatusLine || statusLine}
+            data-status={statusPillView.status}
+            data-status-authority={statusPillView.authority}
+            data-status-source={statusPillView.source}
+            data-structured-status={statusPillView.structuredStatus}
+            title={statusPillView.title}
           >
             <i aria-hidden="true" />
             <span>{availability?.label || statusLine}</span>
@@ -1901,6 +1892,12 @@ export default function SessionSurface({
         const { tabs, activeTabId } = tabsStateFor(session.id);
         const activeTab = tabs.find((tab) => tab.id === activeTabId) || tabs[0];
         const chatTabActive = activeTab.id === "chat";
+        const runStatusView = surfaceRunStatusView(
+          surfaceStatus[session.id],
+          session,
+          sessionActivityVisualState(session) === "running",
+          sessionRunIsActive(session),
+        );
         return (
           <SessionPane data-active={active ? "true" : "false"} key={session.id}>
             {workHeader(session)}
@@ -1913,25 +1910,16 @@ export default function SessionSurface({
                   their PTYs persist daemon-side and are re-adopted here. */}
               {chatTabActive && active && (
                 <>
-                  <ChatHostLayer data-visible={mode === "ui" ? "true" : "false"}>
+                  <ChatHostLayer
+                    data-run-status-authority={runStatusView.authority}
+                    data-run-status-source={runStatusView.source}
+                    data-run-structured-status={runStatusView.structuredStatus}
+                    data-visible={mode === "ui" ? "true" : "false"}
+                  >
                     <SessionTranscript
                       onAnswered={onSessionsRefresh}
                       onSyncingChange={(syncing) => handleTranscriptSyncing(session.id, syncing)}
-                      runStatus={(() => {
-                        /* The shimmer means WORK: thinking/running/tool
-                           calls. The TUI's own strip outranks the bridge's
-                           coarse status — if it says idle (settle lag), no
-                           dot, ever. */
-                        if (sessionActivityVisualState(session) !== "running"
-                          || !sessionRunIsActive(session)) return "";
-                        const entry = surfaceStatus[session.id] || null;
-                        if ((entry?.state || "").toLowerCase() === "idle") return "";
-                        const structured = (entry?.detail || entry?.state || "").trim();
-                        if (/^idle\b/i.test(structured)) return "";
-                        const fallback = (session.state_raw || "").trim();
-                        if (!structured && /^idle\b/i.test(fallback)) return "";
-                        return structured || fallback || "working…";
-                      })()}
+                      runStatus={runStatusView.label}
                       session={session}
                     />
                     <SessionQueuePanel

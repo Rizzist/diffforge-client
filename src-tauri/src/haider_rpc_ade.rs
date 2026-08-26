@@ -4266,10 +4266,8 @@ fn config_document(summary: &Value, providers: &[Value], digest: Value) -> Resul
             }))
         })
         .unwrap_or(Value::Null);
-    let fast = metadata
-        .get("fast")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let fast = metadata.get("fast").and_then(Value::as_bool);
+    let speed = fast.map(|fast| if fast { "fast" } else { "normal" });
     let summary = summary.as_object();
 
     Ok(serde_json::json!({
@@ -4280,7 +4278,7 @@ fn config_document(summary: &Value, providers: &[Value], digest: Value) -> Resul
         "provider": provider,
         "model": model,
         "effort": metadata.get("effort").cloned().unwrap_or(Value::Null),
-        "speed": if fast { "fast" } else { "normal" },
+        "speed": speed,
         "fast": fast,
         "account_alias": Value::Null,
         "agent_type": metadata.get("agent_type").cloned().unwrap_or(Value::Null),
@@ -9642,6 +9640,47 @@ mod tests {
             config_provider_feature_gate(),
             [FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_config_absent_fast_stays_unknown_legacy() {
+        let providers = vec![serde_json::json!({
+            "provider": "openai",
+            "model_details": [{"name": "gpt-5.6-sol", "context_window": 200_000}]
+        })];
+        let digest = serde_json::json!({
+            "session_id": "legacy-session",
+            "metadata": {
+                "provider": "openai",
+                "model": "gpt-5.6-sol"
+            }
+        });
+        let legacy = config_document(&serde_json::json!({}), &providers, digest).unwrap();
+        assert_eq!(
+            legacy["fast"],
+            Value::Null,
+            "legacy absence must not become authoritative fast=false"
+        );
+        assert_eq!(
+            legacy["speed"],
+            Value::Null,
+            "legacy absence must not become authoritative speed=normal"
+        );
+
+        for (fast, speed) in [(false, "normal"), (true, "fast")] {
+            let digest = serde_json::json!({
+                "session_id": "typed-session",
+                "metadata": {
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "fast": fast
+                }
+            });
+            let typed = config_document(&serde_json::json!({}), &providers, digest).unwrap();
+            assert_eq!(typed["fast"], serde_json::json!(fast));
+            assert_eq!(typed["speed"], serde_json::json!(speed));
+        }
     }
 
     #[test]

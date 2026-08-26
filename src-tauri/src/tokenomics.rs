@@ -1395,6 +1395,54 @@ enum TokenomicsStoredLedgerDay {
     },
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenomicsUsageHistoryCoverageState {
+    Day,
+    NoDay,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenomicsUsageHistorySampleState {
+    Sampled,
+    PartiallySampled,
+    NotSampled,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenomicsUsageHistorySlotState {
+    Sampled,
+    NotSampled,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TokenomicsUsageHistorySlotCoverage {
+    slot_index: usize,
+    state: TokenomicsUsageHistorySlotState,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TokenomicsUsageHistoryDayCoverage {
+    device_id: String,
+    date: String,
+    coverage_state: TokenomicsUsageHistoryCoverageState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample_state: Option<TokenomicsUsageHistorySampleState>,
+    slots: Vec<TokenomicsUsageHistorySlotState>,
+    hours: Vec<TokenomicsUsageHistorySampleState>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TokenomicsUsageHistoryCoverage {
+    source: &'static str,
+    slot_minutes: usize,
+    slots_per_hour: usize,
+    slots_per_day: usize,
+    days: Vec<TokenomicsUsageHistoryDayCoverage>,
+}
+
 fn tokenomics_ledger_availability_json(
     availability: &Option<haider_rpc_ade::SnapshotAvailabilityWire>,
 ) -> Result<String, String> {
@@ -2343,6 +2391,175 @@ fn tokenomics_latest_ledger_meter_samples(
             },
         )
         .collect()
+}
+
+fn tokenomics_usage_history_sample_state(
+    sampled_slots: usize,
+    total_slots: usize,
+) -> TokenomicsUsageHistorySampleState {
+    if sampled_slots == 0 {
+        TokenomicsUsageHistorySampleState::NotSampled
+    } else if sampled_slots == total_slots {
+        TokenomicsUsageHistorySampleState::Sampled
+    } else {
+        TokenomicsUsageHistorySampleState::PartiallySampled
+    }
+}
+
+/* Coverage is read from the persisted Option<Slot> markers, never from
+   rollup/ledger rows or token sums. Each day/hour state is only a grouping of
+   the exact sampled/not-sampled slot facts carried alongside it. A no_day
+   coverage record deliberately has no manufactured slot markers. */
+fn tokenomics_usage_history_coverage(
+    conn: &rusqlite::Connection,
+) -> Result<TokenomicsUsageHistoryCoverage, String> {
+    let coverage_rows = conn
+        .prepare(
+            "SELECT device_id, date, state
+             FROM tokenomics_ledger_coverage
+             ORDER BY date, device_id",
+        )
+        .map_err(|error| format!("Unable to prepare usage-history summary coverage: {error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query usage-history summary coverage: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Unable to read usage-history summary coverage: {error}"))?;
+
+    let slot_rows = conn
+        .prepare(
+            "SELECT device_id, date, slot_index, sampled
+             FROM tokenomics_ledger_slots
+             ORDER BY date, device_id, slot_index",
+        )
+        .map_err(|error| format!("Unable to prepare usage-history summary slots: {error}"))?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query usage-history summary slots: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Unable to read usage-history summary slot: {error}"))?;
+    let mut slots_by_day = std::collections::BTreeMap::<
+        (String, String),
+        Vec<TokenomicsUsageHistorySlotCoverage>,
+    >::new();
+    for (device_id, date, slot_index, sampled) in slot_rows {
+        let slot_index = usize::try_from(slot_index)
+            .map_err(|_| format!("Stored usage-history slot index is invalid: {slot_index}"))?;
+        if slot_index >= TOKENOMICS_LEDGER_SLOTS_PER_DAY {
+            return Err(format!(
+                "Stored usage-history slot index is invalid: {slot_index}"
+            ));
+        }
+        let state = match sampled {
+            0 => TokenomicsUsageHistorySlotState::NotSampled,
+            1 => TokenomicsUsageHistorySlotState::Sampled,
+            _ => {
+                return Err(format!(
+                    "Stored usage-history sampled marker is invalid: {sampled}"
+                ));
+            }
+        };
+        slots_by_day
+            .entry((device_id, date))
+            .or_default()
+            .push(TokenomicsUsageHistorySlotCoverage { slot_index, state });
+    }
+
+    let mut days = Vec::with_capacity(coverage_rows.len());
+    for (device_id, date, stored_state) in coverage_rows {
+        let coverage_state = match stored_state.as_str() {
+            "day" => TokenomicsUsageHistoryCoverageState::Day,
+            "no_day" => TokenomicsUsageHistoryCoverageState::NoDay,
+            _ => {
+                return Err(format!(
+                    "Stored usage-history coverage state is invalid: {stored_state}"
+                ));
+            }
+        };
+        let slots = slots_by_day.remove(&(device_id.clone(), date.clone()));
+        if matches!(coverage_state, TokenomicsUsageHistoryCoverageState::NoDay) {
+            if slots.is_some() {
+                return Err(format!(
+                    "Stored absent usage-history day {device_id} {date} has slot markers"
+                ));
+            }
+            days.push(TokenomicsUsageHistoryDayCoverage {
+                device_id,
+                date,
+                coverage_state,
+                sample_state: None,
+                slots: Vec::new(),
+                hours: Vec::new(),
+            });
+            continue;
+        }
+        let Some(slots) = slots else {
+            return Err(format!(
+                "Stored usage-history day {device_id} {date} has no summary slot coverage"
+            ));
+        };
+        if slots.len() != TOKENOMICS_LEDGER_SLOTS_PER_DAY
+            || slots
+                .iter()
+                .enumerate()
+                .any(|(expected, slot)| slot.slot_index != expected)
+        {
+            return Err(format!(
+                "Stored usage-history day {device_id} {date} has invalid summary slot coverage"
+            ));
+        }
+        let sampled_slots = slots
+            .iter()
+            .filter(|slot| matches!(slot.state, TokenomicsUsageHistorySlotState::Sampled))
+            .count();
+        let sample_state = Some(tokenomics_usage_history_sample_state(
+            sampled_slots,
+            TOKENOMICS_LEDGER_SLOTS_PER_DAY,
+        ));
+        let hours = slots
+            .chunks_exact(4)
+            .map(|slots| {
+                let sampled_slots = slots
+                    .iter()
+                    .filter(|slot| {
+                        matches!(slot.state, TokenomicsUsageHistorySlotState::Sampled)
+                    })
+                    .count();
+                tokenomics_usage_history_sample_state(sampled_slots, slots.len())
+            })
+            .collect();
+        days.push(TokenomicsUsageHistoryDayCoverage {
+            device_id,
+            date,
+            coverage_state,
+            sample_state,
+            slots: slots.iter().map(|slot| slot.state).collect(),
+            hours,
+        });
+    }
+    if let Some(((device_id, date), _)) = slots_by_day.first_key_value() {
+        return Err(format!(
+            "Stored usage-history slots for {device_id} {date} have no coverage record"
+        ));
+    }
+    Ok(TokenomicsUsageHistoryCoverage {
+        source: "usage_history_v1",
+        slot_minutes: 15,
+        slots_per_hour: 4,
+        slots_per_day: TOKENOMICS_LEDGER_SLOTS_PER_DAY,
+        days,
+    })
 }
 
 fn tokenomics_u64(value: Option<&Value>) -> u64 {
@@ -10123,6 +10340,7 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
     let ledger_meter_samples = tokenomics_latest_ledger_meter_samples(conn)?;
+    let usage_history_coverage = tokenomics_usage_history_coverage(conn)?;
     let haider_code_plan_status =
         tokenomics_meta_json(conn, TOKENOMICS_HAIDER_CODE_PLAN_STATUS_KEY).unwrap_or_else(|| {
             json!({
@@ -10162,6 +10380,7 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     "limits": limits,
     "usage_authority": usage_authority,
     "ledger_authority": ledger_authority,
+    "usage_history_coverage": usage_history_coverage,
     "meter_states": meter_states,
     "ledger_meter_samples": ledger_meter_samples,
     "haider_code_plan_status": haider_code_plan_status,
@@ -14404,6 +14623,68 @@ mod tokenomics_tests {
             Some(haider_rpc_ade::UsageHistorySlotV1::default()),
             "a sampled zero slot must remain Some(zero)"
         );
+    }
+
+    #[test]
+    fn usage_history_summary_publishes_verbatim_slot_and_hour_coverage() {
+        let _storage = process_test_storage_isolation(stringify!(
+            usage_history_summary_publishes_verbatim_slot_and_hour_coverage
+        ));
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let mut day = tokenomics_test_ledger_day("device-coverage", "2026-08-24");
+        for slot in 8..12 {
+            day.slots[slot] = Some(haider_rpc_ade::UsageHistorySlotV1::default());
+        }
+        tokenomics_ingest_ledger_day(&mut conn, &day, &usage_history_available()).unwrap();
+        tokenomics_record_ledger_no_day(
+            &conn,
+            "device-coverage",
+            "2026-08-23",
+            &usage_history_available(),
+        )
+        .unwrap();
+
+        let summary = tokenomics_summary_from_conn(&conn, false, None).unwrap();
+        let coverage = &summary["usage_history_coverage"];
+        assert_eq!(coverage["source"], json!("usage_history_v1"));
+        assert_eq!(coverage["slot_minutes"], json!(15));
+        assert_eq!(coverage["slots_per_hour"], json!(4));
+        assert_eq!(coverage["slots_per_day"], json!(96));
+        let days = coverage["days"].as_array().unwrap();
+        let absent = days
+            .iter()
+            .find(|row| row["date"] == "2026-08-23")
+            .expect("explicit no_day coverage");
+        assert_eq!(absent["coverage_state"], json!("no_day"));
+        assert!(
+            absent.get("sample_state").is_none(),
+            "no_day must not manufacture a sampled/not-sampled slot value"
+        );
+        assert_eq!(absent["slots"], json!([]));
+        assert_eq!(absent["hours"], json!([]));
+
+        let present = days
+            .iter()
+            .find(|row| row["date"] == "2026-08-24")
+            .expect("stored day coverage");
+        assert_eq!(present["device_id"], json!("device-coverage"));
+        assert_eq!(present["coverage_state"], json!("day"));
+        assert_eq!(present["sample_state"], json!("partially_sampled"));
+        let hours = present["hours"].as_array().unwrap();
+        assert_eq!(hours.len(), 24);
+        assert_eq!(hours[0], json!("partially_sampled"));
+        let slots = present["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 96);
+        assert_eq!(slots[2], json!("not_sampled"));
+        assert_eq!(
+            slots[3],
+            json!("sampled"),
+            "Some(0) must publish sampled, not collapse into not-sampled"
+        );
+        assert!(slots[8..12].iter().all(|slot| slot == "sampled"));
+        assert_eq!(hours[2], json!("sampled"));
+        assert_eq!(hours[3], json!("not_sampled"));
     }
 
     #[test]

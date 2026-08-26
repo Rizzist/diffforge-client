@@ -118,10 +118,16 @@ import {
   harnessProviderAccent,
 } from "./harnessAccountUsage.js";
 import {
+  tokenomicsDayCoverageState,
   tokenomicsDailyBucketPresentation,
   tokenomicsDailyBucketTitle,
+  tokenomicsHourCoverageState,
   tokenomicsLedgerAuthority,
+  tokenomicsPeriodCoverageState,
   tokenomicsPeriodCellValue,
+  tokenomicsUsageHistoryCoverageForSummaryMerge,
+  tokenomicsUsageHistoryCoverageIndex,
+  tokenomicsUsageRatePoint,
 } from "./tokenomicsLedgerHonesty.js";
 import {
   TERMINAL_SESSION_RESTART_MODES,
@@ -1823,7 +1829,7 @@ function withDailyTokenReferenceLimitPercents(rows) {
   });
 }
 
-function buildDailyRows(dailyRows, limitSamples, limits, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all", windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
+function buildDailyRows(dailyRows, limitSamples, limits, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all", coverageIndex = null, windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
   const filtered = filterRows(dailyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey);
   const byDay = new Map();
   for (const row of filtered) {
@@ -1848,9 +1854,9 @@ function buildDailyRows(dailyRows, limitSamples, limits, selectedProvider, selec
       key,
       ...aggregate,
       /* Kept for the tri-state daily presentation: a bucket with no rows is
-         "no usage recorded", never a measured zero, and a bucket whose rows
-         are all pre-ledger archive is labelled as archive. */
+         a measured zero only when all 96 authority slots were sampled. */
       rows: match?.rows || [],
+      coverageState: tokenomicsDayCoverageState(coverageIndex, key),
     });
   }
   const rows = buckets.map((row) => ({
@@ -1861,7 +1867,7 @@ function buildDailyRows(dailyRows, limitSamples, limits, selectedProvider, selec
   return withDailyWeeklyLimitPercents(rows, limitSamples, limits, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey);
 }
 
-function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all", windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
+function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all", coverageIndex = null, windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
   const today = dateFromDayKey(dayKeyUtc(new Date()));
   const startKey = dayKeyUtc(addUtcDays(today, -(Math.max(1, windowDays) - 1)));
   const endKey = dayKeyUtc(today);
@@ -1870,14 +1876,22 @@ function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKeys
       const key = bucketDayKey(row);
       return key >= startKey && key <= endKey;
     });
-  return { ...aggregateRows(rows), rowCount: rows.length };
+  return {
+    ...aggregateRows(rows),
+    rowCount: rows.length,
+    coverageState: tokenomicsPeriodCoverageState(coverageIndex, startKey, endKey),
+  };
 }
 
-function todayAggregate(dailyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all") {
+function todayAggregate(dailyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all", coverageIndex = null) {
   const today = dayKeyUtc(new Date());
   const rows = filterRows(dailyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey)
     .filter((row) => bucketDayKey(row) === today);
-  return { ...aggregateRows(rows), rowCount: rows.length };
+  return {
+    ...aggregateRows(rows),
+    rowCount: rows.length,
+    coverageState: tokenomicsDayCoverageState(coverageIndex, today),
+  };
 }
 
 function limitNumberOrNull(...values) {
@@ -2231,7 +2245,7 @@ function limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable =
   return "Safe at current pace";
 }
 
-function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all", windowKind = "5_hour") {
+function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey = "all", windowKind = "5_hour", coverageIndex = null) {
   const windowSeconds = usageRateWindowSeconds(limit, windowKind);
   const bucketCount = Math.max(1, Math.ceil(windowSeconds / 3600));
   const rows = filterRows(Array.isArray(hourlyRows) ? hourlyRows : [], selectedProvider, selectedAccountKeys, selectedDeviceId, selectedScopeKey);
@@ -2248,13 +2262,18 @@ function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAcc
         cost: previous.cost + rowCost(row),
       });
     }
+    const now = new Date();
+    now.setUTCMinutes(0, 0, 0);
     return Array.from({ length: bucketCount }, (_, index) => {
-      const aggregate = byIndex.get(index) || { total: 0, input: 0, output: 0, cache: 0, cost: 0 };
       const remaining = bucketCount - 1 - index;
+      const date = new Date(now);
+      date.setUTCHours(now.getUTCHours() - remaining);
+      const bucketStart = `${hourKey(date)}:00:00Z`;
+      const coverageState = tokenomicsHourCoverageState(coverageIndex, bucketStart);
       return {
         key: `rolling-${index}`,
         label: remaining === 0 ? "now" : `-${remaining}h`,
-        ...aggregate,
+        ...tokenomicsUsageRatePoint(byIndex.get(index), coverageState),
       };
     });
   }
@@ -2280,11 +2299,11 @@ function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAcc
     const date = new Date(now);
     date.setUTCHours(now.getUTCHours() - offset);
     const key = hourKey(date);
-    const aggregate = byHour.get(key) || { total: 0, input: 0, output: 0, cache: 0, cost: 0 };
+    const coverageState = tokenomicsHourCoverageState(coverageIndex, key);
     recent.push({
       key,
       label: offset === 0 ? "now" : `-${offset}h`,
-      ...aggregate,
+      ...tokenomicsUsageRatePoint(byHour.get(key), coverageState),
     });
   }
   return recent;
@@ -2308,14 +2327,22 @@ function hourKey(date) {
 
 function usageRatePath(points, width, height) {
   if (!points.length) return "";
-  const max = Math.max(1, ...points.map((point) => numeric(point.total)));
+  const max = Math.max(1, ...points.filter((point) => point.known).map((point) => numeric(point.total)));
   const step = points.length > 1 ? width / (points.length - 1) : width;
+  let activeSegment = false;
   return points
     .map((point, index) => {
+      if (!point.known) {
+        activeSegment = false;
+        return "";
+      }
       const x = index * step;
       const y = height - Math.max(4, Math.min(height - 4, (numeric(point.total) / max) * (height - 12)));
-      return `${index === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
+      const command = activeSegment ? "L" : "M";
+      activeSegment = true;
+      return `${command} ${x.toFixed(1)} ${y.toFixed(1)}`;
     })
+    .filter(Boolean)
     .join(" ");
 }
 
@@ -2687,7 +2714,11 @@ function mergeDailyRollupRows(previousRows, nextRows) {
   return [...merged.values()].sort((left, right) => bucketDayKey(right).localeCompare(bucketDayKey(left)));
 }
 
-function mergeTokenomicsSummary(previous, next) {
+function mergeTokenomicsSummary(
+  previous,
+  next,
+  { retainUsageHistoryCoverageOnAbsence = false } = {},
+) {
   if (!previous) return next || {};
   if (!next) return previous;
   const nextIsV2 = String(next.schema_version || "").toLowerCase() === "tokenomics_v2";
@@ -2705,6 +2736,9 @@ function mergeTokenomicsSummary(previous, next) {
     daily_by_device_provider: next.daily_by_device_provider || (clearLegacyRows ? undefined : previous.daily_by_device_provider),
     monthly_by_device_provider: next.monthly_by_device_provider || (clearLegacyRows ? undefined : previous.monthly_by_device_provider),
     hourly: next.hourly || previous.hourly,
+    usage_history_coverage: tokenomicsUsageHistoryCoverageForSummaryMerge(previous, next, {
+      retainOnAbsence: retainUsageHistoryCoverageOnAbsence,
+    }),
     sources: next.sources || previous.sources,
     limits: mergeProviderLimits(previous.limits, next.limits),
     limit_samples: mergeProviderLimitSamples(previous.limit_samples, next.limit_samples),
@@ -2948,7 +2982,9 @@ function mergeSummaryIntoTokenomicsStore(next, { syncLimitChanges = false } = {}
   tokenomicsStore.loadedAccountKey = tokenomicsStore.account_key;
   updateTokenomicsStore((previous) => ({
     summary: (() => {
-      const merged = mergeTokenomicsSummary(previous.summary, next || {});
+      const merged = mergeTokenomicsSummary(previous.summary, next || {}, {
+        retainUsageHistoryCoverageOnAbsence: true,
+      });
       const previousSignature = tokenomicsStore.limitPercentSignature || tokenomicsLimitPercentSignature(previous.summary);
       nextSignature = tokenomicsLimitPercentSignature(merged);
       shouldSyncLimits = Boolean(syncLimitChanges && nextSignature && previousSignature !== nextSignature);
@@ -3232,11 +3268,16 @@ function CostCell({ value, unknown_reason: unknownReason = "" }) {
   return <td title={formatCostTitle(value)}>{formatCost(value)}</td>;
 }
 
-/* Resolves one Today/Last-30-Days row of cells through the pinned tri-state
-   decision: recorded rows render their sums; an empty period renders 0 only
-   while the ledger authority is available, and otherwise renders unknown. */
+/* Resolves one Today/Last-30-Days row of cells through the pinned tri-state:
+   recorded rows render their sums; an empty period renders 0 only when the
+   ledger authority is available and every slot was sampled. */
 function periodRowCells(aggregate, ledgerAuthority) {
-  const cell = tokenomicsPeriodCellValue(aggregate?.input ?? 0, aggregate?.rowCount ?? 0, ledgerAuthority);
+  const cell = tokenomicsPeriodCellValue(
+    aggregate?.input,
+    aggregate?.rowCount,
+    ledgerAuthority,
+    aggregate?.coverageState,
+  );
   if (cell.known) {
     return {
       input: aggregate.input,
@@ -3562,21 +3603,25 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   }, [accountOptionsByProvider, providerAccountKeys, selectedProvider]);
   const dailyRaw = dailyRowsForDisplay(visibleSummary);
   const hourlyRaw = hourlyRowsForDisplay(visibleSummary);
+  const usageHistoryCoverage = useMemo(
+    () => tokenomicsUsageHistoryCoverageIndex(visibleSummary, selectedDeviceId),
+    [selectedDeviceId, visibleSummary],
+  );
   const limitRowsRaw = useMemo(() => limitRowsForDisplay(visibleSummary), [visibleSummary]);
   const limitSamplesRaw = Array.isArray(visibleSummary?.limit_samples)
     ? visibleSummary.limit_samples
     : (Array.isArray(visibleSummary?.limitSamples) ? visibleSummary.limitSamples : []);
   const dailyRows = useMemo(
-    () => buildDailyRows(dailyRaw, limitSamplesRaw, limitRowsRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey, dailyWindowDays),
-    [dailyRaw, dailyWindowDays, limitRowsRaw, limitSamplesRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey],
+    () => buildDailyRows(dailyRaw, limitSamplesRaw, limitRowsRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey, usageHistoryCoverage, dailyWindowDays),
+    [dailyRaw, dailyWindowDays, limitRowsRaw, limitSamplesRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey, usageHistoryCoverage],
   );
   const today = useMemo(
-    () => todayAggregate(dailyRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey),
-    [dailyRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey],
+    () => todayAggregate(dailyRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey, usageHistoryCoverage),
+    [dailyRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey, usageHistoryCoverage],
   );
   const last30Days = useMemo(
-    () => rollingWindowAggregate(dailyRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey),
-    [dailyRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey],
+    () => rollingWindowAggregate(dailyRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey, usageHistoryCoverage),
+    [dailyRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey, usageHistoryCoverage],
   );
   const ledgerAuthority = useMemo(() => tokenomicsLedgerAuthority(summary), [summary]);
   const todayCells = useMemo(() => periodRowCells(today, ledgerAuthority), [ledgerAuthority, today]);
@@ -3631,13 +3676,13 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
   ), [limits, selectedProvider, visibleSummary]);
   const usageRateLimit = usageRateWindowKind === "weekly" ? weekly : fiveHour;
   const sessionUsageRows = useMemo(
-    () => usageRateRowsFromLimit(usageRateLimit, hourlyRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey, usageRateWindowKind),
-    [hourlyRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey, usageRateLimit, usageRateWindowKind],
+    () => usageRateRowsFromLimit(usageRateLimit, hourlyRaw, selectedProvider, selectedAccountFilter, selectedDeviceId, selectedScopeKey, usageRateWindowKind, usageHistoryCoverage),
+    [hourlyRaw, selectedAccountFilter, selectedDeviceId, selectedProvider, selectedScopeKey, usageHistoryCoverage, usageRateLimit, usageRateWindowKind],
   );
   const sessionUsageBarWidth = usageRateBarWidth(sessionUsageRows.length);
   const sessionUsageLabels = usageRateAxisLabels(sessionUsageRows, usageRateWindowKind);
-  const maxSessionUsage = Math.max(1, ...sessionUsageRows.map((row) => row.total));
-  const activeSessionRows = sessionUsageRows.filter((row) => row.total > 0);
+  const maxSessionUsage = Math.max(1, ...sessionUsageRows.filter((row) => row.known).map((row) => row.total));
+  const activeSessionRows = sessionUsageRows.filter((row) => row.known && row.total > 0);
   const averageSessionUsage = activeSessionRows.reduce((sum, row) => sum + row.total, 0) / Math.max(1, activeSessionRows.length);
   const maxDaily = Math.max(1, ...dailyRows.map((row) => dailyUsageValue(row)));
   const breakdown = useMemo(
@@ -3805,9 +3850,11 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
               {sessionUsageRows.map((row, index) => {
                 const step = sessionUsageRows.length > 1 ? 340 / (sessionUsageRows.length - 1) : 0;
                 const x = 10 + index * step;
-                const height = Math.max(row.total > 0 ? 5 : 3, (row.total / maxSessionUsage) * 70);
+                const height = row.known
+                  ? Math.max(row.total > 0 ? 5 : 3, (row.total / maxSessionUsage) * 70)
+                  : 3;
                 const y = 90 - height;
-                const isHot = averageSessionUsage > 0 && row.total > averageSessionUsage * 1.35;
+                const isHot = row.known && averageSessionUsage > 0 && row.total > averageSessionUsage * 1.35;
                 return (
                   <rect
                     key={row.key}
@@ -3816,8 +3863,10 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
                     width={sessionUsageBarWidth}
                     height={height}
                     rx={sessionUsageBarWidth > 3 ? "2" : "1"}
-                    className={isHot ? "hot" : "cool"}
-                  />
+                    className={row.known ? (isHot ? "hot" : "cool") : "no-data"}
+                  >
+                    <title>{row.known ? `${row.label}: ${formatTokens(row.total)}` : `${row.label}: no data`}</title>
+                  </rect>
                 );
               })}
               <path d={usageRatePath(sessionUsageRows, 360, 96)} />
@@ -4900,6 +4949,13 @@ const RateGraph = styled.svg`
 
   rect.hot {
     fill: rgba(251, 146, 60, 0.48);
+  }
+
+  rect.no-data {
+    fill: transparent;
+    stroke: rgba(148, 163, 184, 0.58);
+    stroke-width: 1;
+    stroke-dasharray: 2 2;
   }
 
   path {
