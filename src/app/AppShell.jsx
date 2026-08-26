@@ -71,6 +71,7 @@ import {
 import { listenShared, waitSharedListenerReady } from "./sharedTauriEvents.js";
 import { resolveLoopspaceTodoTerminalSelectors } from "./loopspaceTodoDispatchTargets.js";
 import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
+import { createWorkspaceViewSaver } from "./workspaceViewPersistence.js";
 import {
   cleanAgentLaunchModelId,
   getAgentLaunchDefault,
@@ -18421,6 +18422,26 @@ export default function App() {
   if (!sessionsRosterGateRef.current) {
     sessionsRosterGateRef.current = createSessionsRosterGate();
   }
+  /* Presentation intent is persisted only after startup restore arms this
+     saver with the restored profile/revision. Keeping the saver unarmed here
+     prevents pre-restore React state from overwriting the native snapshot. */
+  const workspaceViewSaverRef = useRef(null);
+  if (!workspaceViewSaverRef.current) {
+    workspaceViewSaverRef.current = createWorkspaceViewSaver({
+      debounceMs: 200,
+      save: (payload) => invoke("workspace_view_save", payload),
+      onError: (error) => {
+        console.error("Failed to persist workspace view.", error);
+      },
+    });
+  }
+  const flushWorkspaceViewSave = useCallback(async () => {
+    try {
+      await workspaceViewSaverRef.current?.flush();
+    } catch (error) {
+      console.error("Failed to flush workspace view.", error);
+    }
+  }, []);
   const [sessionsRoster, setSessionsRoster] = useState(
     () => sessionsRosterGateRef.current.roster,
   );
@@ -18608,6 +18629,52 @@ export default function App() {
     removeWindowBreakout: removeSpaceWindowBreakoutOp,
     trackWindowBreakout: trackSpaceWindowBreakoutOp,
   } = spacesApi;
+  const workspaceViewBarrier = sessionsRosterGateRef.current.barrier;
+  const workspaceViewProfileId = workspaceViewBarrier.state === "reachable"
+    ? workspaceViewBarrier.profile_id
+    : null;
+  useEffect(() => {
+    if (!workspaceViewProfileId) {
+      return;
+    }
+    const activeSpaceId = typeof activeSpaceIdForShell === "string" && activeSpaceIdForShell
+      ? activeSpaceIdForShell
+      : null;
+    let activeTarget = { kind: "home" };
+    if (!sessionDraftOpen && activeSpaceId) {
+      activeTarget = { kind: "space", spaceId: activeSpaceId };
+    } else if (!sessionDraftOpen && activeSessionId) {
+      activeTarget = { kind: "session", sessionRef: activeSessionId };
+    }
+    workspaceViewSaverRef.current.schedule({
+      profileId: workspaceViewProfileId,
+      openSessionRefs: [...openSessionIds],
+      activeTarget,
+      activeSpaceId,
+    });
+  }, [
+    activeSessionId,
+    activeSpaceIdForShell,
+    openSessionIds,
+    sessionDraftOpen,
+    workspaceViewProfileId,
+  ]);
+  useEffect(() => {
+    const flushOnPageHide = () => {
+      void flushWorkspaceViewSave();
+    };
+    const flushOnVisibilityHidden = () => {
+      if (document.visibilityState === "hidden") {
+        void flushWorkspaceViewSave();
+      }
+    };
+    window.addEventListener("pagehide", flushOnPageHide);
+    document.addEventListener("visibilitychange", flushOnVisibilityHidden);
+    return () => {
+      window.removeEventListener("pagehide", flushOnPageHide);
+      document.removeEventListener("visibilitychange", flushOnVisibilityHidden);
+    };
+  }, [flushWorkspaceViewSave]);
   const enterSpaceFromRail = useCallback(async (spaceId, leafId = "") => {
     setMediaDeckOpen(false);
     setSessionDraftOpen(false);
@@ -20293,19 +20360,30 @@ export default function App() {
 
     setCloseConfirmOpen(false);
     runWindowAction(async () => {
-      /* The last space layout must land before the webview is destroyed:
-         await the spaces flush (bounded so a stuck IPC cannot wedge close)
-         BEFORE confirming the close. */
+      /* The last space layout and workspace-view intent must land before the
+         webview is destroyed. Bound both IPC flushes so a stuck save cannot
+         wedge close, and run them BEFORE confirming the close. */
+      const flushTimeout = new Promise((resolve) => { setTimeout(resolve, 2000); });
+      const workspaceViewFlush = flushWorkspaceViewSave();
       await Promise.race([
         Promise.resolve(flushSpaceSaves?.()).catch(() => {}),
-        new Promise((resolve) => { setTimeout(resolve, 2000); }),
+        flushTimeout,
+      ]);
+      await Promise.race([
+        workspaceViewFlush,
+        flushTimeout,
       ]);
       /* Mark the close CONFIRMED so the Rust ExitRequested gate lets the
          shutdown proceed instead of re-raising the modal. */
       await invoke("app_confirm_close").catch(() => {});
       await getSafeCurrentWindow()?.close();
     });
-  }, [flushSpaceSaves, networkingOverlayOpen, nonIdleSessionCount]);
+  }, [
+    flushSpaceSaves,
+    flushWorkspaceViewSave,
+    networkingOverlayOpen,
+    nonIdleSessionCount,
+  ]);
 
 
 
