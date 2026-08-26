@@ -1067,12 +1067,46 @@ fn breakout_upsert_blocking(
     )
 }
 
-fn breakout_remove_blocking(profile_id: String, id: String) -> Result<(), String> {
+fn breakout_remove_in_connection_guarded(
+    connection: &mut rusqlite::Connection,
+    profile_id: &str,
+    id: &str,
+    application_exit_committed: bool,
+) -> Result<bool, String> {
+    if application_exit_committed {
+        return Ok(false);
+    }
+    breakout_remove_in_connection(connection, profile_id, id)?;
+    Ok(true)
+}
+
+fn breakout_remove_blocking_unchecked(profile_id: String, id: String) -> Result<(), String> {
     let _guard = workspace_view_write_lock()
         .lock()
         .map_err(|_| "Workspace view write lock is unavailable.".to_string())?;
     let mut connection = workspace_view_open_database()?;
     breakout_remove_in_connection(&mut connection, profile_id.trim(), id.trim())
+}
+
+fn breakout_remove_blocking_with_exit_guard(
+    application_exit_committed: &std::sync::atomic::AtomicBool,
+    application_exit_mutation_gate: &std::sync::Mutex<()>,
+    profile_id: String,
+    id: String,
+) -> Result<bool, String> {
+    let _exit_guard = application_exit_mutation_gate
+        .lock()
+        .map_err(|_| "Application exit mutation gate is unavailable.".to_string())?;
+    let _guard = workspace_view_write_lock()
+        .lock()
+        .map_err(|_| "Workspace view write lock is unavailable.".to_string())?;
+    let mut connection = workspace_view_open_database()?;
+    breakout_remove_in_connection_guarded(
+        &mut connection,
+        profile_id.trim(),
+        id.trim(),
+        application_exit_committed.load(std::sync::atomic::Ordering::Acquire),
+    )
 }
 
 fn breakout_clear_missing_blocking(
@@ -1142,10 +1176,26 @@ async fn breakout_upsert(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-async fn breakout_remove(profile_id: String, id: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || breakout_remove_blocking(profile_id, id))
-        .await
-        .map_err(|error| format!("Breakout remove worker failed: {error}"))?
+async fn breakout_remove(
+    application_exit_committed: tauri::State<'_, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    application_exit_mutation_gate: tauri::State<'_, std::sync::Arc<std::sync::Mutex<()>>>,
+    profile_id: String,
+    id: String,
+) -> Result<(), String> {
+    let application_exit_committed = std::sync::Arc::clone(application_exit_committed.inner());
+    let application_exit_mutation_gate =
+        std::sync::Arc::clone(application_exit_mutation_gate.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        breakout_remove_blocking_with_exit_guard(
+            &application_exit_committed,
+            &application_exit_mutation_gate,
+            profile_id,
+            id,
+        )
+        .map(drop)
+    })
+    .await
+    .map_err(|error| format!("Breakout remove worker failed: {error}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1155,4 +1205,62 @@ async fn breakout_clear_missing(profile_id: String, keep_ids: Vec<String>) -> Re
     })
     .await
     .map_err(|error| format!("Breakout cleanup worker failed: {error}"))?
+}
+
+#[cfg(test)]
+mod breakout_exit_guard_tests {
+    use super::*;
+
+    fn connection() -> rusqlite::Connection {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        workspace_view_initialize_database(&mut connection).unwrap();
+        connection
+    }
+
+    fn insert_breakout(connection: &mut rusqlite::Connection, id: &str) {
+        breakout_upsert_in_connection(
+            connection,
+            "profile-exit-guard",
+            id,
+            BreakoutKind::Session,
+            Some(format!("session-{id}")),
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+    }
+
+    fn breakout_exists(connection: &rusqlite::Connection, id: &str) -> bool {
+        breakout_get_from_connection(connection, "profile-exit-guard", id)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn breakout_remove_guard_is_noop_while_exiting_and_removes_while_running() {
+        let mut connection = connection();
+        insert_breakout(&mut connection, "remove-before");
+        insert_breakout(&mut connection, "retain-after");
+
+        assert!(breakout_remove_in_connection_guarded(
+            &mut connection,
+            "profile-exit-guard",
+            "remove-before",
+            false,
+        )
+        .unwrap());
+        assert!(!breakout_exists(&connection, "remove-before"));
+
+        assert!(!breakout_remove_in_connection_guarded(
+            &mut connection,
+            "profile-exit-guard",
+            "retain-after",
+            true,
+        )
+        .unwrap());
+        assert!(breakout_exists(&connection, "retain-after"));
+    }
 }

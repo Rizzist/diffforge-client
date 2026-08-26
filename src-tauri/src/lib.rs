@@ -325,6 +325,66 @@ static APP_CLOSE_LISTENER_READY: AtomicBool = AtomicBool::new(false);
 static APP_CLOSE_FORCE_EXIT_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static APP_CLOSE_FORCE_EXIT_STARTED: AtomicBool = AtomicBool::new(false);
 static APP_SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(APP_SHUTDOWN_PHASE_RUNNING);
+#[derive(Clone)]
+struct ApplicationExitAuthority {
+    committed: Arc<AtomicBool>,
+    mutation_gate: Arc<StdMutex<()>>,
+}
+
+impl ApplicationExitAuthority {
+    fn new() -> Self {
+        Self {
+            committed: Arc::new(AtomicBool::new(false)),
+            mutation_gate: Arc::new(StdMutex::new(())),
+        }
+    }
+
+    fn from_app(app: &AppHandle) -> Self {
+        Self {
+            committed: Arc::clone(app.state::<Arc<AtomicBool>>().inner()),
+            mutation_gate: Arc::clone(app.state::<Arc<StdMutex<()>>>().inner()),
+        }
+    }
+
+    fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    fn commit(&self) -> bool {
+        // Exit commitment is one-way. Recover a poisoned gate only to force
+        // the safe state (retain durable intent); mutations fail closed.
+        let _guard = self
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !self.committed.swap(true, Ordering::AcqRel)
+    }
+
+    fn with_gate<T>(&self, operation: impl FnOnce(bool) -> Result<T, String>) -> Result<T, String> {
+        let _guard = self
+            .mutation_gate
+            .lock()
+            .map_err(|_| "Application exit mutation gate is unavailable.".to_string())?;
+        operation(self.is_committed())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BreakoutWindowRegistration {
+    profile_id: String,
+    id: String,
+}
+
+#[derive(Default)]
+struct BreakoutWindowRegistry {
+    registrations: HashMap<String, BreakoutWindowRegistration>,
+    /// A child can receive CloseRequested in the narrow native-open → IPC
+    /// registration gap. Remember that pre-commit user intent so registration
+    /// can consume it instead of leaving a durable orphan.
+    pending_explicit_closes: HashSet<String>,
+}
+
+static BREAKOUT_WINDOW_REGISTRY: OnceLock<StdMutex<BreakoutWindowRegistry>> = OnceLock::new();
 static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static THREAD_BRIDGE_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static BIGVIEW_SYNC_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -463,6 +523,122 @@ unsafe extern "system" {
 
 pub(crate) fn app_shutdown_requested() -> bool {
     APP_SHUTDOWN_PHASE.load(Ordering::Acquire) >= APP_SHUTDOWN_PHASE_QUIESCING
+}
+
+fn commit_application_exit(app: &AppHandle) -> bool {
+    ApplicationExitAuthority::from_app(app).commit()
+}
+
+fn breakout_window_registry() -> &'static StdMutex<BreakoutWindowRegistry> {
+    BREAKOUT_WINDOW_REGISTRY.get_or_init(|| StdMutex::new(BreakoutWindowRegistry::default()))
+}
+
+#[cfg(test)]
+fn breakout_window_registration(
+    registry: &StdMutex<BreakoutWindowRegistry>,
+    window_id: &str,
+) -> Result<Option<BreakoutWindowRegistration>, String> {
+    registry
+        .lock()
+        .map_err(|_| "Breakout window registry is unavailable.".to_string())
+        .map(|state| state.registrations.get(window_id).cloned())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BreakoutWindowRegisterOutcome {
+    Registered,
+    RemovedPendingClose,
+    RetainedForExit,
+}
+
+fn breakout_window_register_with(
+    registry: &StdMutex<BreakoutWindowRegistry>,
+    exit_authority: &ApplicationExitAuthority,
+    window_id: String,
+    registration: BreakoutWindowRegistration,
+    window_exists: bool,
+    remove: impl FnOnce(&BreakoutWindowRegistration) -> Result<(), String>,
+) -> Result<BreakoutWindowRegisterOutcome, String> {
+    exit_authority.with_gate(|committed| {
+        let pending_close = {
+            let state = registry
+                .lock()
+                .map_err(|_| "Breakout window registry is unavailable.".to_string())?;
+            state.pending_explicit_closes.contains(&window_id)
+        };
+        if pending_close {
+            // The user close linearized before exit commit. Its identity only
+            // became available now, so complete that already-authorized delete
+            // even if commitment happened between close and registration.
+            // Production prevents this unregistered close until this branch
+            // consumes it, so a still-managed window is the closing original,
+            // never a same-label fresh incarnation.
+            remove(&registration)?;
+            registry
+                .lock()
+                .map_err(|_| "Breakout window registry is unavailable.".to_string())?
+                .pending_explicit_closes
+                .remove(&window_id);
+            return Ok(BreakoutWindowRegisterOutcome::RemovedPendingClose);
+        }
+        if committed {
+            return Ok(BreakoutWindowRegisterOutcome::RetainedForExit);
+        }
+        if !window_exists {
+            return Err("Cannot register a breakout for a missing session window.".to_string());
+        }
+        registry
+            .lock()
+            .map_err(|_| "Breakout window registry is unavailable.".to_string())?
+            .registrations
+            .insert(window_id, registration);
+        Ok(BreakoutWindowRegisterOutcome::Registered)
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BreakoutWindowCloseOutcome {
+    Unregistered,
+    PendingRegistration,
+    Removed,
+    RetainedForExit,
+}
+
+fn handle_breakout_window_close_with(
+    registry: &StdMutex<BreakoutWindowRegistry>,
+    exit_authority: &ApplicationExitAuthority,
+    window_id: &str,
+    remember_unregistered_close: bool,
+    remove: impl FnOnce(&BreakoutWindowRegistration) -> Result<(), String>,
+) -> Result<BreakoutWindowCloseOutcome, String> {
+    exit_authority.with_gate(|committed| {
+        if committed {
+            return Ok(BreakoutWindowCloseOutcome::RetainedForExit);
+        }
+        let registration = {
+            let mut state = registry
+                .lock()
+                .map_err(|_| "Breakout window registry is unavailable.".to_string())?;
+            match state.registrations.get(window_id).cloned() {
+                Some(registration) => registration,
+                None if !remember_unregistered_close => {
+                    return Ok(BreakoutWindowCloseOutcome::Unregistered);
+                }
+                None => {
+                    state.pending_explicit_closes.insert(window_id.to_string());
+                    return Ok(BreakoutWindowCloseOutcome::PendingRegistration);
+                }
+            }
+        };
+        remove(&registration)?;
+        let mut state = registry
+            .lock()
+            .map_err(|_| "Breakout window registry is unavailable.".to_string())?;
+        if state.registrations.get(window_id) == Some(&registration) {
+            state.registrations.remove(window_id);
+        }
+        Ok(BreakoutWindowCloseOutcome::Removed)
+    })
 }
 
 /// The close-confirm modal's Close: let the next exit request through the
@@ -3652,6 +3828,9 @@ fn run_app_force_exit_tail(app_for_exit: AppHandle, window_label: Option<String>
     if !mark_app_force_exit_started(&APP_CLOSE_FORCE_EXIT_STARTED) {
         return;
     }
+    // This is the immediate/watchdog exit's commit point. It precedes every
+    // AppHandle::exit or fallback window destruction below.
+    let _ = commit_application_exit(&app_for_exit);
 
     log_terminal_crash_forensics_event(
         "backend.app_force_exit.start",
@@ -3733,6 +3912,48 @@ async fn lock_lifecycle_with_timeout(
 mod app_shutdown_tests {
     use super::*;
 
+    fn breakout_test_connection() -> rusqlite::Connection {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        workspace_view_initialize_database(&mut connection).unwrap();
+        connection
+    }
+
+    fn insert_test_breakout(connection: &mut rusqlite::Connection, id: &str) {
+        breakout_upsert_in_connection(
+            connection,
+            "profile-exit-test",
+            id,
+            BreakoutKind::Session,
+            Some(format!("session-{id}")),
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+    }
+
+    fn test_breakout_exists(connection: &rusqlite::Connection, id: &str) -> bool {
+        breakout_get_from_connection(connection, "profile-exit-test", id)
+            .unwrap()
+            .is_some()
+    }
+
+    fn register_test_breakout(
+        registry: &StdMutex<BreakoutWindowRegistry>,
+        window_id: &str,
+        id: &str,
+    ) {
+        registry.lock().unwrap().registrations.insert(
+            window_id.to_string(),
+            BreakoutWindowRegistration {
+                profile_id: "profile-exit-test".to_string(),
+                id: id.to_string(),
+            },
+        );
+    }
+
     #[test]
     fn app_force_exit_schedule_marker_is_idempotent() {
         let scheduled = AtomicBool::new(false);
@@ -3752,6 +3973,199 @@ mod app_shutdown_tests {
         assert!(mark_app_force_exit_scheduled(&scheduled));
         assert!(mark_app_force_exit_started(&started));
         assert!(!mark_app_force_exit_started(&started));
+    }
+
+    #[test]
+    fn registered_child_close_removes_before_commit_and_retains_after_commit() {
+        let mut connection = breakout_test_connection();
+        insert_test_breakout(&mut connection, "breakout-running");
+        insert_test_breakout(&mut connection, "breakout-exiting");
+
+        let running_registry = StdMutex::new(BreakoutWindowRegistry::default());
+        register_test_breakout(
+            &running_registry,
+            "session-window-running",
+            "breakout-running",
+        );
+        let running = ApplicationExitAuthority::new();
+        assert_eq!(
+            handle_breakout_window_close_with(
+                &running_registry,
+                &running,
+                "session-window-running",
+                false,
+                |registration| {
+                    breakout_remove_in_connection(
+                        &mut connection,
+                        &registration.profile_id,
+                        &registration.id,
+                    )
+                },
+            )
+            .unwrap(),
+            BreakoutWindowCloseOutcome::Removed
+        );
+        assert!(!test_breakout_exists(&connection, "breakout-running"));
+        assert!(
+            breakout_window_registration(&running_registry, "session-window-running")
+                .unwrap()
+                .is_none()
+        );
+
+        let exiting_registry = StdMutex::new(BreakoutWindowRegistry::default());
+        register_test_breakout(
+            &exiting_registry,
+            "session-window-exiting",
+            "breakout-exiting",
+        );
+        let exiting = ApplicationExitAuthority::new();
+        assert!(exiting.commit());
+        assert_eq!(
+            handle_breakout_window_close_with(
+                &exiting_registry,
+                &exiting,
+                "session-window-exiting",
+                false,
+                |registration| {
+                    breakout_remove_in_connection(
+                        &mut connection,
+                        &registration.profile_id,
+                        &registration.id,
+                    )
+                },
+            )
+            .unwrap(),
+            BreakoutWindowCloseOutcome::RetainedForExit
+        );
+        assert!(test_breakout_exists(&connection, "breakout-exiting"));
+    }
+
+    #[test]
+    fn live_main_close_before_registration_is_consumed_if_exit_commits_next() {
+        let mut connection = breakout_test_connection();
+        insert_test_breakout(&mut connection, "breakout-register-gap");
+        let registry = StdMutex::new(BreakoutWindowRegistry::default());
+        let authority = ApplicationExitAuthority::new();
+
+        assert_eq!(
+            handle_breakout_window_close_with(
+                &registry,
+                &authority,
+                "session-window-register-gap",
+                true,
+                |_| panic!("an unregistered close has no durable identity yet"),
+            )
+            .unwrap(),
+            BreakoutWindowCloseOutcome::PendingRegistration
+        );
+        assert!(authority.commit());
+        assert_eq!(
+            breakout_window_register_with(
+                &registry,
+                &authority,
+                "session-window-register-gap".to_string(),
+                BreakoutWindowRegistration {
+                    profile_id: "profile-exit-test".to_string(),
+                    id: "breakout-register-gap".to_string(),
+                },
+                true,
+                |registration| {
+                    breakout_remove_in_connection(
+                        &mut connection,
+                        &registration.profile_id,
+                        &registration.id,
+                    )
+                },
+            )
+            .unwrap(),
+            BreakoutWindowRegisterOutcome::RemovedPendingClose
+        );
+        assert!(!test_breakout_exists(&connection, "breakout-register-gap"));
+    }
+
+    #[test]
+    fn pending_close_is_consumed_while_child_is_still_managed() {
+        let mut connection = breakout_test_connection();
+        insert_test_breakout(&mut connection, "breakout-register-before-commit");
+        let registry = StdMutex::new(BreakoutWindowRegistry::default());
+        let authority = ApplicationExitAuthority::new();
+
+        assert_eq!(
+            handle_breakout_window_close_with(
+                &registry,
+                &authority,
+                "session-window-register-before-commit",
+                true,
+                |_| panic!("an unregistered close has no durable identity yet"),
+            )
+            .unwrap(),
+            BreakoutWindowCloseOutcome::PendingRegistration
+        );
+        assert_eq!(
+            breakout_window_register_with(
+                &registry,
+                &authority,
+                "session-window-register-before-commit".to_string(),
+                BreakoutWindowRegistration {
+                    profile_id: "profile-exit-test".to_string(),
+                    id: "breakout-register-before-commit".to_string(),
+                },
+                true,
+                |registration| {
+                    breakout_remove_in_connection(
+                        &mut connection,
+                        &registration.profile_id,
+                        &registration.id,
+                    )
+                },
+            )
+            .unwrap(),
+            BreakoutWindowRegisterOutcome::RemovedPendingClose
+        );
+        assert!(!test_breakout_exists(
+            &connection,
+            "breakout-register-before-commit"
+        ));
+        assert!(authority.commit());
+    }
+
+    #[test]
+    fn explicit_child_close_already_inside_gate_wins_before_exit_commit() {
+        use std::sync::mpsc;
+
+        let authority = Arc::new(ApplicationExitAuthority::new());
+        let (mutation_entered_tx, mutation_entered_rx) = mpsc::channel();
+        let (release_mutation_tx, release_mutation_rx) = mpsc::channel();
+        let mutation_authority = Arc::clone(&authority);
+        let mutation = thread::spawn(move || {
+            mutation_authority.with_gate(|committed| {
+                assert!(!committed);
+                mutation_entered_tx.send(()).unwrap();
+                release_mutation_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        mutation_entered_rx.recv().unwrap();
+
+        let (commit_started_tx, commit_started_rx) = mpsc::channel();
+        let (commit_done_tx, commit_done_rx) = mpsc::channel();
+        let commit_authority = Arc::clone(&authority);
+        let commit = thread::spawn(move || {
+            commit_started_tx.send(()).unwrap();
+            let changed = commit_authority.commit();
+            commit_done_tx.send(changed).unwrap();
+        });
+        commit_started_rx.recv().unwrap();
+        assert_eq!(
+            commit_done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        release_mutation_tx.send(()).unwrap();
+        mutation.join().unwrap().unwrap();
+        assert!(commit_done_rx.recv().unwrap());
+        commit.join().unwrap();
+        assert!(authority.is_committed());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5075,6 +5489,67 @@ async fn close_app_after_terminal_shutdown(
     start_backend_app_shutdown_with_watchdog(app, window_label, force_exit_result)
 }
 
+/// Binds a native session-window label to durable breakout identity for the
+/// lifetime of this process only. The label is never written to the durable
+/// workspace-view store.
+#[tauri::command(rename_all = "snake_case")]
+fn breakout_window_register(
+    app: AppHandle,
+    window_id: String,
+    profile_id: String,
+    id: String,
+) -> Result<(), String> {
+    let window_id = window_id.trim().to_string();
+    let profile_id = profile_id.trim().to_string();
+    let id = id.trim().to_string();
+    validate_session_window_label(&window_id)?;
+    workspace_view_validate_profile_id(&profile_id)?;
+    workspace_view_validate_reference(&id, "Breakout id")?;
+    let window_exists = app.get_webview_window(&window_id).is_some();
+    let exit_authority = ApplicationExitAuthority::from_app(&app);
+    let destroy_label = window_id.clone();
+    let outcome = breakout_window_register_with(
+        breakout_window_registry(),
+        &exit_authority,
+        window_id,
+        BreakoutWindowRegistration { profile_id, id },
+        window_exists,
+        |registration| {
+            breakout_remove_blocking_unchecked(
+                registration.profile_id.clone(),
+                registration.id.clone(),
+            )
+        },
+    )?;
+    if outcome == BreakoutWindowRegisterOutcome::RemovedPendingClose {
+        if let Some(window) = app.get_webview_window(&destroy_label) {
+            window.destroy().map_err(|error| {
+                format!("Unable to finish explicit close for {destroy_label}: {error}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_registered_breakout_window_close(
+    app: &AppHandle,
+    window_id: &str,
+) -> Result<BreakoutWindowCloseOutcome, String> {
+    let exit_authority = ApplicationExitAuthority::from_app(app);
+    handle_breakout_window_close_with(
+        breakout_window_registry(),
+        &exit_authority,
+        window_id,
+        true,
+        |registration| {
+            breakout_remove_blocking_unchecked(
+                registration.profile_id.clone(),
+                registration.id.clone(),
+            )
+        },
+    )
+}
+
 #[tauri::command(rename_all = "snake_case")]
 async fn app_force_exit_now(app: AppHandle, reason: Option<String>) -> Result<(), String> {
     let reason = normalize_app_force_exit_reason(reason, "app_force_exit_now");
@@ -5106,11 +5581,47 @@ fn start_backend_app_shutdown(app: AppHandle, window_label: String) -> Result<()
     start_backend_app_shutdown_with_watchdog(app, window_label, force_exit_result)
 }
 
+fn request_backend_app_shutdown_from_native_close(
+    app: &AppHandle,
+    daemon: bool,
+    source: &str,
+) -> Result<bool, String> {
+    let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
+    if phase == APP_SHUTDOWN_PHASE_RUNNING {
+        // Confirmation is consumed per attempt. Merely asking for or showing
+        // the modal is not an exit commit, so explicit child closes remain
+        // ordinary durable deletes until the confirmed request returns here.
+        let confirmed = APP_CLOSE_CONFIRMED.swap(false, Ordering::AcqRel);
+        if !daemon
+            && !confirmed
+            && !app_is_in_background_mode()
+            && APP_CLOSE_LISTENER_READY.load(Ordering::Acquire)
+            && !app.webview_windows().is_empty()
+            && app
+                .emit(
+                    "forge-app-close-requested",
+                    serde_json::json!({ "source": source }),
+                )
+                .is_ok()
+        {
+            return Ok(false);
+        }
+    }
+
+    if phase < APP_SHUTDOWN_PHASE_EXITING {
+        start_backend_app_shutdown(app.clone(), "main".to_string())?;
+    }
+    Ok(true)
+}
+
 fn start_backend_app_shutdown_with_watchdog(
     app: AppHandle,
     window_label: String,
     force_exit_result: Result<(), String>,
 ) -> Result<(), String> {
+    // This is the graceful exit commit point. It is deliberately after the
+    // close-confirm gate, but before teardown can destroy any child window.
+    let _ = commit_application_exit(&app);
     let _ = begin_app_shutdown();
 
     if APP_CLOSE_SHUTDOWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
@@ -5850,6 +6361,7 @@ fn run_app(daemon: bool) {
         None
     };
     let mut builder = tauri::Builder::default();
+    let application_exit_authority = ApplicationExitAuthority::new();
     let pty_pool = Arc::new(PtyPool::new());
     let terminal_process_epoch = match terminal_process_epoch_allocate() {
         Ok(epoch) => epoch,
@@ -5904,6 +6416,8 @@ fn run_app(daemon: bool) {
     }
 
     builder = builder
+        .manage(Arc::clone(&application_exit_authority.committed))
+        .manage(Arc::clone(&application_exit_authority.mutation_gate))
         .manage(TerminalState {
             terminals: Arc::new(RwLock::new(HashMap::new())),
             pending_restart_intents: Arc::new(StdMutex::new(HashMap::new())),
@@ -6200,6 +6714,7 @@ fn run_app(daemon: bool) {
             breakout_list,
             breakout_upsert,
             breakout_remove,
+            breakout_window_register,
             breakout_clear_missing,
             session_projection_window,
             session_projection_trajectory,
@@ -6664,42 +7179,59 @@ fn run_app(daemon: bool) {
             haider_projection_stop();
             haider_run_stop();
         }
-        if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
-            let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
-
-            if phase == APP_SHUTDOWN_PHASE_RUNNING {
-                // Close-confirm gate: an unconfirmed native exit (Cmd-Q) with
-                // a live, LISTENING frontend raises the modal instead of
-                // shutting down. The confirm is consumed per attempt (a force
-                // close authorizes that attempt only), and every trap door is
-                // held open: daemon builds, background mode (user already
-                // chose it — a quit from there is deliberate), a webview that
-                // is absent or never announced its listener, or a failed emit
-                // all proceed straight to shutdown.
-                let confirmed = APP_CLOSE_CONFIRMED.swap(false, Ordering::AcqRel);
-                if !daemon
-                    && !confirmed
-                    && !app_is_in_background_mode()
-                    && APP_CLOSE_LISTENER_READY.load(Ordering::Acquire)
-                    && !app.webview_windows().is_empty()
-                    && app
-                        .emit(
-                            "forge-app-close-requested",
-                            serde_json::json!({ "source": "exit-request" }),
-                        )
-                        .is_ok()
+        if let tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { api, .. },
+            ..
+        } = &event
+        {
+            if label == "main" {
+                // Closing the main window is an application-close request even
+                // while independent breakout windows keep Tauri's registry
+                // nonempty. Prevent this one window from disappearing and run
+                // the same confirm/commit gate used by ExitRequested.
+                api.prevent_close();
+                if let Err(error) =
+                    request_backend_app_shutdown_from_native_close(app, daemon, "main-window")
                 {
-                    api.prevent_exit();
-                    return;
+                    eprintln!("Failed to start backend shutdown from main window close: {error}");
                 }
-                api.prevent_exit();
-                let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
                 return;
             }
 
+            if validate_session_window_label(label).is_ok() {
+                // CloseRequested is the authoritative user-close source. It
+                // runs synchronously so the durable delete wins if it entered
+                // the commit gate first; an already-committed exit retains.
+                match handle_registered_breakout_window_close(app, label) {
+                    Ok(BreakoutWindowCloseOutcome::PendingRegistration) => {
+                        // The durable identity is still behind the ordered
+                        // upsert. Keep this exact incarnation alive until
+                        // registration consumes the recorded close and
+                        // destroys it, eliminating CloseRequested→Destroyed
+                        // registry timing as an authority input.
+                        api.prevent_close();
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        api.prevent_close();
+                        eprintln!(
+                            "Unable to remove durable breakout for closing window {label}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
+            let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
+
             if phase < APP_SHUTDOWN_PHASE_EXITING {
                 api.prevent_exit();
-                let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
+                if let Err(error) =
+                    request_backend_app_shutdown_from_native_close(app, daemon, "exit-request")
+                {
+                    eprintln!("Failed to start backend shutdown from exit request: {error}");
+                }
                 return;
             }
 

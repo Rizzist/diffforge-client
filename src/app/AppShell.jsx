@@ -48,15 +48,18 @@ import {
 } from "../sessions/sessionsRosterBootstrap.js";
 import { spaceWindowLeaves } from "../sessions/spacesModel.js";
 import {
+  createBreakoutWindowPersistence,
   createSessionWindowIncarnationGuard,
   removeSessionWindowBreakout,
-  removeSessionWindowAfterNativeCheck,
+  reconcileSessionWindowDestroyed,
   returnSessionWindowToSpaceLeaf,
   SESSION_WINDOW_CLOSED_EVENT,
   SESSION_WINDOW_CONTROL_EVENT,
   SESSION_WINDOW_CONTROL_FOCUS_MAIN,
   SESSION_WINDOW_CONTROL_RETURN,
   SESSION_WINDOW_REFRESH_EVENT,
+  sessionWindowControlEndsBreakout,
+  startBreakoutOpenBeforeNativeCheck,
   trackSessionWindowAfterNativeCheck,
   trackSessionWindowBreakout,
   trackSessionWindowStateIfCurrent,
@@ -18567,6 +18570,21 @@ export default function App() {
       },
     });
   }
+  /* Breakout persistence is deliberately a separate restore gate. It remains
+     unarmed in Step 5; Step 6 will list/restore the exact reachable profile,
+     then arm this controller. Native tracking continues independently. */
+  const breakoutWindowPersistenceRef = useRef(null);
+  if (!breakoutWindowPersistenceRef.current) {
+    breakoutWindowPersistenceRef.current = createBreakoutWindowPersistence({
+      upsert: (payload) => invoke("breakout_upsert", payload),
+      register: (payload) => invoke("breakout_window_register", payload),
+      remove: (payload) => invoke("breakout_remove", payload),
+      onError: (error) => {
+        console.error("Failed to persist breakout window intent.", error);
+      },
+    });
+  }
+  const breakoutWindowPersistence = breakoutWindowPersistenceRef.current;
   const workspaceViewPendingTargetRef = useRef(null);
   const flushWorkspaceViewSave = useCallback(async () => {
     try {
@@ -18805,6 +18823,11 @@ export default function App() {
   /* Rail session search: a persistent input under the New chat row (rendered
      by SessionsRail) narrows the Pinned/Recent lists by title. */
   const [railSearchQuery, setRailSearchQuery] = useState("");
+  const workspaceViewBarrier = sessionsRosterGateRef.current.barrier;
+  const workspaceViewBarrierRevision = sessionsRosterGateRef.current.barrierRevision;
+  const workspaceViewProfileId = workspaceViewBarrier.state === "reachable"
+    ? workspaceViewBarrier.profile_id
+    : null;
   /* Spaces: local-only (sessions.sqlite) named session sets + layout trees.
      The hook owns the model state and persistence; the shell only routes
      rail/surface intents and closes the draft/media layers on transitions. */
@@ -18835,12 +18858,6 @@ export default function App() {
     setActiveSessionId(sessionRef);
     showView(DEFAULT_WORKSPACE_VIEW);
   }, [exitSpaceOp, setMediaDeckOpen, showView]);
-  const workspaceViewBarrier = sessionsRosterGateRef.current.barrier;
-  const workspaceViewBarrierRevision = sessionsRosterGateRef.current.barrierRevision;
-  const workspaceViewProfileId = workspaceViewBarrier.state === "reachable"
-    ? workspaceViewBarrier.profile_id
-    : null;
-
   const applyWorkspaceViewHydration = useCallback(async (hydration) => {
     setOpenSessionIds([...hydration.openSessionRefs]);
     setMediaDeckOpen(false);
@@ -20626,10 +20643,12 @@ export default function App() {
     setCloseConfirmOpen(false);
     runWindowAction(async () => {
       /* The last space layout and workspace-view intent must land before the
-         webview is destroyed. Bound both IPC flushes so a stuck save cannot
-         wedge close, and run them BEFORE confirming the close. */
+         webview is destroyed. Bound the general layout saves, but fully drain
+         breakout commands before confirming close: exit commit must never
+         overtake an explicit close already in that ordered stream. */
       const flushTimeout = new Promise((resolve) => { setTimeout(resolve, 2000); });
       const workspaceViewFlush = flushWorkspaceViewSave();
+      const breakoutWindowFlush = breakoutWindowPersistence.flush();
       await Promise.race([
         Promise.resolve(flushSpaceSaves?.()).catch(() => {}),
         flushTimeout,
@@ -20638,12 +20657,16 @@ export default function App() {
         workspaceViewFlush,
         flushTimeout,
       ]);
+      await breakoutWindowFlush;
       /* Mark the close CONFIRMED so the Rust ExitRequested gate lets the
          shutdown proceed instead of re-raising the modal. */
       await invoke("app_confirm_close").catch(() => {});
-      await getSafeCurrentWindow()?.close();
+      const appWindow = getSafeCurrentWindow();
+      if (!appWindow) return;
+      await appWindow.close();
     });
   }, [
+    breakoutWindowPersistence,
     flushSpaceSaves,
     flushWorkspaceViewSave,
     networkingOverlayOpen,
@@ -21531,33 +21554,40 @@ export default function App() {
           width: 960,
         });
         const label = String(result?.label || "");
-        await trackSessionWindowAfterNativeCheck({
-          guard: sessionWindowIncarnationGuard,
-          label,
-          nativeExists: (candidateLabel) => invoke("session_window_focus", {
-            label: candidateLabel,
+        await startBreakoutOpenBeforeNativeCheck({
+          persistOpen: () => breakoutWindowPersistence.persistSessionOpen({
+            profileId: workspaceViewProfileId,
+            sessionRef: sessionId,
+            windowId: label,
           }),
-          remove: () => removeTrackedSessionWindowByLabel(label),
-          track: (claimedIncarnation) => {
-            setSessionWindowBreakouts((current) => trackSessionWindowStateIfCurrent({
-              current,
-              isCurrent: () => sessionWindowIncarnationGuard.isCurrent(
-                label,
-                claimedIncarnation,
-              ),
-              track: (latest) => {
-                const next = trackSessionWindowBreakout(latest, {
-                  ...result,
-                  incarnation: claimedIncarnation,
-                }, {
-                  id: sessionId,
-                  title,
-                });
-                sessionWindowBreakoutsRef.current = next;
-                return next;
-              },
-            }));
-          },
+          trackAfterNativeCheck: () => trackSessionWindowAfterNativeCheck({
+            guard: sessionWindowIncarnationGuard,
+            label,
+            nativeExists: (candidateLabel) => invoke("session_window_focus", {
+              label: candidateLabel,
+            }),
+            remove: () => removeTrackedSessionWindowByLabel(label),
+            track: (claimedIncarnation) => {
+              setSessionWindowBreakouts((current) => trackSessionWindowStateIfCurrent({
+                current,
+                isCurrent: () => sessionWindowIncarnationGuard.isCurrent(
+                  label,
+                  claimedIncarnation,
+                ),
+                track: (latest) => {
+                  const next = trackSessionWindowBreakout(latest, {
+                    ...result,
+                    incarnation: claimedIncarnation,
+                  }, {
+                    id: sessionId,
+                    title,
+                  });
+                  sessionWindowBreakoutsRef.current = next;
+                  return next;
+                },
+              }));
+            },
+          }),
         });
         return label;
       } catch {
@@ -21566,9 +21596,11 @@ export default function App() {
     },
   }), [
     activeAppTheme,
+    breakoutWindowPersistence,
     removeTrackedSessionWindowByLabel,
     sessionWindowIncarnationGuard,
     sessionsRoster,
+    workspaceViewProfileId,
     workspaceSessionsById,
   ]);
 
@@ -21589,24 +21621,32 @@ export default function App() {
         width: 960,
       });
       const label = String(result?.label || "");
-      await trackSessionWindowAfterNativeCheck({
-        guard: sessionWindowIncarnationGuard,
-        label,
-        nativeExists: (candidateLabel) => invoke("session_window_focus", {
-          label: candidateLabel,
+      await startBreakoutOpenBeforeNativeCheck({
+        persistOpen: () => breakoutWindowPersistence.persistSpaceLeafOpen({
+          leafId,
+          profileId: workspaceViewProfileId,
+          spaceId,
+          windowId: label,
         }),
-        remove: () => removeTrackedSessionWindowByLabel(label),
-        track: (claimedIncarnation) => {
-          trackSpaceWindowBreakoutOp({
-            ...result,
-            incarnation: claimedIncarnation,
-          }, {
-            leafId,
-            sessionId,
-            spaceId,
-            title,
-          }, () => sessionWindowIncarnationGuard.isCurrent(label, claimedIncarnation));
-        },
+        trackAfterNativeCheck: () => trackSessionWindowAfterNativeCheck({
+          guard: sessionWindowIncarnationGuard,
+          label,
+          nativeExists: (candidateLabel) => invoke("session_window_focus", {
+            label: candidateLabel,
+          }),
+          remove: () => removeTrackedSessionWindowByLabel(label),
+          track: (claimedIncarnation) => {
+            trackSpaceWindowBreakoutOp({
+              ...result,
+              incarnation: claimedIncarnation,
+            }, {
+              leafId,
+              sessionId,
+              spaceId,
+              title,
+            }, () => sessionWindowIncarnationGuard.isCurrent(label, claimedIncarnation));
+          },
+        }),
       });
       return label;
     } catch {
@@ -21614,9 +21654,11 @@ export default function App() {
     }
   }, [
     activeAppTheme,
+    breakoutWindowPersistence,
     removeTrackedSessionWindowByLabel,
     sessionWindowIncarnationGuard,
     trackSpaceWindowBreakoutOp,
+    workspaceViewProfileId,
   ]);
 
   const openSpaceLeafWindow = useCallback(async (target) => {
@@ -21655,13 +21697,19 @@ export default function App() {
       const payload = event?.payload || {};
       const label = String(payload.window_id || payload.windowId || payload.label || "").trim();
       if (!label) return;
-      void removeSessionWindowAfterNativeCheck({
+      void reconcileSessionWindowDestroyed({
         guard: sessionWindowIncarnationGuard,
         label,
         nativeExists: (candidateLabel) => invoke("session_window_focus", {
           label: candidateLabel,
         }),
-        remove: () => removeTrackedSessionWindowByLabel(label),
+        removeDurable: () => breakoutWindowPersistence.persistExplicitClose({
+          forgetWindow: true,
+          payload,
+          profileId: workspaceViewProfileId,
+          windowId: label,
+        }),
+        removeTracked: () => removeTrackedSessionWindowByLabel(label),
       });
     }).then((stop) => {
       if (disposed) stop();
@@ -21671,7 +21719,12 @@ export default function App() {
       disposed = true;
       unlisten();
     };
-  }, [removeTrackedSessionWindowByLabel, sessionWindowIncarnationGuard]);
+  }, [
+    breakoutWindowPersistence,
+    removeTrackedSessionWindowByLabel,
+    sessionWindowIncarnationGuard,
+    workspaceViewProfileId,
+  ]);
 
   useEffect(() => {
     let disposed = false;
@@ -21693,6 +21746,15 @@ export default function App() {
       const control = String(payload.control || "").trim();
       if (control !== SESSION_WINDOW_CONTROL_FOCUS_MAIN
         && control !== SESSION_WINDOW_CONTROL_RETURN) return;
+      if (sessionWindowControlEndsBreakout(control)) {
+        /* Return ends durable user intent immediately. S3 tracking remains
+           until the native CLOSED path positively confirms absence. */
+        void breakoutWindowPersistence.persistExplicitClose({
+          payload,
+          profileId: workspaceViewProfileId,
+          windowId,
+        });
+      }
       if (spaceBreakout) {
         void enterSpaceFromRail(spaceBreakout.spaceId, spaceBreakout.leafId);
       } else {
@@ -21712,10 +21774,12 @@ export default function App() {
       unlisten();
     };
   }, [
+    breakoutWindowPersistence,
     enterSpaceFromRail,
     openSessionFromRail,
     removeSpaceWindowBreakoutOp,
     sessions,
+    workspaceViewProfileId,
   ]);
   const appStartupEnabled = Boolean(appStartupSettings.enabled);
   const appStartupBusy = appStartupSettingsState === "loading" || appStartupSettingsState === "saving";
