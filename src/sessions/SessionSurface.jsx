@@ -16,6 +16,7 @@ import { Language } from "@styled-icons/material-rounded/Language";
 import { Memory } from "@styled-icons/material-rounded/Memory";
 import { MoreHoriz } from "@styled-icons/material-rounded/MoreHoriz";
 import { Movie } from "@styled-icons/material-rounded/Movie";
+import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Terminal as TerminalGlyph } from "@styled-icons/material-rounded/Terminal";
 import { Timeline } from "@styled-icons/material-rounded/Timeline";
@@ -139,6 +140,7 @@ export default function SessionSurface({
   onDraftMaterialized,
   onHeaderDragStart = null,
   onOpenSession,
+  onPopOutSession = null,
   onResetToDraft,
   onSessionsRefresh = null,
   onShellWarm = null,
@@ -1626,6 +1628,16 @@ export default function SessionSurface({
             document.body,
           )}
         </TitleMenuWrap>
+        {session.id !== "draft" && onPopOutSession && (
+          <HeaderIconButton
+            aria-label="Pop out session"
+            onClick={() => onPopOutSession(session)}
+            title="Open this session in its own window"
+            type="button"
+          >
+            <OpenInNew aria-hidden="true" />
+          </HeaderIconButton>
+        )}
       </TitleRow>
   );
 

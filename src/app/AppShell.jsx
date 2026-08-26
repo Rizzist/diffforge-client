@@ -1,6 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import {
   availableMonitors,
   currentMonitor,
@@ -41,6 +41,21 @@ import {
   SPACE_ROSTER_PENDING_REASON,
   unreachableSpacesRoster,
 } from "../sessions/spacesController.js";
+import { spaceWindowLeaves } from "../sessions/spacesModel.js";
+import {
+  createSessionWindowIncarnationGuard,
+  removeSessionWindowBreakout,
+  removeSessionWindowAfterNativeCheck,
+  returnSessionWindowToSpaceLeaf,
+  SESSION_WINDOW_CLOSED_EVENT,
+  SESSION_WINDOW_CONTROL_EVENT,
+  SESSION_WINDOW_CONTROL_FOCUS_MAIN,
+  SESSION_WINDOW_CONTROL_RETURN,
+  SESSION_WINDOW_REFRESH_EVENT,
+  trackSessionWindowAfterNativeCheck,
+  trackSessionWindowBreakout,
+  trackSessionWindowStateIfCurrent,
+} from "../sessions/sessionWindowBridge.js";
 import MediaDeck from "../media/MediaDeck.jsx";
 import { listSessions, sessionWorkingDirectory } from "../sessions/sessionsModel.js";
 import { sessionCloseCautionSummary } from "../sessions/sessionActivity.js";
@@ -18408,11 +18423,13 @@ export default function App() {
       if (sessionsReadSeqRef.current === seq) {
         setSessions(rows);
         setSessionsRoster(rosterFromSessionsRead({ ok: true, rows }));
+        void emit(SESSION_WINDOW_REFRESH_EVENT, { scope: "sessions" }).catch(() => {});
       }
     } catch (error) {
       // Store not available yet (first boot before Rust lane) — rail stays empty.
       if (sessionsReadSeqRef.current === seq) {
         setSessionsRoster(rosterFromSessionsRead({ ok: false, error }));
+        void emit(SESSION_WINDOW_REFRESH_EVENT, { scope: "sessions" }).catch(() => {});
       }
     }
   }, []);
@@ -18558,13 +18575,28 @@ export default function App() {
     revealConfirmedSession: revealConfirmedSpaceSessionOp,
     revealSession: revealSpaceSessionOp,
     flushSaves: flushSpaceSaves,
+    focusLeaf: focusSpaceLeafOp,
+    removeWindowBreakout: removeSpaceWindowBreakoutOp,
+    trackWindowBreakout: trackSpaceWindowBreakoutOp,
   } = spacesApi;
-  const enterSpaceFromRail = useCallback((spaceId) => {
+  const enterSpaceFromRail = useCallback(async (spaceId, leafId = "") => {
     setMediaDeckOpen(false);
     setSessionDraftOpen(false);
     showView(DEFAULT_WORKSPACE_VIEW);
-    void enterSpaceOp(spaceId);
-  }, [enterSpaceOp, setMediaDeckOpen, showView]);
+    /* Even same-space selection enters the hook's intent stream. This lets a
+       Return-to-A supersede an older enter-B that is still flushing A. */
+    return returnSessionWindowToSpaceLeaf({
+      enterSpace: enterSpaceOp,
+      focusLeaf: focusSpaceLeafOp,
+      leafId,
+      spaceId,
+    });
+  }, [
+    enterSpaceOp,
+    focusSpaceLeafOp,
+    setMediaDeckOpen,
+    showView,
+  ]);
   const createSpaceFromRail = useCallback((name) => {
     setMediaDeckOpen(false);
     setSessionDraftOpen(false);
@@ -21044,6 +21076,239 @@ export default function App() {
     setAuraModeOpen(false);
   }, []);
   const activeAppTheme = normalizeAppTheme(appAppearanceSettings.theme);
+  const [sessionWindowBreakouts, setSessionWindowBreakouts] = useState({});
+  const sessionWindowBreakoutsRef = useRef(sessionWindowBreakouts);
+  const spaceWindowBreakoutsRef = useRef(spacesApi.spaceWindowBreakouts);
+  const sessionWindowIncarnationGuardRef = useRef(null);
+  if (sessionWindowIncarnationGuardRef.current == null) {
+    sessionWindowIncarnationGuardRef.current = createSessionWindowIncarnationGuard();
+  }
+  const sessionWindowIncarnationGuard = sessionWindowIncarnationGuardRef.current;
+  useEffect(() => {
+    sessionWindowBreakoutsRef.current = sessionWindowBreakouts;
+  }, [sessionWindowBreakouts]);
+  useEffect(() => {
+    spaceWindowBreakoutsRef.current = spacesApi.spaceWindowBreakouts;
+  }, [spacesApi.spaceWindowBreakouts]);
+
+  /* Native absence has already won the synchronous incarnation guard before
+     this runs. Remove by stable label, not by that guard token: the tracked
+     row may belong to the immediately previous incarnation. Any later open
+     queues its guarded re-track after this cleanup. */
+  const removeTrackedSessionWindowByLabel = useCallback((labelValue) => {
+    const label = String(labelValue || "").trim();
+    if (!label) return;
+    const payload = { window_id: label };
+    setSessionWindowBreakouts((current) => {
+      const next = removeSessionWindowBreakout(current, payload);
+      sessionWindowBreakoutsRef.current = next;
+      return next;
+    });
+    removeSpaceWindowBreakoutOp(payload);
+  }, [removeSpaceWindowBreakoutOp]);
+
+  const openSessionWindow = useCallback(async (sessionOrId, fallbackTitle = "") => {
+    const sessionId = String(
+      typeof sessionOrId === "string" ? sessionOrId : sessionOrId?.id || "",
+    ).trim();
+    if (!sessionId) return "";
+    const title = String(
+      typeof sessionOrId === "string" ? fallbackTitle : sessionOrId?.title || fallbackTitle,
+    ).trim() || sessionId;
+    try {
+      const result = await invoke("session_window_open", {
+        height: 760,
+        leaf_id: null,
+        session_id: sessionId,
+        space_id: null,
+        theme: activeAppTheme,
+        title,
+        width: 960,
+      });
+      const label = String(result?.label || "");
+      await trackSessionWindowAfterNativeCheck({
+        guard: sessionWindowIncarnationGuard,
+        label,
+        nativeExists: (candidateLabel) => invoke("session_window_focus", {
+          label: candidateLabel,
+        }),
+        remove: () => removeTrackedSessionWindowByLabel(label),
+        track: (claimedIncarnation) => {
+          setSessionWindowBreakouts((current) => trackSessionWindowStateIfCurrent({
+            current,
+            isCurrent: () => sessionWindowIncarnationGuard.isCurrent(
+              label,
+              claimedIncarnation,
+            ),
+            track: (latest) => {
+              const next = trackSessionWindowBreakout(latest, {
+                ...result,
+                incarnation: claimedIncarnation,
+              }, {
+                id: sessionId,
+                title,
+              });
+              sessionWindowBreakoutsRef.current = next;
+              return next;
+            },
+          }));
+        },
+      });
+      return label;
+    } catch {
+      return "";
+    }
+  }, [
+    activeAppTheme,
+    removeTrackedSessionWindowByLabel,
+    sessionWindowIncarnationGuard,
+  ]);
+
+  const invokeSpaceLeafWindow = useCallback(async (target) => {
+    const sessionId = String(target?.sessionId || "").trim();
+    const spaceId = String(target?.spaceId || "").trim();
+    const leafId = String(target?.leafId || "").trim();
+    if (!sessionId || !spaceId || !leafId) return "";
+    const title = String(target?.title || sessionId).trim() || sessionId;
+    try {
+      const result = await invoke("session_window_open", {
+        height: 760,
+        leaf_id: leafId,
+        session_id: sessionId,
+        space_id: spaceId,
+        theme: activeAppTheme,
+        title,
+        width: 960,
+      });
+      const label = String(result?.label || "");
+      await trackSessionWindowAfterNativeCheck({
+        guard: sessionWindowIncarnationGuard,
+        label,
+        nativeExists: (candidateLabel) => invoke("session_window_focus", {
+          label: candidateLabel,
+        }),
+        remove: () => removeTrackedSessionWindowByLabel(label),
+        track: (claimedIncarnation) => {
+          trackSpaceWindowBreakoutOp({
+            ...result,
+            incarnation: claimedIncarnation,
+          }, {
+            leafId,
+            sessionId,
+            spaceId,
+            title,
+          }, () => sessionWindowIncarnationGuard.isCurrent(label, claimedIncarnation));
+        },
+      });
+      return label;
+    } catch {
+      return "";
+    }
+  }, [
+    activeAppTheme,
+    removeTrackedSessionWindowByLabel,
+    sessionWindowIncarnationGuard,
+    trackSpaceWindowBreakoutOp,
+  ]);
+
+  const openSpaceLeafWindow = useCallback(async (target) => {
+    const spaceId = String(target?.spaceId || "").trim();
+    if (!spaceId) return "";
+    /* The leaf host reads space_get and reconciles it against its own roster.
+       Flush the model-owned latest bytes before opening; a failed save remains
+       pending, and the host reports a missing/stale leaf honestly. */
+    await flushSpaceSaves(spaceId);
+    return invokeSpaceLeafWindow(target);
+  }, [flushSpaceSaves, invokeSpaceLeafWindow]);
+
+  const openActiveSpaceWindows = useCallback(async () => {
+    const spaceId = String(spacesApi.activeSpaceId || "").trim();
+    if (!spaceId || !spacesApi.spaceState) return [];
+    const targets = spaceWindowLeaves(spacesApi.spaceState).map((leaf) => ({
+      ...leaf,
+      spaceId,
+      title: sessions.find((session) => session.id === leaf.sessionId)?.title || leaf.sessionId,
+    }));
+    await flushSpaceSaves(spaceId);
+    return Promise.all(targets.map(invokeSpaceLeafWindow));
+  }, [
+    flushSpaceSaves,
+    invokeSpaceLeafWindow,
+    sessions,
+    spacesApi.activeSpaceId,
+    spacesApi.spaceState,
+  ]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(SESSION_WINDOW_CLOSED_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      const label = String(payload.window_id || payload.windowId || payload.label || "").trim();
+      if (!label) return;
+      void removeSessionWindowAfterNativeCheck({
+        guard: sessionWindowIncarnationGuard,
+        label,
+        nativeExists: (candidateLabel) => invoke("session_window_focus", {
+          label: candidateLabel,
+        }),
+        remove: () => removeTrackedSessionWindowByLabel(label),
+      });
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [removeTrackedSessionWindowByLabel, sessionWindowIncarnationGuard]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(SESSION_WINDOW_CONTROL_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      const windowId = String(payload.window_id || "").trim();
+      const payloadSessionId = String(payload.session_id || "").trim();
+      const payloadSpaceId = String(payload.space_id || "").trim();
+      const payloadLeafId = String(payload.leaf_id || "").trim();
+      const sessionBreakout = sessionWindowBreakoutsRef.current[windowId]
+        || (!payloadSpaceId && payloadSessionId ? { sessionId: payloadSessionId } : null);
+      const spaceBreakout = spaceWindowBreakoutsRef.current[windowId]
+        || (payloadSpaceId && payloadLeafId
+          ? { leafId: payloadLeafId, spaceId: payloadSpaceId }
+          : null);
+      if (!sessionBreakout && !spaceBreakout) return;
+      const control = String(payload.control || "").trim();
+      if (control !== SESSION_WINDOW_CONTROL_FOCUS_MAIN
+        && control !== SESSION_WINDOW_CONTROL_RETURN) return;
+      if (spaceBreakout) {
+        void enterSpaceFromRail(spaceBreakout.spaceId, spaceBreakout.leafId);
+      } else {
+        const session = sessions.find((row) => row.id === sessionBreakout.sessionId);
+        if (session) openSessionFromRail(session);
+      }
+      getCurrentWindow().show().catch(() => {});
+      getCurrentWindow().setFocus().catch(() => {});
+      /* Return is routing intent, not proof that the native close succeeded.
+         The CLOSED listener retains tracking until native absence is confirmed. */
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [
+    enterSpaceFromRail,
+    openSessionFromRail,
+    removeSpaceWindowBreakoutOp,
+    sessions,
+  ]);
   const appStartupEnabled = Boolean(appStartupSettings.enabled);
   const appStartupBusy = appStartupSettingsState === "loading" || appStartupSettingsState === "saving";
   const appStartupRegistered = appStartupSettings.autostart_enabled === true;
@@ -24412,6 +24677,7 @@ export default function App() {
                           onSelectMedia={openMediaSession}
                           onUpdateMedia={updateMediaSession}
                           onSelectSession={openSessionFromRail}
+                          onPopOutSession={openSessionWindow}
                           onToggleShell={toggleShellWarm}
                           shellPrefs={shellPrefs}
                           /* Collapsed hides the search box, so the filter
@@ -24873,6 +25139,8 @@ export default function App() {
                       onExitSpace={spacesApi.exitSpace}
                       onFocusLeaf={spacesApi.focusLeaf}
                       onHeaderDragStart={handleTitleBarMouseDown}
+                      onPopOutAll={openActiveSpaceWindows}
+                      onPopOutLeaf={openSpaceLeafWindow}
                       onSelectTab={spacesApi.selectTab}
                       opError={spacesApi.spaceOpError}
                       saveError={spacesApi.saveError}
@@ -24890,6 +25158,7 @@ export default function App() {
                       onDraftMaterialized={handleDraftMaterialized}
                       onHeaderDragStart={handleTitleBarMouseDown}
                       onOpenSession={openSessionFromRail}
+                      onPopOutSession={openSessionWindow}
                       onResetToDraft={startNewSessionChat}
                       onSessionsRefresh={refreshSessions}
                       onShellWarm={markShellWarm}

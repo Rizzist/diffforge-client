@@ -2884,6 +2884,7 @@ include!("terminals.rs");
 include!("swarm_runtime.rs");
 include!("orchestrator_pool.rs");
 include!("tools_window.rs");
+include!("session_window.rs");
 include!("web_panel.rs");
 include!("api.rs");
 include!("activity_overlay.rs");
@@ -6634,6 +6635,9 @@ fn run_app(daemon: bool) {
             tools_window_open,
             tools_window_close,
             tools_window_focus,
+            session_window_open,
+            session_window_close,
+            session_window_focus,
             web_panel_open,
             web_panel_close,
             web_panel_focus,

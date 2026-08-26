@@ -7,6 +7,7 @@ import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Movie } from "@styled-icons/material-rounded/Movie";
 import { Close } from "@styled-icons/material-rounded/Close";
+import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 
 import {
   SettingsNavGroupLabel,
@@ -48,6 +49,7 @@ export default function SessionsRail({
   onSearchChange = null,
   onSelectMedia = null,
   onSelectSession,
+  onPopOutSession = null,
   onToggleShell = null,
   onUpdateMedia = null,
   searchQuery = "",
@@ -330,6 +332,24 @@ export default function SessionsRail({
         {/* Spans, not buttons: the row itself is a button and nesting one
             inside another is invalid and swallows clicks. */}
         <RowActions>
+          <RowActionButton
+            aria-label="Pop out session"
+            onClick={(event) => {
+              event.stopPropagation();
+              onPopOutSession?.(session);
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return;
+              event.preventDefault();
+              event.stopPropagation();
+              onPopOutSession?.(session);
+            }}
+            role="button"
+            tabIndex={0}
+            title="Open this session in its own window"
+          >
+            <OpenInNew aria-hidden="true" />
+          </RowActionButton>
           <RowActionButton
             aria-label={session.pinned ? "Unpin" : "Pin"}
             data-on={session.pinned ? "true" : undefined}

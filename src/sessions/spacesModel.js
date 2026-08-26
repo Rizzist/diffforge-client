@@ -132,6 +132,22 @@ export function spaceLeafIds(state) {
   return ids;
 }
 
+/* A space root is a window SET, not a second layout model. Preserve every
+   leaf coordinate in traversal order: the same session may intentionally
+   appear in multiple panes and each leaf owns a distinct native window. */
+export function spaceWindowLeaves(state) {
+  validateSpaceState(state);
+  const leaves = [];
+  visitLeaves(state.root, (leaf) => {
+    leaves.push({
+      leafId: leaf.id,
+      sessionId: leaf.sessionRef,
+      viewKind: leaf.viewKind,
+    });
+  });
+  return leaves;
+}
+
 export function spaceLeafCount(state) {
   return spaceLeafIds(state).length;
 }
@@ -352,6 +368,12 @@ export function focusedSpaceSessionRef(state) {
   validateSpaceState(state);
   if (state.focusedLeaf == null) return null;
   return findLeaf(state.root, state.focusedLeaf).sessionRef;
+}
+
+export function spaceLeafById(state, leafId) {
+  validateSpaceState(state);
+  requireTrimmed(leafId, "Leaf id");
+  return findLeaf(state.root, leafId);
 }
 
 export function addSpaceMember(state, sessionRef) {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 
 import {
   closeSpaceLeaf,
@@ -17,6 +18,12 @@ import {
   spaceRailScope,
   SPACE_LAYOUT_CANONICAL_DIVERGENCE,
 } from "./spacesController.js";
+import {
+  removeSpaceWindowBreakout,
+  SESSION_WINDOW_REFRESH_EVENT,
+  trackSessionWindowStateIfCurrent,
+  trackSpaceWindowBreakout,
+} from "./sessionWindowBridge.js";
 
 /* React seam for Spaces: owns the record list, the active space's model
    state, and layout persistence. Every layout mutation flows through ONE
@@ -54,6 +61,83 @@ function normalizeSpaceEntry(entry) {
   };
 }
 
+/* Space entry is an intent stream, not merely an async read. Tokens advance
+   synchronously so a newer request can supersede an older request even while
+   that older request is still flushing the space it is leaving. */
+export function createSpaceEntryIntentSequence() {
+  let current = 0;
+  return Object.freeze({
+    begin() {
+      current += 1;
+      return current;
+    },
+    isCurrent(sequence) {
+      return current === sequence;
+    },
+    supersede() {
+      current += 1;
+      return current;
+    },
+  });
+}
+
+/* Importable orchestration seam for the A -> B -> A race. The intent is
+   claimed before the first await, and selecting the already-current A still
+   claims an intent; therefore it cancels a pending B without reloading A. */
+export async function resolveLatestSpaceEntryIntent({
+  activeSpaceId,
+  activeSpaceState,
+  activate,
+  flush,
+  intents,
+  load,
+  spaceId,
+} = {}) {
+  const requestedSpaceId = String(spaceId || "").trim();
+  if (!requestedSpaceId
+    || typeof intents?.begin !== "function"
+    || typeof intents?.isCurrent !== "function") {
+    return { status: "invalid" };
+  }
+  const sequence = intents.begin();
+  const leavingSpaceId = String(activeSpaceId || "").trim();
+  if (leavingSpaceId === requestedSpaceId && activeSpaceState) {
+    return { sequence, status: "current" };
+  }
+  if (leavingSpaceId && leavingSpaceId !== requestedSpaceId && typeof flush === "function") {
+    await flush(leavingSpaceId);
+    if (!intents.isCurrent(sequence)) return { sequence, status: "superseded" };
+  }
+  if (!intents.isCurrent(sequence)) return { sequence, status: "superseded" };
+  if (typeof activate === "function") activate(requestedSpaceId);
+  try {
+    const record = await load(requestedSpaceId);
+    if (!intents.isCurrent(sequence)) return { sequence, status: "superseded" };
+    return { record, sequence, status: "loaded" };
+  } catch (error) {
+    if (!intents.isCurrent(sequence)) return { sequence, status: "superseded" };
+    return { error, sequence, status: "error" };
+  }
+}
+
+/* Final APPLY boundary after the resolver's promise continuation. A newer
+   microtask can supersede the resolution after its last internal check but
+   before the hook resumes; only this synchronous check may authorize React
+   publication of current/error/loaded outcomes. */
+export function commitLatestSpaceEntryIntent({
+  commit,
+  intents,
+  resolution,
+} = {}) {
+  if (!resolution
+    || typeof intents?.isCurrent !== "function"
+    || !intents.isCurrent(resolution.sequence)
+    || typeof commit !== "function") {
+    return false;
+  }
+  return commit(resolution);
+}
+
 export function useSpaces({ enabled = true, roster, sessions = [] }) {
   const [spaces, setSpaces] = useState([]);
   const [spacesListError, setSpacesListError] = useState("");
@@ -63,12 +147,16 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
   const [saveErrorsBySpace, setSaveErrorsBySpace] = useState({}); // spaceId -> message
   const [deleteError, setDeleteError] = useState(null); // { spaceId, message }
   const [spaceOpError, setSpaceOpError] = useState("");
+  const [spaceWindowBreakouts, setSpaceWindowBreakouts] = useState({});
 
   const spaceStateRef = useRef(null);
   const activeSpaceIdRef = useRef("");
   const rosterRef = useRef(roster);
   rosterRef.current = roster;
-  const enterSeqRef = useRef(0);
+  const enterIntentsRef = useRef(null);
+  if (enterIntentsRef.current == null) {
+    enterIntentsRef.current = createSpaceEntryIntentSequence();
+  }
 
   const saverRef = useRef(null);
   if (saverRef.current == null) {
@@ -79,6 +167,12 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
           layout_json: layoutJson,
           focused_leaf: focusedLeaf,
         });
+        /* The stored record is the cross-window authority. Notify leaf hosts
+           only after these canonical bytes have actually landed. */
+        void emit(SESSION_WINDOW_REFRESH_EVENT, {
+          scope: "space",
+          space_id: spaceId,
+        }).catch(() => {});
         /* A successful save clears ONLY this space's error and updates ONLY
            this space's row — never another space's pending error. */
         setSaveErrorsBySpace((current) => {
@@ -125,9 +219,9 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
 
   const exitSpace = useCallback(() => {
     const leaving = activeSpaceIdRef.current;
+    enterIntentsRef.current.supersede();
     if (leaving) void saverRef.current.flush(leaving);
     activeSpaceIdRef.current = "";
-    enterSeqRef.current += 1;
     setActiveSpaceId("");
     publishState(null);
     setSpaceError(null);
@@ -135,34 +229,43 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
   }, [publishState]);
 
   const enterSpace = useCallback(async (spaceId) => {
-    if (!spaceId) return;
-    /* Flush the space we are leaving (if any) so its last bytes land — or stay
-       pending with their own error — before we switch. */
-    const leaving = activeSpaceIdRef.current;
-    if (leaving && leaving !== spaceId) await saverRef.current.flush(leaving);
-    const seq = enterSeqRef.current + 1;
-    enterSeqRef.current = seq;
-    activeSpaceIdRef.current = spaceId;
-    setActiveSpaceId(spaceId);
-    publishState(null);
-    setSpaceError(null);
-    setSpaceOpError("");
-    let record;
-    try {
-      record = await invoke("space_get", { space_id: spaceId });
-    } catch (error) {
-      /* A divergent stored layout fails space_get with the store's own reason;
-         it maps to the typed card — never a silent reset. */
-      if (enterSeqRef.current === seq) setSpaceError(storeErrorPresentation(error));
-      return;
-    }
-    if (enterSeqRef.current !== seq) return;
-    const result = enterSpaceState(record, rosterRef.current);
-    if (result.ok) {
-      publishState(result.state);
-    } else {
-      setSpaceError(result.error);
-    }
+    if (!spaceId) return false;
+    const resolution = await resolveLatestSpaceEntryIntent({
+      activeSpaceId: activeSpaceIdRef.current,
+      activeSpaceState: spaceStateRef.current,
+      activate: (nextSpaceId) => {
+        activeSpaceIdRef.current = nextSpaceId;
+        setActiveSpaceId(nextSpaceId);
+        publishState(null);
+        setSpaceError(null);
+        setSpaceOpError("");
+      },
+      flush: (leavingSpaceId) => saverRef.current.flush(leavingSpaceId),
+      intents: enterIntentsRef.current,
+      load: (nextSpaceId) => invoke("space_get", { space_id: nextSpaceId }),
+      spaceId,
+    });
+    return commitLatestSpaceEntryIntent({
+      intents: enterIntentsRef.current,
+      resolution,
+      commit: (latest) => {
+        if (latest.status === "current") return true;
+        if (latest.status === "error") {
+          /* A divergent stored layout fails space_get with the store's own reason;
+             it maps to the typed card — never a silent reset. */
+          setSpaceError(storeErrorPresentation(latest.error));
+          return false;
+        }
+        if (latest.status !== "loaded") return false;
+        const result = enterSpaceState(latest.record, rosterRef.current);
+        if (result.ok) {
+          publishState(result.state);
+          return true;
+        }
+        setSpaceError(result.error);
+        return false;
+      },
+    });
   }, [publishState]);
 
   /* The one mutation door. Model op errors surface as text — the state the
@@ -245,6 +348,10 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
     /* Deleted for real: the row no longer exists, so dropping pending bytes is
        correct rather than flushing them into a not-found error. */
     saverRef.current.discard(spaceId);
+    void emit(SESSION_WINDOW_REFRESH_EVENT, {
+      scope: "space",
+      space_id: spaceId,
+    }).catch(() => {});
     setDeleteError((current) => (current?.spaceId === spaceId ? null : current));
     setSaveErrorsBySpace((current) => {
       if (!(spaceId in current)) return current;
@@ -297,11 +404,26 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
     mutateSpace((state) => dragOutLeafInSpace(state, leafId, targetLeafId, options));
   }, [mutateSpace]);
 
+  /* Native-window bookkeeping lives beside the space model it coordinates,
+     keyed by the model's stable space+leaf identity. It is deliberately not
+     serialized into layout_json: S1's canonical schema has exact keys and no
+     migration for a window set yet. */
+  const trackWindowBreakout = useCallback((result, target, isCurrent = null) => {
+    setSpaceWindowBreakouts((current) => trackSessionWindowStateIfCurrent({
+      current,
+      isCurrent,
+      track: (latest) => trackSpaceWindowBreakout(latest, result, target),
+    }));
+  }, []);
+  const removeWindowBreakout = useCallback((payload) => {
+    setSpaceWindowBreakouts((current) => removeSpaceWindowBreakout(current, payload));
+  }, []);
+
   /* Quit/hide safety: flush every space's pending bytes. The shell's close
      handler awaits flushSaves() before the window closes; pagehide and a
      hidden visibility transition are the belt-and-braces for a close the
      handler does not mediate. */
-  const flushSaves = useCallback(() => saverRef.current.flush(), []);
+  const flushSaves = useCallback((spaceId = null) => saverRef.current.flush(spaceId), []);
   useEffect(() => {
     const onHide = () => { void saverRef.current.flush(); };
     const onVisibility = () => {
@@ -356,5 +478,8 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
     spaceError,
     spaceOpError,
     spaceState,
+    spaceWindowBreakouts,
+    trackWindowBreakout,
+    removeWindowBreakout,
   };
 }

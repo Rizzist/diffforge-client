@@ -23,6 +23,7 @@ import {
   SpaceLayoutCanonicalDivergenceError,
   spaceLeafCount,
   spaceLeafIds,
+  spaceWindowLeaves,
 } from "./spacesModel.js";
 
 function leaf(id, sessionRef, viewKind = "chat") {
@@ -305,4 +306,20 @@ test("[pin] the same session remains valid across different panes", () => {
   assert.equal(spaceLeafCount(opened), 4);
   assert.equal(opened.root.children[1].tabs.at(-1).sessionRef, "session-a");
   assert.equal(opened.focusedLeaf, "leaf-a-mirror");
+});
+
+test("[pin] a space root resolves to one stable window per leaf", () => {
+  const state = splitState();
+  const opened = openSpaceLeaf(state, leaf("leaf-a-mirror", "session-a"), {
+    stackId: "stack-right",
+  });
+  assert.deepEqual(
+    spaceWindowLeaves(opened),
+    [
+      { leafId: "leaf-a", sessionId: "session-a", viewKind: "chat" },
+      { leafId: "leaf-b", sessionId: "session-b", viewKind: "chat" },
+      { leafId: "leaf-c", sessionId: "session-c", viewKind: "chat" },
+      { leafId: "leaf-a-mirror", sessionId: "session-a", viewKind: "chat" },
+    ],
+  );
 });

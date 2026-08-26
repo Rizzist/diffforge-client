@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import styled from "styled-components";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { Forum } from "@styled-icons/material-rounded/Forum";
+import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Timeline } from "@styled-icons/material-rounded/Timeline";
 import { Workspaces } from "@styled-icons/material-rounded/Workspaces";
@@ -51,6 +52,8 @@ export default function SpaceSurface({
   onCloseLeaf,
   onDragOutLeaf,
   onExitSpace,
+  onPopOutAll = null,
+  onPopOutLeaf = null,
   onDismissDeleteError,
   onHeaderDragStart = null,
 }) {
@@ -205,6 +208,23 @@ export default function SpaceSurface({
                     {presentation.mode === "tombstone" ? "gone" : "?"}
                   </StackTabStateMark>
                 )}
+                <StackTabPopout
+                  aria-label="Pop out leaf"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onPopOutLeaf?.({
+                      leafId: tab.id,
+                      sessionId: tab.sessionRef,
+                      spaceId: space?.id,
+                      title,
+                    });
+                  }}
+                  role="button"
+                  tabIndex={-1}
+                  title="Open this leaf in its own window"
+                >
+                  <OpenInNew aria-hidden="true" />
+                </StackTabPopout>
                 <StackTabClose
                   aria-label="Close view"
                   onClick={(event) => {
@@ -287,6 +307,16 @@ export default function SpaceSurface({
             Layout save failed — retrying on the next change
           </SpaceHeaderNotice>
         )}
+        <SpaceHeaderPopOutAll
+          disabled={!state?.root || !onPopOutAll}
+          onClick={() => onPopOutAll?.()}
+          onMouseDown={(event) => event.stopPropagation()}
+          title="Open every leaf in its own window"
+          type="button"
+        >
+          <OpenInNew aria-hidden="true" />
+          <span>Pop out all</span>
+        </SpaceHeaderPopOutAll>
         <SpaceHeaderExit
           onClick={() => onExitSpace?.()}
           onMouseDown={(event) => event.stopPropagation()}
@@ -405,7 +435,6 @@ const SpaceHeaderNotice = styled.span`
 
 const SpaceHeaderExit = styled.button`
   flex: 0 0 auto;
-  margin-left: auto;
   padding: 3px 9px;
   border: 1px solid var(--forge-border-strong);
   border-radius: 6px;
@@ -418,6 +447,20 @@ const SpaceHeaderExit = styled.button`
   &:hover {
     color: var(--forge-text);
     background: var(--forge-surface-hover);
+  }
+`;
+
+const SpaceHeaderPopOutAll = styled(SpaceHeaderExit)`
+  display: inline-flex;
+  margin-left: auto;
+  align-items: center;
+  gap: 5px;
+
+  svg { width: 11px; height: 11px; }
+
+  &:disabled {
+    opacity: 0.45;
+    cursor: default;
   }
 `;
 
@@ -646,6 +689,15 @@ const StackTabClose = styled.span`
   &:hover {
     color: var(--forge-text);
     background: var(--forge-surface-hover);
+  }
+`;
+
+const StackTabPopout = styled(StackTabClose)`
+  opacity: 0.58;
+
+  ${StackTab}:hover &,
+  ${StackTab}:focus-visible & {
+    opacity: 1;
   }
 `;
 
