@@ -2857,6 +2857,9 @@ include!("process.rs");
 include!("backend_cpu.rs");
 include!("workspace_files.rs");
 include!("sessions.rs");
+// Spaces persist next to sessions in sessions.sqlite; the include boundary is
+// pinned by tests/spaces.rs, which compiles the same file around a stub path.
+include!("spaces.rs");
 include!("haider_bridge.rs");
 include!("haider_projection.rs");
 mod haider_rpc_ade;
@@ -6182,6 +6185,12 @@ fn run_app(daemon: bool) {
             session_set_pinned,
             session_delete,
             sessions_home_dir,
+            spaces_list,
+            space_create,
+            space_rename,
+            space_delete,
+            space_save_layout,
+            space_get,
             session_projection_window,
             session_projection_trajectory,
             session_projection_ensure,

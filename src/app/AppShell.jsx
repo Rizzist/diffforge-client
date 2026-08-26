@@ -33,6 +33,14 @@ import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import { AuthFlow, SUCCESS_HOLD_MS as AUTH_SUCCESS_HOLD_MS } from "../auth";
 import SessionsRail from "../sessions/SessionsRail.jsx";
 import SessionSurface from "../sessions/SessionSurface.jsx";
+import SpaceSurface from "../sessions/SpaceSurface.jsx";
+import { useSpaces } from "../sessions/useSpaces.js";
+import {
+  rosterFromSessionsRead,
+  rosterWithConfirmedSession,
+  SPACE_ROSTER_PENDING_REASON,
+  unreachableSpacesRoster,
+} from "../sessions/spacesController.js";
 import MediaDeck from "../media/MediaDeck.jsx";
 import { listSessions, sessionWorkingDirectory } from "../sessions/sessionsModel.js";
 import { sessionCloseCautionSummary } from "../sessions/sessionActivity.js";
@@ -18383,6 +18391,15 @@ export default function App() {
      visibly restoring a park card the user just answered. Last request
      issued is the only one allowed to publish. */
   const sessionsReadSeqRef = useRef(0);
+  /* Spaces reconcile against this roster snapshot. Its three shapes are
+     honest: pending (never answered), reachable-with-refs (answered — an
+     empty list means the daemon truly lists nothing), unreachable-with-reason
+     (asked and failed). sessions=[] alone can never claim "everything is
+     gone" — that distinction is what keeps space leaves from fabricating
+     tombstones while the store is simply not up yet. */
+  const [sessionsRoster, setSessionsRoster] = useState(
+    () => unreachableSpacesRoster(SPACE_ROSTER_PENDING_REASON),
+  );
   const refreshSessions = useCallback(async () => {
     const seq = sessionsReadSeqRef.current + 1;
     sessionsReadSeqRef.current = seq;
@@ -18390,9 +18407,13 @@ export default function App() {
       const rows = await listSessions();
       if (sessionsReadSeqRef.current === seq) {
         setSessions(rows);
+        setSessionsRoster(rosterFromSessionsRead({ ok: true, rows }));
       }
-    } catch {
+    } catch (error) {
       // Store not available yet (first boot before Rust lane) — rail stays empty.
+      if (sessionsReadSeqRef.current === seq) {
+        setSessionsRoster(rosterFromSessionsRead({ ok: false, error }));
+      }
     }
   }, []);
   /* Media sessions (demo, under development): first-class rail entries
@@ -18521,13 +18542,83 @@ export default function App() {
   /* Rail session search: a persistent input under the New chat row (rendered
      by SessionsRail) narrows the Pinned/Recent lists by title. */
   const [railSearchQuery, setRailSearchQuery] = useState("");
+  /* Spaces: local-only (sessions.sqlite) named session sets + layout trees.
+     The hook owns the model state and persistence; the shell only routes
+     rail/surface intents and closes the draft/media layers on transitions. */
+  const spacesApi = useSpaces({
+    enabled: authState === "authenticated",
+    roster: sessionsRoster,
+    sessions,
+  });
+  const {
+    activeSpaceId: activeSpaceIdForShell,
+    enterSpace: enterSpaceOp,
+    exitSpace: exitSpaceOp,
+    createSpace: createSpaceOp,
+    revealConfirmedSession: revealConfirmedSpaceSessionOp,
+    revealSession: revealSpaceSessionOp,
+    flushSaves: flushSpaceSaves,
+  } = spacesApi;
+  const enterSpaceFromRail = useCallback((spaceId) => {
+    setMediaDeckOpen(false);
+    setSessionDraftOpen(false);
+    showView(DEFAULT_WORKSPACE_VIEW);
+    void enterSpaceOp(spaceId);
+  }, [enterSpaceOp, setMediaDeckOpen, showView]);
+  const createSpaceFromRail = useCallback((name) => {
+    setMediaDeckOpen(false);
+    setSessionDraftOpen(false);
+    showView(DEFAULT_WORKSPACE_VIEW);
+    void createSpaceOp(name);
+  }, [createSpaceOp, setMediaDeckOpen, showView]);
+  const selectSpaceSessionFromRail = useCallback((session) => {
+    if (!session?.id) {
+      return;
+    }
+    setMediaDeckOpen(false);
+    setSessionDraftOpen(false);
+    showView(DEFAULT_WORKSPACE_VIEW);
+    revealSpaceSessionOp(session.id);
+  }, [revealSpaceSessionOp, setMediaDeckOpen, showView]);
+  const railSpaceScope = useMemo(() => (
+    spacesApi.railScope
+      ? {
+        memberIds: spacesApi.railScope.memberSessions.map((row) => row.id),
+        highlightedSessionRef: spacesApi.railScope.highlightedSessionRef,
+      }
+      : null
+  ), [spacesApi.railScope]);
   const handleDraftMaterialized = useCallback((session) => {
     if (!session?.id) {
       return;
     }
     setSessions((current) => [session, ...current.filter((row) => row.id !== session.id)]);
+    if (activeSpaceIdForShell) {
+      /* New-chat-into-space: once the session exists it becomes a member and a
+         leaf in the focused stack. Materialization is a daemon-confirmed live
+         fact, so publish that one id into the roster before reconciliation;
+         local sessions in general remain non-authoritative. */
+      setSessionsRoster((current) => rosterWithConfirmedSession(current, session.id));
+      if (revealConfirmedSpaceSessionOp(session.id)) {
+        setSessionDraftOpen(false);
+        showView(DEFAULT_WORKSPACE_VIEW);
+        return;
+      }
+      /* The space is not applyable (still opening, or a typed layout error).
+         The new session must NEVER be hidden behind the space surface, so exit
+         the space and open the session in the ordinary view — it is always
+         visible, and the user can re-enter the space to add it once the space
+         is usable again. */
+      exitSpaceOp();
+    }
     openSessionFromRail(session);
-  }, [openSessionFromRail]);
+  }, [
+    activeSpaceIdForShell,
+    exitSpaceOp,
+    openSessionFromRail,
+    revealConfirmedSpaceSessionOp,
+    showView,
+  ]);
 
   useEffect(() => {
     if (authState !== "authenticated") {
@@ -20104,12 +20195,19 @@ export default function App() {
 
     setCloseConfirmOpen(false);
     runWindowAction(async () => {
+      /* The last space layout must land before the webview is destroyed:
+         await the spaces flush (bounded so a stuck IPC cannot wedge close)
+         BEFORE confirming the close. */
+      await Promise.race([
+        Promise.resolve(flushSpaceSaves?.()).catch(() => {}),
+        new Promise((resolve) => { setTimeout(resolve, 2000); }),
+      ]);
       /* Mark the close CONFIRMED so the Rust ExitRequested gate lets the
          shutdown proceed instead of re-raising the modal. */
       await invoke("app_confirm_close").catch(() => {});
       await getSafeCurrentWindow()?.close();
     });
-  }, [networkingOverlayOpen, nonIdleSessionCount]);
+  }, [flushSpaceSaves, networkingOverlayOpen, nonIdleSessionCount]);
 
 
 
@@ -24320,6 +24418,16 @@ export default function App() {
                              must not keep acting invisibly. */
                           searchQuery={workspaceRailCollapsed ? "" : railSearchQuery}
                           sessions={sessions}
+                          spaces={spacesApi.spaces}
+                          activeSpaceId={spacesApi.activeSpaceId}
+                          spaceScope={railSpaceScope}
+                          spacesListError={spacesApi.spacesListError}
+                          onCreateSpace={createSpaceFromRail}
+                          onRenameSpace={spacesApi.renameSpace}
+                          onDeleteSpace={spacesApi.deleteSpace}
+                          onEnterSpace={enterSpaceFromRail}
+                          onExitSpace={spacesApi.exitSpace}
+                          onSelectSpaceSession={selectSpaceSessionFromRail}
                         />
                       )}
                     </WorkspaceList>
@@ -24329,7 +24437,7 @@ export default function App() {
                   {/* Footer nav (Terminals/Files, account) must never deselect
                       the active session — swallow the rail's deselect click. */}
                   <RailFooter onClick={(event) => event.stopPropagation()}>
-                    {activeSessionId && !loopspacesModeActive && (
+                    {activeSessionId && !loopspacesModeActive && !activeSpaceIdForShell && (
                       <RailViewActions aria-label="Session views">
                         <RailActionButton
                           aria-label="Terminals"
@@ -24754,7 +24862,27 @@ export default function App() {
                       sessionId={activeMediaId}
                     />
                   )}
-                  {!loopspacesModeActive && !mediaDeckOpen && (
+                  {!loopspacesModeActive && !mediaDeckOpen
+                    && spacesApi.activeSpaceId && !sessionDraftOpen && (
+                    <SpaceSurface
+                      deleteError={spacesApi.activeDeleteError}
+                      error={spacesApi.spaceError}
+                      onCloseLeaf={spacesApi.closeLeaf}
+                      onDragOutLeaf={spacesApi.dragOutLeaf}
+                      onDismissDeleteError={spacesApi.dismissDeleteError}
+                      onExitSpace={spacesApi.exitSpace}
+                      onFocusLeaf={spacesApi.focusLeaf}
+                      onHeaderDragStart={handleTitleBarMouseDown}
+                      onSelectTab={spacesApi.selectTab}
+                      opError={spacesApi.spaceOpError}
+                      saveError={spacesApi.saveError}
+                      sessions={sessions}
+                      space={spacesApi.activeSpace}
+                      state={spacesApi.spaceState}
+                    />
+                  )}
+                  {!loopspacesModeActive && !mediaDeckOpen
+                    && (!spacesApi.activeSpaceId || sessionDraftOpen) && (
                     <SessionSurface
                       activeSessionId={activeSessionId}
                       appThemeIsLight={activeAppTheme === APP_THEME_LIGHT}

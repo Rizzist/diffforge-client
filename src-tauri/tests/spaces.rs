@@ -176,12 +176,69 @@ mod tests {
             spaces_list_from_connection(&connection)
                 .unwrap()
                 .into_iter()
-                .map(|space| space.id)
+                .map(|entry| match entry {
+                    SpaceListEntry::Ready(record) => record.id,
+                    SpaceListEntry::Divergent { id, .. } => id,
+                })
                 .collect::<Vec<_>>(),
             ["space-first", "space-second"]
         );
         space_delete_in_connection(&mut connection, &second.id).unwrap();
         assert_eq!(spaces_list_from_connection(&connection).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_noncanonical_stored_row_lists_as_divergent_without_failing_the_whole_list() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        spaces_initialize_database(&mut connection).unwrap();
+        let good = space_create_in_connection(
+            &mut connection,
+            "Good".to_string(),
+            Some(0),
+            10,
+            "space-good".to_string(),
+        )
+        .unwrap();
+        let bad = space_create_in_connection(
+            &mut connection,
+            "Bad".to_string(),
+            Some(1),
+            11,
+            "space-bad".to_string(),
+        )
+        .unwrap();
+        // Write non-canonical bytes directly, bypassing the save gate, to simulate a
+        // corrupt-on-disk row (unsorted members are non-canonical).
+        connection
+            .execute(
+                "UPDATE spaces SET layout_json = ?1 WHERE id = ?2",
+                rusqlite::params![r#"{"members":["b","a"],"root":null}"#, bad.id],
+            )
+            .unwrap();
+
+        let entries = spaces_list_from_connection(&connection).unwrap();
+        assert_eq!(entries.len(), 2, "one bad row must not drop the good one");
+        assert_eq!(entries.iter().map(SpaceListEntry::id).collect::<Vec<_>>(), [
+            "space-good",
+            "space-bad"
+        ]);
+        assert!(
+            matches!(&entries[0], SpaceListEntry::Ready(record) if record.id == good.id),
+            "the canonical row lists as Ready"
+        );
+        match &entries[1] {
+            SpaceListEntry::Divergent { id, name, reason, .. } => {
+                assert_eq!(id, "space-bad");
+                assert_eq!(name, "Bad");
+                assert!(
+                    reason.contains("canonical"),
+                    "the divergent entry carries the store's canonical-divergence reason: {reason}"
+                );
+            }
+            other => panic!("expected the corrupt row to list as Divergent, got {other:?}"),
+        }
+        // The strict gate is unchanged: entering the row still fails.
+        assert!(space_get_from_connection(&connection, "space-bad").is_err());
     }
 
     #[test]

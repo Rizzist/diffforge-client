@@ -25,6 +25,8 @@ import {
   sessionRunIsActive,
 } from "./sessionActivity.js";
 import { SessionAvailabilityAffordance } from "./sessionAvailability.js";
+import { spaceRailRowAuthority } from "./spacesController.js";
+import SpacesRailSection from "./SpacesRailSection.jsx";
 import { ModelBrandIcon } from "./modelBrand.jsx";
 
 /* Session Deck rail list: a prominent "New chat" compose row on top, then
@@ -50,6 +52,16 @@ export default function SessionsRail({
   onUpdateMedia = null,
   searchQuery = "",
   shellPrefs = {},
+  spaces = [],
+  activeSpaceId = "",
+  spaceScope = null,
+  spacesListError = "",
+  onCreateSpace = null,
+  onRenameSpace = null,
+  onDeleteSpace = null,
+  onEnterSpace = null,
+  onExitSpace = null,
+  onSelectSpaceSession = null,
 }) {
   /* Relative times tick once a minute while the rail is mounted. */
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -141,8 +153,34 @@ export default function SessionsRail({
     }
   }, [mediaSessions, onUpdateMedia, renameDraft, renamingId]);
 
+  /* Space scoping has TWO states that must not be conflated:
+       - spaceMode: a space is active. The rail must NEVER fall back to the
+         ordinary activeSessionId highlight or the ordinary click route, even
+         before the scope resolves — doing so leaks a stale ordinary session as
+         "active" while a space is opening or showing a typed error.
+       - spaceScoped: the space's member scope has resolved. Only then can we
+         list members and derive the highlight from the model's focused leaf.
+     While spaceMode holds but the scope has not resolved, the session area is
+     honestly empty (opening / error) rather than showing the full session list
+     or a parallel selection. */
+  /* One authority (unit-pinned in spacesController) decides space mode, the
+     effective active id, and click routing — the rail never re-derives them. */
+  const railAuthority = spaceRailRowAuthority({
+    activeSpaceId,
+    spaceScope,
+    activeSessionId,
+    sessionId: "",
+  });
+  const spaceMode = railAuthority.spaceMode;
+  const spaceScoped = railAuthority.spaceScoped;
+  const spaceMemberIds = spaceScoped ? new Set(spaceScope.memberIds || []) : null;
+  /* In space mode the highlight/unseen authority is the space's focused leaf,
+     NEVER activeSessionId; while the scope is pending it is simply absent. */
+  const effectiveActiveId = railAuthority.effectiveActiveId;
   /* Rail search narrows every coordinate domain by title or opening message. */
-  const allSessions = [...sessions, ...mediaSessions];
+  const allSessions = spaceMode
+    ? (spaceScoped ? sessions.filter((session) => spaceMemberIds.has(session.id)) : [])
+    : [...sessions, ...mediaSessions];
   const query = searchQuery.trim().toLowerCase();
   const matches = query
     ? allSessions.filter((session) => (
@@ -176,7 +214,7 @@ export default function SessionsRail({
     /* Settled rows: daemon-durable seen state. Activity after the last ack
        shows the dot; the active session never does (viewing IS the ack —
        the daemon receipt clears it moments later). */
-    const unseen = session.id !== activeSessionId
+    const unseen = session.id !== effectiveActiveId
       && Number(session.last_activity_ms) > Number(session.seen_at_ms || 0);
     return (
       <SessionRowMeta>
@@ -256,11 +294,22 @@ export default function SessionsRail({
         </SessionRenameRow>
       );
     }
+    /* In space mode the highlight is the space's focused leaf and clicks route
+       through the space handler — NEVER the ordinary activeSessionId highlight
+       or onSelectSession, even while the scope is still resolving. */
+    const rowAuthority = spaceRailRowAuthority({
+      activeSpaceId,
+      spaceScope,
+      activeSessionId,
+      sessionId: session.id,
+    });
     return (
       <SessionRowButton
-        data-active={session.id === activeSessionId ? "true" : undefined}
+        data-active={rowAuthority.isActive ? "true" : undefined}
         key={session.id}
-        onClick={() => onSelectSession(session)}
+        onClick={() => (rowAuthority.routeToSpace
+          ? onSelectSpaceSession?.(session)
+          : onSelectSession(session))}
         onContextMenu={(event) => openMenu(event, session)}
         title={session.first_user_message || session.title}
         type="button"
@@ -384,6 +433,16 @@ export default function SessionsRail({
       </RailSearchRow>
 
       <SessionListArea>
+        <SpacesRailSection
+          activeSpaceId={activeSpaceId}
+          listError={spacesListError}
+          onCreateSpace={onCreateSpace}
+          onDeleteSpace={onDeleteSpace}
+          onEnterSpace={onEnterSpace}
+          onExitSpace={onExitSpace}
+          onRenameSpace={onRenameSpace}
+          spaces={spaces}
+        />
         {pinned.length > 0 && (
           <SessionGroup>
             <SettingsNavGroupLabel>Pinned</SettingsNavGroupLabel>
@@ -411,7 +470,9 @@ export default function SessionsRail({
 
         {!allSessions.length && (
           <SessionsEmptyHint>
-            No sessions yet. Start with New chat.
+            {spaceScoped
+              ? "No sessions in this space yet. New chat adds one here."
+              : "No sessions yet. Start with New chat."}
           </SessionsEmptyHint>
         )}
         {allSessions.length > 0 && !matches.length && (

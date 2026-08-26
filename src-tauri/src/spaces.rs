@@ -86,6 +86,34 @@ pub struct SpaceRecord {
     pub schema_version: i64,
 }
 
+// A listed space is either ready (canonical, enterable) or divergent (its stored
+// bytes are not canonical / not decodable). Listing must NOT fail wholesale on one
+// bad row: a single corrupt layout would otherwise hide every other space and make
+// the typed "nothing was normalized or reset" card unreachable, because there would
+// be no id to enter. A divergent entry still carries id/name/ordinal so the rail can
+// list it and route entry into the typed error card; the strict canonical gate stays
+// enforced by space_get / space_save_layout / reconcile_space.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SpaceListEntry {
+    Ready(SpaceRecord),
+    Divergent {
+        id: String,
+        name: String,
+        ordinal: i64,
+        reason: String,
+    },
+}
+
+impl SpaceListEntry {
+    fn id(&self) -> &str {
+        match self {
+            SpaceListEntry::Ready(record) => &record.id,
+            SpaceListEntry::Divergent { id, .. } => id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SpaceRosterSnapshot {
@@ -529,7 +557,7 @@ fn space_get_from_connection(
 
 fn spaces_list_from_connection(
     connection: &rusqlite::Connection,
-) -> Result<Vec<SpaceRecord>, String> {
+) -> Result<Vec<SpaceListEntry>, String> {
     let query = format!(
         "SELECT {SPACES_SELECT_COLUMNS} FROM spaces ORDER BY ordinal ASC, created_at_ms ASC, id ASC"
     );
@@ -541,10 +569,27 @@ fn spaces_list_from_connection(
         .map_err(|error| format!("Unable to list spaces: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to decode space row: {error}"))?;
-    records
+    // Per-row typing: a row that fails validation (non-canonical bytes, bad schema
+    // version) is surfaced as Divergent, never dropped and never allowed to fail the
+    // whole listing. Its identity is preserved so the rail can list it and entering
+    // it reaches the typed error card via space_get's strict validation.
+    Ok(records
         .into_iter()
-        .map(spaces_validate_stored_record)
-        .collect()
+        .map(|record| {
+            let id = record.id.clone();
+            let name = record.name.clone();
+            let ordinal = record.ordinal;
+            match spaces_validate_stored_record(record) {
+                Ok(valid) => SpaceListEntry::Ready(valid),
+                Err(reason) => SpaceListEntry::Divergent {
+                    id,
+                    name,
+                    ordinal,
+                    reason,
+                },
+            }
+        })
+        .collect())
 }
 
 fn space_create_in_connection(
@@ -679,7 +724,7 @@ fn space_delete_in_connection(
         .map_err(|error| format!("Unable to commit space deletion: {error}"))
 }
 
-fn spaces_list_blocking() -> Result<Vec<SpaceRecord>, String> {
+fn spaces_list_blocking() -> Result<Vec<SpaceListEntry>, String> {
     let connection = spaces_open_database()?;
     spaces_list_from_connection(&connection)
 }
@@ -804,7 +849,7 @@ pub fn reconcile_space(
 }
 
 #[tauri::command]
-async fn spaces_list() -> Result<Vec<SpaceRecord>, String> {
+async fn spaces_list() -> Result<Vec<SpaceListEntry>, String> {
     tauri::async_runtime::spawn_blocking(spaces_list_blocking)
         .await
         .map_err(|error| format!("Spaces list worker failed: {error}"))?
