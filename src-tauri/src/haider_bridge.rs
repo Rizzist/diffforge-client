@@ -3,6 +3,147 @@ const HAIDER_BRIDGE_INITIAL_SYNC_DELAY: Duration = Duration::from_secs(3);
 const HAIDER_BRIDGE_FULL_RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const HAIDER_BRIDGE_WATCH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const HAIDER_BRIDGE_MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
+const HAIDER_ROSTER_BOOTSTRAP_CHANGED_EVENT: &str = "haider-roster-bootstrap-changed";
+const HAIDER_ROSTER_BOOTSTRAP_REQUEST_EVENT: &str = "haider-roster-bootstrap-request";
+const HAIDER_ROSTER_BOOTSTRAP_PENDING_REASON: &str =
+    "Awaiting a fresh complete daemon roster for the current connection.";
+const HAIDER_ROSTER_BOOTSTRAP_UNREACHABLE_REASON: &str =
+    "The Haider daemon is not reachable.";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum HaiderRosterBootstrapState {
+    Reachable {
+        profile_id: String,
+        daemon_generation: u64,
+        applied_at_ms: i64,
+    },
+    Pending {
+        reason: String,
+    },
+    Unreachable {
+        reason: String,
+    },
+}
+
+impl Default for HaiderRosterBootstrapState {
+    fn default() -> Self {
+        Self::Pending {
+            reason: HAIDER_ROSTER_BOOTSTRAP_PENDING_REASON.to_string(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct HaiderRosterBootstrapTracker {
+    connection: Option<haider_rpc_ade::RosterConnectionIdentity>,
+    state: HaiderRosterBootstrapState,
+}
+
+impl HaiderRosterBootstrapTracker {
+    fn connection_pending(
+        &mut self,
+        connection: haider_rpc_ade::RosterConnectionIdentity,
+    ) -> Option<HaiderRosterBootstrapState> {
+        if self.connection.as_ref() == Some(&connection) {
+            return None;
+        }
+        self.connection = Some(connection);
+        let state = HaiderRosterBootstrapState::Pending {
+            reason: HAIDER_ROSTER_BOOTSTRAP_PENDING_REASON.to_string(),
+        };
+        self.state = state.clone();
+        Some(state)
+    }
+
+    fn connection_unreachable(&mut self) -> Option<HaiderRosterBootstrapState> {
+        self.connection = None;
+        self.replace(HaiderRosterBootstrapState::Unreachable {
+            reason: HAIDER_ROSTER_BOOTSTRAP_UNREACHABLE_REASON.to_string(),
+        })
+    }
+
+    fn complete_roster_applied(
+        &mut self,
+        connection: &haider_rpc_ade::RosterConnectionIdentity,
+        applied_at_ms: i64,
+    ) -> Option<HaiderRosterBootstrapState> {
+        if self.connection.as_ref() != Some(connection)
+            || matches!(&self.state, HaiderRosterBootstrapState::Reachable { .. })
+        {
+            return None;
+        }
+        self.replace(HaiderRosterBootstrapState::Reachable {
+            profile_id: connection.profile_id.clone(),
+            daemon_generation: connection.daemon_generation,
+            applied_at_ms,
+        })
+    }
+
+    fn replace(
+        &mut self,
+        state: HaiderRosterBootstrapState,
+    ) -> Option<HaiderRosterBootstrapState> {
+        if self.state == state {
+            return None;
+        }
+        self.state = state.clone();
+        Some(state)
+    }
+}
+
+fn haider_roster_bootstrap_tracker() -> &'static StdMutex<HaiderRosterBootstrapTracker> {
+    static TRACKER: OnceLock<StdMutex<HaiderRosterBootstrapTracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| StdMutex::new(HaiderRosterBootstrapTracker::default()))
+}
+
+// `app.emit` is synchronous. Callers hold the tracker mutex across mutation
+// (or snapshot clone) and this non-locking helper so bootstrap events have the
+// same total order as the states they publish.
+fn haider_bridge_emit_roster_bootstrap(app: &AppHandle, state: HaiderRosterBootstrapState) {
+    let _ = app.emit(HAIDER_ROSTER_BOOTSTRAP_CHANGED_EVENT, state);
+}
+
+fn haider_bridge_emit_current_roster_bootstrap(app: &AppHandle) {
+    if let Ok(tracker) = haider_roster_bootstrap_tracker().lock() {
+        haider_bridge_emit_roster_bootstrap(app, tracker.state.clone());
+    }
+}
+
+pub(crate) fn haider_bridge_roster_connection_pending(
+    app: &AppHandle,
+    connection: haider_rpc_ade::RosterConnectionIdentity,
+) -> bool {
+    if let Ok(mut tracker) = haider_roster_bootstrap_tracker().lock() {
+        if let Some(state) = tracker.connection_pending(connection) {
+            haider_bridge_emit_roster_bootstrap(app, state);
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn haider_bridge_roster_connection_unreachable(app: &AppHandle) {
+    if let Ok(mut tracker) = haider_roster_bootstrap_tracker().lock() {
+        if let Some(state) = tracker.connection_unreachable() {
+            haider_bridge_emit_roster_bootstrap(app, state);
+        }
+    }
+}
+
+fn haider_bridge_roster_complete_applied(
+    app: &AppHandle,
+    connection: &haider_rpc_ade::RosterConnectionIdentity,
+) {
+    if !haider_rpc_ade::roster_connection_is_current(connection) {
+        return;
+    }
+    if let Ok(mut tracker) = haider_roster_bootstrap_tracker().lock() {
+        if let Some(state) = tracker.complete_roster_applied(connection, sessions_now_ms()) {
+            haider_bridge_emit_roster_bootstrap(app, state);
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HaiderBridgeSession {
@@ -785,7 +926,7 @@ async fn haider_bridge_apply_summary_values(
     summaries: Vec<Value>,
     complete: bool,
     policy: HaiderBridgeReconcilePolicy,
-) {
+) -> bool {
     let changed = tauri::async_runtime::spawn_blocking(move || {
         let _sync_guard = haider_bridge_sync_lock()
             .lock()
@@ -794,10 +935,19 @@ async fn haider_bridge_apply_summary_values(
     })
     .await;
     match changed {
-        Ok(Ok(true)) => sessions_emit_changed(app),
-        Ok(Ok(false)) => {}
-        Ok(Err(error)) => eprintln!("Haider session reconciliation failed: {error}"),
-        Err(error) => eprintln!("Haider session reconciliation worker failed: {error}"),
+        Ok(Ok(true)) => {
+            sessions_emit_changed(app);
+            true
+        }
+        Ok(Ok(false)) => true,
+        Ok(Err(error)) => {
+            eprintln!("Haider session reconciliation failed: {error}");
+            false
+        }
+        Err(error) => {
+            eprintln!("Haider session reconciliation worker failed: {error}");
+            false
+        }
     }
 }
 
@@ -807,31 +957,29 @@ fn haider_bridge_reconcile_from_summaries(app: AppHandle, summaries: Vec<Value>)
 }
 
 fn haider_bridge_seed_from_rpc(app: AppHandle) {
-    // All RPC persistence uses this FIFO. The actor enqueues the triggering
-    // delta first, this seed second, and later deltas after it. Thus a snapshot
-    // fetch+apply cannot commit after a delta that arrived later on the wire.
+    // All RPC persistence uses this FIFO. A new connection enqueues its seed
+    // after publishing the actor identity and before run_connected can enqueue
+    // later wire deltas, so the snapshot cannot commit after a newer delta.
     let _ = haider_bridge_rpc_reconcile_queue().send(HaiderBridgeRpcReconcileJob::Snapshot {
         app,
         reply: None,
     });
 }
 
-fn haider_bridge_rpc_snapshot_permits_cli_fallback(
-    snapshot: &Option<Result<Vec<Value>, String>>,
-) -> bool {
+fn haider_bridge_rpc_snapshot_permits_cli_fallback<T>(snapshot: &Option<Result<T, String>>) -> bool {
     snapshot.is_none()
 }
 
 async fn haider_bridge_reconcile_rpc_snapshot_queued(app: &AppHandle) -> bool {
-    let snapshot = haider_rpc_ade::session_roster_snapshot_rpc().await;
+    let snapshot = haider_rpc_ade::session_roster_snapshot_for_bootstrap_rpc().await;
     if haider_bridge_rpc_snapshot_permits_cli_fallback(&snapshot) {
         return false;
     }
     let Some(result) = snapshot else {
         unreachable!("offline RPC snapshots return before result decoding");
     };
-    let summaries = match result {
-        Ok(summaries) => summaries,
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             eprintln!("Haider RPC roster seed failed: {error}");
             // A connected RPC route remains authoritative even when this
@@ -840,13 +988,16 @@ async fn haider_bridge_reconcile_rpc_snapshot_queued(app: &AppHandle) -> bool {
             return true;
         }
     };
-    haider_bridge_apply_summary_values(
+    let applied = haider_bridge_apply_summary_values(
         app,
-        summaries,
+        snapshot.summaries,
         true,
         HaiderBridgeReconcilePolicy::rpc(),
     )
     .await;
+    if applied {
+        haider_bridge_roster_complete_applied(app, &snapshot.connection);
+    }
     true
 }
 
@@ -912,6 +1063,13 @@ fn haider_bridge_start(app: AppHandle) {
     if let Ok(mut trackers) = haider_bridge_reconcile_trackers().lock() {
         *trackers = HaiderBridgeReconcileTrackers::default();
     }
+    if let Ok(mut tracker) = haider_roster_bootstrap_tracker().lock() {
+        *tracker = HaiderRosterBootstrapTracker::default();
+    }
+    let request_app = app.clone();
+    app.listen(HAIDER_ROSTER_BOOTSTRAP_REQUEST_EVENT, move |_| {
+        haider_bridge_emit_current_roster_bootstrap(&request_app);
+    });
     haider_rpc_ade::roster_watch_start(app.clone());
 
     let sync_app = app.clone();
@@ -1107,6 +1265,115 @@ fn haider_usage_snapshot_value(
 mod haider_bridge_tests {
     use super::*;
 
+    fn roster_connection(
+        profile_id: &str,
+        daemon_generation: u64,
+        connection_serial: u64,
+    ) -> haider_rpc_ade::RosterConnectionIdentity {
+        haider_rpc_ade::RosterConnectionIdentity {
+            profile_id: profile_id.to_string(),
+            daemon_generation,
+            connection_serial,
+        }
+    }
+
+    #[test]
+    fn roster_bootstrap_requires_complete_apply_on_current_connection() {
+        let connection = roster_connection("profile-fresh", 41, 1);
+        let mut tracker = HaiderRosterBootstrapTracker::default();
+
+        assert_eq!(tracker.complete_roster_applied(&connection, 90), None);
+        assert!(matches!(
+            &tracker.state,
+            HaiderRosterBootstrapState::Pending { .. }
+        ));
+
+        tracker
+            .connection_pending(connection.clone())
+            .expect("a Welcome starts a pending connection");
+        assert!(matches!(
+            &tracker.state,
+            HaiderRosterBootstrapState::Pending { .. }
+        ));
+
+        let reachable = tracker
+            .complete_roster_applied(&connection, 123_456)
+            .expect("the current connection's complete apply lifts the barrier");
+        assert_eq!(
+            serde_json::to_value(&reachable).expect("serialize bootstrap state"),
+            json!({
+                "state": "reachable",
+                "profile_id": "profile-fresh",
+                "daemon_generation": 41,
+                "applied_at_ms": 123_456,
+            })
+        );
+        assert_eq!(
+            tracker.complete_roster_applied(&connection, 999_999),
+            None,
+            "only the first complete apply publishes reachability"
+        );
+    }
+
+    #[test]
+    fn roster_bootstrap_reconnect_and_generation_change_reset_pending() {
+        let first = roster_connection("profile-stable", 7, 1);
+        let reconnect = roster_connection("profile-stable", 7, 2);
+        let next_generation = roster_connection("profile-stable", 8, 3);
+        let mut tracker = HaiderRosterBootstrapTracker::default();
+
+        tracker.connection_pending(first.clone());
+        tracker.complete_roster_applied(&first, 100);
+        assert!(matches!(
+            &tracker.state,
+            HaiderRosterBootstrapState::Reachable {
+                daemon_generation: 7,
+                ..
+            }
+        ));
+
+        tracker
+            .connection_pending(reconnect.clone())
+            .expect("a reconnect resets a reachable generation to pending");
+        assert!(matches!(
+            &tracker.state,
+            HaiderRosterBootstrapState::Pending { .. }
+        ));
+        assert_eq!(
+            tracker.complete_roster_applied(&first, 101),
+            None,
+            "an old connection's late apply cannot lift the new barrier"
+        );
+        tracker.complete_roster_applied(&reconnect, 102);
+
+        tracker
+            .connection_pending(next_generation.clone())
+            .expect("a new daemon generation resets reachability to pending");
+        assert!(matches!(
+            &tracker.state,
+            HaiderRosterBootstrapState::Pending { .. }
+        ));
+        let reachable = tracker
+            .complete_roster_applied(&next_generation, 103)
+            .expect("the new generation's complete apply lifts its barrier");
+        assert!(matches!(
+            reachable,
+            HaiderRosterBootstrapState::Reachable {
+                profile_id,
+                daemon_generation: 8,
+                applied_at_ms: 103,
+            } if profile_id == "profile-stable"
+        ));
+
+        tracker
+            .connection_unreachable()
+            .expect("disconnecting a reachable daemon publishes unreachable");
+        assert!(matches!(
+            &tracker.state,
+            HaiderRosterBootstrapState::Unreachable { .. }
+        ));
+    }
+
     #[test]
     fn haider_usage_snapshot_preserves_rpc_failure_reason() {
         assert_eq!(
@@ -1275,8 +1542,9 @@ mod haider_bridge_tests {
     #[test]
     fn haider_bridge_cli_fallback_requires_an_offline_rpc_route() {
         let unavailable: Option<Result<Vec<Value>, String>> = None;
-        let live_error = Some(Err("protocol rejected the snapshot".to_string()));
-        let live_success = Some(Ok(Vec::new()));
+        let live_error: Option<Result<Vec<Value>, String>> =
+            Some(Err("protocol rejected the snapshot".to_string()));
+        let live_success: Option<Result<Vec<Value>, String>> = Some(Ok(Vec::new()));
 
         assert!(haider_bridge_rpc_snapshot_permits_cli_fallback(&unavailable));
         assert!(!haider_bridge_rpc_snapshot_permits_cli_fallback(&live_error));

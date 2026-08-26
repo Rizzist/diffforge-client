@@ -1771,11 +1771,25 @@ impl RevisionGate {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RosterConnectionIdentity {
+    pub(crate) profile_id: String,
+    pub(crate) daemon_generation: u64,
+    pub(crate) connection_serial: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CompleteSessionRosterSnapshot {
+    pub(crate) connection: RosterConnectionIdentity,
+    pub(crate) summaries: Vec<Value>,
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, Default)]
 struct ConnectionSnapshot {
     connected: bool,
     roster_watch_active: bool,
+    roster_identity: Option<RosterConnectionIdentity>,
     features: BTreeSet<String>,
     capabilities_granted: BTreeSet<Capability>,
     frame_limit: usize,
@@ -2294,41 +2308,96 @@ pub(crate) fn roster_watch_healthy() -> bool {
 pub(crate) async fn session_roster_snapshot_rpc() -> Option<Result<Vec<Value>, String>> {
     #[cfg(unix)]
     {
-        let mut cursor = None;
-        let mut seen_cursors = BTreeSet::new();
-        let mut summaries = Vec::new();
-        loop {
-            let response = rpc_request(
-                RequestBody::SessionList {
-                    cursor: cursor.clone(),
-                    limit: 256,
-                },
-                Capability::View,
-                BTreeSet::new(),
-            )
-            .await?;
-            let (sessions, next_cursor) = match response {
-                Ok(ResponseBody::SessionList {
-                    sessions,
-                    next_cursor,
-                }) => (sessions, next_cursor),
-                Ok(_) => {
-                    return Some(Err("session.list response method mismatch".to_string()));
-                }
-                Err(error) => return Some(Err(error)),
-            };
-            summaries.extend(sessions);
-            let Some(next_cursor) = next_cursor else {
-                return Some(Ok(summaries));
-            };
-            if !seen_cursors.insert(next_cursor.clone()) {
-                return Some(Err("session.list returned a repeated cursor".to_string()));
-            }
-            cursor = Some(next_cursor);
-        }
+        return session_roster_snapshot_for_bootstrap_rpc()
+            .await
+            .map(|result| result.map(|snapshot| snapshot.summaries));
     }
     #[cfg(not(unix))]
     None
+}
+
+/// Fetches one complete roster fenced to the Welcome that began the current
+/// socket connection. The bridge uses the returned identity to ensure a
+/// roster from an older connection can never lift the bootstrap barrier.
+pub(crate) async fn session_roster_snapshot_for_bootstrap_rpc(
+) -> Option<Result<CompleteSessionRosterSnapshot, String>> {
+    #[cfg(unix)]
+    {
+        let connection = actor_handle().connection.borrow().clone();
+        if !connection.connected {
+            return None;
+        }
+        let Some(identity) = connection.roster_identity else {
+            return Some(Err(
+                "session.list connection is missing Welcome identity".to_string(),
+            ));
+        };
+        let result = session_roster_snapshot_on_connection(identity.clone()).await;
+        return Some(result.map(|summaries| CompleteSessionRosterSnapshot {
+            connection: identity,
+            summaries,
+        }));
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+#[cfg(unix)]
+async fn session_roster_snapshot_on_connection(
+    identity: RosterConnectionIdentity,
+) -> Result<Vec<Value>, String> {
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut summaries = Vec::new();
+    loop {
+        if !roster_connection_is_current(&identity) {
+            return Err("session.list connection changed before completion".to_string());
+        }
+        let response = rpc_request(
+            RequestBody::SessionList {
+                cursor: cursor.clone(),
+                limit: 256,
+            },
+            Capability::View,
+            BTreeSet::new(),
+        )
+        .await
+        .ok_or_else(|| "session.list connection became unavailable".to_string())?;
+        if !roster_connection_is_current(&identity) {
+            return Err("session.list connection changed before completion".to_string());
+        }
+        let (sessions, next_cursor) = match response {
+            Ok(ResponseBody::SessionList {
+                sessions,
+                next_cursor,
+            }) => (sessions, next_cursor),
+            Ok(_) => return Err("session.list response method mismatch".to_string()),
+            Err(error) => return Err(error),
+        };
+        summaries.extend(sessions);
+        let Some(next_cursor) = next_cursor else {
+            return Ok(summaries);
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err("session.list returned a repeated cursor".to_string());
+        }
+        cursor = Some(next_cursor);
+    }
+}
+
+pub(crate) fn roster_connection_is_current(identity: &RosterConnectionIdentity) -> bool {
+    #[cfg(unix)]
+    {
+        return ACTOR.get().is_some_and(|handle| {
+            let connection = handle.connection.borrow();
+            connection.connected && connection.roster_identity.as_ref() == Some(identity)
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = identity;
+        false
+    }
 }
 
 impl QueueCommandError {
@@ -5492,6 +5561,7 @@ async fn run_actor(
     let mut roster_app = None;
     let mut account_roster_window = None;
     let mut reconnect_delay = Duration::from_millis(100);
+    let mut connection_serial = 0_u64;
 
     loop {
         while let Ok(command) = commands.try_recv() {
@@ -5509,6 +5579,9 @@ async fn run_actor(
         #[cfg(debug_assertions)]
         eprintln!("[ade-rpc] resolve -> {resolved:?}");
         let Some(socket_path) = resolved else {
+            if let Some(app) = roster_app.as_ref() {
+                super::haider_bridge_roster_connection_unreachable(app);
+            }
             publish_disconnected(&connection_tx);
             publish_account_roster_watch_state(
                 &account_roster_watch_tx,
@@ -5546,6 +5619,9 @@ async fn run_actor(
         }
         let connected = attempt.ok().and_then(Result::ok);
         let Some((mut stream, welcome)) = connected else {
+            if let Some(app) = roster_app.as_ref() {
+                super::haider_bridge_roster_connection_unreachable(app);
+            }
             publish_disconnected(&connection_tx);
             publish_account_roster_watch_state(
                 &account_roster_watch_tx,
@@ -5570,9 +5646,19 @@ async fn run_actor(
         };
 
         reconnect_delay = Duration::from_millis(100);
+        connection_serial = connection_serial.saturating_add(1);
+        let roster_identity = RosterConnectionIdentity {
+            profile_id: welcome.profile_id.clone(),
+            daemon_generation: welcome.daemon_generation,
+            connection_serial,
+        };
+        let roster_bootstrap_pending = roster_app.as_ref().is_some_and(|app| {
+            super::haider_bridge_roster_connection_pending(app, roster_identity.clone())
+        });
         let mut snapshot = ConnectionSnapshot {
             connected: true,
             roster_watch_active: false,
+            roster_identity: Some(roster_identity.clone()),
             features: welcome.features.clone(),
             capabilities_granted: welcome.capabilities_granted.clone(),
             frame_limit: (welcome.frame_limit as usize).min(DEFAULT_FRAME_LIMIT),
@@ -5581,6 +5667,9 @@ async fn run_actor(
         let encoding = match WireEncoding::from_welcome(&welcome) {
             Ok(encoding) => encoding,
             Err(_) => {
+                if let Some(app) = roster_app.as_ref() {
+                    super::haider_bridge_roster_connection_unreachable(app);
+                }
                 publish_disconnected(&connection_tx);
                 continue;
             }
@@ -5634,6 +5723,14 @@ async fn run_actor(
         }
 
         publish_connection(&connection_tx, snapshot.clone());
+        if roster_bootstrap_pending {
+            if let Some(app) = roster_app.as_ref() {
+                // Reuse the bridge's one complete paginated list path. This is
+                // after identity publication but before run_connected can
+                // enqueue any later daemon delta.
+                super::haider_bridge_seed_from_rpc(app.clone());
+            }
+        }
 
         if !setup_failed {
             run_connected(
@@ -5654,6 +5751,9 @@ async fn run_actor(
         }
         let binding = resident_binding_tx.borrow().without_binding();
         publish_resident_binding(&resident_binding_tx, roster_app.as_ref(), binding);
+        if let Some(app) = roster_app.as_ref() {
+            super::haider_bridge_roster_connection_unreachable(app);
+        }
         publish_disconnected(&connection_tx);
         publish_account_roster_watch_state(
             &account_roster_watch_tx,
@@ -5688,6 +5788,7 @@ fn publish_disconnected(connection_tx: &watch::Sender<ConnectionSnapshot>) {
     let mut snapshot = connection_tx.borrow().clone();
     snapshot.connected = false;
     snapshot.roster_watch_active = false;
+    snapshot.roster_identity = None;
     ROSTER_WATCH_ACTIVE.store(false, Ordering::Release);
     publish_connection(connection_tx, snapshot);
 }
@@ -5971,12 +6072,9 @@ async fn run_connected(
                 }
             }
             WireFrame::SessionRosterDelta { summaries } => {
-                let first_delta = !ROSTER_WATCH_ACTIVE.swap(true, Ordering::AcqRel);
+                ROSTER_WATCH_ACTIVE.store(true, Ordering::Release);
                 if let Some(app) = roster_app.as_ref() {
                     super::haider_bridge_reconcile_from_summaries(app.clone(), summaries);
-                    if first_delta {
-                        super::haider_bridge_seed_from_rpc(app.clone());
-                    }
                 }
             }
             WireFrame::AccountsChanged { revision } => {
@@ -6119,6 +6217,13 @@ async fn apply_connected_command(
         ActorCommand::ReconnectNow => true,
         ActorCommand::RosterAttach { app } => {
             *roster_app = Some(app);
+            if let (Some(app), Some(identity)) =
+                (roster_app.as_ref(), connection.roster_identity.clone())
+            {
+                if super::haider_bridge_roster_connection_pending(app, identity) {
+                    super::haider_bridge_seed_from_rpc(app.clone());
+                }
+            }
             let active = connection.can_watch_roster();
             let written = !active
                 || send_roster_watch(stream, connection.frame_limit, encoding, next_request)
@@ -7324,6 +7429,11 @@ mod tests {
         let expected_feature = FEATURE_PROVIDER_MANAGEMENT_V1.to_string();
         let snapshot = ConnectionSnapshot {
             connected: true,
+            roster_identity: Some(RosterConnectionIdentity {
+                profile_id: "profile-test".to_string(),
+                daemon_generation: 7,
+                connection_serial: 1,
+            }),
             features: BTreeSet::from([expected_feature.clone()]),
             ..ConnectionSnapshot::default()
         };
@@ -7332,6 +7442,10 @@ mod tests {
 
         assert!(connection_tx.borrow().connected);
         assert!(connection_tx.borrow().features.contains(&expected_feature));
+
+        publish_disconnected(&connection_tx);
+        assert!(!connection_tx.borrow().connected);
+        assert_eq!(connection_tx.borrow().roster_identity, None);
     }
 
     #[test]

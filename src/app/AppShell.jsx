@@ -36,11 +36,16 @@ import SessionSurface from "../sessions/SessionSurface.jsx";
 import SpaceSurface from "../sessions/SpaceSurface.jsx";
 import { useSpaces } from "../sessions/useSpaces.js";
 import {
-  rosterFromSessionsRead,
   rosterWithConfirmedSession,
-  SPACE_ROSTER_PENDING_REASON,
-  unreachableSpacesRoster,
 } from "../sessions/spacesController.js";
+import {
+  applyRosterBootstrapEvent,
+  createSessionsRosterGate,
+  HAIDER_ROSTER_BOOTSTRAP_CHANGED_EVENT,
+  HAIDER_ROSTER_BOOTSTRAP_REQUEST_EVENT,
+  reduceSessionsRosterGate,
+  ROSTER_BOOTSTRAP_PENDING_REASON,
+} from "../sessions/sessionsRosterBootstrap.js";
 import { spaceWindowLeaves } from "../sessions/spacesModel.js";
 import {
   createSessionWindowIncarnationGuard,
@@ -18412,27 +18417,51 @@ export default function App() {
      (asked and failed). sessions=[] alone can never claim "everything is
      gone" — that distinction is what keeps space leaves from fabricating
      tombstones while the store is simply not up yet. */
+  const sessionsRosterGateRef = useRef(null);
+  if (!sessionsRosterGateRef.current) {
+    sessionsRosterGateRef.current = createSessionsRosterGate();
+  }
   const [sessionsRoster, setSessionsRoster] = useState(
-    () => unreachableSpacesRoster(SPACE_ROSTER_PENDING_REASON),
+    () => sessionsRosterGateRef.current.roster,
   );
+  const publishSessionsRosterGate = useCallback((action) => {
+    const next = reduceSessionsRosterGate(sessionsRosterGateRef.current, action);
+    sessionsRosterGateRef.current = next;
+    setSessionsRoster(next.roster);
+    return next;
+  }, []);
   const refreshSessions = useCallback(async () => {
     const seq = sessionsReadSeqRef.current + 1;
     sessionsReadSeqRef.current = seq;
+    const {
+      barrierRevision,
+      confirmationRevision,
+    } = sessionsRosterGateRef.current;
     try {
       const rows = await listSessions();
       if (sessionsReadSeqRef.current === seq) {
         setSessions(rows);
-        setSessionsRoster(rosterFromSessionsRead({ ok: true, rows }));
+        publishSessionsRosterGate({
+          type: "sessions-read",
+          barrierRevision,
+          confirmationRevision,
+          read: { ok: true, rows },
+        });
         void emit(SESSION_WINDOW_REFRESH_EVENT, { scope: "sessions" }).catch(() => {});
       }
     } catch (error) {
       // Store not available yet (first boot before Rust lane) — rail stays empty.
       if (sessionsReadSeqRef.current === seq) {
-        setSessionsRoster(rosterFromSessionsRead({ ok: false, error }));
+        publishSessionsRosterGate({
+          type: "sessions-read",
+          barrierRevision,
+          confirmationRevision,
+          read: { ok: false, error },
+        });
         void emit(SESSION_WINDOW_REFRESH_EVENT, { scope: "sessions" }).catch(() => {});
       }
     }
-  }, []);
+  }, [publishSessionsRosterGate]);
   /* Media sessions (demo, under development): first-class rail entries
      SEPARATE from AI sessions but ordered with them on latest edit. Rows
      persist locally; deck items are in-run only until the real backend. */
@@ -18630,6 +18659,7 @@ export default function App() {
          leaf in the focused stack. Materialization is a daemon-confirmed live
          fact, so publish that one id into the roster before reconciliation;
          local sessions in general remain non-authoritative. */
+      publishSessionsRosterGate({ type: "confirmed-session", sessionRef: session.id });
       setSessionsRoster((current) => rosterWithConfirmedSession(current, session.id));
       if (revealConfirmedSpaceSessionOp(session.id)) {
         setSessionDraftOpen(false);
@@ -18648,9 +18678,45 @@ export default function App() {
     activeSpaceIdForShell,
     exitSpaceOp,
     openSessionFromRail,
+    publishSessionsRosterGate,
     revealConfirmedSpaceSessionOp,
     showView,
   ]);
+
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      publishSessionsRosterGate({
+        type: "barrier",
+        value: { state: "pending", reason: ROSTER_BOOTSTRAP_PENDING_REASON },
+      });
+      return undefined;
+    }
+    let disposed = false;
+    const unsubscribe = listenShared(HAIDER_ROSTER_BOOTSTRAP_CHANGED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      // The complete apply precedes this event. Read its atomically projected
+      // rows now; no read begun under either prior revision can authorize refs.
+      void applyRosterBootstrapEvent(
+        event?.payload,
+        publishSessionsRosterGate,
+        refreshSessions,
+      );
+    });
+    void waitSharedListenerReady(HAIDER_ROSTER_BOOTSTRAP_CHANGED_EVENT)
+      .then(() => {
+        if (!disposed) {
+          return emit(HAIDER_ROSTER_BOOTSTRAP_REQUEST_EVENT, {});
+        }
+        return undefined;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [authState, publishSessionsRosterGate, refreshSessions]);
 
   useEffect(() => {
     if (authState !== "authenticated") {
