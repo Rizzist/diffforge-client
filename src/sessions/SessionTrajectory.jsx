@@ -63,13 +63,11 @@ function cssColor(name, fallback) {
 
 /* Lane + color class for one event point. */
 function eventClass(point) {
-  const failedTool = point.kind === "tool"
-    && /\bfailed\b|\berror\b|\bdenied\b/i.test(point.label || "");
   if (point.kind === "error") {
     return { lane: 1, color: "error" };
   }
   if (point.kind === "tool") {
-    return { lane: 2, color: failedTool ? "error" : "tool" };
+    return { lane: 2, color: point.tool_status === "failed" ? "error" : "tool" };
   }
   if (point.role === "user") {
     return { lane: 0, color: "input" };

@@ -103,3 +103,28 @@ test("absent trajectory duration renders an em dash", () => {
     "absent published lifecycle coordinates must render —, never a fabricated duration",
   );
 });
+
+test("trajectory tool rendering trusts typed status and never scary labels", () => {
+  const source = readFileSync(new URL("./SessionTrajectory.jsx", import.meta.url), "utf8");
+  const start = source.indexOf("function eventClass(point) {");
+  const end = source.indexOf("\n\nexport default function SessionTrajectory", start);
+  assert.notEqual(start, -1, "eventClass must remain directly testable");
+  assert.notEqual(end, -1, "eventClass boundary must remain directly testable");
+  const eventClass = Function(`${source.slice(start, end)}; return eventClass;`)();
+
+  assert.deepEqual(
+    eventClass({ kind: "tool", tool_status: "failed", label: "all good" }),
+    { lane: 2, color: "error" },
+    "published failed status must render as an error",
+  );
+  assert.deepEqual(
+    eventClass({ kind: "tool", tool_status: "success", label: "ERROR: denied and failed" }),
+    { lane: 2, color: "tool" },
+    "published success must beat a scary presentation label",
+  );
+  assert.deepEqual(
+    eventClass({ kind: "tool", tool_status: null, label: "ERROR: denied and failed" }),
+    { lane: 2, color: "tool" },
+    "absent published status must stay unknown/pending, never failed-by-label",
+  );
+});

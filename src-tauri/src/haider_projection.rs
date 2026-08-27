@@ -4334,8 +4334,53 @@ fn haider_projection_exact_request(meta: &Value) -> Option<Value> {
     Some(Value::Object(exact))
 }
 
+fn haider_projection_typed_tool_status(meta: &Value) -> Value {
+    let authority = meta
+        .get(HAIDER_PROJECTION_PIPE_AUTHORITY_META_KEY)
+        .and_then(Value::as_object);
+    let published = authority
+        .and_then(|authority| authority.get("version"))
+        .and_then(Value::as_i64)
+        .is_some_and(|version| version >= 6)
+        && authority
+            .and_then(|authority| authority.get("pipe_tool_status_v1"))
+            .and_then(Value::as_bool)
+            == Some(true);
+    if !published {
+        return Value::Null;
+    }
+    meta.get("status")
+        .filter(|status| status.is_string())
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn haider_projection_add_trajectory_metadata(point: &mut Value, kind: &str, meta_text: &str) {
+    if kind != "usage" && kind != "tool" {
+        return;
+    }
+    let meta: Value = serde_json::from_str(meta_text).unwrap_or(Value::Null);
+    let Some(object) = point.as_object_mut() else {
+        return;
+    };
+    if kind == "tool" {
+        object.insert(
+            "tool_status".to_string(),
+            haider_projection_typed_tool_status(&meta),
+        );
+        return;
+    }
+    if let Some(request) = haider_projection_exact_request(&meta) {
+        object.insert("request".to_string(), request);
+    }
+    if let Some(run_id) = meta.pointer("/scope/run").and_then(Value::as_str) {
+        object.insert("run_id".to_string(), json!(run_id));
+    }
+}
+
 /// Lean full-session feed for the trajectory strip: one small point per row,
-/// token/cache stats extracted server-side so the wire never carries payloads.
+/// token/cache stats and authoritative tool status extracted server-side so
+/// the wire never carries payloads or full metadata.
 #[tauri::command(rename_all = "snake_case")]
 async fn session_projection_trajectory(session_id: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -4397,21 +4442,11 @@ async fn session_projection_trajectory(session_id: String) -> Result<Value, Stri
                             "at_ms": at_ms,
                             "label": haider_projection_compact(&text, 140),
                         });
-                        if kind == "usage" {
-                            let meta: Value =
-                                serde_json::from_str(&meta_text).unwrap_or(Value::Null);
-                            if let Some(object) = point.as_object_mut() {
-                                if let Some(request) = haider_projection_exact_request(&meta) {
-                                    object.insert("request".to_string(), request);
-                                }
-                                if let Some(run_id) = meta
-                                    .pointer("/scope/run")
-                                    .and_then(Value::as_str)
-                                {
-                                    object.insert("run_id".to_string(), json!(run_id));
-                                }
-                            }
-                        }
+                        haider_projection_add_trajectory_metadata(
+                            &mut point,
+                            &kind,
+                            &meta_text,
+                        );
                         point
                     },
                 )
@@ -5549,6 +5584,59 @@ mod haider_projection_tests {
         assert_eq!(
             haider_projection_exact_request(&meta),
             Some(json!({"ordinal":3, "input":9, "output":0, "cached":0}))
+        );
+    }
+
+    #[test]
+    fn trajectory_tool_status_round_trips_without_label_inference() {
+        let mut scary = json!({
+            "kind": "tool",
+            "label": "ERROR: denied and failed",
+        });
+        haider_projection_add_trajectory_metadata(
+            &mut scary,
+            "tool",
+            &json!({
+                "status": "success",
+                "_diffforge_pipe": {
+                    "version": 6,
+                    "pipe_tool_status_v1": true,
+                },
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            scary["tool_status"],
+            json!("success"),
+            "a scary presentation label must not overwrite published success"
+        );
+        assert_eq!(scary["label"], "ERROR: denied and failed");
+
+        let mut absent = json!({"kind": "tool", "label": "future tool"});
+        haider_projection_add_trajectory_metadata(
+            &mut absent,
+            "tool",
+            &json!({
+                "_diffforge_pipe": {
+                    "version": 6,
+                    "pipe_tool_status_v1": true,
+                },
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            absent["tool_status"],
+            Value::Null,
+            "absent published status must stay null"
+        );
+
+        assert_eq!(
+            haider_projection_typed_tool_status(&json!({
+                "status": "failed",
+                "label": "failed, but this legacy metadata has no authority",
+            })),
+            Value::Null,
+            "status without typed pipe authority must stay null"
         );
     }
 
