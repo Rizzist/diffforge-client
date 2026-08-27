@@ -111,7 +111,6 @@ test("backend todo queue submit remains authoritative", () => {
 test("panel agent prompt submit keeps agent mode open and drives shared activity", async () => {
   const composerSource = await readFile(path.resolve(__dirname, "PanelAgentPromptComposer.jsx"), "utf8");
   const activitySource = await readFile(path.resolve(__dirname, "PanelAgentPromptActivity.jsx"), "utf8");
-  const overlaySource = await readFile(path.resolve(__dirname, "../web/webAgentPromptOverlay.js"), "utf8");
 
   const submitStart = composerSource.indexOf("const submitPrompt = useCallback");
   const submitEnd = composerSource.indexOf("const targetCount", submitStart);
@@ -123,16 +122,6 @@ test("panel agent prompt submit keeps agent mode open and drives shared activity
   assert.doesNotMatch(submitBody, /onClose\?\.\(\)/);
   assert.match(activitySource, /compactActivityText\(item\.text \|\| item\.title \|\| item\.label \|\| "Prompt"\)/);
   assert.match(activitySource, /normalizedItems\.slice\(-4\)\.reverse\(\)/);
-  assert.match(overlaySource, /activityItems: normalizeOverlayActivityItems\(activityItems\)/);
-  assert.match(overlaySource, /class="activity-stack"/);
-
-  const overlaySubmitStart = overlaySource.indexOf("await submitRef.current?.");
-  const overlaySubmitEnd = overlaySource.indexOf("} catch (err)", overlaySubmitStart);
-  assert.notEqual(overlaySubmitStart, -1);
-  assert.notEqual(overlaySubmitEnd, -1);
-  const overlaySubmitBody = overlaySource.slice(overlaySubmitStart, overlaySubmitEnd);
-  assert.match(overlaySubmitBody, /runOverlayAction\("submitted"/);
-  assert.doesNotMatch(overlaySubmitBody, /closeRef\.current\?\.\(\)/);
 });
 
 test("local slash command detection never synthesizes thinking for command-shaped input", () => {

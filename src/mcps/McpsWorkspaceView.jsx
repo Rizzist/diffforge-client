@@ -40,7 +40,6 @@ import {
   TerminalAgentDot,
 } from "../app/appStyles";
 import { MCP_CATALOG, mcpCatalogInstallInput } from "../tools/mcpCatalog.js";
-import { SshMcpTargets } from "../ssh/SshMcpTargets.jsx";
 
 const SECRETS_SERVER_KEY = "secrets";
 const APPROVAL_ALWAYS_ALLOW = "always_allow";
@@ -1554,58 +1553,6 @@ export default function McpsWorkspaceView({
     [beginAction, commandBase, finishAction, replaceRegistry, workspaceId, workspaceName],
   );
 
-  const upsertSshTarget = useCallback(
-    async (input) => {
-      if (!workspaceId) return { ok: false, error: "No workspace selected." };
-      beginAction("saving_ssh_target", { name: input?.name || "SSH target" });
-      setError("");
-      try {
-        const response = await invoke("coordination_upsert_workspace_mcp_ssh_target", {
-          ...commandBase,
-          workspace_id: workspaceId,
-          workspace_name: workspaceName,
-          input,
-        });
-        const data = replaceRegistry(response);
-        const secretsServer = asArray(data?.servers).find(isSecretsServer);
-        setSelectedId(secretsServer?.id || SECRETS_SERVER_KEY);
-        return { ok: true };
-      } catch (caught) {
-        const message = errorMessage(caught);
-        setError(message);
-        return { ok: false, error: message };
-      } finally {
-        finishAction();
-      }
-    },
-    [beginAction, commandBase, finishAction, replaceRegistry, workspaceId, workspaceName],
-  );
-
-  const deleteSshTarget = useCallback(
-    async (sshTargetId) => {
-      if (!workspaceId || !sshTargetId) return { ok: false, error: "No SSH target." };
-      beginAction("deleting_ssh_target", { name: "SSH target" });
-      setError("");
-      try {
-        const response = await invoke("coordination_delete_workspace_mcp_ssh_target", {
-          ...commandBase,
-          workspace_id: workspaceId,
-          workspace_name: workspaceName,
-          ssh_target_id: sshTargetId,
-        });
-        replaceRegistry(response);
-        return { ok: true };
-      } catch (caught) {
-        const message = errorMessage(caught);
-        setError(message);
-        return { ok: false, error: message };
-      } finally {
-        finishAction();
-      }
-    },
-    [beginAction, commandBase, finishAction, replaceRegistry, workspaceId, workspaceName],
-  );
-
   const catalogByKey = useMemo(
     () => new Map(MCP_CATALOG.map((entry) => [entry.id, entry])),
     [],
@@ -2581,16 +2528,7 @@ export default function McpsWorkspaceView({
         )}
 
         {selectedIsSecrets ? (
-          <>
-            {renderSecretsPanel(selectedServer)}
-            <SshMcpTargets
-              busy={actionState !== "idle"}
-              onDelete={deleteSshTarget}
-              onUpsert={upsertSshTarget}
-              scope={scopeValue === MCP_GLOBAL_SCOPE_VALUE ? "global" : "workspace"}
-              targets={asArray(selectedServer.ssh_targets)}
-            />
-          </>
+          renderSecretsPanel(selectedServer)
         ) : (
           <McpAccessPanel>
             <McpAccessTopline>

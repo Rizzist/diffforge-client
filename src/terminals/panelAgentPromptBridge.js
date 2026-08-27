@@ -20,18 +20,6 @@ function compactPanelAgentPromptText(value, maxLength = 240) {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
 }
 
-function compactPanelAgentPromptMultilineText(value, maxLength = 1600) {
-  const normalized = String(value || "")
-    .split(/\n+/)
-    .map((line) => line.replace(/[^\S\n]+/g, " ").trim())
-    .filter(Boolean)
-    .join("\n");
-  if (!normalized || normalized.length <= maxLength) {
-    return normalized;
-  }
-  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
-}
-
 function clampPanelAgentPromptMultilineText(value, maxLength = 1600) {
   const text = String(value || "").trim();
   if (!text || text.length <= maxLength) {
@@ -92,97 +80,6 @@ function clampPanelAgentPromptBlocks(blocks, maxLength = 1600) {
     .join(separator);
 }
 
-function panelAgentPromptNumber(value) {
-  const number = Number(value);
-  return Number.isFinite(number) ? Math.round(number * 10) / 10 : 0;
-}
-
-function normalizeWebElementContextRef(context) {
-  if (!context || typeof context !== "object") {
-    return null;
-  }
-  const kind = String(context.kind || context.type || "").trim().toLowerCase();
-  if (kind && kind !== "web-element") {
-    return null;
-  }
-  const selector = compactPanelAgentPromptText(context.selector, 260);
-  const element = compactPanelAgentPromptText(context.element || context.tag_name, 140);
-  const url = compactPanelAgentPromptText(context.url, 420);
-  if (!selector && !element && !url) {
-    return null;
-  }
-  const rect = context.rect && typeof context.rect === "object" ? context.rect : {};
-  const pageRect = context.pageRect && typeof context.pageRect === "object"
-    ? context.pageRect
-    : context.page_rect && typeof context.page_rect === "object"
-      ? context.page_rect
-      : {};
-  const scroll = context.scroll && typeof context.scroll === "object" ? context.scroll : {};
-  const viewport = context.viewport && typeof context.viewport === "object" ? context.viewport : {};
-  const styles = context.styles && typeof context.styles === "object" ? context.styles : {};
-  const attributes = context.attributes && typeof context.attributes === "object" ? context.attributes : {};
-  const parent = context.parent && typeof context.parent === "object" ? context.parent : null;
-  return {
-    attributes: {
-      aria_label: compactPanelAgentPromptText(attributes["aria-label"] || attributes.aria_label, 160),
-      alt: compactPanelAgentPromptText(attributes.alt, 160),
-      href: compactPanelAgentPromptText(attributes.href, 240),
-      placeholder: compactPanelAgentPromptText(attributes.placeholder, 160),
-      role: compactPanelAgentPromptText(attributes.role, 80),
-      title: compactPanelAgentPromptText(attributes.title, 160),
-      type: compactPanelAgentPromptText(attributes.type, 80),
-    },
-    captured_at_ms: Number(context.captured_at_ms || 0) || Date.now(),
-    element,
-    id: compactPanelAgentPromptText(context.id || context.context_id, 120),
-    kind: "web-element",
-    panel_kind: compactPanelAgentPromptText(context.panel_kind || "web", 80),
-    pane_id: compactPanelAgentPromptText(context.pane_id, 120),
-    pageRect: {
-      height: panelAgentPromptNumber(pageRect.height),
-      left: panelAgentPromptNumber(pageRect.left ?? pageRect.x),
-      top: panelAgentPromptNumber(pageRect.top ?? pageRect.y),
-      width: panelAgentPromptNumber(pageRect.width),
-    },
-    parent: parent ? {
-      element: compactPanelAgentPromptText(parent.element || parent.tag_name, 140),
-      selector: compactPanelAgentPromptText(parent.selector, 220),
-      text: compactPanelAgentPromptText(parent.text, 180),
-    } : null,
-    rect: {
-      height: panelAgentPromptNumber(rect.height),
-      left: panelAgentPromptNumber(rect.left ?? rect.x),
-      top: panelAgentPromptNumber(rect.top ?? rect.y),
-      width: panelAgentPromptNumber(rect.width),
-    },
-    scroll: {
-      x: panelAgentPromptNumber(scroll.x),
-      y: panelAgentPromptNumber(scroll.y),
-    },
-    selector,
-    styles: {
-      background_color: compactPanelAgentPromptText(styles.background_color, 80),
-      border_color: compactPanelAgentPromptText(styles.border_color, 80),
-      border_radius: compactPanelAgentPromptText(styles.border_radius, 80),
-      color: compactPanelAgentPromptText(styles.color, 80),
-      display: compactPanelAgentPromptText(styles.display, 80),
-      font_size: compactPanelAgentPromptText(styles.font_size, 80),
-      font_weight: compactPanelAgentPromptText(styles.font_weight, 80),
-      gap: compactPanelAgentPromptText(styles.gap, 80),
-      line_height: compactPanelAgentPromptText(styles.line_height, 80),
-      padding: compactPanelAgentPromptText(styles.padding, 120),
-    },
-    text: compactPanelAgentPromptText(context.text, 360),
-    title: compactPanelAgentPromptText(context.title, 160),
-    url,
-    viewport: {
-      height: panelAgentPromptNumber(viewport.height),
-      width: panelAgentPromptNumber(viewport.width),
-    },
-    workspace_id: compactPanelAgentPromptText(context.workspace_id, 160),
-  };
-}
-
 export function normalizePanelAgentPromptContextRefs(value) {
   const values = Array.isArray(value)
     ? value
@@ -192,76 +89,12 @@ export function normalizePanelAgentPromptContextRefs(value) {
   return values
     .map((context) => {
       const kind = String(context?.kind || context?.type || "").trim().toLowerCase();
-      if (kind === "pcb-element") {
-        return normalizePcbElementContexts([context])[0] || null;
-      }
-      return normalizeWebElementContextRef(context);
+      return kind === "pcb-element"
+        ? normalizePcbElementContexts([context])[0] || null
+        : null;
     })
     .filter(Boolean)
     .slice(0, 3);
-}
-
-function formatWebPanelAgentPromptContextNote(contexts) {
-  if (!contexts.length) {
-    return null;
-  }
-  const lines = [
-    contexts.length === 1
-      ? "Selected web element context:"
-      : `Selected web element contexts (${contexts.length}):`,
-  ];
-  contexts.forEach((context, index) => {
-    if (contexts.length > 1) {
-      lines.push(`Element ${index + 1}:`);
-    }
-    if (context.url) {
-      lines.push(`- url: ${context.url}`);
-    }
-    if (context.title) {
-      lines.push(`- page title: ${context.title}`);
-    }
-    if (context.element) {
-      lines.push(`- element: ${context.element}`);
-    }
-    if (context.selector) {
-      lines.push(`- selector: ${context.selector}`);
-    }
-    if (context.text) {
-      lines.push(`- text: ${context.text}`);
-    }
-    const attrs = [];
-    if (context.attributes.role) attrs.push(`role=${context.attributes.role}`);
-    if (context.attributes.aria_label) attrs.push(`aria-label=${context.attributes.aria_label}`);
-    if (context.attributes.alt) attrs.push(`alt=${context.attributes.alt}`);
-    if (context.attributes.placeholder) attrs.push(`placeholder=${context.attributes.placeholder}`);
-    if (context.attributes.href) attrs.push(`href=${context.attributes.href}`);
-    if (attrs.length) {
-      lines.push(`- attributes: ${attrs.join("; ")}`);
-    }
-    if (context.rect.width || context.rect.height) {
-      lines.push(`- viewport rect: x=${context.rect.left}, y=${context.rect.top}, w=${context.rect.width}, h=${context.rect.height}`);
-    }
-    if (context.scroll.x || context.scroll.y) {
-      lines.push(`- page scroll: x=${context.scroll.x}, y=${context.scroll.y}`);
-    }
-    const styleParts = [];
-    if (context.styles.display) styleParts.push(`display=${context.styles.display}`);
-    if (context.styles.font_size) styleParts.push(`font=${context.styles.font_size}${context.styles.font_weight ? `/${context.styles.font_weight}` : ""}`);
-    if (context.styles.color) styleParts.push(`color=${context.styles.color}`);
-    if (context.styles.background_color) styleParts.push(`background=${context.styles.background_color}`);
-    if (context.styles.border_radius) styleParts.push(`radius=${context.styles.border_radius}`);
-    if (context.styles.padding) styleParts.push(`padding=${context.styles.padding}`);
-    if (styleParts.length) {
-      lines.push(`- styles: ${styleParts.join("; ")}`);
-    }
-    if (context.parent?.element) {
-      lines.push(`- parent: ${context.parent.element}${context.parent.text ? ` text=${context.parent.text}` : ""}`);
-    }
-  });
-  return {
-    title: contexts.length === 1 ? "Selected web element" : "Selected web elements",
-    text: compactPanelAgentPromptMultilineText(lines.join("\n"), 1600),
-  };
 }
 
 function joinPanelAgentPromptParts(parts) {
@@ -316,22 +149,9 @@ export function formatPanelAgentPromptContextNote(contextRefs) {
   if (!contexts.length) {
     return null;
   }
-  const webContexts = contexts.filter((context) => context.kind === "web-element");
-  const pcbContexts = contexts.filter((context) => context.kind === "pcb-element");
-  if (webContexts.length === contexts.length) {
-    return formatWebPanelAgentPromptContextNote(webContexts);
-  }
-  const blocks = contexts.map((context) => {
-    if (context.kind === "pcb-element") {
-      return formatPcbElementBlock(context);
-    }
-    return formatWebPanelAgentPromptContextNote([context])?.text || "";
-  }).filter(Boolean);
   return {
-    title: pcbContexts.length && !webContexts.length
-      ? (pcbContexts.length === 1 ? "Selected PCB element" : "Selected PCB elements")
-      : "Selected panel contexts",
-    text: clampPanelAgentPromptBlocks(blocks, 1600),
+    title: contexts.length === 1 ? "Selected PCB element" : "Selected PCB elements",
+    text: clampPanelAgentPromptBlocks(contexts.map(formatPcbElementBlock), 1600),
   };
 }
 

@@ -2,19 +2,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
-// Shared building blocks for the native Tauri child-webview overlay used by the
-// left-nav Web view, the in-grid Web pane, and the Web pane breakout window.
+// Shared building blocks for native Tauri child-webview overlays, including
+// the video editor's live Hyperframes preview.
 //
 // A native child webview always composites ON TOP of the DOM and cannot be
 // reparented, so each surface positions exactly one child webview over a DOM
-// "viewport" element and keeps it fitted as the layout changes. Iframes cannot
-// be used because most sites (Google) refuse to be framed.
+// "viewport" element and keeps it fitted as the layout changes.
 
-export const DEFAULT_WEB_URL = "https://www.google.com";
-export const WEB_SEARCH_URL = "https://www.google.com/search?q=";
 export const WORKSPACE_WEBVIEW_LOAD_EVENT = "workspace-webview-load";
 
-const LOCAL_HOST_PATTERN = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?(?:[/?#]|$)/i;
 const MIN_NATIVE_DIMENSION = 24;
 const HIDDEN_NATIVE_WEBVIEW_OFFSET = 100000;
 const NATIVE_WEBVIEW_EXCLUSION_SELECTOR = "[data-native-webview-exclusion]";
@@ -185,62 +181,6 @@ function clearNativeWebviewVisibleRect(label) {
 
 export function hasTauriRuntime() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
-}
-
-export function nativeErrorMessage(error, fallback) {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-  const message = String(error || "").trim();
-  return message || fallback;
-}
-
-// Turn an address-bar value into a navigable https URL, or a Google search.
-export function normalizeWebInput(value) {
-  const raw = String(value || "").trim();
-  if (!raw) {
-    return "";
-  }
-
-  const hasScheme = /^[a-z][a-z\d+.-]*:/i.test(raw);
-  if (hasScheme) {
-    try {
-      const url = new URL(raw);
-      if (url.protocol === "http:" || url.protocol === "https:") {
-        return url.href;
-      }
-      return "";
-    } catch {
-      return "";
-    }
-  }
-
-  if (LOCAL_HOST_PATTERN.test(raw)) {
-    try {
-      return new URL(`http://${raw}`).href;
-    } catch {
-      return "";
-    }
-  }
-
-  const looksLikeHost = /^[^\s/]+\.[^\s]+/.test(raw);
-  if (looksLikeHost) {
-    try {
-      return new URL(`https://${raw}`).href;
-    } catch {
-      return "";
-    }
-  }
-
-  return `${WEB_SEARCH_URL}${encodeURIComponent(raw)}`;
-}
-
-export function hostForUrl(url) {
-  try {
-    return new URL(url).host || url;
-  } catch {
-    return url;
-  }
 }
 
 // Build a label that satisfies the Rust validator: starts with "workspace-web-",

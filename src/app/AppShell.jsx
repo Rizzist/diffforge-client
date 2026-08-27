@@ -832,7 +832,6 @@ import AudioWorkspaceView, {
 import { VOICE_AGENT_HIGHLIGHT_APP_EVENT } from "../audio/cloudVoiceAgentClient.js";
 import TerminalWindowHost, { TERMINAL_WINDOW_HASH } from "../terminals/TerminalWindowHost.jsx";
 import PcbWindowHost, { PCB_WINDOW_HASH } from "../pcb/PcbWindowHost.jsx";
-import { SshSettingsPanel } from "../ssh/SshSettingsPanel.jsx";
 import SnippingWorkspaceView, {
   SnippingOverlayWindow,
   SnippingRecordingControlsWindow,
@@ -922,7 +921,6 @@ const DEFAULT_WORKSPACE_VIEW = "terminals";
 const SETTINGS_TAB_GENERAL = "general";
 const SETTINGS_TAB_NOTIFICATIONS = "notifications";
 const SETTINGS_TAB_PERMISSIONS = "permissions";
-const SETTINGS_TAB_SSH = "ssh";
 const SETTINGS_TAB_EMAIL = "email";
 const NOTIFICATION_PREFERENCES_CHANGED_EVENT = "forge-notification-preferences-changed";
 const WEB_NOTIFICATION_SETTINGS_URL = "https://diffforge.ai/dashboard?tab=settings&settings=notifications";
@@ -941,7 +939,6 @@ const GLOBAL_TOOLS_VIEWS = new Set(["tools", "architectures", "mcps", "clis", "s
 const WORKSPACE_TAB_VIEW_BY_ID = {
   terminals: DEFAULT_WORKSPACE_VIEW,
   files: "files",
-  web: "web",
   history: "architecture",
 };
 const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
@@ -1887,9 +1884,6 @@ function normalizeWorkspaceTabId(value) {
   }
   if (normalized === "doc" || normalized === "docs" || normalized === "document" || normalized === "workspace_docs" || normalized === "workspace_documents") {
     return DEFAULT_WORKSPACE_VIEW;
-  }
-  if (normalized === "browser" || normalized === "workspace_web" || normalized === "workspace_browser") {
-    return "web";
   }
   if (normalized === "histories" || normalized === "task_history" || normalized === "todo_history") {
     return "history";
@@ -15833,7 +15827,6 @@ const AudioAccountWorkspaceSurface = memo(function AudioAccountWorkspaceSurface(
 
 const WORKSPACE_PANE_KIND_TERMINAL = "terminal";
 const WORKSPACE_PANE_KIND_DOCS = "docs";
-const WORKSPACE_PANE_KIND_WEB = "web";
 const WORKSPACE_PANE_KIND_PCB = "pcb";
 const WORKSPACE_PANE_KIND_VM = "vm";
 const WORKSPACE_PANE_KIND_VIDEO = "video";
@@ -15849,7 +15842,7 @@ const WORKSPACE_PANE_KIND_SWARM = "swarm";
 
 
 // paneKinds maps an integer terminal slot index -> a non-terminal pane kind
-// ("web" or "pcb"). Slots without an entry are normal terminals. This rides
+// (for example, "pcb"). Slots without an entry are normal terminals. This rides
 // alongside terminalRoles without polluting the agent-role space.
 
 
@@ -15891,9 +15884,9 @@ const WORKSPACE_PANE_KIND_SWARM = "swarm";
 
 
 
-// Reconcile terminal slots while keeping a reserved set (e.g. web pane slots)
+// Reconcile terminal slots while keeping a reserved set of panel pane slots
 // free so the two never collide. Used by saveWorkspaceSettings to reconcile the
-// terminal harness count without disturbing web panes that share the slot space.
+// terminal harness count without disturbing panels that share the slot space.
 
 
 
@@ -16031,11 +16024,9 @@ export default function App() {
     ? "Notifications"
     : settingsTab === SETTINGS_TAB_PERMISSIONS
       ? "Permissions"
-      : settingsTab === SETTINGS_TAB_SSH
-        ? "SSH clients"
-        : settingsTab === SETTINGS_TAB_EMAIL
-          ? "Email delivery"
-          : "General";
+      : settingsTab === SETTINGS_TAB_EMAIL
+        ? "Email delivery"
+        : "General";
   const accountDisplayName = String(user?.name || user?.email || "Account").trim() || "Account";
   const accountInitial = accountDisplayName.charAt(0).toUpperCase();
   // The daemon usage roster is rendered in Tokenomics. Until it publishes a
@@ -18121,21 +18112,6 @@ export default function App() {
     }, VIEW_TRANSITION_MS);
   }, [activeView, visibleView]);
 
-
-
-
-  // Tracks the web tab's current native webview label so pop-out and return can
-  // move the living page between windows instead of reloading it.
-
-
-
-
-
-  // Rust preserved a closing web-tab popout's living webview (reparented to the
-  // main window, hidden); remember its label so the tab adopts it back.
-
-
-
   const loadSettingsPermissionState = useCallback(async () => {
     setSettingsPermissionState((current) => ({
       ...current,
@@ -18488,7 +18464,7 @@ export default function App() {
 
   const showSettingsView = useCallback((tab = SETTINGS_TAB_GENERAL) => {
     setSettingsTab(
-      [SETTINGS_TAB_NOTIFICATIONS, SETTINGS_TAB_PERMISSIONS, SETTINGS_TAB_SSH, SETTINGS_TAB_EMAIL].includes(tab)
+      [SETTINGS_TAB_NOTIFICATIONS, SETTINGS_TAB_PERMISSIONS, SETTINGS_TAB_EMAIL].includes(tab)
         ? tab
         : SETTINGS_TAB_GENERAL,
     );
@@ -20672,8 +20648,8 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [closeConfirmOpen]);
-  /* Native Web panes float above the DOM — the close modal must suppress
-     them or it renders underneath an unclickable child webview. */
+  /* Native child webviews float above the DOM — the close modal must suppress
+     them or it renders underneath an unclickable preview. */
   useEffect(() => {
     setNativeWebviewsSuppressed("close-confirm", closeConfirmOpen);
     return () => {
@@ -24714,7 +24690,7 @@ export default function App() {
     openUrl("https://diffforge.ai/pricing").catch(() => {});
   }, []);
   // The tier-up and low-credits overlays are full-window DOM takeovers, but
-  // native web panes composite above ALL DOM — park them while either
+  // Native child webviews composite above all DOM — park them while either
   // overlay is up (same contract as the app-close confirmation).
   useEffect(() => {
     const overlayActive = plusUpsellState === "shown" || lowCreditsUpsellState === "shown";
@@ -25244,20 +25220,10 @@ export default function App() {
                               </RailViewActions>
                             </>
                           )}
-                          {(settingsNavShow("SSH clients") || settingsNavShow("Email delivery") || settingsNavShow("Communication")) && (
+                          {(settingsNavShow("Email delivery") || settingsNavShow("Communication")) && (
                             <>
                               <SettingsNavGroupLabel>Connections</SettingsNavGroupLabel>
                               <RailViewActions aria-label="Connection settings">
-                                {settingsNavShow("SSH clients") && (
-                                  <RailActionButton
-                                    data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_SSH ? "true" : undefined}
-                                    onClick={() => showSettingsView(SETTINGS_TAB_SSH)}
-                                    type="button"
-                                  >
-                                    <ButtonTerminalIcon aria-hidden="true" />
-                                    <span>SSH clients</span>
-                                  </RailActionButton>
-                                )}
                                 {settingsNavShow("Email delivery") && (
                                   <RailActionButton
                                     data-active={activeView === "settings" && settingsTab === SETTINGS_TAB_EMAIL ? "true" : undefined}
@@ -26669,8 +26635,6 @@ export default function App() {
                         </AccountCard>
                       </AccountSettingsPanel>
                     </>
-                  ) : settingsTab === SETTINGS_TAB_SSH ? (
-                    <SshSettingsPanel />
                   ) : settingsTab === SETTINGS_TAB_EMAIL ? (
                     <Suspense fallback={null}>
                       <EmailDeliverySettingsPanel />

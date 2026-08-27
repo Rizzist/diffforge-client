@@ -73,8 +73,6 @@ const loadRootComponent = hash === "#/snipping-overlay"
   ? import("./tools/ToolsWindowHost.jsx").then((module) => module.default)
   : hash.startsWith("#/session-window")
   ? import("./sessions/SessionWindowHost.jsx").then((module) => module.default)
-  : hash.startsWith("#/web-panel")
-  ? import("./web/WebPanelHost.jsx").then((module) => module.default)
   : hash.startsWith("#/pcb-window")
   ? import("./pcb/PcbWindowHost.jsx").then((module) => module.default)
   : hash.startsWith("#/video-window")
