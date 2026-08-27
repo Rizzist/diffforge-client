@@ -40,6 +40,7 @@ import { useSpaces } from "../sessions/useSpaces.js";
 import { useLoom } from "../sessions/useLoom.js";
 import { useWorkflow } from "../sessions/useWorkflow.js";
 import { useFleet } from "../sessions/useFleet.js";
+import { useWorkflowGraph } from "../sessions/useWorkflowGraph.js";
 import {
   rosterWithConfirmedSession,
 } from "../sessions/spacesController.js";
@@ -18888,6 +18889,13 @@ export default function App() {
      reads are on-view only (no polling) and the hook settles once into
      unavailable on a feature-gated daemon. */
   const fleetApi = useFleet({ enabled: authState === "authenticated" });
+  /* Workflow live-runtime graph (P6): the workflow_graph_v1 projection for
+     the surface's Graph view. Both invokes (workflow_graph_state +
+     workflow_graph_watch) live in useWorkflowGraph.js; the watch is a
+     CHANGE SIGNAL only — every rendered node state comes from a
+     workflow_graph_state re-fetch — and the hook settles once into
+     unavailable on a feature-gated daemon. */
+  const workflowGraphApi = useWorkflowGraph({ enabled: authState === "authenticated" });
   const readWorkflowStatus = workflowApi.status;
   useEffect(() => {
     if (authState !== "authenticated" || !activeSessionId) return;
@@ -25847,6 +25855,12 @@ export default function App() {
                           onObserveFleetChild={fleetApi.observeChild}
                           onObserveFleetBatch={fleetApi.observeBatch}
                           onSendAgentMessage={fleetApi.sendMessage}
+                          workflowGraphBySession={workflowGraphApi.graphBySession}
+                          workflowGraphCursor={workflowGraphApi.cursor}
+                          workflowGraphEvents={workflowGraphApi.recentEvents}
+                          workflowGraphError={workflowGraphApi.error}
+                          workflowGraphUnavailable={workflowGraphApi.unavailable}
+                          onWatchWorkflowGraph={workflowGraphApi.startWatch}
                         />
                       )
                   )}

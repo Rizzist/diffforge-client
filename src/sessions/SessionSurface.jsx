@@ -14,6 +14,7 @@ import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
 import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Forum } from "@styled-icons/material-rounded/Forum";
 import { Language } from "@styled-icons/material-rounded/Language";
+import { Mediation } from "@styled-icons/material-rounded/Mediation";
 import { Memory } from "@styled-icons/material-rounded/Memory";
 import { MoreHoriz } from "@styled-icons/material-rounded/MoreHoriz";
 import { Movie } from "@styled-icons/material-rounded/Movie";
@@ -68,6 +69,7 @@ import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
 import FleetPanel from "./FleetPanel.jsx";
 import FleetChildTranscript from "./FleetChildTranscript.jsx";
+import WorkflowGraphView from "./WorkflowGraphView.jsx";
 import { findFleetNode, fleetSessionIds } from "./fleetModel.js";
 import {
   formatSessionRelativeTime,
@@ -170,6 +172,12 @@ export default function SessionSurface({
   onObserveFleetChild = null,
   onObserveFleetBatch = null,
   onSendAgentMessage = null,
+  workflowGraphBySession = {},
+  workflowGraphCursor = null,
+  workflowGraphEvents = [],
+  workflowGraphError = "",
+  workflowGraphUnavailable = false,
+  onWatchWorkflowGraph = null,
 }) {
   const [viewModes, setViewModes] = useState({});
   /* Fleet drilldown selection: sessionId -> selected agent_id. Only the REAL
@@ -1110,6 +1118,19 @@ export default function SessionSurface({
     onLoadFleet?.(id);
   }, [activeSessionId, viewModes, onLoadFleet]);
 
+  /* Live workflow graph view (P6): entering it starts the watch-as-change-
+     signal poll for the active session (workflow.graph.watch signals, then
+     workflow.graph.state re-fetches carry the authority — both invokes
+     live in useWorkflowGraph.js); leaving the view stops the poll. */
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft" || (viewModes[id] || "ui") !== "graph") {
+      onWatchWorkflowGraph?.("");
+      return;
+    }
+    onWatchWorkflowGraph?.(id);
+  }, [activeSessionId, viewModes, onWatchWorkflowGraph]);
+
   /* Session-history sync, lifted from the transcript's additive callback
      (projection caught_up + cold-load state) and reported upward for the
      rail's syncing pill. Keyed per session; only the ACTIVE session's state
@@ -1752,6 +1773,19 @@ export default function SessionSurface({
               <span>Fleet</span>
             </SessionViewButton>
           )}
+          {session.id !== "draft" && (
+            <SessionViewButton
+              aria-selected={activeTabIsChat && modeFor(session.id) === "graph"}
+              data-active={activeTabIsChat && modeFor(session.id) === "graph" ? "true" : undefined}
+              onClick={() => selectView("graph")}
+              role="tab"
+              title="Live workflow graph"
+              type="button"
+            >
+              <Mediation aria-hidden="true" size={13} />
+              <span>Graph</span>
+            </SessionViewButton>
+          )}
           {panelTabs.map((tab) => {
             const panel = PANEL_KINDS[tab.kind];
             const PanelIcon = panel?.Icon || ButtonAddIcon;
@@ -2107,6 +2141,25 @@ export default function SessionSurface({
                       </FleetHostLayer>
                     );
                   })()}
+                  {/* Live workflow graph (P6): the workflow_graph_v1
+                      projection — topology + per-node runtime state from
+                      workflow.graph.state, kept live by the hook's
+                      workflow.graph.watch change-signal loop. The view is
+                      presentational only — both invokes live in
+                      useWorkflowGraph.js (AppShell-owned) — and an UNSEEN
+                      state read stays undefined here: it is never
+                      collapsed into a "no live graph" claim. */}
+                  {mode === "graph" && session.id !== "draft" && (
+                    <GraphHostLayer>
+                      <WorkflowGraphView
+                        cursor={workflowGraphCursor}
+                        entry={workflowGraphBySession[session.id]}
+                        error={workflowGraphError}
+                        events={workflowGraphEvents}
+                        unavailable={workflowGraphUnavailable}
+                      />
+                    </GraphHostLayer>
+                  )}
                 </>
               )}
               {/* Three honest reasons to mount: you are looking at it; it is
@@ -2529,6 +2582,14 @@ const FleetHostLayer = styled.div`
     flex: none;
     max-height: 45%;
   }
+`;
+
+/* Live workflow-graph view host: the graph section owns the scroll. */
+const GraphHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
 `;
 
 const ChatHostLayer = styled.div`
