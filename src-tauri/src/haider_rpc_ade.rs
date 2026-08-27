@@ -64,8 +64,16 @@ const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
 const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
 const FEATURE_USAGE_HISTORY_V1: &str = "usage_history_v1";
 const FEATURE_HAIDER_CODE_PLAN_STATUS_V1: &str = "haider_code_plan_status_v1";
+const FEATURE_CONVERGENCE_GRAPH_V1: &str = "convergence_graph_v1";
+const FEATURE_CONVERGENCE_GRAPH_V2: &str = "convergence_graph_v2";
+const FEATURE_CONVERGENCE_GRAPH_V3: &str = "convergence_graph_v3";
+const FEATURE_CONVERGENCE_GRAPH_V4: &str = "convergence_graph_v4";
 const FEATURE_LOOM_V1: &str = "loom_v1";
+const FEATURE_LOOM_PIPE_DAG_V1: &str = "loom_pipe_dag_v1";
 const FEATURE_LOOM_CLI_PRESENCE_V1: &str = "loom_cli_presence_v1";
+const FEATURE_WORKFLOW_CATALOG_V1: &str = "workflow_catalog_v1";
+const FEATURE_WORKFLOW_INSTANCE_V1: &str = "workflow_instance_v1";
+const FEATURE_SESSION_WORKFLOW_STATE_V1: &str = "session_workflow_state_v1";
 const FEATURE_TYPED_AGENT_INSTALL_V1: &str = "typed_agent_install_v1";
 const FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1: &str = "typed_agent_install_control_v1";
 const FEATURE_SESSION_AGENT_TYPE_SELECT_V1: &str = "session_agent_type_select_v1";
@@ -560,14 +568,333 @@ pub struct LoomAgentType {
     pub rev: u32,
 }
 
+/// Registry class of an immutable workflow instance. Unknown future strings
+/// cross the Rust/JS boundary unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowInstanceSourceV1 {
+    BuiltIn,
+    User,
+    Unknown(String),
+}
+
+impl WorkflowInstanceSourceV1 {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::BuiltIn => "built_in",
+            Self::User => "user",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for WorkflowInstanceSourceV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkflowInstanceSourceV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "built_in" => Self::BuiltIn,
+            "user" => Self::User,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+/// Exact daemon-owned workflow revision. Deep graph and Loom records remain
+/// JSON values so the client never recompiles or re-mirrors authority data.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowInstanceV1 {
+    pub id: String,
+    pub revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    pub template_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipe_version: Option<String>,
+    pub source: WorkflowInstanceSourceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_metadata: Option<Value>,
+    pub compiled_template: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowInstanceResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<WorkflowInstanceV1>,
+}
+
+/// Built-in and user catalog entries retain their complete nested authority
+/// records. An unknown origin retains the complete raw object as well.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowCatalogEntryV1 {
+    BuiltIn {
+        id: String,
+        main_session_eligible: bool,
+        template: Value,
+    },
+    User {
+        id: String,
+        main_session_eligible: bool,
+        workflow: Value,
+    },
+    Unknown(Value),
+}
+
+impl Serialize for WorkflowCatalogEntryV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::BuiltIn {
+                id,
+                main_session_eligible,
+                template,
+            } => serde_json::json!({
+                "origin": "built_in",
+                "id": id,
+                "main_session_eligible": main_session_eligible,
+                "template": template,
+            })
+            .serialize(serializer),
+            Self::User {
+                id,
+                main_session_eligible,
+                workflow,
+            } => serde_json::json!({
+                "origin": "user",
+                "id": id,
+                "main_session_eligible": main_session_eligible,
+                "workflow": workflow,
+            })
+            .serialize(serializer),
+            Self::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkflowCatalogEntryV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct BuiltInEntry {
+            id: String,
+            main_session_eligible: bool,
+            template: Value,
+        }
+
+        #[derive(Deserialize)]
+        struct UserEntry {
+            id: String,
+            main_session_eligible: bool,
+            workflow: Value,
+        }
+
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("origin").and_then(Value::as_str) {
+            Some("built_in") => {
+                let entry: BuiltInEntry =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::BuiltIn {
+                    id: entry.id,
+                    main_session_eligible: entry.main_session_eligible,
+                    template: entry.template,
+                })
+            }
+            Some("user") => {
+                let entry: UserEntry =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::User {
+                    id: entry.id,
+                    main_session_eligible: entry.main_session_eligible,
+                    workflow: entry.workflow,
+                })
+            }
+            _ => Ok(Self::Unknown(raw)),
+        }
+    }
+}
+
+fn empty_json_array() -> Value {
+    Value::Array(Vec::new())
+}
+
+fn value_is_empty_array(value: &Value) -> bool {
+    value.as_array().is_some_and(Vec::is_empty)
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Scalar Convergence Graph coordinates used by the ADE. Nested graph
+/// authority records are carried verbatim rather than duplicated here.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphStatus {
+    pub graph_id: String,
+    pub template: String,
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub template_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_node: Option<String>,
+    pub phase: String,
+    pub current_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ready_nodes: Vec<String>,
+    pub attempt: u32,
+    pub nodes: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_menu: Option<Value>,
+    #[serde(
+        default = "empty_json_array",
+        skip_serializing_if = "value_is_empty_array"
+    )]
+    pub pending_menus: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_set: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphInspectResult {
+    pub snapshot: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphPinReceipt {
+    pub session_id: String,
+    pub graph_id: String,
+    pub template: String,
+    pub digest: String,
+    pub pinned_seq: u64,
+    pub opened_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphSwitchReceipt {
+    pub session_id: String,
+    pub old_graph_id: String,
+    pub new_graph_id: String,
+    pub template: String,
+    pub digest: String,
+    pub superseded_seq: u64,
+    pub pinned_seq: u64,
+    pub opened_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphAbandonReceipt {
+    pub session_id: String,
+    pub graph_id: String,
+    pub abandoned_seq: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GraphRunSetOpenReceipt {
+    pub session_id: String,
+    pub run_set_id: String,
+    pub root_graph_id: String,
+    pub plan_item_id: String,
+    pub plan_event_seq: u64,
+    pub template: String,
+    pub digest: String,
+    pub run_set_opened_seq: u64,
+    pub through_seq: u64,
+    #[serde(default = "empty_json_array")]
+    pub children: Value,
+    pub worker_generation: u64,
+}
+
+/// Typed recovery coordinates for a workflow selection fence mismatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRevisionConflict {
+    pub expected_digest: String,
+    pub current_digest: String,
+    pub current_revision: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkflowErrorData {
+    WorkflowRevisionConflict(WorkflowRevisionConflict),
+    Unknown(Value),
+}
+
+impl Serialize for WorkflowErrorData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::WorkflowRevisionConflict(conflict) => serde_json::json!({
+                "kind": "workflow_revision_conflict",
+                "expected_digest": conflict.expected_digest,
+                "current_digest": conflict.current_digest,
+                "current_revision": conflict.current_revision,
+            })
+            .serialize(serializer),
+            Self::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkflowErrorData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        if raw.get("kind").and_then(Value::as_str) == Some("workflow_revision_conflict") {
+            let conflict =
+                serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+            Ok(Self::WorkflowRevisionConflict(conflict))
+        } else {
+            Ok(Self::Unknown(raw))
+        }
+    }
+}
+
+/// Structured rejection for graph mutations and workflow registration.
+/// Unknown error payloads, including future compile diagnostics, remain raw.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowCommandError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<WorkflowErrorData>,
+}
+
 /// Agent-type registry plus point-in-time CLI inventory. Map absence is the
 /// third state: no key means not probed, distinct from `Some(false)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoomListResult {
     #[serde(default)]
     pub agent_types: Vec<LoomAgentType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<Value>,
     #[serde(default)]
     pub cli_present: BTreeMap<String, bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_catalog: Option<Vec<WorkflowCatalogEntryV1>>,
 }
 
 impl LoomListResult {
@@ -1371,6 +1698,57 @@ enum RequestBody {
     LoomList {},
     #[serde(rename = "loom.register_agent_type")]
     LoomRegisterAgentType { record: LoomAgentType },
+    #[serde(rename = "loom.register_workflow")]
+    LoomRegisterWorkflow { source: String },
+    #[serde(rename = "workflow.instance")]
+    WorkflowInstance {
+        workflow_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template_digest: Option<String>,
+    },
+    #[serde(rename = "graph.status")]
+    GraphStatus { session_id: String },
+    #[serde(rename = "graph.inspect")]
+    GraphInspect {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        limit: u32,
+    },
+    #[serde(rename = "graph.pin")]
+    GraphPin {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        template: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
+    #[serde(rename = "graph.switch")]
+    GraphSwitch {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        old_graph_id: String,
+        template: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
+    #[serde(rename = "graph.abandon")]
+    GraphAbandon {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        why: String,
+    },
+    #[serde(rename = "graph.run_set.open")]
+    GraphRunSetOpen {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        plan_item_id: String,
+        plan_event_seq: u64,
+    },
     #[serde(rename = "loom.install.status")]
     LoomInstallStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1625,14 +2003,78 @@ enum ResponseBody {
     LoomList {
         #[serde(default)]
         agent_types: Vec<LoomAgentType>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        workflows: Vec<Value>,
         #[serde(default)]
         cli_present: BTreeMap<String, bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow_catalog: Option<Vec<WorkflowCatalogEntryV1>>,
     },
     #[serde(rename = "loom.registered")]
     LoomRegistered {
         registration: LoomRegistrationWire,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         install_job_id: Option<String>,
+    },
+    #[serde(rename = "workflow.instance")]
+    WorkflowInstance {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<WorkflowInstanceV1>,
+    },
+    #[serde(rename = "graph.status")]
+    GraphStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<GraphStatus>,
+    },
+    #[serde(rename = "graph.inspect")]
+    GraphInspect {
+        snapshot: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+    },
+    #[serde(rename = "graph.pin")]
+    GraphPin {
+        session_id: String,
+        graph_id: String,
+        template: String,
+        digest: String,
+        pinned_seq: u64,
+        opened_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "graph.switch")]
+    GraphSwitch {
+        session_id: String,
+        old_graph_id: String,
+        new_graph_id: String,
+        template: String,
+        digest: String,
+        superseded_seq: u64,
+        pinned_seq: u64,
+        opened_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "graph.abandon")]
+    GraphAbandon {
+        session_id: String,
+        graph_id: String,
+        abandoned_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "graph.run_set.open")]
+    GraphRunSetOpen {
+        session_id: String,
+        run_set_id: String,
+        root_graph_id: String,
+        plan_item_id: String,
+        plan_event_seq: u64,
+        template: String,
+        digest: String,
+        run_set_opened_seq: u64,
+        through_seq: u64,
+        #[serde(default = "empty_json_array")]
+        children: Value,
+        worker_generation: u64,
     },
     #[serde(rename = "loom.install.status")]
     LoomInstallStatus {
@@ -3583,10 +4025,14 @@ fn loom_list_response(body: ResponseBody) -> Result<LoomListResult, String> {
     match body {
         ResponseBody::LoomList {
             agent_types,
+            workflows,
             cli_present,
+            workflow_catalog,
         } => Ok(LoomListResult {
             agent_types,
+            workflows,
             cli_present,
+            workflow_catalog,
         }),
         _ => Err("loom.list response method mismatch".to_string()),
     }
@@ -3681,6 +4127,462 @@ async fn loom_request(
     }
 }
 
+fn workflow_instance_response(body: ResponseBody) -> Result<WorkflowInstanceResult, String> {
+    match body {
+        ResponseBody::WorkflowInstance { instance } => Ok(WorkflowInstanceResult { instance }),
+        _ => Err("workflow.instance response method mismatch".to_string()),
+    }
+}
+
+fn graph_status_response(body: ResponseBody) -> Result<Option<GraphStatus>, String> {
+    match body {
+        ResponseBody::GraphStatus { status } => Ok(status),
+        _ => Err("graph.status response method mismatch".to_string()),
+    }
+}
+
+fn graph_inspect_response(body: ResponseBody) -> Result<GraphInspectResult, String> {
+    match body {
+        ResponseBody::GraphInspect {
+            snapshot,
+            next_cursor,
+        } => Ok(GraphInspectResult {
+            snapshot,
+            next_cursor,
+        }),
+        _ => Err("graph.inspect response method mismatch".to_string()),
+    }
+}
+
+impl WorkflowCommandError {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "unavailable".to_string(),
+            message: message.into(),
+            retryable: true,
+            data: None,
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.into(),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn from_daemon(code: String, message: String, retryable: bool, data: Option<Value>) -> Self {
+        let data = data.map(|raw| {
+            if code == "revision_conflict"
+                && raw.get("kind").and_then(Value::as_str) == Some("workflow_revision_conflict")
+            {
+                serde_json::from_value(raw.clone()).unwrap_or(WorkflowErrorData::Unknown(raw))
+            } else {
+                WorkflowErrorData::Unknown(raw)
+            }
+        });
+        Self {
+            code,
+            message,
+            retryable,
+            data,
+        }
+    }
+}
+
+fn workflow_response_error(body: ResponseBody, mismatch: &'static str) -> WorkflowCommandError {
+    match body {
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => WorkflowCommandError::from_daemon(code, message, retryable, data),
+        _ => WorkflowCommandError::protocol(mismatch),
+    }
+}
+
+fn graph_pin_response(body: ResponseBody) -> Result<GraphPinReceipt, WorkflowCommandError> {
+    match body {
+        ResponseBody::GraphPin {
+            session_id,
+            graph_id,
+            template,
+            digest,
+            pinned_seq,
+            opened_seq,
+            worker_generation,
+        } => Ok(GraphPinReceipt {
+            session_id,
+            graph_id,
+            template,
+            digest,
+            pinned_seq,
+            opened_seq,
+            worker_generation,
+        }),
+        response => Err(workflow_response_error(
+            response,
+            "graph.pin response method mismatch",
+        )),
+    }
+}
+
+fn graph_switch_response(body: ResponseBody) -> Result<GraphSwitchReceipt, WorkflowCommandError> {
+    match body {
+        ResponseBody::GraphSwitch {
+            session_id,
+            old_graph_id,
+            new_graph_id,
+            template,
+            digest,
+            superseded_seq,
+            pinned_seq,
+            opened_seq,
+            worker_generation,
+        } => Ok(GraphSwitchReceipt {
+            session_id,
+            old_graph_id,
+            new_graph_id,
+            template,
+            digest,
+            superseded_seq,
+            pinned_seq,
+            opened_seq,
+            worker_generation,
+        }),
+        response => Err(workflow_response_error(
+            response,
+            "graph.switch response method mismatch",
+        )),
+    }
+}
+
+fn graph_abandon_response(body: ResponseBody) -> Result<GraphAbandonReceipt, WorkflowCommandError> {
+    match body {
+        ResponseBody::GraphAbandon {
+            session_id,
+            graph_id,
+            abandoned_seq,
+            worker_generation,
+        } => Ok(GraphAbandonReceipt {
+            session_id,
+            graph_id,
+            abandoned_seq,
+            worker_generation,
+        }),
+        response => Err(workflow_response_error(
+            response,
+            "graph.abandon response method mismatch",
+        )),
+    }
+}
+
+fn graph_run_set_open_response(
+    body: ResponseBody,
+) -> Result<GraphRunSetOpenReceipt, WorkflowCommandError> {
+    match body {
+        ResponseBody::GraphRunSetOpen {
+            session_id,
+            run_set_id,
+            root_graph_id,
+            plan_item_id,
+            plan_event_seq,
+            template,
+            digest,
+            run_set_opened_seq,
+            through_seq,
+            children,
+            worker_generation,
+        } => Ok(GraphRunSetOpenReceipt {
+            session_id,
+            run_set_id,
+            root_graph_id,
+            plan_item_id,
+            plan_event_seq,
+            template,
+            digest,
+            run_set_opened_seq,
+            through_seq,
+            children,
+            worker_generation,
+        }),
+        response => Err(workflow_response_error(
+            response,
+            "graph.run_set.open response method mismatch",
+        )),
+    }
+}
+
+fn loom_workflow_registration_response(
+    body: ResponseBody,
+) -> Result<LoomRegistrationReceipt, WorkflowCommandError> {
+    match body {
+        ResponseBody::LoomRegistered {
+            registration,
+            install_job_id,
+        } => Ok(LoomRegistrationReceipt {
+            id: registration.id,
+            rev: registration.rev,
+            digest: registration.digest,
+            updated: registration.updated,
+            install_job_id,
+        }),
+        response => Err(workflow_response_error(
+            response,
+            "loom.register_workflow response method mismatch",
+        )),
+    }
+}
+
+fn graph_selection_expected_digest(
+    advertised_features: &BTreeSet<String>,
+    expected_digest: Option<String>,
+) -> Option<String> {
+    advertised_features
+        .contains(FEATURE_WORKFLOW_INSTANCE_V1)
+        .then_some(expected_digest)
+        .flatten()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph_pin_request_for_features(
+    command_id: String,
+    session_id: String,
+    worker_generation: u64,
+    template: String,
+    expected_digest: Option<String>,
+    advertised_features: &BTreeSet<String>,
+) -> RequestBody {
+    RequestBody::GraphPin {
+        command_id,
+        session_id,
+        worker_generation,
+        template,
+        expected_digest: graph_selection_expected_digest(advertised_features, expected_digest),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph_switch_request_for_features(
+    command_id: String,
+    session_id: String,
+    worker_generation: u64,
+    old_graph_id: String,
+    template: String,
+    expected_digest: Option<String>,
+    advertised_features: &BTreeSet<String>,
+) -> RequestBody {
+    RequestBody::GraphSwitch {
+        command_id,
+        session_id,
+        worker_generation,
+        old_graph_id,
+        template,
+        expected_digest: graph_selection_expected_digest(advertised_features, expected_digest),
+    }
+}
+
+#[cfg(unix)]
+fn workflow_feature_gate(features: &BTreeSet<String>) -> FeatureGate {
+    FeatureGate::all(features.clone())
+}
+
+#[cfg(unix)]
+fn workflow_rpc_transport_error(error: String) -> WorkflowCommandError {
+    if error.starts_with("missing_feature:") {
+        WorkflowCommandError {
+            code: "missing_feature".to_string(),
+            message: error,
+            retryable: false,
+            data: None,
+        }
+    } else if error == "capability_denied" {
+        WorkflowCommandError {
+            code: error,
+            message: "The current Haider RPC connection lacks the required capability.".to_string(),
+            retryable: false,
+            data: None,
+        }
+    } else {
+        WorkflowCommandError::unavailable(error)
+    }
+}
+
+#[cfg(unix)]
+async fn workflow_request(
+    body: RequestBody,
+    capability: Capability,
+    features: &BTreeSet<String>,
+) -> Result<ResponseBody, WorkflowCommandError> {
+    match rpc_request_with_feature_gate(
+        body,
+        capability,
+        workflow_feature_gate(features),
+        RpcErrorStyle::Passthrough,
+    )
+    .await
+    {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) => Err(workflow_rpc_transport_error(error)),
+        None => Err(WorkflowCommandError::unavailable(
+            "The workflow RPC request did not receive a response.",
+        )),
+    }
+}
+
+#[cfg(unix)]
+async fn workflow_connection_features() -> Result<BTreeSet<String>, WorkflowCommandError> {
+    let handle = actor_handle();
+    let mut connection = handle.connection.subscribe();
+    if !connection.borrow().connected {
+        let _ = tokio::time::timeout(FEATURE_SNIFF_TIMEOUT, async {
+            while connection.changed().await.is_ok() {
+                if connection.borrow().connected {
+                    break;
+                }
+            }
+        })
+        .await;
+    }
+    let snapshot = connection.borrow().clone();
+    if snapshot.connected {
+        Ok(snapshot.features)
+    } else {
+        Err(WorkflowCommandError::unavailable(
+            "The Haider RPC connection is unavailable.",
+        ))
+    }
+}
+
+#[cfg(unix)]
+async fn graph_provider_session_id(session_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        super::session_provider_session_id_blocking(&session_id)
+    })
+    .await
+    .map_err(|error| format!("Workflow session lookup failed: {error}"))?
+    .map_err(|error| format!("Workflow session lookup failed: {error}"))
+}
+
+#[cfg(unix)]
+async fn graph_provider_session_id_for_mutation(
+    session_id: String,
+) -> Result<String, WorkflowCommandError> {
+    graph_provider_session_id(session_id)
+        .await
+        .map_err(WorkflowCommandError::protocol)
+}
+
+#[cfg(unix)]
+struct WorkflowControlAttachment {
+    attachment_id: String,
+    session_id: String,
+    worker_generation: u64,
+}
+
+#[cfg(unix)]
+async fn workflow_session_summary(
+    session_id: &str,
+    features: &BTreeSet<String>,
+) -> Result<Value, WorkflowCommandError> {
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let response = workflow_request(
+            RequestBody::SessionList { cursor, limit: 256 },
+            Capability::Control,
+            features,
+        )
+        .await?;
+        let (sessions, next_cursor) = match response {
+            ResponseBody::SessionList {
+                sessions,
+                next_cursor,
+            } => (sessions, next_cursor),
+            response => {
+                return Err(workflow_response_error(
+                    response,
+                    "session.list response method mismatch while attaching graph control",
+                ));
+            }
+        };
+        if let Some(summary) = sessions
+            .into_iter()
+            .find(|summary| summary.get("session_id").and_then(Value::as_str) == Some(session_id))
+        {
+            return Ok(summary);
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Err(WorkflowCommandError::protocol(format!(
+                "session `{session_id}` was not found"
+            )));
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err(WorkflowCommandError::protocol(
+                "session.list returned a repeated cursor while attaching graph control",
+            ));
+        }
+        cursor = Some(next_cursor);
+    }
+}
+
+#[cfg(unix)]
+async fn workflow_detach(attachment_id: String) {
+    let _ = workflow_request(
+        RequestBody::SessionDetach { attachment_id },
+        Capability::Control,
+        &BTreeSet::new(),
+    )
+    .await;
+}
+
+#[cfg(unix)]
+async fn workflow_control_attachment(
+    session_id: &str,
+    features: &BTreeSet<String>,
+) -> Result<WorkflowControlAttachment, WorkflowCommandError> {
+    let summary = workflow_session_summary(session_id, features).await?;
+    let head_seq = config_u64(summary.get("head_seq"))
+        .ok_or_else(|| WorkflowCommandError::protocol("session summary head_seq was missing"))?;
+    let response = workflow_request(
+        RequestBody::SessionAttach {
+            session_id: session_id.to_string(),
+            after_seq: head_seq,
+            mode: AttachMode::Control,
+            sealed_replay: false,
+        },
+        Capability::Control,
+        features,
+    )
+    .await?;
+    let (attachment_id, attach_state) = match response {
+        ResponseBody::SessionAttach {
+            attachment_id,
+            attach_state,
+        } => (attachment_id, attach_state),
+        response => {
+            return Err(workflow_response_error(
+                response,
+                "session.attach response method mismatch for graph control",
+            ));
+        }
+    };
+    if attach_state.session_id != session_id {
+        workflow_detach(attachment_id).await;
+        return Err(WorkflowCommandError::protocol(
+            "session.attach response session mismatch for graph control",
+        ));
+    }
+    Ok(WorkflowControlAttachment {
+        attachment_id,
+        session_id: attach_state.session_id,
+        worker_generation: attach_state.worker_generation,
+    })
+}
+
 /// Read only the P0.3 agent-type registry and advisory CLI-presence map.
 /// Workflow records are deliberately left to P0.4.
 #[tauri::command(rename_all = "snake_case")]
@@ -3699,6 +4601,277 @@ pub async fn loom_list() -> Result<LoomListResult, String> {
     }
     #[cfg(not(unix))]
     Err("loom.list unavailable on this platform".to_string())
+}
+
+/// Read an exact daemon-owned workflow revision. Feature-gate failure is an
+/// unavailable read, never permission to compile or substitute a local row.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn workflow_instance_get(
+    workflow_id: String,
+    template_digest: Option<String>,
+) -> Result<WorkflowInstanceResult, String> {
+    #[cfg(unix)]
+    {
+        return workflow_instance_response(
+            loom_request(
+                "workflow.instance",
+                RequestBody::WorkflowInstance {
+                    workflow_id,
+                    template_digest,
+                },
+                Capability::View,
+                FEATURE_WORKFLOW_INSTANCE_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (workflow_id, template_digest);
+        Err("workflow.instance unavailable on this platform".to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn graph_status(session_id: String) -> Result<Option<GraphStatus>, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = graph_provider_session_id(session_id).await?;
+        return graph_status_response(
+            loom_request(
+                "graph.status",
+                RequestBody::GraphStatus {
+                    session_id: provider_session_id,
+                },
+                Capability::View,
+                FEATURE_CONVERGENCE_GRAPH_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session_id;
+        Err("graph.status unavailable on this platform".to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn graph_inspect(
+    session_id: String,
+    cursor: Option<String>,
+    limit: u32,
+) -> Result<GraphInspectResult, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = graph_provider_session_id(session_id).await?;
+        return graph_inspect_response(
+            loom_request(
+                "graph.inspect",
+                RequestBody::GraphInspect {
+                    session_id: provider_session_id,
+                    cursor,
+                    limit,
+                },
+                Capability::View,
+                FEATURE_CONVERGENCE_GRAPH_V3,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, cursor, limit);
+        Err("graph.inspect unavailable on this platform".to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn graph_pin(
+    session_id: String,
+    template: String,
+    expected_digest: Option<String>,
+) -> Result<GraphPinReceipt, WorkflowCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = graph_provider_session_id_for_mutation(session_id).await?;
+        let advertised_features = workflow_connection_features().await?;
+        let base_features = BTreeSet::from([FEATURE_CONVERGENCE_GRAPH_V1.to_string()]);
+        let attachment = workflow_control_attachment(&provider_session_id, &base_features).await?;
+        let fenced =
+            expected_digest.is_some() && advertised_features.contains(FEATURE_WORKFLOW_INSTANCE_V1);
+        let request = graph_pin_request_for_features(
+            config_command_id("graph-pin"),
+            attachment.session_id.clone(),
+            attachment.worker_generation,
+            template,
+            expected_digest,
+            &advertised_features,
+        );
+        let mut mutation_features = base_features;
+        if fenced {
+            mutation_features.insert(FEATURE_WORKFLOW_INSTANCE_V1.to_string());
+        }
+        let response = workflow_request(request, Capability::Control, &mutation_features).await;
+        let result = match response {
+            Ok(body) => graph_pin_response(body),
+            Err(error) => Err(error),
+        };
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, template, expected_digest);
+        Err(WorkflowCommandError::unavailable(
+            "graph.pin unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn graph_switch(
+    session_id: String,
+    old_graph_id: String,
+    template: String,
+    expected_digest: Option<String>,
+) -> Result<GraphSwitchReceipt, WorkflowCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = graph_provider_session_id_for_mutation(session_id).await?;
+        let advertised_features = workflow_connection_features().await?;
+        let base_features = BTreeSet::from([FEATURE_CONVERGENCE_GRAPH_V2.to_string()]);
+        let attachment = workflow_control_attachment(&provider_session_id, &base_features).await?;
+        let fenced =
+            expected_digest.is_some() && advertised_features.contains(FEATURE_WORKFLOW_INSTANCE_V1);
+        let request = graph_switch_request_for_features(
+            config_command_id("graph-switch"),
+            attachment.session_id.clone(),
+            attachment.worker_generation,
+            old_graph_id,
+            template,
+            expected_digest,
+            &advertised_features,
+        );
+        let mut mutation_features = base_features;
+        if fenced {
+            mutation_features.insert(FEATURE_WORKFLOW_INSTANCE_V1.to_string());
+        }
+        let response = workflow_request(request, Capability::Control, &mutation_features).await;
+        let result = match response {
+            Ok(body) => graph_switch_response(body),
+            Err(error) => Err(error),
+        };
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, old_graph_id, template, expected_digest);
+        Err(WorkflowCommandError::unavailable(
+            "graph.switch unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn graph_abandon(
+    session_id: String,
+    why: String,
+) -> Result<GraphAbandonReceipt, WorkflowCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = graph_provider_session_id_for_mutation(session_id).await?;
+        let features = BTreeSet::from([FEATURE_CONVERGENCE_GRAPH_V1.to_string()]);
+        let attachment = workflow_control_attachment(&provider_session_id, &features).await?;
+        let response = workflow_request(
+            RequestBody::GraphAbandon {
+                command_id: config_command_id("graph-abandon"),
+                session_id: attachment.session_id.clone(),
+                worker_generation: attachment.worker_generation,
+                why,
+            },
+            Capability::Control,
+            &features,
+        )
+        .await;
+        let result = match response {
+            Ok(body) => graph_abandon_response(body),
+            Err(error) => Err(error),
+        };
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, why);
+        Err(WorkflowCommandError::unavailable(
+            "graph.abandon unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn graph_run_set_open(
+    session_id: String,
+    plan_item_id: String,
+    plan_event_seq: u64,
+) -> Result<GraphRunSetOpenReceipt, WorkflowCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = graph_provider_session_id_for_mutation(session_id).await?;
+        let features = BTreeSet::from([FEATURE_CONVERGENCE_GRAPH_V4.to_string()]);
+        let attachment = workflow_control_attachment(&provider_session_id, &features).await?;
+        let response = workflow_request(
+            RequestBody::GraphRunSetOpen {
+                command_id: config_command_id("graph-run-set-open"),
+                session_id: attachment.session_id.clone(),
+                worker_generation: attachment.worker_generation,
+                plan_item_id,
+                plan_event_seq,
+            },
+            Capability::Control,
+            &features,
+        )
+        .await;
+        let result = match response {
+            Ok(body) => graph_run_set_open_response(body),
+            Err(error) => Err(error),
+        };
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, plan_item_id, plan_event_seq);
+        Err(WorkflowCommandError::unavailable(
+            "graph.run_set.open unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_register_workflow(
+    source: String,
+) -> Result<LoomRegistrationReceipt, WorkflowCommandError> {
+    #[cfg(unix)]
+    {
+        let features = BTreeSet::from([FEATURE_LOOM_V1.to_string()]);
+        let response = workflow_request(
+            RequestBody::LoomRegisterWorkflow { source },
+            Capability::Control,
+            &features,
+        )
+        .await?;
+        return loom_workflow_registration_response(response);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source;
+        Err(WorkflowCommandError::unavailable(
+            "loom.register_workflow unavailable on this platform",
+        ))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8162,6 +9335,11 @@ fn blake3_g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u3
 #[cfg(test)]
 #[path = "haider_rpc_ade_loom_tests.rs"]
 mod loom_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_workflow_tests.rs"]
+mod workflow_tests;
 
 #[cfg(test)]
 mod tests {
