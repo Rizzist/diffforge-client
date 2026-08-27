@@ -76,6 +76,7 @@ const FEATURE_LOOM_PIPE_DAG_V1: &str = "loom_pipe_dag_v1";
 const FEATURE_LOOM_CLI_PRESENCE_V1: &str = "loom_cli_presence_v1";
 const FEATURE_WORKFLOW_CATALOG_V1: &str = "workflow_catalog_v1";
 const FEATURE_WORKFLOW_INSTANCE_V1: &str = "workflow_instance_v1";
+const FEATURE_WORKFLOW_GRAPH_V1: &str = "workflow_graph_v1";
 const FEATURE_SESSION_WORKFLOW_STATE_V1: &str = "session_workflow_state_v1";
 const FEATURE_TYPED_AGENT_INSTALL_V1: &str = "typed_agent_install_v1";
 const FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1: &str = "typed_agent_install_control_v1";
@@ -957,6 +958,99 @@ pub struct WorkflowInstanceV1 {
 pub struct WorkflowInstanceResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<WorkflowInstanceV1>,
+}
+
+/// Daemon-owned activation-graph phase. Future phase strings cross the
+/// Rust/JS boundary unchanged instead of being coerced to a known phase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkflowGraphPhaseV1 {
+    Active,
+    Completed,
+    Rejected,
+    Unknown(String),
+}
+
+impl WorkflowGraphPhaseV1 {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Rejected => "rejected",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for WorkflowGraphPhaseV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkflowGraphPhaseV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "active" => Self::Active,
+            "completed" => Self::Completed,
+            "rejected" => Self::Rejected,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+fn serialize_workflow_graph_cursor<S>(cursor: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.collect_str(cursor)
+}
+
+/// Scalar live-runtime graph coordinates typed by the ADE. The activation
+/// AST and nested authority records remain verbatim JSON values.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowGraphStateV1 {
+    pub graph_id: String,
+    pub ast: Value,
+    /// Daemon-issued topology fence; clients must never recompute it.
+    pub ast_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<Value>,
+    pub phase: WorkflowGraphPhaseV1,
+    #[serde(serialize_with = "serialize_workflow_graph_cursor")]
+    pub through_cursor: u64,
+    pub next_activation_order: u64,
+    pub back_edge_activations: u32,
+    pub nodes: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activation_order: Vec<Value>,
+}
+
+/// One cursor-bearing journal fact. The complete `type`-tagged fact remains
+/// raw so unknown future event families survive unchanged.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowGraphWatchEventV1 {
+    #[serde(serialize_with = "serialize_workflow_graph_cursor")]
+    pub cursor: u64,
+    pub event: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowGraphWatchPageV1 {
+    #[serde(serialize_with = "serialize_workflow_graph_cursor")]
+    pub requested_after_cursor: u64,
+    #[serde(serialize_with = "serialize_workflow_graph_cursor")]
+    pub replay_through_cursor: u64,
+    #[serde(serialize_with = "serialize_workflow_graph_cursor")]
+    pub next_cursor: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<WorkflowGraphWatchEventV1>,
 }
 
 /// Built-in and user catalog entries retain their complete nested authority
@@ -2032,6 +2126,18 @@ enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         template_digest: Option<String>,
     },
+    #[serde(rename = "workflow.graph.state")]
+    WorkflowGraphState {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        graph_id: Option<String>,
+    },
+    #[serde(rename = "workflow.graph.watch")]
+    WorkflowGraphWatch {
+        session_id: String,
+        after_cursor: u64,
+        limit: u32,
+    },
     #[serde(rename = "graph.status")]
     GraphStatus { session_id: String },
     #[serde(rename = "graph.inspect")]
@@ -2368,6 +2474,13 @@ enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instance: Option<WorkflowInstanceV1>,
     },
+    #[serde(rename = "workflow.graph.state")]
+    WorkflowGraphState {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<WorkflowGraphStateV1>,
+    },
+    #[serde(rename = "workflow.graph.watch")]
+    WorkflowGraphWatch { page: WorkflowGraphWatchPageV1 },
     #[serde(rename = "graph.status")]
     GraphStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4579,6 +4692,46 @@ fn workflow_instance_response(body: ResponseBody) -> Result<WorkflowInstanceResu
     }
 }
 
+fn workflow_graph_state_request(session_id: String, graph_id: Option<String>) -> RequestBody {
+    RequestBody::WorkflowGraphState {
+        session_id,
+        graph_id,
+    }
+}
+
+fn workflow_graph_watch_request(session_id: String, after_cursor: u64, limit: u32) -> RequestBody {
+    RequestBody::WorkflowGraphWatch {
+        session_id,
+        after_cursor,
+        limit,
+    }
+}
+
+fn parse_workflow_graph_watch_after_cursor(after_cursor: &str) -> Result<u64, String> {
+    if after_cursor.is_empty() || !after_cursor.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("workflow.graph.watch after_cursor must be a decimal u64 string".to_string());
+    }
+    after_cursor
+        .parse::<u64>()
+        .map_err(|_| "workflow.graph.watch after_cursor must be a decimal u64 string".to_string())
+}
+
+fn workflow_graph_state_response(
+    body: ResponseBody,
+) -> Result<Option<WorkflowGraphStateV1>, String> {
+    match body {
+        ResponseBody::WorkflowGraphState { state } => Ok(state),
+        _ => Err("workflow.graph.state response method mismatch".to_string()),
+    }
+}
+
+fn workflow_graph_watch_response(body: ResponseBody) -> Result<WorkflowGraphWatchPageV1, String> {
+    match body {
+        ResponseBody::WorkflowGraphWatch { page } => Ok(page),
+        _ => Err("workflow.graph.watch response method mismatch".to_string()),
+    }
+}
+
 fn graph_status_response(body: ResponseBody) -> Result<Option<GraphStatus>, String> {
     match body {
         ResponseBody::GraphStatus { status } => Ok(status),
@@ -5227,6 +5380,62 @@ pub async fn workflow_instance_get(
     {
         let _ = (workflow_id, template_digest);
         Err("workflow.instance unavailable on this platform".to_string())
+    }
+}
+
+/// Read one daemon-indexed activation graph. `None` is honest absence for the
+/// requested graph or the session's most-recently-changed graph.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn workflow_graph_state(
+    session_id: String,
+    graph_id: Option<String>,
+) -> Result<Option<WorkflowGraphStateV1>, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = graph_provider_session_id(session_id).await?;
+        return workflow_graph_state_response(
+            loom_request(
+                "workflow.graph.state",
+                workflow_graph_state_request(provider_session_id, graph_id),
+                Capability::View,
+                FEATURE_WORKFLOW_GRAPH_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, graph_id);
+        Err("workflow.graph.state unavailable on this platform".to_string())
+    }
+}
+
+/// Replay daemon journal facts after an applied cursor. Every returned cursor
+/// and event payload is passed through without client-side interpretation.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn workflow_graph_watch(
+    session_id: String,
+    after_cursor: String,
+    limit: u32,
+) -> Result<WorkflowGraphWatchPageV1, String> {
+    let after_cursor = parse_workflow_graph_watch_after_cursor(&after_cursor)?;
+    #[cfg(unix)]
+    {
+        let provider_session_id = graph_provider_session_id(session_id).await?;
+        return workflow_graph_watch_response(
+            loom_request(
+                "workflow.graph.watch",
+                workflow_graph_watch_request(provider_session_id, after_cursor, limit),
+                Capability::View,
+                FEATURE_WORKFLOW_GRAPH_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, after_cursor, limit);
+        Err("workflow.graph.watch unavailable on this platform".to_string())
     }
 }
 
@@ -9944,6 +10153,11 @@ mod workflow_tests;
 #[allow(clippy::expect_used)]
 #[path = "haider_rpc_ade_fleet_tests.rs"]
 mod fleet_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_graph_tests.rs"]
+mod graph_tests;
 
 #[cfg(test)]
 mod tests {

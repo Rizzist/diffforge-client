@@ -6736,6 +6736,8 @@ fn run_app(daemon: bool) {
             haider_rpc_ade::agent_message,
             haider_rpc_ade::session_observe,
             haider_rpc_ade::session_observe_batch,
+            haider_rpc_ade::workflow_graph_state,
+            haider_rpc_ade::workflow_graph_watch,
             haider_rpc_ade::loom_list,
             haider_rpc_ade::loom_register_agent_type,
             haider_rpc_ade::loom_install_status,
