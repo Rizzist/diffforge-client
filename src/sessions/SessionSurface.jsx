@@ -18,6 +18,7 @@ import { Mediation } from "@styled-icons/material-rounded/Mediation";
 import { Memory } from "@styled-icons/material-rounded/Memory";
 import { MoreHoriz } from "@styled-icons/material-rounded/MoreHoriz";
 import { Movie } from "@styled-icons/material-rounded/Movie";
+import { NotificationsActive } from "@styled-icons/material-rounded/NotificationsActive";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Terminal as TerminalGlyph } from "@styled-icons/material-rounded/Terminal";
@@ -69,6 +70,7 @@ import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
 import FleetPanel from "./FleetPanel.jsx";
 import FleetChildTranscript from "./FleetChildTranscript.jsx";
+import MonitorPanel from "./MonitorPanel.jsx";
 import WorkflowGraphView from "./WorkflowGraphView.jsx";
 import { findFleetNode, fleetSessionIds } from "./fleetModel.js";
 import {
@@ -172,6 +174,18 @@ export default function SessionSurface({
   onObserveFleetChild = null,
   onObserveFleetBatch = null,
   onSendAgentMessage = null,
+  monitorBySession = {},
+  monitorDeliveries = [],
+  monitorCursor = null,
+  monitorWatchOutcome = null,
+  monitorError = "",
+  monitorLoading = false,
+  monitorUnavailable = false,
+  onLoadMonitors = null,
+  onRegisterMonitor = null,
+  onRemoveMonitor = null,
+  onStartMonitorWatch = null,
+  onStopMonitorWatch = null,
   workflowGraphBySession = {},
   workflowGraphCursor = null,
   workflowGraphEvents = [],
@@ -1118,6 +1132,29 @@ export default function SessionSurface({
     onLoadFleet?.(id);
   }, [activeSessionId, viewModes, onLoadFleet]);
 
+  /* Monitor manager (P4): entering the view reads the authoritative
+     registry and starts its delivery watch. Leaving, switching sessions,
+     or unmounting stops the watch; all four invokes remain centralized in
+     useMonitor.js. */
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft" || (viewModes[id] || "ui") !== "monitors") {
+      onStopMonitorWatch?.();
+      return undefined;
+    }
+    onLoadMonitors?.(id);
+    onStartMonitorWatch?.(id);
+    return () => {
+      onStopMonitorWatch?.();
+    };
+  }, [
+    activeSessionId,
+    viewModes,
+    onLoadMonitors,
+    onStartMonitorWatch,
+    onStopMonitorWatch,
+  ]);
+
   /* Live workflow graph view (P6): entering it starts the watch-as-change-
      signal poll for the active session (workflow.graph.watch signals, then
      workflow.graph.state re-fetches carry the authority — both invokes
@@ -1773,6 +1810,19 @@ export default function SessionSurface({
               <span>Fleet</span>
             </SessionViewButton>
           )}
+          {session && session.id !== "draft" && (
+            <SessionViewButton
+              aria-selected={activeTabIsChat && modeFor(session.id) === "monitors"}
+              data-active={activeTabIsChat && modeFor(session.id) === "monitors" ? "true" : undefined}
+              onClick={() => selectView("monitors")}
+              role="tab"
+              title="Monitors"
+              type="button"
+            >
+              <NotificationsActive aria-hidden="true" size={13} />
+              <span>Monitors</span>
+            </SessionViewButton>
+          )}
           {session.id !== "draft" && (
             <SessionViewButton
               aria-selected={activeTabIsChat && modeFor(session.id) === "graph"}
@@ -2141,6 +2191,26 @@ export default function SessionSurface({
                       </FleetHostLayer>
                     );
                   })()}
+                  {/* Monitor manager (P4): per-source availability, the
+                      listed registry, register/remove controls, and the
+                      live delivery stream. MonitorPanel is presentational;
+                      useMonitor.js owns every daemon dispatch. */}
+                  {mode === "monitors" && session && session.id !== "draft" && (
+                    <MonitorHostLayer>
+                      <MonitorPanel
+                        cursor={monitorCursor}
+                        deliveries={monitorDeliveries}
+                        entry={monitorBySession[session.id]}
+                        error={monitorError}
+                        loading={monitorLoading}
+                        onRefresh={() => onLoadMonitors?.(session.id)}
+                        onRegister={(spec) => onRegisterMonitor?.(session.id, spec)}
+                        onRemove={(monitorId) => onRemoveMonitor?.(session.id, monitorId)}
+                        unavailable={monitorUnavailable}
+                        watchOutcome={monitorWatchOutcome}
+                      />
+                    </MonitorHostLayer>
+                  )}
                   {/* Live workflow graph (P6): the workflow_graph_v1
                       projection — topology + per-node runtime state from
                       workflow.graph.state, kept live by the hook's
@@ -2582,6 +2652,14 @@ const FleetHostLayer = styled.div`
     flex: none;
     max-height: 45%;
   }
+`;
+
+/* Monitor manager host: MonitorPanel owns its vertical scroll. */
+const MonitorHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
 `;
 
 /* Live workflow-graph view host: the graph section owns the scroll. */

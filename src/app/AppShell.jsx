@@ -40,6 +40,7 @@ import { useSpaces } from "../sessions/useSpaces.js";
 import { useLoom } from "../sessions/useLoom.js";
 import { useWorkflow } from "../sessions/useWorkflow.js";
 import { useFleet } from "../sessions/useFleet.js";
+import { useMonitor } from "../sessions/useMonitor.js";
 import { useWorkflowGraph } from "../sessions/useWorkflowGraph.js";
 import {
   rosterWithConfirmedSession,
@@ -18889,6 +18890,10 @@ export default function App() {
      reads are on-view only (no polling) and the hook settles once into
      unavailable on a feature-gated daemon. */
   const fleetApi = useFleet({ enabled: authState === "authenticated" });
+  /* Monitor manager (P4): the per-session registry and delivery watch for
+     the surface's Monitors view. All four monitor invokes live in
+     useMonitor.js and the feature-gated daemon settles unavailable once. */
+  const monitorApi = useMonitor({ enabled: authState === "authenticated" });
   /* Workflow live-runtime graph (P6): the workflow_graph_v1 projection for
      the surface's Graph view. Both invokes (workflow_graph_state +
      workflow_graph_watch) live in useWorkflowGraph.js; the watch is a
@@ -25855,6 +25860,18 @@ export default function App() {
                           onObserveFleetChild={fleetApi.observeChild}
                           onObserveFleetBatch={fleetApi.observeBatch}
                           onSendAgentMessage={fleetApi.sendMessage}
+                          monitorBySession={monitorApi.bySession}
+                          monitorDeliveries={monitorApi.deliveries}
+                          monitorCursor={monitorApi.cursor}
+                          monitorWatchOutcome={monitorApi.watchOutcome}
+                          monitorError={monitorApi.error}
+                          monitorLoading={monitorApi.loading}
+                          monitorUnavailable={monitorApi.unavailable}
+                          onLoadMonitors={monitorApi.list}
+                          onRegisterMonitor={monitorApi.register}
+                          onRemoveMonitor={monitorApi.remove}
+                          onStartMonitorWatch={monitorApi.startWatch}
+                          onStopMonitorWatch={monitorApi.stopWatch}
                           workflowGraphBySession={workflowGraphApi.graphBySession}
                           workflowGraphCursor={workflowGraphApi.cursor}
                           workflowGraphEvents={workflowGraphApi.recentEvents}
