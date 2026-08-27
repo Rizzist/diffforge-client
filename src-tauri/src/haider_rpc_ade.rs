@@ -40,6 +40,9 @@ const FEATURE_ARTIFACT_PUT_V1: &str = "artifact_put_v1";
 const FEATURE_SESSION_LIST_WATCH_V1: &str = "session_list_watch_v1";
 const FEATURE_SESSION_CONFIG_V1: &str = "session_config_v1";
 const FEATURE_SESSION_OBSERVE_V1: &str = "session_observe_v1";
+const FEATURE_SESSION_OBSERVE_BATCH_V1: &str = "session_observe_batch_v1";
+const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
+const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
 const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
 const FEATURE_SESSION_EFFORT_SELECT_V1: &str = "session_effort_select_v1";
 const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
@@ -77,6 +80,7 @@ const FEATURE_SESSION_WORKFLOW_STATE_V1: &str = "session_workflow_state_v1";
 const FEATURE_TYPED_AGENT_INSTALL_V1: &str = "typed_agent_install_v1";
 const FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1: &str = "typed_agent_install_control_v1";
 const FEATURE_SESSION_AGENT_TYPE_SELECT_V1: &str = "session_agent_type_select_v1";
+const FEATURE_SESSION_LINEAGE_V1: &str = "session_lineage_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
 const HAIDER_NEEDS_INPUT_NO_CONNECTION: &str = "haider_needs_input_no_connection";
@@ -541,6 +545,328 @@ pub struct AccountRemoveResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replacement_active_alias: Option<String>,
     pub revision: u64,
+}
+
+/// Stable fleet state from the daemon. Future string values remain available
+/// to JS instead of collapsing into a client-invented state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FleetAgentStateWire {
+    Queued,
+    Live,
+    Waiting,
+    Done,
+    Failed,
+    Cancelled,
+    Unknown(String),
+}
+
+impl FleetAgentStateWire {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::Queued => "queued",
+            Self::Live => "live",
+            Self::Waiting => "waiting",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for FleetAgentStateWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for FleetAgentStateWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "queued" => Self::Queued,
+            "live" => Self::Live,
+            "waiting" => Self::Waiting,
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+/// One bounded descendant. `metrics` remains the complete daemon-authored
+/// record; only the fleet coordinates and completeness fields are mirrored.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FleetNodeWire {
+    pub agent_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callsign: Option<String>,
+    pub task: String,
+    pub depth: u32,
+    pub parent_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    pub state: FleetAgentStateWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Value>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub folded_children: u32,
+    #[serde(default)]
+    pub children: Vec<FleetNodeWire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetStateCountsWire {
+    pub queued: u32,
+    pub live: u32,
+    pub waiting: u32,
+    pub done: u32,
+    pub failed: u32,
+    pub cancelled: u32,
+}
+
+/// Totals over returned nodes only. Missing usage is typed absence because at
+/// least one node lacks durable usage truth; it is never a zero total.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FleetMetricsTotalsWire {
+    pub elapsed_ms: u64,
+    pub tool_attempts: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FleetRollupWire {
+    pub node_count: u32,
+    pub states: FleetStateCountsWire,
+    pub max_depth: u32,
+    pub metrics: FleetMetricsTotalsWire,
+    pub metrics_complete: bool,
+    pub complete: bool,
+}
+
+/// Bounded point-in-time fleet truth. `truncated`, `complete`, and each
+/// node's `folded_children` must be interpreted together by consumers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionFleetSnapshot {
+    pub session_id: String,
+    pub generated_at_ms: u64,
+    pub node_limit: u32,
+    pub depth_limit: u32,
+    #[serde(default)]
+    pub roots: Vec<FleetNodeWire>,
+    pub rollup: FleetRollupWire,
+    pub truncated: bool,
+}
+
+/// How the daemon delivered one parent-authored child message. Unknown
+/// strings cross the SDK boundary unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentMessageDeliveryWire {
+    DeliveredSteer,
+    DeliveredQueued,
+    DeliveredSubturn,
+    Unknown(String),
+}
+
+impl AgentMessageDeliveryWire {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::DeliveredSteer => "delivered_steer",
+            Self::DeliveredQueued => "delivered_queued",
+            Self::DeliveredSubturn => "delivered_subturn",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for AgentMessageDeliveryWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentMessageDeliveryWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "delivered_steer" => Self::DeliveredSteer,
+            "delivered_queued" => Self::DeliveredQueued,
+            "delivered_subturn" => Self::DeliveredSubturn,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+/// Receipt run state. Scalar coordinates needed by the ADE are typed; nested
+/// reason records stay verbatim, and an unknown future state retains its
+/// complete object rather than losing additive fields.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RunStateWire {
+    Queued,
+    Thinking,
+    Streaming,
+    RunningTool,
+    Waiting {
+        reason: Value,
+    },
+    Retrying {
+        attempt: u32,
+        max: u32,
+        delay_ms: u64,
+        reason: Value,
+    },
+    InputRequired {
+        menu: String,
+    },
+    PermissionRequired {
+        menu: String,
+    },
+    Compacting,
+    Verifying {
+        step: String,
+    },
+    Concluding,
+    EffectOutcomeUnknown,
+    Cancelling,
+    Done,
+    Errored,
+    Cancelled,
+    Unknown(Value),
+}
+
+impl Serialize for RunStateWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let raw = match self {
+            Self::Queued => serde_json::json!({"state": "queued"}),
+            Self::Thinking => serde_json::json!({"state": "thinking"}),
+            Self::Streaming => serde_json::json!({"state": "streaming"}),
+            Self::RunningTool => serde_json::json!({"state": "running_tool"}),
+            Self::Waiting { reason } => {
+                serde_json::json!({"state": "waiting", "reason": reason})
+            }
+            Self::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                reason,
+            } => serde_json::json!({
+                "state": "retrying",
+                "attempt": attempt,
+                "max": max,
+                "delay_ms": delay_ms,
+                "reason": reason,
+            }),
+            Self::InputRequired { menu } => {
+                serde_json::json!({"state": "input_required", "menu": menu})
+            }
+            Self::PermissionRequired { menu } => {
+                serde_json::json!({"state": "permission_required", "menu": menu})
+            }
+            Self::Compacting => serde_json::json!({"state": "compacting"}),
+            Self::Verifying { step } => {
+                serde_json::json!({"state": "verifying", "step": step})
+            }
+            Self::Concluding => serde_json::json!({"state": "concluding"}),
+            Self::EffectOutcomeUnknown => {
+                serde_json::json!({"state": "effect_outcome_unknown"})
+            }
+            Self::Cancelling => serde_json::json!({"state": "cancelling"}),
+            Self::Done => serde_json::json!({"state": "done"}),
+            Self::Errored => serde_json::json!({"state": "errored"}),
+            Self::Cancelled => serde_json::json!({"state": "cancelled"}),
+            Self::Unknown(raw) => raw.clone(),
+        };
+        raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RunStateWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        let state = raw
+            .get("state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("run state tag was missing"))?
+            .to_string();
+        let field = |name: &str| {
+            raw.get(name)
+                .cloned()
+                .ok_or_else(|| serde::de::Error::custom(format!("run state {name} was missing")))
+        };
+        let string_field = |name: &str| {
+            field(name)
+                .and_then(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))
+        };
+        let u32_field = |name: &str| {
+            field(name)
+                .and_then(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))
+        };
+        let u64_field = |name: &str| {
+            field(name)
+                .and_then(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))
+        };
+        Ok(match state.as_str() {
+            "queued" => Self::Queued,
+            "thinking" => Self::Thinking,
+            "streaming" => Self::Streaming,
+            "running_tool" => Self::RunningTool,
+            "waiting" => Self::Waiting {
+                reason: field("reason")?,
+            },
+            "retrying" => Self::Retrying {
+                attempt: u32_field("attempt")?,
+                max: u32_field("max")?,
+                delay_ms: u64_field("delay_ms")?,
+                reason: field("reason")?,
+            },
+            "input_required" => Self::InputRequired {
+                menu: string_field("menu")?,
+            },
+            "permission_required" => Self::PermissionRequired {
+                menu: string_field("menu")?,
+            },
+            "compacting" => Self::Compacting,
+            "verifying" => Self::Verifying {
+                step: string_field("step")?,
+            },
+            "concluding" => Self::Concluding,
+            "effect_outcome_unknown" => Self::EffectOutcomeUnknown,
+            "cancelling" => Self::Cancelling,
+            "done" => Self::Done,
+            "errored" => Self::Errored,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentMessageReceipt {
+    pub agent: String,
+    pub delivery: AgentMessageDeliveryWire,
+    pub child_run_id: String,
+    pub child_run_state: RunStateWire,
 }
 
 /// One daemon-owned Loom agent-type registry record. Every authoring field
@@ -1763,8 +2089,21 @@ enum RequestBody {
     #[serde(rename = "session.observe")]
     SessionObserve {
         session_id: String,
+        #[serde(default)]
         last_event_limit: u32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        metadata_only: bool,
     },
+    #[serde(rename = "session.observe_batch")]
+    SessionObserveBatch {
+        session_ids: Vec<String>,
+        #[serde(default)]
+        last_event_limit: u32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        metadata_only: bool,
+    },
+    #[serde(rename = "session.fleet")]
+    SessionFleet { session_id: String },
     #[serde(rename = "session.attach")]
     SessionAttach {
         session_id: String,
@@ -1817,6 +2156,14 @@ enum RequestBody {
         enabled: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         confirm_new_epoch: bool,
+    },
+    #[serde(rename = "agent.message")]
+    AgentMessage {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        agent: String,
+        text: String,
     },
     #[serde(rename = "session.surface_publish")]
     SessionSurfacePublish {
@@ -2093,6 +2440,10 @@ enum ResponseBody {
     },
     #[serde(rename = "session.observe")]
     SessionObserve { digest: Value },
+    #[serde(rename = "session.observe_batch")]
+    SessionObserveBatch { digests: Vec<Value> },
+    #[serde(rename = "session.fleet")]
+    SessionFleet { snapshot: SessionFleetSnapshot },
     #[serde(rename = "session.attach")]
     SessionAttach {
         attachment_id: String,
@@ -2138,6 +2489,8 @@ enum ResponseBody {
         selected_seq: u64,
         worker_generation: u64,
     },
+    #[serde(rename = "agent.message")]
+    AgentMessage { receipt: AgentMessageReceipt },
     #[serde(rename = "session.surface_publish")]
     SessionSurfacePublished {
         session_id: String,
@@ -4081,6 +4434,77 @@ fn loom_install_watch_response(
     }
 }
 
+fn session_fleet_response(body: ResponseBody) -> Result<SessionFleetSnapshot, String> {
+    match body {
+        ResponseBody::SessionFleet { snapshot } => Ok(snapshot),
+        _ => Err("session.fleet response method mismatch".to_string()),
+    }
+}
+
+fn agent_message_response(body: ResponseBody) -> Result<AgentMessageReceipt, String> {
+    match body {
+        ResponseBody::AgentMessage { receipt } => Ok(receipt),
+        _ => Err("agent.message response method mismatch".to_string()),
+    }
+}
+
+fn session_observe_response(body: ResponseBody) -> Result<Value, String> {
+    match body {
+        ResponseBody::SessionObserve { digest } => Ok(digest),
+        _ => Err("session.observe response method mismatch".to_string()),
+    }
+}
+
+fn session_observe_batch_response(body: ResponseBody) -> Result<Vec<Value>, String> {
+    match body {
+        ResponseBody::SessionObserveBatch { digests } => Ok(digests),
+        _ => Err("session.observe_batch response method mismatch".to_string()),
+    }
+}
+
+fn session_observe_request(
+    session_id: String,
+    last_event_limit: u32,
+    metadata_only: bool,
+) -> RequestBody {
+    RequestBody::SessionObserve {
+        session_id,
+        last_event_limit,
+        metadata_only,
+    }
+}
+
+fn session_observe_batch_request(
+    session_ids: Vec<String>,
+    last_event_limit: u32,
+    metadata_only: bool,
+) -> Result<RequestBody, String> {
+    if !(1..=64).contains(&session_ids.len()) {
+        return Err("session.observe_batch requires between 1 and 64 session ids".to_string());
+    }
+    Ok(RequestBody::SessionObserveBatch {
+        session_ids,
+        last_event_limit,
+        metadata_only,
+    })
+}
+
+fn agent_message_request(
+    command_id: String,
+    session_id: String,
+    worker_generation: u64,
+    agent: String,
+    text: String,
+) -> RequestBody {
+    RequestBody::AgentMessage {
+        command_id,
+        session_id,
+        worker_generation,
+        agent,
+        text,
+    }
+}
+
 fn session_agent_type_persona_binding_response(
     body: ResponseBody,
     expected_session_id: &str,
@@ -4108,6 +4532,27 @@ fn loom_feature_gate(feature: &str) -> FeatureGate {
 
 #[cfg(unix)]
 async fn loom_request(
+    method: &str,
+    body: RequestBody,
+    capability: Capability,
+    feature: &str,
+) -> Result<ResponseBody, String> {
+    match rpc_request_with_feature_gate(
+        body,
+        capability,
+        loom_feature_gate(feature),
+        RpcErrorStyle::Public,
+    )
+    .await
+    {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) => Err(error),
+        None => Err(format!("{method} unavailable: no ADE connection")),
+    }
+}
+
+#[cfg(unix)]
+async fn fleet_request(
     method: &str,
     body: RequestBody,
     capability: Capability,
@@ -4468,6 +4913,29 @@ async fn graph_provider_session_id(session_id: String) -> Result<String, String>
 }
 
 #[cfg(unix)]
+async fn fleet_provider_session_id(session_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        super::session_provider_session_id_blocking(&session_id)
+    })
+    .await
+    .map_err(|error| format!("Fleet session lookup failed: {error}"))?
+    .map_err(|error| format!("Fleet session lookup failed: {error}"))
+}
+
+#[cfg(unix)]
+async fn fleet_provider_session_ids(session_ids: Vec<String>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        session_ids
+            .into_iter()
+            .map(|session_id| super::session_provider_session_id_blocking(&session_id))
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await
+    .map_err(|error| format!("Fleet session lookup failed: {error}"))?
+    .map_err(|error| format!("Fleet session lookup failed: {error}"))
+}
+
+#[cfg(unix)]
 async fn graph_provider_session_id_for_mutation(
     session_id: String,
 ) -> Result<String, WorkflowCommandError> {
@@ -4601,6 +5069,136 @@ pub async fn loom_list() -> Result<LoomListResult, String> {
     }
     #[cfg(not(unix))]
     Err("loom.list unavailable on this platform".to_string())
+}
+
+/// Read the daemon's bounded descendant tree. An available empty snapshot is
+/// genuine emptiness; feature or transport absence is returned as an error.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_fleet(session_id: String) -> Result<SessionFleetSnapshot, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = fleet_provider_session_id(session_id).await?;
+        return session_fleet_response(
+            fleet_request(
+                "session.fleet",
+                RequestBody::SessionFleet {
+                    session_id: provider_session_id,
+                },
+                Capability::View,
+                FEATURE_SESSION_FLEET_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session_id;
+        Err("session.fleet unavailable on this platform".to_string())
+    }
+}
+
+/// Read one complete observation digest without rebuilding the daemon's
+/// projection locally. Metadata-only defaults remain authority-defined.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_observe(
+    session_id: String,
+    last_event_limit: u32,
+    metadata_only: bool,
+) -> Result<Value, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = fleet_provider_session_id(session_id).await?;
+        return session_observe_response(
+            fleet_request(
+                "session.observe",
+                session_observe_request(provider_session_id, last_event_limit, metadata_only),
+                Capability::View,
+                FEATURE_SESSION_OBSERVE_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, last_event_limit, metadata_only);
+        Err("session.observe unavailable on this platform".to_string())
+    }
+}
+
+/// Read 1..=64 observation digests in the exact request order. Each digest
+/// remains verbatim because its nested projection is daemon authority.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_observe_batch(
+    session_ids: Vec<String>,
+    last_event_limit: u32,
+    metadata_only: bool,
+) -> Result<Vec<Value>, String> {
+    #[cfg(unix)]
+    {
+        session_observe_batch_request(session_ids.clone(), last_event_limit, metadata_only)?;
+        let provider_session_ids = fleet_provider_session_ids(session_ids).await?;
+        return session_observe_batch_response(
+            fleet_request(
+                "session.observe_batch",
+                session_observe_batch_request(
+                    provider_session_ids,
+                    last_event_limit,
+                    metadata_only,
+                )?,
+                Capability::View,
+                FEATURE_SESSION_OBSERVE_BATCH_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_ids, last_event_limit, metadata_only);
+        Err("session.observe_batch unavailable on this platform".to_string())
+    }
+}
+
+/// Message one direct child through a current control attachment. The
+/// command id and worker generation are minted/read internally and are never
+/// accepted from JS.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn agent_message(
+    session_id: String,
+    agent: String,
+    text: String,
+) -> Result<AgentMessageReceipt, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = fleet_provider_session_id(session_id).await?;
+        let features = BTreeSet::from([FEATURE_AGENT_MESSAGE_V1.to_string()]);
+        let attachment = workflow_control_attachment(&provider_session_id, &features)
+            .await
+            .map_err(|error| error.message)?;
+        let response = fleet_request(
+            "agent.message",
+            agent_message_request(
+                config_command_id("agent-message"),
+                attachment.session_id.clone(),
+                attachment.worker_generation,
+                agent,
+                text,
+            ),
+            Capability::Control,
+            FEATURE_AGENT_MESSAGE_V1,
+        )
+        .await;
+        let result = match response {
+            Ok(body) => agent_message_response(body),
+            Err(error) => Err(error),
+        };
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, agent, text);
+        Err("agent.message unavailable on this platform".to_string())
+    }
 }
 
 /// Read an exact daemon-owned workflow revision. Feature-gate failure is an
@@ -6395,6 +6993,7 @@ async fn session_config_get_rpc_inner(session_id: String) -> Result<Option<Value
         RequestBody::SessionObserve {
             session_id,
             last_event_limit: 0,
+            metadata_only: false,
         },
         Capability::View,
         &[],
@@ -9342,6 +9941,11 @@ mod loom_tests;
 mod workflow_tests;
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_fleet_tests.rs"]
+mod fleet_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -11221,6 +11825,7 @@ mod tests {
                 body: RequestBody::SessionObserve {
                     session_id: "session-1".to_string(),
                     last_event_limit: 0,
+                    metadata_only: false,
                 },
             }),
             r#"{"v":1,"kind":"request","request_id":"req-observe","body":{"method":"session.observe","session_id":"session-1","last_event_limit":0}}"#
