@@ -8,8 +8,28 @@ const INTERNAL_ITEM_NAMES = new Set([
   "session_renamed",
 ]);
 
+function isPresentationalAgentExtension(row, meta) {
+  const rowKind = String(row?.kind || "").trim();
+  if ([
+    "child_spawn",
+    "child_result",
+    "agent_spawned",
+    "agent_report",
+    "agent_chip_state",
+    "agent_graph_rollup_v1",
+  ].includes(rowKind)) return true;
+
+  const itemKind = String(meta.item || meta.type || "").trim();
+  const extensionKind = String(meta.kind || "").trim();
+  return itemKind === "extension" && extensionKind === "agent_graph_rollup_v1";
+}
+
 function isInternalToolRow(row) {
   const meta = row?.meta && typeof row.meta === "object" ? row.meta : {};
+  // `extension` is normally an internal escape hatch, but the daemon's
+  // stable agent rollup is explicitly parent-stream presentation data. Keep
+  // both freshly typed rows and pre-v9 cached generic rows observable.
+  if (isPresentationalAgentExtension(row, meta)) return false;
   const name = String(meta.item || meta.type || meta.name || "").trim();
   if (INTERNAL_ITEM_NAMES.has(name)) return true;
   const lead = String(row?.text || "").split("·")[0].trim();

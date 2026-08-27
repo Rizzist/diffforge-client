@@ -7,9 +7,9 @@ const HAIDER_PROJECTION_MAX_EXPORT_BYTES: u64 = 32 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const HAIDER_PROJECTION_MAX_WINDOW_ROWS: i64 = 1_000;
 const HAIDER_PROJECTION_WATCH_LIMIT: usize = 6;
-// v8 refolds cached pipe rows so v6 tool-status authority reaches metadata
-// persisted by clients that first read those sidecars before this adoption.
-const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 8;
+// v9 refolds child and agent-extension rows that older clients persisted as
+// generic tools, preserving the daemon's typed parent-stream vocabulary.
+const HAIDER_PROJECTION_SCHEMA_VERSION: i64 = 9;
 const HAIDER_PROJECTION_PIPE_BATCH_LINES: usize = 256;
 const HAIDER_PROJECTION_PIPE_SAFETY_POLL: Duration = Duration::from_secs(2);
 const HAIDER_PROJECTION_PIPE_STOP_POLL: Duration = Duration::from_millis(100);
@@ -815,6 +815,14 @@ fn haider_projection_item_class(item: &Value) -> (&'static str, &'static str) {
         })
         .unwrap_or_default()
         .to_ascii_lowercase();
+    if kind == "extension"
+        && item
+            .as_object()
+            .and_then(|object| haider_projection_text(object.get("kind")))
+            .is_some_and(|kind| kind == "agent_graph_rollup_v1")
+    {
+        return ("agent_graph_rollup_v1", "agent");
+    }
     match kind.as_str() {
         "agent_message" | "assistant" | "assistant_message" | "output_text" => {
             ("message", "assistant")
@@ -824,8 +832,14 @@ fn haider_projection_item_class(item: &Value) -> (&'static str, &'static str) {
         DeepSeek-style open chains of thought otherwise read as the reply. */
         "reasoning" | "plan" => ("thinking", "assistant"),
         "refusal" => ("error", "assistant"),
-        "tool_call" | "command_execution" | "file_change" | "child_spawn" | "child_result"
-        | "context_compaction" | "extension" => ("tool", "tool"),
+        "child_spawn" => ("child_spawn", "agent"),
+        "child_result" => ("child_result", "agent"),
+        "agent_spawned" => ("agent_spawned", "agent"),
+        "agent_report" => ("agent_report", "agent"),
+        "agent_chip_state" => ("agent_chip_state", "agent"),
+        "tool_call" | "command_execution" | "file_change" | "context_compaction" | "extension" => {
+            ("tool", "tool")
+        }
         /* The item vocabulary is OPEN and already wider than this list. An
         unrecognised but NAMED kind renders in the tool cluster — the
         neutral container — because dropping it means a future item type
@@ -950,9 +964,7 @@ fn haider_projection_fold_item_event(
     }
     match event.as_str() {
         "started" => {
-            if state.open_items.contains_key(&item_id)
-                || state.closed_item_ids.contains(&item_id)
-            {
+            if state.open_items.contains_key(&item_id) || state.closed_item_ids.contains(&item_id) {
                 return;
             }
             let Some(item) = object.get("item") else {
@@ -1045,9 +1057,7 @@ fn haider_projection_fold_item_event(
     }
 }
 
-fn haider_projection_live_tail(
-    state: &HaiderProjectionFoldState,
-) -> Option<SessionProjectionRow> {
+fn haider_projection_live_tail(state: &HaiderProjectionFoldState) -> Option<SessionProjectionRow> {
     state
         .open_items
         .values()
@@ -1098,8 +1108,12 @@ fn haider_projection_fold_value_locked(
     }
     let payload = haider_projection_payload(value);
     let payload_object = payload.as_object();
+    let payload_type = payload_object
+        .and_then(|object| haider_projection_text(object.get("type")))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
-    if payload_object.is_some_and(|object| object.contains_key("role")) {
+    if payload_type.is_empty() && payload_object.is_some_and(|object| object.contains_key("role")) {
         /* Once the enveloped item stream is live it is canonical: bare
         role-shaped compat records would duplicate its content at fresh
         seqs (and add empty turn-start markers). Cold export folds and
@@ -1112,10 +1126,6 @@ fn haider_projection_fold_value_locked(
         return step;
     }
 
-    let payload_type = payload_object
-        .and_then(|object| haider_projection_text(object.get("type")))
-        .unwrap_or_default()
-        .to_ascii_lowercase();
     match payload_type.as_str() {
         "user_message" => {
             let Some(seq) = haider_projection_seq(state, value, payload) else {
@@ -1803,8 +1813,8 @@ fn haider_projection_ingest_value(
     let provider_session_id = haider_projection_resolve_provider_session(session_id)
         .ok()
         .map(|(_, provider_session_id)| provider_session_id);
-    let sync = haider_projection_sync(session_id, provider_session_id.as_deref())
-        .unwrap_or_default();
+    let sync =
+        haider_projection_sync(session_id, provider_session_id.as_deref()).unwrap_or_default();
     let from_seq = (appended > 0)
         .then(|| all_rows.iter().map(|row| row.seq).min())
         .flatten();
@@ -2357,8 +2367,7 @@ fn haider_projection_resolve_pipe_route_rpc(
     {
         return Err("Haider daemon does not advertise pipe_native_v2.".to_string());
     }
-    let tool_status_v1 =
-        haider_projection_pipe_feature(&welcome, "pipe_tool_status_v1");
+    let tool_status_v1 = haider_projection_pipe_feature(&welcome, "pipe_tool_status_v1");
     if let (Some(expected), Some(actual)) = (
         haider_rpc_ade::expected_profile_id(),
         welcome.get("profile_id").and_then(Value::as_str),
@@ -2465,9 +2474,9 @@ static HAIDER_PROJECTION_PIPE_VERSION_AHEAD: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
 /* Reading a format newer than we understand is a real condition the operator
-   should be able to see, so it is recorded rather than logged and forgotten.
-   Latched at the highest version observed: it is a property of the daemon we
-   are talking to, not of one file, and it must not flap per-read. */
+should be able to see, so it is recorded rather than logged and forgotten.
+Latched at the highest version observed: it is a property of the daemon we
+are talking to, not of one file, and it must not flap per-read. */
 fn haider_projection_note_pipe_version_ahead(version: i64) {
     let previous = HAIDER_PROJECTION_PIPE_VERSION_AHEAD
         .fetch_max(version, std::sync::atomic::Ordering::Relaxed);
@@ -2844,8 +2853,7 @@ fn haider_projection_ingest_pipe_owned(
         .map_err(|error| format!("Unable to open Haider session pipe: {error}"))?;
     let (mut reader, root_header, root_header_end, root_file_len) =
         haider_projection_prepare_pipe_file(root_file, provider_session_id)?;
-    if root_header.version >= 4
-        && (root_header.segment_index != 0 || root_header.starts_after != 0)
+    if root_header.version >= 4 && (root_header.segment_index != 0 || root_header.starts_after != 0)
     {
         return Err("Haider pipe root segment coordinates were invalid.".to_string());
     }
@@ -4290,11 +4298,10 @@ async fn session_projection_window(
             )?;
             Ok((total_rows, rows))
         })?;
-        let live_tail = haider_projection_states().lock().ok().and_then(|states| {
-            states
-                .get(session_id)
-                .and_then(haider_projection_live_tail)
-        });
+        let live_tail = haider_projection_states()
+            .lock()
+            .ok()
+            .and_then(|states| states.get(session_id).and_then(haider_projection_live_tail));
         let provider_session_id = haider_projection_resolve_provider_session(session_id)
             .ok()
             .map(|(_, provider_session_id)| provider_session_id);
@@ -4442,11 +4449,7 @@ async fn session_projection_trajectory(session_id: String) -> Result<Value, Stri
                             "at_ms": at_ms,
                             "label": haider_projection_compact(&text, 140),
                         });
-                        haider_projection_add_trajectory_metadata(
-                            &mut point,
-                            &kind,
-                            &meta_text,
-                        );
+                        haider_projection_add_trajectory_metadata(&mut point, &kind, &meta_text);
                         point
                     },
                 )
@@ -5524,15 +5527,30 @@ mod haider_projection_tests {
 
     #[test]
     fn haider_projection_final_unterminated_eof_is_required_for_pipe_head() {
-        assert_eq!(haider_projection_caught_up(Some(9), None, None), Some(false));
-        assert_eq!(haider_projection_caught_up(Some(9), None, Some(9)), Some(true));
-        assert_eq!(haider_projection_caught_up(Some(9), None, Some(8)), Some(false));
+        assert_eq!(
+            haider_projection_caught_up(Some(9), None, None),
+            Some(false)
+        );
+        assert_eq!(
+            haider_projection_caught_up(Some(9), None, Some(9)),
+            Some(true)
+        );
+        assert_eq!(
+            haider_projection_caught_up(Some(9), None, Some(8)),
+            Some(false)
+        );
     }
 
     #[test]
     fn haider_projection_journal_coverage_can_independently_prove_head() {
-        assert_eq!(haider_projection_caught_up(Some(9), Some(9), None), Some(true));
-        assert_eq!(haider_projection_caught_up(Some(9), Some(8), None), Some(false));
+        assert_eq!(
+            haider_projection_caught_up(Some(9), Some(9), None),
+            Some(true)
+        );
+        assert_eq!(
+            haider_projection_caught_up(Some(9), Some(8), None),
+            Some(false)
+        );
     }
 
     #[test]
@@ -5712,6 +5730,111 @@ mod haider_projection_tests {
     }
 
     #[test]
+    fn haider_projection_keeps_subagent_activity_typed_and_lineage_verbatim() {
+        let agent_spawned = json!({
+            "type": "agent_spawned",
+            "agent": "agent-child",
+            "role": "subagent",
+            "task": "audit the projection",
+            "callsign": "Halley",
+            "parent": "agent-parent",
+            "coordinates": {
+                "child_session_id": "session-child",
+                "parent_run_id": "run-parent",
+                "lineage_kind": "fan_out"
+            }
+        });
+        let rows = [
+            (
+                json!({"item": "child_spawn", "agent": "agent-child"}),
+                "child_spawn",
+            ),
+            (
+                json!({
+                    "item": "child_result",
+                    "report": {
+                        "agent": "agent-child",
+                        "summary": "projection audited",
+                        "verified": "verified"
+                    }
+                }),
+                "child_result",
+            ),
+            (agent_spawned, "agent_spawned"),
+            (
+                json!({
+                    "type": "agent_report",
+                    "agent": "agent-child",
+                    "summary": "projection audited",
+                    "verified": "verified"
+                }),
+                "agent_report",
+            ),
+            (
+                json!({
+                    "type": "agent_chip_state",
+                    "agent": "agent-child",
+                    "chip": "permission_required"
+                }),
+                "agent_chip_state",
+            ),
+            (
+                json!({
+                    "item": "extension",
+                    "kind": "agent_graph_rollup_v1",
+                    "data": {
+                        "agent": "agent-child",
+                        "workflow_id": "ship-safe",
+                        "template_digest": "blake3:typed",
+                        "state": "gate",
+                        "node_index": 2,
+                        "nodes_total": 4,
+                        "nodes_green": 1,
+                        "node_label": "verify",
+                        "agent_type": "reviewer",
+                        "gate": "human"
+                    }
+                }),
+                "agent_graph_rollup_v1",
+            ),
+        ];
+
+        for (index, (item, expected_kind)) in rows.into_iter().enumerate() {
+            let mut state = HaiderProjectionFoldState::default();
+            let payload = if item.get("item").is_some() {
+                json!({
+                    "type": "item",
+                    "event": "completed",
+                    "item_id": format!("agent-item-{index}"),
+                    "item": item.clone()
+                })
+            } else {
+                item.clone()
+            };
+            let envelope = json!({
+                "seq": 100 + index,
+                "branch_id": "parent-main",
+                "payload": payload
+            });
+            let folded =
+                haider_projection_fold_value_locked(&mut state, "session-parent", &envelope);
+            let [row] = folded.rows.as_slice() else {
+                panic!("typed subagent activity must produce exactly one projection row");
+            };
+
+            assert_eq!(
+                row.kind, expected_kind,
+                "subagent activity must not be reclassified as a generic tool"
+            );
+            assert_eq!(row.role, "agent");
+            assert_eq!(
+                row.meta, item,
+                "child identity, parent coordinates, and lineage must remain verbatim"
+            );
+        }
+    }
+
+    #[test]
     fn haider_projection_skips_watch_compat_records_once_items_stream() {
         // Watch/run streams can carry a bare export-shaped compatibility row
         // after the richer enveloped item. The item stream is canonical for
@@ -5779,10 +5902,7 @@ mod haider_projection_tests {
                 .rows
                 .is_empty()
         );
-        assert_eq!(
-            state.open_items.get("item-1").unwrap().row.text,
-            "Hello"
-        );
+        assert_eq!(state.open_items.get("item-1").unwrap().row.text, "Hello");
         let sealed = haider_projection_fold_value_locked(&mut state, "local", &completed);
         assert_eq!(sealed.rows.len(), 1);
         assert_eq!(sealed.rows[0].seq, 42);
@@ -5798,65 +5918,109 @@ mod haider_projection_tests {
                 "event": event,
                 "item_id": item_id,
             });
-            payload.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(body.as_object().unwrap().clone());
             json!({"seq": seq, "payload": payload})
         };
         let mut state = HaiderProjectionFoldState::default();
 
         // Orphan deltas never invent an open item.
-        let orphan = event(1, "delta", "orphan", json!({
-            "delta": {"delta":"text", "text":"invented"}
-        }));
-        assert!(haider_projection_fold_value_locked(&mut state, "local", &orphan).rows.is_empty());
+        let orphan = event(
+            1,
+            "delta",
+            "orphan",
+            json!({
+                "delta": {"delta":"text", "text":"invented"}
+            }),
+        );
+        assert!(
+            haider_projection_fold_value_locked(&mut state, "local", &orphan)
+                .rows
+                .is_empty()
+        );
         assert!(state.open_items.is_empty());
 
-        let started = event(2, "started", "item-1", json!({
-            "item": {"item":"agent_message", "text":""}
-        }));
+        let started = event(
+            2,
+            "started",
+            "item-1",
+            json!({
+                "item": {"item":"agent_message", "text":""}
+            }),
+        );
         haider_projection_fold_value_locked(&mut state, "local", &started);
-        let duplicate_start = event(3, "started", "item-1", json!({
-            "item": {"item":"reasoning", "summary":"replacement"}
-        }));
+        let duplicate_start = event(
+            3,
+            "started",
+            "item-1",
+            json!({
+                "item": {"item":"reasoning", "summary":"replacement"}
+            }),
+        );
         haider_projection_fold_value_locked(&mut state, "local", &duplicate_start);
         assert_eq!(state.open_items["item-1"].row.kind, "message");
 
         // A nested delta kind that does not match the opened item is ignored.
-        let mismatch = event(4, "delta", "item-1", json!({
-            "delta": {"delta":"reasoning", "text":"wrong lane"}
-        }));
+        let mismatch = event(
+            4,
+            "delta",
+            "item-1",
+            json!({
+                "delta": {"delta":"reasoning", "text":"wrong lane"}
+            }),
+        );
         haider_projection_fold_value_locked(&mut state, "local", &mismatch);
         assert_eq!(state.open_items["item-1"].row.text, "");
 
-        let completed = event(5, "completed", "item-1", json!({
-            "item": {"item":"agent_message", "text":"authoritative final"}
-        }));
+        let completed = event(
+            5,
+            "completed",
+            "item-1",
+            json!({
+                "item": {"item":"agent_message", "text":"authoritative final"}
+            }),
+        );
         let sealed = haider_projection_fold_value_locked(&mut state, "local", &completed);
         assert_eq!(sealed.rows[0].text, "authoritative final");
 
         // Closed ids neither duplicate nor reopen.
-        let duplicate_completion = event(6, "completed", "item-1", json!({
-            "item": {"item":"agent_message", "text":"duplicate"}
-        }));
-        assert!(haider_projection_fold_value_locked(
-            &mut state,
-            "local",
-            &duplicate_completion,
-        ).rows.is_empty());
-        let reopen = event(7, "started", "item-1", json!({
-            "item": {"item":"agent_message", "text":"reopened"}
-        }));
+        let duplicate_completion = event(
+            6,
+            "completed",
+            "item-1",
+            json!({
+                "item": {"item":"agent_message", "text":"duplicate"}
+            }),
+        );
+        assert!(
+            haider_projection_fold_value_locked(&mut state, "local", &duplicate_completion,)
+                .rows
+                .is_empty()
+        );
+        let reopen = event(
+            7,
+            "started",
+            "item-1",
+            json!({
+                "item": {"item":"agent_message", "text":"reopened"}
+            }),
+        );
         haider_projection_fold_value_locked(&mut state, "local", &reopen);
         assert!(state.open_items.is_empty());
 
         // Mid-stream attach may first observe completion and must still insert.
-        let unattached_completion = event(8, "completed", "item-2", json!({
-            "item": {"item":"reasoning", "summary":"sealed reasoning"}
-        }));
-        let inserted = haider_projection_fold_value_locked(
-            &mut state,
-            "local",
-            &unattached_completion,
+        let unattached_completion = event(
+            8,
+            "completed",
+            "item-2",
+            json!({
+                "item": {"item":"reasoning", "summary":"sealed reasoning"}
+            }),
         );
+        let inserted =
+            haider_projection_fold_value_locked(&mut state, "local", &unattached_completion);
         assert_eq!(inserted.rows[0].text, "sealed reasoning");
     }
 
@@ -6295,12 +6459,12 @@ mod haider_projection_tests {
     }
 
     /* The upper bound is OPEN by design. A closed one turned a routine daemon
-       release into an outage across every session at once, and the refusal was
-       silent on top of it. The floor stays closed because below it the shapes
-       genuinely differ.
+    release into an outage across every session at once, and the refusal was
+    silent on top of it. The floor stays closed because below it the shapes
+    genuinely differ.
 
-       This test is the reason a future bump is not an incident: it must keep
-       passing when the daemon ships a version this build has never heard of. */
+    This test is the reason a future bump is not an incident: it must keep
+    passing when the daemon ships a version this build has never heard of. */
     #[test]
     fn a_pipe_version_newer_than_this_build_is_read_and_reported_not_refused() {
         for (version, generation) in [(2, 7), (3, 8), (4, 9), (5, 10), (6, 11)] {
@@ -6347,7 +6511,9 @@ mod haider_projection_tests {
             "session-test",
         );
         assert!(too_old.is_err());
-        assert!(too_old.unwrap_err().contains("older than the supported floor"));
+        assert!(too_old
+            .unwrap_err()
+            .contains("older than the supported floor"));
 
         // Magic is still enforced regardless of version.
         assert!(haider_projection_parse_pipe_header(
@@ -6445,13 +6611,19 @@ mod haider_projection_tests {
         assert!(haider_projection_validate_pipe_chain_successor(&current, &valid, 55).is_ok());
         assert!(haider_projection_validate_pipe_chain_successor(
             &current,
-            &HaiderProjectionPipeHeader { segment_index: 4, ..valid.clone() },
+            &HaiderProjectionPipeHeader {
+                segment_index: 4,
+                ..valid.clone()
+            },
             55,
         )
         .is_err());
         assert!(haider_projection_validate_pipe_chain_successor(
             &current,
-            &HaiderProjectionPipeHeader { starts_after: 54, ..valid },
+            &HaiderProjectionPipeHeader {
+                starts_after: 54,
+                ..valid
+            },
             55,
         )
         .is_err());
@@ -6735,16 +6907,16 @@ mod haider_projection_tests {
     }
 
     /* Prove at-head on an unterminated segment, THEN receive a seal whose
-       successor is not on disk. A daemon that seals before its successor is
-       durable makes this a race, not an exotic case.
+    successor is not on disk. A daemon that seals before its successor is
+    durable makes this a race, not an exotic case.
 
-       What this pins is that the failure is LOUD: the ingest errors instead of
-       inheriting the earlier "caught up" and reporting a frozen transcript as
-       complete. Measured, not assumed — the error arm is the one that fires
-       ("Unable to open Haider pipe segment successor"). It does NOT reach the
-       stale-proof clearing at the top of the read loop, which sits behind this
-       error path; removing that line leaves every test green. It is kept as
-       defence for paths that return Ok, not because this test covers it. */
+    What this pins is that the failure is LOUD: the ingest errors instead of
+    inheriting the earlier "caught up" and reporting a frozen transcript as
+    complete. Measured, not assumed — the error arm is the one that fires
+    ("Unable to open Haider pipe segment successor"). It does NOT reach the
+    stale-proof clearing at the top of the read loop, which sits behind this
+    error path; removing that line leaves every test green. It is kept as
+    defence for paths that return Ok, not because this test covers it. */
     #[test]
     fn a_seal_whose_successor_cannot_be_opened_never_reports_at_head() {
         let test_session = haider_projection_test_session();
@@ -6779,7 +6951,11 @@ mod haider_projection_tests {
             &route,
         )
         .unwrap();
-        assert_eq!(first.caught_up, Some(true), "an unterminated EOF does prove head");
+        assert_eq!(
+            first.caught_up,
+            Some(true),
+            "an unterminated EOF does prove head"
+        );
 
         // Now the segment seals, naming a successor that is not on disk yet.
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();

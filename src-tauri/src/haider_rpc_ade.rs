@@ -1506,10 +1506,18 @@ enum QueueEventPayloadWire {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum QueueChangeWire {
-    Enqueued { row: QueueRowWire },
-    Removed { id: String },
-    PromotedSteer { id: String },
-    Consumed { id: String },
+    Enqueued {
+        row: QueueRowWire,
+    },
+    Removed {
+        id: String,
+    },
+    PromotedSteer {
+        id: String,
+    },
+    Consumed {
+        id: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -2006,8 +2014,7 @@ fn actor_handle() -> &'static ActorHandle {
         let (commands, receiver) = mpsc::unbounded_channel();
         let (connection, _) = watch::channel(ConnectionSnapshot::default());
         let (resident_binding, _) = watch::channel(ResidentSessionBindingSnapshot::default());
-        let (haider_code_plan_status, _) =
-            watch::channel(HaiderCodePlanStatusSnapshot::default());
+        let (haider_code_plan_status, _) = watch::channel(HaiderCodePlanStatusSnapshot::default());
         let (account_roster_watch, _) = watch::channel(AccountRosterWatchState::default());
         tauri::async_runtime::spawn(run_actor(
             receiver,
@@ -2083,10 +2090,7 @@ fn account_roster_watch_preflight(
             "The Haider RPC connection is unavailable for a live account roster watch.",
         ));
     }
-    if !connection
-        .features
-        .contains(FEATURE_ACCOUNT_LIST_WATCH_V1)
-    {
+    if !connection.features.contains(FEATURE_ACCOUNT_LIST_WATCH_V1) {
         return Err(AccountRosterWatchState::unavailable(format!(
             "unsupported: the daemon does not advertise {FEATURE_ACCOUNT_LIST_WATCH_V1}"
         )));
@@ -2106,14 +2110,14 @@ fn account_watch_state_from_response(
     body: ResponseBody,
 ) -> Result<AccountRosterWatchState, String> {
     match body {
-        ResponseBody::AccountListWatch { accepted: Value::Bool(true) } => {
-            Ok(AccountRosterWatchState::Live)
-        }
-        ResponseBody::AccountListWatch { accepted: Value::Bool(false) } => {
-            Ok(AccountRosterWatchState::unavailable(
-                "The daemon did not accept account.list_watch.",
-            ))
-        }
+        ResponseBody::AccountListWatch {
+            accepted: Value::Bool(true),
+        } => Ok(AccountRosterWatchState::Live),
+        ResponseBody::AccountListWatch {
+            accepted: Value::Bool(false),
+        } => Ok(AccountRosterWatchState::unavailable(
+            "The daemon did not accept account.list_watch.",
+        )),
         ResponseBody::AccountListWatch { .. } => {
             Err("account.list_watch returned a malformed accepted flag".to_string())
         }
@@ -2145,9 +2149,7 @@ fn forward_account_roster_change(
 /// `account_list` result carries the same state so snapshot presence never
 /// silently implies live authority.
 #[tauri::command]
-pub async fn account_list_watch(
-    window: tauri::WebviewWindow,
-) -> AccountRosterWatchState {
+pub async fn account_list_watch(window: tauri::WebviewWindow) -> AccountRosterWatchState {
     #[cfg(unix)]
     {
         let handle = actor_handle();
@@ -2174,9 +2176,7 @@ pub async fn account_list_watch(
     #[cfg(not(unix))]
     {
         let _ = window;
-        AccountRosterWatchState::unavailable(
-            "account.list_watch is unavailable on this platform.",
-        )
+        AccountRosterWatchState::unavailable("account.list_watch is unavailable on this platform.")
     }
 }
 
@@ -2329,7 +2329,7 @@ pub(crate) async fn session_roster_snapshot_for_bootstrap_rpc(
         }
         let Some(identity) = connection.roster_identity else {
             return Some(Err(
-                "session.list connection is missing Welcome identity".to_string(),
+                "session.list connection is missing Welcome identity".to_string()
             ));
         };
         let result = session_roster_snapshot_on_connection(identity.clone()).await;
@@ -2404,9 +2404,7 @@ impl QueueCommandError {
     fn unsupported() -> Self {
         Self {
             code: "unsupported".to_string(),
-            message: format!(
-                "The daemon does not advertise {FEATURE_QUEUE_CONTROL_V1}."
-            ),
+            message: format!("The daemon does not advertise {FEATURE_QUEUE_CONTROL_V1}."),
             retryable: false,
             data: None,
         }
@@ -2598,8 +2596,8 @@ where
     L: Future<Output = Result<ResponseBody, QueueCommandError>>,
 {
     /* Neither response owns authority alone. Awaiting both makes attach-first
-       and list-first delivery equivalent while the webview listener buffers
-       any deltas that race the snapshot. */
+    and list-first delivery equivalent while the webview listener buffers
+    any deltas that race the snapshot. */
     let (watch_result, list_result) = tokio::join!(watch, list);
     watch_result?;
     queue_list_result(list_result)
@@ -2880,12 +2878,14 @@ pub async fn command_invoke(
             None
         } else {
             let lookup_id = local_session_id.clone();
-            Some(tauri::async_runtime::spawn_blocking(move || {
-                super::session_provider_session_id_blocking(&lookup_id)
-            })
-            .await
-            .map_err(|_| HAIDER_COMMAND_INVOKE_FAILED.to_string())?
-            .map_err(|_| HAIDER_COMMAND_INVOKE_FAILED.to_string())?)
+            Some(
+                tauri::async_runtime::spawn_blocking(move || {
+                    super::session_provider_session_id_blocking(&lookup_id)
+                })
+                .await
+                .map_err(|_| HAIDER_COMMAND_INVOKE_FAILED.to_string())?
+                .map_err(|_| HAIDER_COMMAND_INVOKE_FAILED.to_string())?,
+            )
         };
         let command_id = if command_id.trim().is_empty() {
             format!("diffforge-command-{}", uuid::Uuid::new_v4())
@@ -2944,10 +2944,7 @@ pub(crate) async fn session_read_rpc(
         let response = rpc_request(
             RequestBody::SessionRead {
                 session_id,
-                range: SessionReadRange {
-                    start_seq,
-                    end_seq,
-                },
+                range: SessionReadRange { start_seq, end_seq },
             },
             Capability::View,
             BTreeSet::new(),
@@ -3155,10 +3152,9 @@ pub async fn account_list(provider: Option<String>) -> Result<AccountListResult,
         )
         .await
         {
-            Some(Ok(body)) => account_list_response(
-                body,
-                actor_handle().account_roster_watch.borrow().clone(),
-            ),
+            Some(Ok(body)) => {
+                account_list_response(body, actor_handle().account_roster_watch.borrow().clone())
+            }
             Some(Err(error)) if error.starts_with("missing_feature:") => {
                 Err(HAIDER_ACCOUNTS_UNAVAILABLE.to_string())
             }
@@ -3690,7 +3686,9 @@ pub async fn haider_account_device_candidates() -> Result<AccountDeviceCandidate
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub async fn haider_account_import_device(candidate: String) -> Result<AccountImportResult, String> {
+pub async fn haider_account_import_device(
+    candidate: String,
+) -> Result<AccountImportResult, String> {
     #[cfg(unix)]
     {
         let response = account_request(
@@ -3735,7 +3733,7 @@ pub async fn account_set_label(
     #[cfg(unix)]
     {
         /* Empty-after-trim clears, matching the daemon: the UI's "erase the
-           label" gesture and an explicit clear are the same intent. */
+        label" gesture and an explicit clear are the same intent. */
         let label = label
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
@@ -4164,12 +4162,11 @@ async fn resident_turn_submit_session_summary(
 ) -> Result<Option<Value>, String> {
     let mut cursor = None;
     loop {
-        let Some(response) =
-            resident_turn_submit_request(
-                RequestBody::SessionList { cursor, limit: 256 },
-                explicit_mode,
-            )
-            .await?
+        let Some(response) = resident_turn_submit_request(
+            RequestBody::SessionList { cursor, limit: 256 },
+            explicit_mode,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -4299,6 +4296,11 @@ fn config_document(summary: &Value, providers: &[Value], digest: Value) -> Resul
     let digest = digest
         .as_object()
         .ok_or_else(|| "session.observe digest was invalid".to_string())?;
+    let subagents = match digest.get("subagents") {
+        Some(subagents @ Value::Array(_)) => subagents.clone(),
+        Some(_) => return Err("session.observe subagents was invalid".to_string()),
+        None => Value::Null,
+    };
     let metadata = digest
         .get("metadata")
         .and_then(Value::as_object)
@@ -4359,7 +4361,10 @@ fn config_document(summary: &Value, providers: &[Value], digest: Value) -> Resul
         "worker_generation": digest.get("worker_generation").cloned().unwrap_or(Value::Null),
         "turn_count": summary.and_then(|summary| summary.get("turn_count")).cloned().unwrap_or(Value::Null),
         "footprint": footprint,
-        "subagent_count": digest.get("subagents").and_then(Value::as_array).map_or(0, Vec::len),
+        // The observe digest is the authority for both identity and state.
+        // An omitted field is legacy/unknown, which is distinct from a
+        // present empty array and must not be collapsed into a zero count.
+        "subagents": subagents,
         "agent_metrics": summary.and_then(|summary| summary.get("agent_metrics")).cloned().unwrap_or(Value::Null),
         "updated_at_ms": digest.get("updated_at_ms").cloned().unwrap_or(Value::Null),
     }))
@@ -5208,7 +5213,9 @@ async fn computer_permission_open_settings_rpc(
             Some(ResponseBody::ComputerPermissionOpenSettings { permission }) => {
                 Ok(serde_json::json!({ "permission": permission }))
             }
-            Some(_) => Err("computer.permission_open_settings response method mismatch".to_string()),
+            Some(_) => {
+                Err("computer.permission_open_settings response method mismatch".to_string())
+            }
             None => Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string()),
         }
     }
@@ -5251,11 +5258,8 @@ pub async fn session_answer_menu(
             session_needs_input_reachability(&actor_handle().connection.borrow());
         // Unlike the old snapshot-only gate, the disconnected arm reaches the
         // actor. During backoff it wakes the loop and starts a socket attempt.
-        let (provider_session_id, option_index, command_id) = session_answer_menu_prepare(
-            context,
-            initial_reachability,
-            nudge_rpc_reconnect,
-        )?;
+        let (provider_session_id, option_index, command_id) =
+            session_answer_menu_prepare(context, initial_reachability, nudge_rpc_reconnect)?;
         let answer = session_answer_menu_rpc_inner(
             command_id.clone(),
             provider_session_id.clone(),
@@ -5360,11 +5364,9 @@ async fn resident_turn_submit_rpc_inner(
     }
     .await;
 
-    let _ = resident_turn_submit_request(
-        RequestBody::SessionDetach { attachment_id },
-        explicit_mode,
-    )
-    .await;
+    let _ =
+        resident_turn_submit_request(RequestBody::SessionDetach { attachment_id }, explicit_mode)
+            .await;
     submit
 }
 
@@ -6108,12 +6110,7 @@ async fn run_connected(
                 session_id,
                 envelope,
             } => {
-                if !handle_queue_event(
-                    subscriptions,
-                    attachment_id,
-                    session_id,
-                    envelope,
-                ) {
+                if !handle_queue_event(subscriptions, attachment_id, session_id, envelope) {
                     return;
                 }
             }
@@ -6144,7 +6141,7 @@ async fn run_connected(
                             SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
-                            .unwrap_or(0),
+                                .unwrap_or(0),
                         ),
                     });
                     if let Some(app) = roster_app.as_ref() {
@@ -6265,13 +6262,8 @@ async fn apply_connected_command(
                 account_roster_window.as_ref(),
                 pending,
             );
-            match send_account_roster_watch(
-                stream,
-                connection.frame_limit,
-                encoding,
-                next_request,
-            )
-            .await
+            match send_account_roster_watch(stream, connection.frame_limit, encoding, next_request)
+                .await
             {
                 Ok(request_id) => {
                     *pending_account_roster_watch = Some(request_id);
@@ -6445,13 +6437,9 @@ async fn apply_connected_command(
                 .is_ok();
             let queue_written = if written
                 && connection.can_watch_queue()
-                && subscriptions
-                    .get(&session_id)
-                    .is_some_and(|subscription| {
-                        subscription.queue_attachment_id.is_none()
-                            && !subscription.queue_attach_pending
-                    })
-            {
+                && subscriptions.get(&session_id).is_some_and(|subscription| {
+                    subscription.queue_attachment_id.is_none() && !subscription.queue_attach_pending
+                }) {
                 send_queue_watch(
                     stream,
                     connection.frame_limit,
@@ -6473,8 +6461,7 @@ async fn apply_connected_command(
         }
         ActorCommand::Detach { session_id, reply } => {
             subscriptions.remove(&session_id);
-            let had_daemon_watch =
-                connection.can_watch_surfaces() || connection.can_watch_queue();
+            let had_daemon_watch = connection.can_watch_surfaces() || connection.can_watch_queue();
             let _ = reply.send(SurfaceCommandStatus::from_connection(
                 connection,
                 had_daemon_watch,
@@ -6744,9 +6731,7 @@ fn finish_queue_watch(
             retryable,
             data,
         } => {
-            eprintln!(
-                "[ade-rpc] queue watch failed for {expected_session_id}: {message}"
-            );
+            eprintln!("[ade-rpc] queue watch failed for {expected_session_id}: {message}");
             emit_queue_watch_failure_for_session(
                 subscription,
                 &expected_session_id,
@@ -6763,12 +6748,7 @@ fn finish_queue_watch(
         _ => {
             let reason = "session.attach returned a malformed queue watch response";
             eprintln!("[ade-rpc] {reason} for {expected_session_id}");
-            emit_queue_watch_failure_for_session(
-                subscription,
-                &expected_session_id,
-                reason,
-                false,
-            );
+            emit_queue_watch_failure_for_session(subscription, &expected_session_id, reason, false);
             finish_queue_watch_waiters(
                 Some(subscription),
                 Err(QueueCommandError::protocol(reason)),
@@ -6947,9 +6927,7 @@ async fn connect_and_handshake(path: &Path) -> std::io::Result<(UnixStream, Welc
 }
 
 #[cfg(unix)]
-async fn handshake_connected_stream(
-    stream: UnixStream,
-) -> std::io::Result<(UnixStream, Welcome)> {
+async fn handshake_connected_stream(stream: UnixStream) -> std::io::Result<(UnixStream, Welcome)> {
     handshake_connected_stream_for_profile(stream, None).await
 }
 
@@ -7414,8 +7392,7 @@ mod tests {
             "a reconnect that still advertises the feature must retain the last provider frame"
         );
 
-        let unsupported =
-            HaiderCodePlanStatusSnapshot::for_features(&BTreeSet::new(), &published);
+        let unsupported = HaiderCodePlanStatusSnapshot::for_features(&BTreeSet::new(), &published);
         assert_eq!(unsupported.supported, Some(false));
         assert!(!unsupported.known);
         assert_eq!(unsupported.outcome, None);
@@ -7965,13 +7942,11 @@ mod tests {
         // ResponseBody queue shapes: crates/haider-rpc/src/frame.rs:2455-2475.
         let list_json = br#"{"v":1,"kind":"response","request_id":"req-list","body":{"method":"queue.list","session_id":"session-1","revision":31,"rows":[{"id":"user-queued-1","text":"  keep this text\nverbatim  ","mode":"queue","ordinal":1,"created_at_ms":1753500000000}]}}"#;
         let list_frame = decode_body(list_json, DEFAULT_FRAME_LIMIT).expect("decode queue.list");
-        let WireFrame::Response { body, .. } = list_frame.clone()
-        else {
+        let WireFrame::Response { body, .. } = list_frame.clone() else {
             panic!("expected queue.list response");
         };
         assert_eq!(
-            &encode_framed(&list_frame, DEFAULT_FRAME_LIMIT)
-                .expect("re-encode queue.list")[4..],
+            &encode_framed(&list_frame, DEFAULT_FRAME_LIMIT).expect("re-encode queue.list")[4..],
             list_json
         );
         let snapshot = queue_list_response(body).expect("authoritative list");
@@ -8039,16 +8014,13 @@ mod tests {
         };
         queue_preflight(&connection).expect("View may read queue.list");
         let watch = queue_watch_preflight(&connection);
-        let result = queue_list_with_watch(
-            async move { watch },
-            async {
-                Ok(ResponseBody::QueueList {
-                    session_id: "session-1".to_string(),
-                    revision: 31,
-                    rows: Vec::new(),
-                })
-            },
-        )
+        let result = queue_list_with_watch(async move { watch }, async {
+            Ok(ResponseBody::QueueList {
+                session_id: "session-1".to_string(),
+                revision: 31,
+                rows: Vec::new(),
+            })
+        })
         .await
         .expect_err("an empty list without a live watch is not authoritative");
         assert_eq!(result.code, "capability_denied");
@@ -8082,7 +8054,10 @@ mod tests {
         if attach_first {
             watch_tx.send(Ok(())).expect("send watch readiness");
             tokio::task::yield_now().await;
-            assert!(!task.is_finished(), "watch alone must not publish authority");
+            assert!(
+                !task.is_finished(),
+                "watch alone must not publish authority"
+            );
             list_tx.send(list).expect("send list response");
         } else {
             list_tx.send(list).expect("send list response");
@@ -8351,11 +8326,12 @@ mod tests {
         assert_eq!(availability, None, "legacy omission stays ambiguous");
 
         let WireFrame::Response {
-            body: ResponseBody::ProviderList {
-                revision,
-                availability,
-                ..
-            },
+            body:
+                ResponseBody::ProviderList {
+                    revision,
+                    availability,
+                    ..
+                },
             ..
         } = response(serde_json::json!({
             "method":"provider.list",
@@ -8375,10 +8351,11 @@ mod tests {
         );
 
         let WireFrame::Response {
-            body: ResponseBody::UsageReport {
-                report,
-                availability,
-            },
+            body:
+                ResponseBody::UsageReport {
+                    report,
+                    availability,
+                },
             ..
         } = response(serde_json::json!({
             "method":"usage.report",
@@ -8645,8 +8622,7 @@ mod tests {
             revision: serde_json::json!(42),
         };
         assert_eq!(
-            &encode_framed(&changed, DEFAULT_FRAME_LIMIT)
-                .expect("encode AccountsChanged")[4..],
+            &encode_framed(&changed, DEFAULT_FRAME_LIMIT).expect("encode AccountsChanged")[4..],
             changed_json
         );
         assert_eq!(
@@ -8701,10 +8677,8 @@ mod tests {
         // MUTATION CHECK (executed): defaulting a missing revision to zero
         // fails with `a missing revision is malformed: ()`.
         let mut forwarded = Vec::new();
-        let error = forward_account_roster_change(Value::Null, |payload| {
-            forwarded.push(payload)
-        })
-        .expect_err("a missing revision is malformed");
+        let error = forward_account_roster_change(Value::Null, |payload| forwarded.push(payload))
+            .expect_err("a missing revision is malformed");
         assert_eq!(
             error,
             "AccountsChanged revision was not an unsigned integer"
@@ -9400,8 +9374,7 @@ mod tests {
         let mut revisions = HashMap::new();
         let mut roster_app = None;
         let mut account_roster_window = None;
-        let (account_roster_watch_tx, _) =
-            watch::channel(AccountRosterWatchState::default());
+        let (account_roster_watch_tx, _) = watch::channel(AccountRosterWatchState::default());
         apply_disconnected_command(
             ActorCommand::RpcRequest {
                 body: RequestBody::SessionList {
@@ -9430,8 +9403,7 @@ mod tests {
         let mut revisions = HashMap::new();
         let mut roster_app = None;
         let mut account_roster_window = None;
-        let (account_roster_watch_tx, _) =
-            watch::channel(AccountRosterWatchState::default());
+        let (account_roster_watch_tx, _) = watch::channel(AccountRosterWatchState::default());
         commands
             .send(ActorCommand::ReconnectNow)
             .expect("queue reconnect nudge");
@@ -9797,6 +9769,64 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn session_config_carries_observed_subagents_verbatim_and_preserves_absence() {
+        let providers = vec![serde_json::json!({
+            "provider": "openai",
+            "model_details": [{"name": "gpt-5.6-sol", "context_window": 200_000}]
+        })];
+        let observed_subagents = serde_json::json!([
+            {
+                "agent_id": "agent-child-a",
+                "callsign": "Halley",
+                "task": "audit the projection",
+                "state": "thinking"
+            },
+            {
+                "agent_id": "agent-child-b",
+                "task": "verify the mutation",
+                "state": "permission_required"
+            }
+        ]);
+        let digest = serde_json::json!({
+            "session_id": "typed-session",
+            "metadata": {
+                "provider": "openai",
+                "model": "gpt-5.6-sol"
+            },
+            "subagents": observed_subagents.clone()
+        });
+
+        let config = config_document(&serde_json::json!({}), &providers, digest).unwrap();
+        assert_eq!(
+            config["subagents"], observed_subagents,
+            "session_config_get must carry every observe subagent entry and field verbatim"
+        );
+        assert!(
+            config.get("subagent_count").is_none(),
+            "a count is not a substitute for the observed subagent array"
+        );
+
+        let absent = config_document(
+            &serde_json::json!({}),
+            &providers,
+            serde_json::json!({
+                "session_id": "legacy-session",
+                "metadata": {
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            absent["subagents"],
+            Value::Null,
+            "an unobserved subagent field is unknown, not an observed empty array or zero"
+        );
+    }
+
     #[test]
     fn a_published_catalog_replaces_the_shipped_import_list() {
         // The shipped list is a floor for daemons predating the catalog, and
@@ -9805,10 +9835,7 @@ mod tests {
             serde_json::json!({"source": "codex", "available": true}),
             serde_json::json!({"source": "grok-cli", "available": false}),
         ];
-        assert!(haider_import_source_is_known(
-            Some(&published),
-            "grok-cli"
-        ));
+        assert!(haider_import_source_is_known(Some(&published), "grok-cli"));
         assert!(
             !haider_import_source_is_known(Some(&published), "kimi-code"),
             "a published catalog is the whole answer, not an addition to ours"
