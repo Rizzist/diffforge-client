@@ -5,7 +5,7 @@
 //! four-byte big-endian body length followed by one negotiated `WireFrame`.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -14,7 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -64,6 +64,11 @@ const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
 const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
 const FEATURE_USAGE_HISTORY_V1: &str = "usage_history_v1";
 const FEATURE_HAIDER_CODE_PLAN_STATUS_V1: &str = "haider_code_plan_status_v1";
+const FEATURE_LOOM_V1: &str = "loom_v1";
+const FEATURE_LOOM_CLI_PRESENCE_V1: &str = "loom_cli_presence_v1";
+const FEATURE_TYPED_AGENT_INSTALL_V1: &str = "typed_agent_install_v1";
+const FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1: &str = "typed_agent_install_control_v1";
+const FEATURE_SESSION_AGENT_TYPE_SELECT_V1: &str = "session_agent_type_select_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
 const HAIDER_NEEDS_INPUT_NO_CONNECTION: &str = "haider_needs_input_no_connection";
@@ -530,6 +535,440 @@ pub struct AccountRemoveResult {
     pub revision: u64,
 }
 
+/// One daemon-owned Loom agent-type registry record. Every authoring field
+/// remains verbatim; `rev` is the registry revision, never an availability
+/// or install-readiness projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomAgentType {
+    pub id: String,
+    pub name: String,
+    pub job: String,
+    pub in_type: String,
+    pub out_type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clis: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apis: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scripts: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub glyph: String,
+    pub rev: u32,
+}
+
+/// Agent-type registry plus point-in-time CLI inventory. Map absence is the
+/// third state: no key means not probed, distinct from `Some(false)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomListResult {
+    #[serde(default)]
+    pub agent_types: Vec<LoomAgentType>,
+    #[serde(default)]
+    pub cli_present: BTreeMap<String, bool>,
+}
+
+impl LoomListResult {
+    #[must_use]
+    pub fn cli_presence(&self, program: &str) -> Option<bool> {
+        self.cli_present.get(program).copied()
+    }
+}
+
+/// Flattened client receipt for `loom.register_agent_type`. The daemon's
+/// opaque install coordinate is optional on the wire and must never be
+/// synthesized from the registry id, revision, digest, or PATH inventory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomRegistrationReceipt {
+    pub id: String,
+    pub rev: u32,
+    pub digest: String,
+    pub updated: bool,
+    #[serde(default)]
+    pub install_job_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LoomRegistrationWire {
+    id: String,
+    rev: u32,
+    digest: String,
+    updated: bool,
+}
+
+/// Frozen 962 states plus a raw future value. Unknown strings survive the
+/// Rust/JS boundary unchanged instead of disappearing into a unit fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypedAgentInstallState {
+    Queued,
+    Installing,
+    Verifying,
+    Succeeded,
+    Failed,
+    Unknown(String),
+}
+
+impl TypedAgentInstallState {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::Queued => "queued",
+            Self::Installing => "installing",
+            Self::Verifying => "verifying",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for TypedAgentInstallState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TypedAgentInstallState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "queued" => Self::Queued,
+            "installing" => Self::Installing,
+            "verifying" => Self::Verifying,
+            "succeeded" => Self::Succeeded,
+            "failed" => Self::Failed,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallProgress {
+    pub total: u16,
+    pub completed: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_cli: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallJob {
+    pub job_id: String,
+    pub agent_type_id: String,
+    pub agent_type_rev: u32,
+    pub agent_type_digest: String,
+    pub state: TypedAgentInstallState,
+    pub progress: TypedAgentInstallProgress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentRequiredCli {
+    pub program: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallItem {
+    pub job_id: String,
+    pub ordinal: u16,
+    pub required_cli: TypedAgentRequiredCli,
+    pub state: TypedAgentInstallState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallStatus {
+    #[serde(default)]
+    pub jobs: Vec<TypedAgentInstallJob>,
+    #[serde(default)]
+    pub items: Vec<TypedAgentInstallItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallEvent {
+    pub cursor: u64,
+    pub job: TypedAgentInstallJob,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypedAgentInstallRetryRejection {
+    JobNotFound,
+    StateNotRetryable { state: TypedAgentInstallState },
+    ContractNotCurrent,
+    Unknown { raw: Value },
+}
+
+impl Serialize for TypedAgentInstallRetryRejection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::JobNotFound => serde_json::json!({"reason": "job_not_found"}),
+            Self::StateNotRetryable { state } => {
+                serde_json::json!({"reason": "state_not_retryable", "state": state})
+            }
+            Self::ContractNotCurrent => serde_json::json!({"reason": "contract_not_current"}),
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TypedAgentInstallRetryRejection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("reason").and_then(Value::as_str) {
+            Some("job_not_found") => Ok(Self::JobNotFound),
+            Some("state_not_retryable") => {
+                let state = raw
+                    .get("state")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::missing_field("state"))?;
+                Ok(Self::StateNotRetryable {
+                    state: serde_json::from_value(state).map_err(serde::de::Error::custom)?,
+                })
+            }
+            Some("contract_not_current") => Ok(Self::ContractNotCurrent),
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypedAgentInstallRetryOutcome {
+    Requeued {
+        job: TypedAgentInstallJob,
+    },
+    Rejected {
+        rejection: TypedAgentInstallRetryRejection,
+    },
+    Unknown {
+        raw: Value,
+    },
+}
+
+impl Serialize for TypedAgentInstallRetryOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Requeued { job } => serde_json::json!({"status": "requeued", "job": job}),
+            Self::Rejected { rejection } => {
+                serde_json::json!({"status": "rejected", "rejection": rejection})
+            }
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TypedAgentInstallRetryOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("status").and_then(Value::as_str) {
+            Some("requeued") => {
+                let job = raw
+                    .get("job")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::missing_field("job"))?;
+                Ok(Self::Requeued {
+                    job: serde_json::from_value(job).map_err(serde::de::Error::custom)?,
+                })
+            }
+            Some("rejected") => {
+                let rejection = raw
+                    .get("rejection")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::missing_field("rejection"))?;
+                Ok(Self::Rejected {
+                    rejection: serde_json::from_value(rejection)
+                        .map_err(serde::de::Error::custom)?,
+                })
+            }
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallRetryReceipt {
+    pub job_id: String,
+    pub outcome: TypedAgentInstallRetryOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypedAgentInstallWatchRejection {
+    JobNotFound,
+    CursorAhead { requested: u64, head: u64 },
+    Unknown { raw: Value },
+}
+
+impl Serialize for TypedAgentInstallWatchRejection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::JobNotFound => serde_json::json!({"reason": "job_not_found"}),
+            Self::CursorAhead { requested, head } => {
+                serde_json::json!({"reason": "cursor_ahead", "requested": requested, "head": head})
+            }
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TypedAgentInstallWatchRejection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("reason").and_then(Value::as_str) {
+            Some("job_not_found") => Ok(Self::JobNotFound),
+            Some("cursor_ahead") => {
+                let requested = raw
+                    .get("requested")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| serde::de::Error::missing_field("requested"))?;
+                let head = raw
+                    .get("head")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| serde::de::Error::missing_field("head"))?;
+                Ok(Self::CursorAhead { requested, head })
+            }
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypedAgentInstallWatchOutcome {
+    Watching {
+        requested_after_cursor: u64,
+        replay_through_cursor: u64,
+        next_cursor: u64,
+        events: Vec<TypedAgentInstallEvent>,
+    },
+    Rejected {
+        rejection: TypedAgentInstallWatchRejection,
+    },
+    Unknown {
+        raw: Value,
+    },
+}
+
+impl Serialize for TypedAgentInstallWatchOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Watching {
+                requested_after_cursor,
+                replay_through_cursor,
+                next_cursor,
+                events,
+            } => {
+                let mut raw = serde_json::json!({
+                    "status": "watching",
+                    "requested_after_cursor": requested_after_cursor,
+                    "replay_through_cursor": replay_through_cursor,
+                    "next_cursor": next_cursor,
+                });
+                if !events.is_empty() {
+                    raw["events"] =
+                        serde_json::to_value(events).map_err(serde::ser::Error::custom)?;
+                }
+                raw
+            }
+            Self::Rejected { rejection } => {
+                serde_json::json!({"status": "rejected", "rejection": rejection})
+            }
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TypedAgentInstallWatchOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("status").and_then(Value::as_str) {
+            Some("watching") => {
+                #[derive(Deserialize)]
+                struct WatchingFields {
+                    requested_after_cursor: u64,
+                    replay_through_cursor: u64,
+                    next_cursor: u64,
+                    #[serde(default)]
+                    events: Vec<TypedAgentInstallEvent>,
+                }
+                let fields: WatchingFields =
+                    serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
+                Ok(Self::Watching {
+                    requested_after_cursor: fields.requested_after_cursor,
+                    replay_through_cursor: fields.replay_through_cursor,
+                    next_cursor: fields.next_cursor,
+                    events: fields.events,
+                })
+            }
+            Some("rejected") => {
+                let rejection = raw
+                    .get("rejection")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::missing_field("rejection"))?;
+                Ok(Self::Rejected {
+                    rejection: serde_json::from_value(rejection)
+                        .map_err(serde::de::Error::custom)?,
+                })
+            }
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallWatchReceipt {
+    pub job_id: String,
+    pub outcome: TypedAgentInstallWatchOutcome,
+}
+
+/// Durable live-persona binding coordinates. This receipt does not claim
+/// PATH presence, install success, executor readiness, a grant, or CLI scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAgentTypePersonaBindingReceipt {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    pub selected_seq: u64,
+    pub worker_generation: u64,
+}
+
 #[derive(Clone, Serialize)]
 pub struct AccountSetDefaultModelResult {
     pub provider_summary: Value,
@@ -928,6 +1367,21 @@ enum RequestBody {
     UsageHistoryDay { date: String },
     #[serde(rename = "usage.history_range")]
     UsageHistoryRange { through_date: String, days: u16 },
+    #[serde(rename = "loom.list")]
+    LoomList {},
+    #[serde(rename = "loom.register_agent_type")]
+    LoomRegisterAgentType { record: LoomAgentType },
+    #[serde(rename = "loom.install.status")]
+    LoomInstallStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type_id: Option<String>,
+    },
+    #[serde(rename = "loom.install.retry")]
+    LoomInstallRetry { job_id: String },
+    #[serde(rename = "loom.install.watch")]
+    LoomInstallWatch { job_id: String, after_cursor: u64 },
     #[serde(rename = "session.observe")]
     SessionObserve {
         session_id: String,
@@ -969,6 +1423,13 @@ enum RequestBody {
         effort: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         confirm_new_epoch: bool,
+    },
+    #[serde(rename = "session.select_agent_type")]
+    SessionSelectAgentType {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        agent_type: Option<String>,
     },
     #[serde(rename = "session.select_fast")]
     SessionSelectFast {
@@ -1160,6 +1621,34 @@ enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         availability: Option<SnapshotAvailabilityWire>,
     },
+    #[serde(rename = "loom.list")]
+    LoomList {
+        #[serde(default)]
+        agent_types: Vec<LoomAgentType>,
+        #[serde(default)]
+        cli_present: BTreeMap<String, bool>,
+    },
+    #[serde(rename = "loom.registered")]
+    LoomRegistered {
+        registration: LoomRegistrationWire,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        install_job_id: Option<String>,
+    },
+    #[serde(rename = "loom.install.status")]
+    LoomInstallStatus {
+        #[serde(default)]
+        jobs: Vec<TypedAgentInstallJob>,
+        #[serde(default)]
+        items: Vec<TypedAgentInstallItem>,
+    },
+    #[serde(rename = "loom.install.retry")]
+    LoomInstallRetry {
+        receipt: TypedAgentInstallRetryReceipt,
+    },
+    #[serde(rename = "loom.install.watch")]
+    LoomInstallWatch {
+        receipt: TypedAgentInstallWatchReceipt,
+    },
     #[serde(rename = "session.observe")]
     SessionObserve { digest: Value },
     #[serde(rename = "session.attach")]
@@ -1189,6 +1678,14 @@ enum ResponseBody {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
+        selected_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "session.select_agent_type")]
+    SessionSelectAgentType {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<String>,
         selected_seq: u64,
         worker_generation: u64,
     },
@@ -3079,6 +3576,349 @@ fn account_list_response(
             watch,
         }),
         _ => Err("account.list response method mismatch".to_string()),
+    }
+}
+
+fn loom_list_response(body: ResponseBody) -> Result<LoomListResult, String> {
+    match body {
+        ResponseBody::LoomList {
+            agent_types,
+            cli_present,
+        } => Ok(LoomListResult {
+            agent_types,
+            cli_present,
+        }),
+        _ => Err("loom.list response method mismatch".to_string()),
+    }
+}
+
+fn loom_registration_response(body: ResponseBody) -> Result<LoomRegistrationReceipt, String> {
+    match body {
+        ResponseBody::LoomRegistered {
+            registration,
+            install_job_id,
+        } => Ok(LoomRegistrationReceipt {
+            id: registration.id,
+            rev: registration.rev,
+            digest: registration.digest,
+            updated: registration.updated,
+            install_job_id,
+        }),
+        _ => Err("loom.register_agent_type response method mismatch".to_string()),
+    }
+}
+
+fn loom_install_status_response(body: ResponseBody) -> Result<TypedAgentInstallStatus, String> {
+    match body {
+        ResponseBody::LoomInstallStatus { jobs, items } => {
+            Ok(TypedAgentInstallStatus { jobs, items })
+        }
+        _ => Err("loom.install.status response method mismatch".to_string()),
+    }
+}
+
+fn loom_install_retry_response(
+    body: ResponseBody,
+) -> Result<TypedAgentInstallRetryReceipt, String> {
+    match body {
+        ResponseBody::LoomInstallRetry { receipt } => Ok(receipt),
+        _ => Err("loom.install.retry response method mismatch".to_string()),
+    }
+}
+
+fn loom_install_watch_response(
+    body: ResponseBody,
+) -> Result<TypedAgentInstallWatchReceipt, String> {
+    match body {
+        ResponseBody::LoomInstallWatch { receipt } => Ok(receipt),
+        _ => Err("loom.install.watch response method mismatch".to_string()),
+    }
+}
+
+fn session_agent_type_persona_binding_response(
+    body: ResponseBody,
+    expected_session_id: &str,
+) -> Result<SessionAgentTypePersonaBindingReceipt, String> {
+    match body {
+        ResponseBody::SessionSelectAgentType {
+            session_id,
+            agent_type,
+            selected_seq,
+            worker_generation,
+        } if session_id == expected_session_id => Ok(SessionAgentTypePersonaBindingReceipt {
+            session_id,
+            agent_type,
+            selected_seq,
+            worker_generation,
+        }),
+        _ => Err("session.select_agent_type response method mismatch".to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn loom_feature_gate(feature: &str) -> FeatureGate {
+    FeatureGate::all(BTreeSet::from([feature.to_string()]))
+}
+
+#[cfg(unix)]
+async fn loom_request(
+    method: &str,
+    body: RequestBody,
+    capability: Capability,
+    feature: &str,
+) -> Result<ResponseBody, String> {
+    match rpc_request_with_feature_gate(
+        body,
+        capability,
+        loom_feature_gate(feature),
+        RpcErrorStyle::Public,
+    )
+    .await
+    {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) => Err(error),
+        None => Err(format!("{method} unavailable: no ADE connection")),
+    }
+}
+
+/// Read only the P0.3 agent-type registry and advisory CLI-presence map.
+/// Workflow records are deliberately left to P0.4.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_list() -> Result<LoomListResult, String> {
+    #[cfg(unix)]
+    {
+        return loom_list_response(
+            loom_request(
+                "loom.list",
+                RequestBody::LoomList {},
+                Capability::View,
+                FEATURE_LOOM_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    Err("loom.list unavailable on this platform".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_register_agent_type(
+    id: String,
+    name: String,
+    job: String,
+    in_type: String,
+    out_type: String,
+    clis: Vec<String>,
+    apis: Vec<String>,
+    skills: Vec<String>,
+    scripts: Vec<String>,
+    color: String,
+    glyph: String,
+) -> Result<LoomRegistrationReceipt, String> {
+    #[cfg(unix)]
+    {
+        let record = LoomAgentType {
+            id,
+            name,
+            job,
+            in_type,
+            out_type,
+            clis,
+            apis,
+            skills,
+            scripts,
+            color,
+            glyph,
+            // Registration input never controls the registry revision. The
+            // 962 request wire carries zero and the daemon stores/returns the
+            // authoritative positive revision in its receipt and list rows.
+            rev: 0,
+        };
+        return loom_registration_response(
+            loom_request(
+                "loom.register_agent_type",
+                RequestBody::LoomRegisterAgentType { record },
+                Capability::Control,
+                FEATURE_LOOM_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            id, name, job, in_type, out_type, clis, apis, skills, scripts, color, glyph,
+        );
+        Err("loom.register_agent_type unavailable on this platform".to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_install_status(agent_type_id: String) -> Result<TypedAgentInstallStatus, String> {
+    #[cfg(unix)]
+    {
+        return loom_install_status_response(
+            loom_request(
+                "loom.install.status",
+                RequestBody::LoomInstallStatus {
+                    job_id: None,
+                    agent_type_id: Some(agent_type_id),
+                },
+                Capability::View,
+                FEATURE_TYPED_AGENT_INSTALL_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = agent_type_id;
+        Err("loom.install.status unavailable on this platform".to_string())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_install_retry(
+    install_job_id: String,
+) -> Result<TypedAgentInstallRetryReceipt, String> {
+    #[cfg(unix)]
+    {
+        return loom_install_retry_response(
+            loom_request(
+                "loom.install.retry",
+                RequestBody::LoomInstallRetry {
+                    job_id: install_job_id,
+                },
+                Capability::Control,
+                FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = install_job_id;
+        Err("loom.install.retry unavailable on this platform".to_string())
+    }
+}
+
+/// Poll one cursor-replayable install progress page. The returned cursor and
+/// state names are daemon-issued and are carried without reinterpretation.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_install_watch(
+    install_job_id: String,
+    after_cursor: u64,
+) -> Result<TypedAgentInstallWatchReceipt, String> {
+    #[cfg(unix)]
+    {
+        return loom_install_watch_response(
+            loom_request(
+                "loom.install.watch",
+                RequestBody::LoomInstallWatch {
+                    job_id: install_job_id,
+                    after_cursor,
+                },
+                Capability::View,
+                FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (install_job_id, after_cursor);
+        Err("loom.install.watch unavailable on this platform".to_string())
+    }
+}
+
+#[cfg(unix)]
+async fn session_select_agent_type_inner(
+    session_id: String,
+    agent_type_id: String,
+) -> Result<SessionAgentTypePersonaBindingReceipt, String> {
+    let Some(summary) = config_session_summary(&session_id, Capability::Control).await? else {
+        return Err("session.select_agent_type unavailable: no ADE connection".to_string());
+    };
+    let head_seq = config_u64(summary.get("head_seq"))
+        .ok_or_else(|| "session summary head_seq was missing".to_string())?;
+    let Some(response) = config_request(
+        RequestBody::SessionAttach {
+            session_id: session_id.clone(),
+            after_seq: head_seq,
+            mode: AttachMode::Control,
+            sealed_replay: false,
+        },
+        Capability::Control,
+        &[FEATURE_SESSION_AGENT_TYPE_SELECT_V1],
+    )
+    .await?
+    else {
+        return Err("session.select_agent_type unavailable: no ADE connection".to_string());
+    };
+    let ResponseBody::SessionAttach {
+        attachment_id,
+        attach_state,
+    } = response
+    else {
+        return Err("session.attach response method mismatch".to_string());
+    };
+    if attach_state.session_id != session_id {
+        let _ = config_request(
+            RequestBody::SessionDetach { attachment_id },
+            Capability::Control,
+            &[],
+        )
+        .await;
+        return Err("session.attach response session mismatch".to_string());
+    }
+
+    let selection = match config_request(
+        RequestBody::SessionSelectAgentType {
+            command_id: config_command_id("session-agent-type"),
+            session_id: session_id.clone(),
+            worker_generation: attach_state.worker_generation,
+            agent_type: Some(agent_type_id),
+        },
+        Capability::Control,
+        &[FEATURE_SESSION_AGENT_TYPE_SELECT_V1],
+    )
+    .await
+    {
+        Ok(Some(body)) => session_agent_type_persona_binding_response(body, &session_id),
+        Ok(None) => Err("session.select_agent_type unavailable: no ADE connection".to_string()),
+        Err(error) => Err(error),
+    };
+
+    let _ = config_request(
+        RequestBody::SessionDetach { attachment_id },
+        Capability::Control,
+        &[],
+    )
+    .await;
+    selection
+}
+
+/// Bind one registered type as this live session's persona. This is not an
+/// install, readiness, capability, grant, or typed-executor command.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_select_agent_type(
+    session_id: String,
+    agent_type_id: String,
+) -> Result<SessionAgentTypePersonaBindingReceipt, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = tauri::async_runtime::spawn_blocking(move || {
+            super::session_provider_session_id_blocking(&session_id)
+        })
+        .await
+        .map_err(|error| format!("Session agent-type worker failed: {error}"))??;
+        return session_select_agent_type_inner(provider_session_id, agent_type_id).await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, agent_type_id);
+        Err("session.select_agent_type unavailable on this platform".to_string())
     }
 }
 
@@ -7320,6 +8160,10 @@ fn blake3_g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u3
 }
 
 #[cfg(test)]
+#[path = "haider_rpc_ade_loom_tests.rs"]
+mod loom_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -9877,6 +10721,11 @@ mod tests {
             FEATURE_USAGE_REPORT_V1,
             FEATURE_USAGE_HISTORY_V1,
             FEATURE_HAIDER_CODE_PLAN_STATUS_V1,
+            FEATURE_LOOM_V1,
+            FEATURE_LOOM_CLI_PRESENCE_V1,
+            FEATURE_TYPED_AGENT_INSTALL_V1,
+            FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1,
+            FEATURE_SESSION_AGENT_TYPE_SELECT_V1,
         ] {
             assert!(
                 welcome.features.contains(feature),
