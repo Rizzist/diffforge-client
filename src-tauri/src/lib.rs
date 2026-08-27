@@ -3064,7 +3064,6 @@ include!("swarm_runtime.rs");
 include!("orchestrator_pool.rs");
 include!("tools_window.rs");
 include!("session_window.rs");
-include!("web_panel.rs");
 include!("api.rs");
 include!("activity_overlay.rs");
 include!("todo_dispatch.rs");
@@ -7180,9 +7179,6 @@ fn run_app(daemon: bool) {
             session_window_open,
             session_window_close,
             session_window_focus,
-            web_panel_open,
-            web_panel_close,
-            web_panel_focus,
             terminal_pane_runtime_info,
             terminal_live_sessions,
             close_app_after_terminal_shutdown,
