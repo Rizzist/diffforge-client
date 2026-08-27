@@ -82,6 +82,8 @@ const FEATURE_TYPED_AGENT_INSTALL_V1: &str = "typed_agent_install_v1";
 const FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1: &str = "typed_agent_install_control_v1";
 const FEATURE_SESSION_AGENT_TYPE_SELECT_V1: &str = "session_agent_type_select_v1";
 const FEATURE_SESSION_LINEAGE_V1: &str = "session_lineage_v1";
+const FEATURE_MONITOR_CONTROL_V1: &str = "monitor_control_v1";
+const FEATURE_MONITOR_DELIVERY_V1: &str = "monitor_delivery_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
 const HAIDER_NEEDS_INPUT_NO_CONNECTION: &str = "haider_needs_input_no_connection";
@@ -107,6 +109,8 @@ const SESSION_QUEUE_CHANGED_EVENT: &str = "session-queue-changed";
 const ACCOUNT_ROSTER_CHANGED_EVENT: &str = "account-roster-changed";
 const RESIDENT_SESSION_BINDING_EVENT: &str = "resident-session-binding";
 const TOKENOMICS_UPDATED_EVENT: &str = "diffforge://tokenomics-updated";
+const MONITOR_DELIVERY_EVENT: &str = "monitor-delivery";
+const MONITOR_DELIVERY_CAUGHT_UP_EVENT: &str = "monitor-delivery-caught-up";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const FEATURE_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1051,6 +1055,830 @@ pub struct WorkflowGraphWatchPageV1 {
     pub next_cursor: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<WorkflowGraphWatchEventV1>,
+}
+
+/// Monitor source family used by typed policy/rejection/report coordinates.
+/// Complete source declarations remain raw JSON in registrations and requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MonitorSourceKindV1 {
+    Sms,
+    Process,
+    File,
+    Poll,
+    Timer,
+    Unknown(String),
+}
+
+impl MonitorSourceKindV1 {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::Sms => "sms",
+            Self::Process => "process",
+            Self::File => "file",
+            Self::Poll => "poll",
+            Self::Timer => "timer",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for MonitorSourceKindV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorSourceKindV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "sms" => Self::Sms,
+            "process" => Self::Process,
+            "file" => Self::File,
+            "poll" => Self::Poll,
+            "timer" => Self::Timer,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+/// Capability values in the monitor policy/rejection summary. Future values
+/// retain their exact string instead of being folded into a unit fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MonitorPolicyCapabilityV1 {
+    View,
+    Control,
+    Unknown(String),
+}
+
+impl MonitorPolicyCapabilityV1 {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::View => "view",
+            Self::Control => "control",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for MonitorPolicyCapabilityV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorPolicyCapabilityV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "view" => Self::View,
+            "control" => Self::Control,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+/// Honest adapter state. Missing or future state tags never become Available;
+/// unavailable reasons remain verbatim protocol data.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MonitorSourceAvailabilityStateV1 {
+    Available,
+    Unavailable { reason: Option<Value> },
+    Unknown { raw: Value },
+}
+
+impl Serialize for MonitorSourceAvailabilityStateV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Available => serde_json::json!({"state": "available"}),
+            Self::Unavailable { reason } => {
+                let mut raw = serde_json::json!({"state": "unavailable"});
+                if let Some(reason) = reason {
+                    raw["reason"] = reason.clone();
+                }
+                raw
+            }
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorSourceAvailabilityStateV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        Ok(match raw.get("state").and_then(Value::as_str) {
+            Some("available") => Self::Available,
+            Some("unavailable") => Self::Unavailable {
+                reason: raw.get("reason").cloned(),
+            },
+            _ => Self::Unknown { raw },
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorSourceAvailabilityV1 {
+    pub source: MonitorSourceKindV1,
+    pub availability: MonitorSourceAvailabilityStateV1,
+}
+
+/// Descriptive policy echoed by every monitor receipt. Negotiated grants and
+/// live attachment ownership remain the actual authorization authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorControlPolicyV1 {
+    pub list: MonitorPolicyCapabilityV1,
+    pub register: MonitorPolicyCapabilityV1,
+    pub register_requires_control_attachment: bool,
+    pub remove: MonitorPolicyCapabilityV1,
+    pub remove_requires_control_attachment: bool,
+    pub watch: MonitorPolicyCapabilityV1,
+}
+
+/// Durable registry row. Deep source/filter/action vocabulary and occurrence
+/// stay verbatim so the ADE never becomes a second monitor parser.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorRegistrationV1 {
+    pub monitor_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub source: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Value>,
+    pub action: Value,
+    pub occurrence: Value,
+    pub created_at_ms: u64,
+    pub start_source_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+}
+
+fn monitor_u64_field(raw: &Value, field: &'static str) -> Result<u64, String> {
+    let value = raw
+        .get(field)
+        .ok_or_else(|| format!("missing field `{field}`"))?;
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|decimal| decimal.parse().ok()))
+        .ok_or_else(|| format!("field `{field}` must be a u64"))
+}
+
+/// Structured monitor refusal. Known reasons expose their recovery fields;
+/// an unknown reason retains the complete raw object.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MonitorControlRejectionV1 {
+    CapabilityDenied {
+        required: MonitorPolicyCapabilityV1,
+    },
+    ControlAttachmentRequired,
+    SourceUnavailable {
+        source: MonitorSourceKindV1,
+    },
+    LimitReached {
+        count: u32,
+        limit: u32,
+    },
+    NotFound {
+        monitor_id: String,
+    },
+    SessionNotFound,
+    StaleGeneration {
+        requested: u64,
+        current: u64,
+    },
+    CursorAhead {
+        requested: u64,
+        head: u64,
+    },
+    InvalidRequest {
+        field: Option<String>,
+        detail: String,
+    },
+    CommandConflict,
+    ServiceStopped,
+    StoreUnavailable {
+        retryable: bool,
+        detail: String,
+    },
+    Unknown {
+        raw: Value,
+    },
+}
+
+impl Serialize for MonitorControlRejectionV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let raw = match self {
+            Self::CapabilityDenied { required } => serde_json::json!({
+                "reason": "capability_denied",
+                "required": required,
+            }),
+            Self::ControlAttachmentRequired => {
+                serde_json::json!({"reason": "control_attachment_required"})
+            }
+            Self::SourceUnavailable { source } => serde_json::json!({
+                "reason": "source_unavailable",
+                "source": source,
+            }),
+            Self::LimitReached { count, limit } => serde_json::json!({
+                "reason": "limit_reached",
+                "count": count,
+                "limit": limit,
+            }),
+            Self::NotFound { monitor_id } => serde_json::json!({
+                "reason": "not_found",
+                "monitor_id": monitor_id,
+            }),
+            Self::SessionNotFound => serde_json::json!({"reason": "session_not_found"}),
+            Self::StaleGeneration { requested, current } => serde_json::json!({
+                "reason": "stale_generation",
+                "requested": requested,
+                "current": current,
+            }),
+            Self::CursorAhead { requested, head } => serde_json::json!({
+                "reason": "cursor_ahead",
+                "requested": requested.to_string(),
+                "head": head.to_string(),
+            }),
+            Self::InvalidRequest { field, detail } => {
+                let mut raw = serde_json::json!({
+                    "reason": "invalid_request",
+                    "detail": detail,
+                });
+                if let Some(field) = field {
+                    raw["field"] = Value::String(field.clone());
+                }
+                raw
+            }
+            Self::CommandConflict => serde_json::json!({"reason": "command_conflict"}),
+            Self::ServiceStopped => serde_json::json!({"reason": "service_stopped"}),
+            Self::StoreUnavailable { retryable, detail } => serde_json::json!({
+                "reason": "store_unavailable",
+                "retryable": retryable,
+                "detail": detail,
+            }),
+            Self::Unknown { raw } => raw.clone(),
+        };
+        raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorControlRejectionV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct CapabilityDeniedFields {
+            required: MonitorPolicyCapabilityV1,
+        }
+        #[derive(Deserialize)]
+        struct SourceUnavailableFields {
+            source: MonitorSourceKindV1,
+        }
+        #[derive(Deserialize)]
+        struct LimitReachedFields {
+            count: u32,
+            limit: u32,
+        }
+        #[derive(Deserialize)]
+        struct NotFoundFields {
+            monitor_id: String,
+        }
+        #[derive(Deserialize)]
+        struct StaleGenerationFields {
+            requested: u64,
+            current: u64,
+        }
+        #[derive(Deserialize)]
+        struct InvalidRequestFields {
+            #[serde(default)]
+            field: Option<String>,
+            detail: String,
+        }
+        #[derive(Deserialize)]
+        struct StoreUnavailableFields {
+            retryable: bool,
+            detail: String,
+        }
+
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("reason").and_then(Value::as_str) {
+            Some("capability_denied") => {
+                let fields: CapabilityDeniedFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::CapabilityDenied {
+                    required: fields.required,
+                })
+            }
+            Some("control_attachment_required") => Ok(Self::ControlAttachmentRequired),
+            Some("source_unavailable") => {
+                let fields: SourceUnavailableFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::SourceUnavailable {
+                    source: fields.source,
+                })
+            }
+            Some("limit_reached") => {
+                let fields: LimitReachedFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::LimitReached {
+                    count: fields.count,
+                    limit: fields.limit,
+                })
+            }
+            Some("not_found") => {
+                let fields: NotFoundFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::NotFound {
+                    monitor_id: fields.monitor_id,
+                })
+            }
+            Some("session_not_found") => Ok(Self::SessionNotFound),
+            Some("stale_generation") => {
+                let fields: StaleGenerationFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::StaleGeneration {
+                    requested: fields.requested,
+                    current: fields.current,
+                })
+            }
+            Some("cursor_ahead") => Ok(Self::CursorAhead {
+                requested: monitor_u64_field(&raw, "requested")
+                    .map_err(<D::Error as serde::de::Error>::custom)?,
+                head: monitor_u64_field(&raw, "head")
+                    .map_err(<D::Error as serde::de::Error>::custom)?,
+            }),
+            Some("invalid_request") => {
+                let fields: InvalidRequestFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::InvalidRequest {
+                    field: fields.field,
+                    detail: fields.detail,
+                })
+            }
+            Some("command_conflict") => Ok(Self::CommandConflict),
+            Some("service_stopped") => Ok(Self::ServiceStopped),
+            Some("store_unavailable") => {
+                let fields: StoreUnavailableFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::StoreUnavailable {
+                    retryable: fields.retryable,
+                    detail: fields.detail,
+                })
+            }
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MonitorListOutcomeV1 {
+    Listed {
+        monitors: Vec<MonitorRegistrationV1>,
+    },
+    Rejected {
+        rejection: MonitorControlRejectionV1,
+    },
+    Unknown {
+        raw: Value,
+    },
+}
+
+impl Serialize for MonitorListOutcomeV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Listed { monitors } => serde_json::json!({
+                "status": "listed",
+                "monitors": monitors,
+            }),
+            Self::Rejected { rejection } => serde_json::json!({
+                "status": "rejected",
+                "rejection": rejection,
+            }),
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorListOutcomeV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ListedFields {
+            #[serde(default)]
+            monitors: Vec<MonitorRegistrationV1>,
+        }
+        #[derive(Deserialize)]
+        struct RejectedFields {
+            rejection: MonitorControlRejectionV1,
+        }
+
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("status").and_then(Value::as_str) {
+            Some("listed") => {
+                let fields: ListedFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::Listed {
+                    monitors: fields.monitors,
+                })
+            }
+            Some("rejected") => {
+                let fields: RejectedFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::Rejected {
+                    rejection: fields.rejection,
+                })
+            }
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MonitorRegisterOutcomeV1 {
+    Registered {
+        monitor: MonitorRegistrationV1,
+    },
+    Rejected {
+        rejection: MonitorControlRejectionV1,
+    },
+    Unknown {
+        raw: Value,
+    },
+}
+
+impl Serialize for MonitorRegisterOutcomeV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Registered { monitor } => serde_json::json!({
+                "status": "registered",
+                "monitor": monitor,
+            }),
+            Self::Rejected { rejection } => serde_json::json!({
+                "status": "rejected",
+                "rejection": rejection,
+            }),
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorRegisterOutcomeV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RegisteredFields {
+            monitor: MonitorRegistrationV1,
+        }
+        #[derive(Deserialize)]
+        struct RejectedFields {
+            rejection: MonitorControlRejectionV1,
+        }
+
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("status").and_then(Value::as_str) {
+            Some("registered") => {
+                let fields: RegisteredFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::Registered {
+                    monitor: fields.monitor,
+                })
+            }
+            Some("rejected") => {
+                let fields: RejectedFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::Rejected {
+                    rejection: fields.rejection,
+                })
+            }
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MonitorRemoveOutcomeV1 {
+    Removed {
+        monitor_id: String,
+    },
+    Rejected {
+        rejection: MonitorControlRejectionV1,
+    },
+    Unknown {
+        raw: Value,
+    },
+}
+
+impl Serialize for MonitorRemoveOutcomeV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Removed { monitor_id } => serde_json::json!({
+                "status": "removed",
+                "monitor_id": monitor_id,
+            }),
+            Self::Rejected { rejection } => serde_json::json!({
+                "status": "rejected",
+                "rejection": rejection,
+            }),
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorRemoveOutcomeV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RemovedFields {
+            monitor_id: String,
+        }
+        #[derive(Deserialize)]
+        struct RejectedFields {
+            rejection: MonitorControlRejectionV1,
+        }
+
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("status").and_then(Value::as_str) {
+            Some("removed") => {
+                let fields: RemovedFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::Removed {
+                    monitor_id: fields.monitor_id,
+                })
+            }
+            Some("rejected") => {
+                let fields: RejectedFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::Rejected {
+                    rejection: fields.rejection,
+                })
+            }
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MonitorWatchOutcomeV1 {
+    Watching {
+        watch_id: String,
+        requested_after_cursor: u64,
+        replay_through_cursor: u64,
+    },
+    Rejected {
+        rejection: MonitorControlRejectionV1,
+    },
+    Unknown {
+        raw: Value,
+    },
+}
+
+impl Serialize for MonitorWatchOutcomeV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Watching {
+                watch_id,
+                requested_after_cursor,
+                replay_through_cursor,
+            } => serde_json::json!({
+                "status": "watching",
+                "watch_id": watch_id,
+                "requested_after_cursor": requested_after_cursor.to_string(),
+                "replay_through_cursor": replay_through_cursor.to_string(),
+            }),
+            Self::Rejected { rejection } => serde_json::json!({
+                "status": "rejected",
+                "rejection": rejection,
+            }),
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorWatchOutcomeV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RejectedFields {
+            rejection: MonitorControlRejectionV1,
+        }
+
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("status").and_then(Value::as_str) {
+            Some("watching") => {
+                let watch_id = raw
+                    .get("watch_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| serde::de::Error::missing_field("watch_id"))?
+                    .to_string();
+                Ok(Self::Watching {
+                    watch_id,
+                    requested_after_cursor: monitor_u64_field(&raw, "requested_after_cursor")
+                        .map_err(<D::Error as serde::de::Error>::custom)?,
+                    replay_through_cursor: monitor_u64_field(&raw, "replay_through_cursor")
+                        .map_err(<D::Error as serde::de::Error>::custom)?,
+                })
+            }
+            Some("rejected") => {
+                let fields: RejectedFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::Rejected {
+                    rejection: fields.rejection,
+                })
+            }
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorListReceiptV1 {
+    pub session_id: String,
+    pub policy: MonitorControlPolicyV1,
+    pub sources: Vec<MonitorSourceAvailabilityV1>,
+    pub outcome: MonitorListOutcomeV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorRegisterReceiptV1 {
+    pub command_id: String,
+    pub session_id: String,
+    pub worker_generation: u64,
+    pub policy: MonitorControlPolicyV1,
+    pub sources: Vec<MonitorSourceAvailabilityV1>,
+    pub outcome: MonitorRegisterOutcomeV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorRemoveReceiptV1 {
+    pub command_id: String,
+    pub session_id: String,
+    pub worker_generation: u64,
+    pub policy: MonitorControlPolicyV1,
+    pub sources: Vec<MonitorSourceAvailabilityV1>,
+    pub outcome: MonitorRemoveOutcomeV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorWatchReceiptV1 {
+    pub session_id: String,
+    pub policy: MonitorControlPolicyV1,
+    pub sources: Vec<MonitorSourceAvailabilityV1>,
+    pub outcome: MonitorWatchOutcomeV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MonitorReportStatusV1 {
+    Matched,
+    RateLimited,
+    TimedOut,
+    Unknown(String),
+}
+
+impl MonitorReportStatusV1 {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::Matched => "matched",
+            Self::RateLimited => "rate_limited",
+            Self::TimedOut => "timed_out",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for MonitorReportStatusV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MonitorReportStatusV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "matched" => Self::Matched,
+            "rate_limited" => Self::RateLimited,
+            "timed_out" => Self::TimedOut,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorDeliveryDedupeV1 {
+    pub delivery_key: String,
+    pub report_key: String,
+}
+
+fn serialize_monitor_cursor<S>(cursor: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.collect_str(cursor)
+}
+
+fn deserialize_monitor_cursor<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Value::deserialize(deserializer)?;
+    raw.as_u64()
+        .or_else(|| raw.as_str().and_then(|decimal| decimal.parse().ok()))
+        .ok_or_else(|| serde::de::Error::custom("monitor cursor must be a decimal u64"))
+}
+
+/// Dedicated durable report record. Source events and the copied action stay
+/// raw; identity, grouping, omission, status, and cursor coordinates are typed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorDeliveryReportV1 {
+    pub report_id: String,
+    pub monitor_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub source: MonitorSourceKindV1,
+    pub status: MonitorReportStatusV1,
+    #[serde(default)]
+    pub events: Vec<Value>,
+    pub coalesced_count: u64,
+    pub omitted_count: u64,
+    pub action: Value,
+    #[serde(
+        serialize_with = "serialize_monitor_cursor",
+        deserialize_with = "deserialize_monitor_cursor"
+    )]
+    pub cursor: u64,
+    pub dedupe: MonitorDeliveryDedupeV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MonitorDeliveryEventV1 {
+    pub watch_id: String,
+    pub report: MonitorDeliveryReportV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MonitorDeliveryCaughtUpEventV1 {
+    pub watch_id: String,
+    pub session_id: String,
+    #[serde(serialize_with = "serialize_monitor_cursor")]
+    pub high_water_cursor: u64,
 }
 
 /// Built-in and user catalog entries retain their complete nested authority
@@ -2138,6 +2966,32 @@ enum RequestBody {
         after_cursor: u64,
         limit: u32,
     },
+    #[serde(rename = "monitor.list")]
+    MonitorList { session_id: String },
+    #[serde(rename = "monitor.register")]
+    MonitorRegister {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        source: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<Value>,
+        action: Value,
+        occurrence: Value,
+        lifetime: Value,
+    },
+    #[serde(rename = "monitor.remove")]
+    MonitorRemove {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        monitor_id: String,
+    },
+    #[serde(rename = "monitor.watch")]
+    MonitorWatch {
+        session_id: String,
+        after_cursor: u64,
+    },
     #[serde(rename = "graph.status")]
     GraphStatus { session_id: String },
     #[serde(rename = "graph.inspect")]
@@ -2481,6 +3335,14 @@ enum ResponseBody {
     },
     #[serde(rename = "workflow.graph.watch")]
     WorkflowGraphWatch { page: WorkflowGraphWatchPageV1 },
+    #[serde(rename = "monitor.list")]
+    MonitorList { receipt: MonitorListReceiptV1 },
+    #[serde(rename = "monitor.register")]
+    MonitorRegister { receipt: MonitorRegisterReceiptV1 },
+    #[serde(rename = "monitor.remove")]
+    MonitorRemove { receipt: MonitorRemoveReceiptV1 },
+    #[serde(rename = "monitor.watch")]
+    MonitorWatch { receipt: MonitorWatchReceiptV1 },
     #[serde(rename = "graph.status")]
     GraphStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2817,6 +3679,15 @@ enum WireFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         worker_generation: u64,
+    },
+    MonitorDelivery {
+        watch_id: String,
+        report: MonitorDeliveryReportV1,
+    },
+    MonitorDeliveryCaughtUp {
+        watch_id: String,
+        session_id: String,
+        high_water_cursor: u64,
     },
     MenuAnswer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4547,6 +5418,91 @@ fn loom_install_watch_response(
     }
 }
 
+fn monitor_list_request(session_id: String) -> RequestBody {
+    RequestBody::MonitorList { session_id }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn monitor_register_request(
+    command_id: String,
+    session_id: String,
+    worker_generation: u64,
+    source: Value,
+    filter: Option<Value>,
+    action: Value,
+    occurrence: Value,
+    lifetime: Value,
+) -> RequestBody {
+    RequestBody::MonitorRegister {
+        command_id,
+        session_id,
+        worker_generation,
+        source,
+        filter: filter.filter(|filter| !filter.is_null()),
+        action,
+        occurrence,
+        lifetime,
+    }
+}
+
+fn monitor_remove_request(
+    command_id: String,
+    session_id: String,
+    worker_generation: u64,
+    monitor_id: String,
+) -> RequestBody {
+    RequestBody::MonitorRemove {
+        command_id,
+        session_id,
+        worker_generation,
+        monitor_id,
+    }
+}
+
+fn monitor_watch_request(session_id: String, after_cursor: u64) -> RequestBody {
+    RequestBody::MonitorWatch {
+        session_id,
+        after_cursor,
+    }
+}
+
+fn parse_monitor_watch_after_cursor(after_cursor: &str) -> Result<u64, String> {
+    if after_cursor.is_empty() || !after_cursor.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("monitor.watch after_cursor must be a decimal u64 string".to_string());
+    }
+    after_cursor
+        .parse::<u64>()
+        .map_err(|_| "monitor.watch after_cursor must be a decimal u64 string".to_string())
+}
+
+fn monitor_list_response(body: ResponseBody) -> Result<MonitorListReceiptV1, String> {
+    match body {
+        ResponseBody::MonitorList { receipt } => Ok(receipt),
+        _ => Err("monitor.list response method mismatch".to_string()),
+    }
+}
+
+fn monitor_register_response(body: ResponseBody) -> Result<MonitorRegisterReceiptV1, String> {
+    match body {
+        ResponseBody::MonitorRegister { receipt } => Ok(receipt),
+        _ => Err("monitor.register response method mismatch".to_string()),
+    }
+}
+
+fn monitor_remove_response(body: ResponseBody) -> Result<MonitorRemoveReceiptV1, String> {
+    match body {
+        ResponseBody::MonitorRemove { receipt } => Ok(receipt),
+        _ => Err("monitor.remove response method mismatch".to_string()),
+    }
+}
+
+fn monitor_watch_response(body: ResponseBody) -> Result<MonitorWatchReceiptV1, String> {
+    match body {
+        ResponseBody::MonitorWatch { receipt } => Ok(receipt),
+        _ => Err("monitor.watch response method mismatch".to_string()),
+    }
+}
+
 fn session_fleet_response(body: ResponseBody) -> Result<SessionFleetSnapshot, String> {
     match body {
         ResponseBody::SessionFleet { snapshot } => Ok(snapshot),
@@ -5076,6 +6032,16 @@ async fn fleet_provider_session_id(session_id: String) -> Result<String, String>
 }
 
 #[cfg(unix)]
+async fn monitor_provider_session_id(session_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        super::session_provider_session_id_blocking(&session_id)
+    })
+    .await
+    .map_err(|error| format!("Monitor session lookup failed: {error}"))?
+    .map_err(|error| format!("Monitor session lookup failed: {error}"))
+}
+
+#[cfg(unix)]
 async fn fleet_provider_session_ids(session_ids: Vec<String>) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         session_ids
@@ -5436,6 +6402,146 @@ pub async fn workflow_graph_watch(
     {
         let _ = (session_id, after_cursor, limit);
         Err("workflow.graph.watch unavailable on this platform".to_string())
+    }
+}
+
+/// Read the authoritative durable monitor registry. Only a `listed` outcome
+/// carries a monitor set; rejected and future outcomes retain that distinction.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn monitor_list(session_id: String) -> Result<MonitorListReceiptV1, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = monitor_provider_session_id(session_id).await?;
+        return monitor_list_response(
+            fleet_request(
+                "monitor.list",
+                monitor_list_request(provider_session_id),
+                Capability::View,
+                FEATURE_MONITOR_CONTROL_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session_id;
+        Err("monitor.list unavailable on this platform".to_string())
+    }
+}
+
+/// Register through a fresh live Control attachment. Durable command and
+/// worker-generation coordinates are internal and never accepted from JS.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn monitor_register(
+    session_id: String,
+    source: Value,
+    filter: Option<Value>,
+    action: Value,
+    occurrence: Value,
+    lifetime: Value,
+) -> Result<MonitorRegisterReceiptV1, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = monitor_provider_session_id(session_id).await?;
+        let features = BTreeSet::from([FEATURE_MONITOR_CONTROL_V1.to_string()]);
+        let attachment = workflow_control_attachment(&provider_session_id, &features)
+            .await
+            .map_err(|error| error.message)?;
+        let response = fleet_request(
+            "monitor.register",
+            monitor_register_request(
+                config_command_id("monitor-register"),
+                attachment.session_id.clone(),
+                attachment.worker_generation,
+                source,
+                filter,
+                action,
+                occurrence,
+                lifetime,
+            ),
+            Capability::Control,
+            FEATURE_MONITOR_CONTROL_V1,
+        )
+        .await;
+        let result = match response {
+            Ok(body) => monitor_register_response(body),
+            Err(error) => Err(error),
+        };
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, source, filter, action, occurrence, lifetime);
+        Err("monitor.register unavailable on this platform".to_string())
+    }
+}
+
+/// Remove through a fresh live Control attachment. The daemon receipt keeps
+/// not-found and other structured refusals as ordinary typed outcome data.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn monitor_remove(
+    session_id: String,
+    monitor_id: String,
+) -> Result<MonitorRemoveReceiptV1, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = monitor_provider_session_id(session_id).await?;
+        let features = BTreeSet::from([FEATURE_MONITOR_CONTROL_V1.to_string()]);
+        let attachment = workflow_control_attachment(&provider_session_id, &features)
+            .await
+            .map_err(|error| error.message)?;
+        let response = fleet_request(
+            "monitor.remove",
+            monitor_remove_request(
+                config_command_id("monitor-remove"),
+                attachment.session_id.clone(),
+                attachment.worker_generation,
+                monitor_id,
+            ),
+            Capability::Control,
+            FEATURE_MONITOR_CONTROL_V1,
+        )
+        .await;
+        let result = match response {
+            Ok(body) => monitor_remove_response(body),
+            Err(error) => Err(error),
+        };
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, monitor_id);
+        Err("monitor.remove unavailable on this platform".to_string())
+    }
+}
+
+/// Start replay strictly after the greatest fully applied journal cursor.
+/// Tauri accepts a decimal string; only the daemon-facing request uses u64.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn monitor_watch(
+    session_id: String,
+    after_cursor: String,
+) -> Result<MonitorWatchReceiptV1, String> {
+    let after_cursor = parse_monitor_watch_after_cursor(&after_cursor)?;
+    #[cfg(unix)]
+    {
+        let provider_session_id = monitor_provider_session_id(session_id).await?;
+        return monitor_watch_response(
+            fleet_request(
+                "monitor.watch",
+                monitor_watch_request(provider_session_id, after_cursor),
+                Capability::View,
+                FEATURE_MONITOR_DELIVERY_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, after_cursor);
+        Err("monitor.watch unavailable on this platform".to_string())
     }
 }
 
@@ -8985,6 +10091,34 @@ async fn run_connected(
                     publish_resident_binding(resident_binding_tx, roster_app.as_ref(), snapshot);
                 }
             }
+            WireFrame::MonitorDelivery { watch_id, report } => {
+                if connection.features.contains(FEATURE_MONITOR_DELIVERY_V1) {
+                    if let Some(app) = roster_app.as_ref() {
+                        let _ = app.emit(
+                            MONITOR_DELIVERY_EVENT,
+                            MonitorDeliveryEventV1 { watch_id, report },
+                        );
+                    }
+                }
+            }
+            WireFrame::MonitorDeliveryCaughtUp {
+                watch_id,
+                session_id,
+                high_water_cursor,
+            } => {
+                if connection.features.contains(FEATURE_MONITOR_DELIVERY_V1) {
+                    if let Some(app) = roster_app.as_ref() {
+                        let _ = app.emit(
+                            MONITOR_DELIVERY_CAUGHT_UP_EVENT,
+                            MonitorDeliveryCaughtUpEventV1 {
+                                watch_id,
+                                session_id,
+                                high_water_cursor,
+                            },
+                        );
+                    }
+                }
+            }
             WireFrame::Ping { nonce } => {
                 if write_frame(
                     stream,
@@ -9805,6 +10939,8 @@ fn wire_frame_kind(frame: &WireFrame) -> &'static str {
         WireFrame::SessionSurfaceDelta { .. } => "session_surface_delta",
         WireFrame::HaiderCodePlanStatus { .. } => "haider_code_plan_status",
         WireFrame::ResidentSessionBinding { .. } => "resident_session_binding",
+        WireFrame::MonitorDelivery { .. } => "monitor_delivery",
+        WireFrame::MonitorDeliveryCaughtUp { .. } => "monitor_delivery_caught_up",
         WireFrame::MenuAnswer { .. } => "menu_answer",
         WireFrame::Ping { .. } => "ping",
         WireFrame::Pong { .. } => "pong",
@@ -10158,6 +11294,11 @@ mod fleet_tests;
 #[allow(clippy::expect_used)]
 #[path = "haider_rpc_ade_graph_tests.rs"]
 mod graph_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_monitor_tests.rs"]
+mod monitor_tests;
 
 #[cfg(test)]
 mod tests {
