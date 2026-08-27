@@ -39,6 +39,7 @@ import SpaceSurface from "../sessions/SpaceSurface.jsx";
 import { useSpaces } from "../sessions/useSpaces.js";
 import { useLoom } from "../sessions/useLoom.js";
 import { useWorkflow } from "../sessions/useWorkflow.js";
+import { useFleet } from "../sessions/useFleet.js";
 import {
   rosterWithConfirmedSession,
 } from "../sessions/spacesController.js";
@@ -18882,6 +18883,11 @@ export default function App() {
      workflow state is never derived from the workflows list, a selected
      agent_type, or session lineage). */
   const workflowApi = useWorkflow({ enabled: authState === "authenticated" });
+  /* Subagent fleet (P2): descendant tree + drilldown + agent.message for the
+     surface's Fleet view. All four P0.5 fleet invokes live in useFleet.js;
+     reads are on-view only (no polling) and the hook settles once into
+     unavailable on a feature-gated daemon. */
+  const fleetApi = useFleet({ enabled: authState === "authenticated" });
   const readWorkflowStatus = workflowApi.status;
   useEffect(() => {
     if (authState !== "authenticated" || !activeSessionId) return;
@@ -25832,6 +25838,15 @@ export default function App() {
                           onSelectPersona={loomApi.select}
                           workflowStatusBySession={workflowApi.statusBySession}
                           workflowUnavailable={workflowApi.unavailable}
+                          fleetBySession={fleetApi.fleetBySession}
+                          fleetChildDigests={fleetApi.childDigests}
+                          fleetError={fleetApi.error}
+                          fleetLoading={fleetApi.loading}
+                          fleetUnavailable={fleetApi.unavailable}
+                          onLoadFleet={fleetApi.loadFleet}
+                          onObserveFleetChild={fleetApi.observeChild}
+                          onObserveFleetBatch={fleetApi.observeBatch}
+                          onSendAgentMessage={fleetApi.sendMessage}
                         />
                       )
                   )}

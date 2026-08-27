@@ -10,6 +10,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import styled from "styled-components";
+import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
 import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Forum } from "@styled-icons/material-rounded/Forum";
 import { Language } from "@styled-icons/material-rounded/Language";
@@ -65,6 +66,9 @@ import WorkflowStatusChip from "./WorkflowStatusChip.jsx";
 import SessionTerminal from "./SessionTerminal.jsx";
 import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
+import FleetPanel from "./FleetPanel.jsx";
+import FleetChildTranscript from "./FleetChildTranscript.jsx";
+import { findFleetNode, fleetSessionIds } from "./fleetModel.js";
 import {
   formatSessionRelativeTime,
   sessionModelProviderFallback,
@@ -157,8 +161,22 @@ export default function SessionSurface({
   onSelectPersona = null,
   workflowStatusBySession = {},
   workflowUnavailable = false,
+  fleetBySession = {},
+  fleetChildDigests = {},
+  fleetError = "",
+  fleetLoading = false,
+  fleetUnavailable = false,
+  onLoadFleet = null,
+  onObserveFleetChild = null,
+  onObserveFleetBatch = null,
+  onSendAgentMessage = null,
 }) {
   const [viewModes, setViewModes] = useState({});
+  /* Fleet drilldown selection: sessionId -> selected agent_id. Only the REAL
+     agent id from the snapshot is stored; the node view is re-resolved from
+     the CURRENT tree on every render, so a refresh never leaves a stale
+     node copy rendered. */
+  const [fleetSelected, setFleetSelected] = useState({});
   /* Spawn discipline: selecting a session never spawns anything — the Shell
      PTY mounts (and adopts/spawns) only after the Shell view is first shown
      for that session; from then on it stays warm-mounted. */
@@ -1081,6 +1099,17 @@ export default function SessionSurface({
     onShellWarm?.(id);
   }, [activeSessionId, viewModes, sessionTabs, onShellWarm]);
 
+  /* Fleet view: entering it reads the session's fleet snapshot from the
+     daemon (session.fleet). The read is on-view only — no polling — and
+     useFleet settles once into unavailable if the daemon lacks the
+     feature. */
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft") return;
+    if ((viewModes[id] || "ui") !== "fleet") return;
+    onLoadFleet?.(id);
+  }, [activeSessionId, viewModes, onLoadFleet]);
+
   /* Session-history sync, lifted from the transcript's additive callback
      (projection caught_up + cold-load state) and reported upward for the
      rail's syncing pill. Keyed per session; only the ACTIVE session's state
@@ -1710,6 +1739,19 @@ export default function SessionSurface({
               <span>Traj</span>
             </SessionViewButton>
           )}
+          {session.id !== "draft" && (
+            <SessionViewButton
+              aria-selected={activeTabIsChat && modeFor(session.id) === "fleet"}
+              data-active={activeTabIsChat && modeFor(session.id) === "fleet" ? "true" : undefined}
+              onClick={() => selectView("fleet")}
+              role="tab"
+              title="Subagents"
+              type="button"
+            >
+              <AccountTree aria-hidden="true" size={13} />
+              <span>Fleet</span>
+            </SessionViewButton>
+          )}
           {panelTabs.map((tab) => {
             const panel = PANEL_KINDS[tab.kind];
             const PanelIcon = panel?.Icon || ButtonAddIcon;
@@ -2014,6 +2056,57 @@ export default function SessionSurface({
                       <SessionTrajectory session={session} />
                     </TrajectoryHostLayer>
                   )}
+                  {/* Fleet view (P2): descendant tree + rollup chips from
+                      session.fleet, drilldown into a child's OWN transcript,
+                      agent.message composer. Presentational components only —
+                      every invoke lives in useFleet.js (AppShell-owned). */}
+                  {mode === "fleet" && session.id !== "draft" && (() => {
+                    const fleetEntry = fleetBySession[session.id];
+                    const fleetSelectedAgentId = fleetSelected[session.id] || "";
+                    const fleetSelectedNode = fleetEntry
+                      ? findFleetNode(fleetEntry.tree, fleetSelectedAgentId)
+                      : null;
+                    return (
+                      <FleetHostLayer>
+                        <FleetPanel
+                          entry={fleetEntry}
+                          error={fleetError}
+                          loading={fleetLoading}
+                          onObserveAll={() => {
+                            if (!fleetEntry) return;
+                            /* SDK bound: at most 64 ids per observe batch. */
+                            onObserveFleetBatch?.(
+                              fleetSessionIds(fleetEntry.tree).slice(0, 64),
+                            );
+                          }}
+                          onRefresh={() => onLoadFleet?.(session.id)}
+                          onSelectNode={(node) => {
+                            setFleetSelected((current) => ({
+                              ...current,
+                              [session.id]: node.agentId,
+                            }));
+                            if (node.sessionId) onObserveFleetChild?.(node.sessionId);
+                          }}
+                          onSendMessage={(node, text) => (
+                            /* agent.message addresses a DIRECT child of its
+                               session_id — so the dispatch uses the node's
+                               REAL parent_session_id from the fleet, never an
+                               assumed parent. */
+                            onSendAgentMessage?.(node.parentSessionId, node.agentId, text)
+                          )}
+                          selectedAgentId={fleetSelectedAgentId}
+                          unavailable={fleetUnavailable}
+                        />
+                        {fleetSelectedNode && (
+                          <FleetChildTranscript
+                            digest={fleetChildDigests[fleetSelectedNode.sessionId]}
+                            node={fleetSelectedNode}
+                            onObserve={() => onObserveFleetChild?.(fleetSelectedNode.sessionId)}
+                          />
+                        )}
+                      </FleetHostLayer>
+                    );
+                  })()}
                 </>
               )}
               {/* Three honest reasons to mount: you are looking at it; it is
@@ -2422,6 +2515,20 @@ const TrajectoryHostLayer = styled.div`
   min-height: 0;
   flex: 1;
   flex-direction: column;
+`;
+
+/* Fleet view host: the tree/rollup panel on top (own scroll), the selected
+   child's transcript filling the rest. */
+const FleetHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+
+  > section[aria-label="Subagents"] {
+    flex: none;
+    max-height: 45%;
+  }
 `;
 
 const ChatHostLayer = styled.div`
