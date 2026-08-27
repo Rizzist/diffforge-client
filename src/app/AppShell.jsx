@@ -38,6 +38,7 @@ import SessionSurface from "../sessions/SessionSurface.jsx";
 import SpaceSurface from "../sessions/SpaceSurface.jsx";
 import { useSpaces } from "../sessions/useSpaces.js";
 import { useLoom } from "../sessions/useLoom.js";
+import { useWorkflow } from "../sessions/useWorkflow.js";
 import {
   rosterWithConfirmedSession,
 } from "../sessions/spacesController.js";
@@ -18899,6 +18900,17 @@ export default function App() {
      cli_present, raw install states); the select receipt is the only
      binding truth the surface shows. */
   const loomApi = useLoom({ enabled: authState === "authenticated" });
+  /* Workflow / convergence graphs (P1′): catalog + instances in the rail,
+     graph_status in the surface chip. All eight invokes live in
+     useWorkflow.js; the chip shows ONLY graph_status reads (house law:
+     workflow state is never derived from the workflows list, a selected
+     agent_type, or session lineage). */
+  const workflowApi = useWorkflow({ enabled: authState === "authenticated" });
+  const readWorkflowStatus = workflowApi.status;
+  useEffect(() => {
+    if (authState !== "authenticated" || !activeSessionId) return;
+    void readWorkflowStatus(activeSessionId);
+  }, [activeSessionId, authState, readWorkflowStatus]);
   const selectUnavailableSessionTab = useCallback((sessionRef) => {
     if (!sessionRef) return;
     workspaceViewPendingTargetRef.current = null;
@@ -25353,6 +25365,17 @@ export default function App() {
                           onRegisterAgentType={loomApi.register}
                           onRefreshAgentInstall={loomApi.installStatus}
                           onRetryAgentInstall={loomApi.retry}
+                          workflowCatalog={workflowApi.catalog}
+                          workflowRecords={workflowApi.workflows}
+                          workflowInstanceById={workflowApi.instanceById}
+                          workflowStatusBySession={workflowApi.statusBySession}
+                          workflowListError={workflowApi.error}
+                          workflowUnavailable={workflowApi.unavailable}
+                          onReadWorkflowInstance={workflowApi.instance}
+                          onRegisterWorkflow={workflowApi.registerWorkflow}
+                          onPinWorkflow={workflowApi.pin}
+                          onSwitchWorkflow={workflowApi.switch}
+                          onAbandonWorkflow={workflowApi.abandon}
                         />
                       )}
                     </WorkspaceList>
@@ -25841,6 +25864,8 @@ export default function App() {
                           loomAgentTypes={loomApi.agentTypes}
                           loomPersonaBySession={loomApi.personaBySession}
                           onSelectPersona={loomApi.select}
+                          workflowStatusBySession={workflowApi.statusBySession}
+                          workflowUnavailable={workflowApi.unavailable}
                         />
                       )
                   )}

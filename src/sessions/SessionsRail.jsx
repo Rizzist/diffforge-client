@@ -29,6 +29,7 @@ import { SessionAvailabilityAffordance } from "./sessionAvailability.js";
 import { spaceRailRowAuthority } from "./spacesController.js";
 import SpacesRailSection from "./SpacesRailSection.jsx";
 import LoomRailSection from "./LoomRailSection.jsx";
+import WorkflowRailSection from "./WorkflowRailSection.jsx";
 import { ModelBrandIcon } from "./modelBrand.jsx";
 
 /* Session Deck rail list: a prominent "New chat" compose row on top, then
@@ -73,6 +74,17 @@ export default function SessionsRail({
   onRegisterAgentType = null,
   onRefreshAgentInstall = null,
   onRetryAgentInstall = null,
+  workflowCatalog = { kind: "unread", entries: [] },
+  workflowRecords = [],
+  workflowInstanceById = {},
+  workflowStatusBySession = {},
+  workflowListError = "",
+  workflowUnavailable = false,
+  onReadWorkflowInstance = null,
+  onRegisterWorkflow = null,
+  onPinWorkflow = null,
+  onSwitchWorkflow = null,
+  onAbandonWorkflow = null,
 }) {
   /* Relative times tick once a minute while the rail is mounted. */
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -481,6 +493,20 @@ export default function SessionsRail({
           onRegister={onRegisterAgentType}
           onRetryInstall={onRetryAgentInstall}
           unavailable={loomUnavailable}
+        />
+        <WorkflowRailSection
+          activeSessionId={activeSessionId}
+          catalog={workflowCatalog}
+          instanceById={workflowInstanceById}
+          listError={workflowListError}
+          onAbandon={onAbandonWorkflow}
+          onPin={onPinWorkflow}
+          onReadInstance={onReadWorkflowInstance}
+          onRegisterWorkflow={onRegisterWorkflow}
+          onSwitch={onSwitchWorkflow}
+          statusBySession={workflowStatusBySession}
+          unavailable={workflowUnavailable}
+          workflows={workflowRecords}
         />
         {pinned.length > 0 && (
           <SessionGroup>

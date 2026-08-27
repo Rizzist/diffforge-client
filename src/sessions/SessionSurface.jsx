@@ -61,6 +61,7 @@ import {
   sessionBindingAnnouncement,
 } from "./sessionTerminalBinding.js";
 import SessionPersonaSelect from "./SessionPersonaSelect.jsx";
+import WorkflowStatusChip from "./WorkflowStatusChip.jsx";
 import SessionTerminal from "./SessionTerminal.jsx";
 import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
@@ -154,6 +155,8 @@ export default function SessionSurface({
   loomAgentTypes = [],
   loomPersonaBySession = {},
   onSelectPersona = null,
+  workflowStatusBySession = {},
+  workflowUnavailable = false,
 }) {
   const [viewModes, setViewModes] = useState({});
   /* Spawn discipline: selecting a session never spawns anything — the Shell
@@ -1773,6 +1776,17 @@ export default function SessionSurface({
             binding={loomPersonaBySession[session.id]}
             onSelect={onSelectPersona}
             sessionId={session.id}
+          />
+        )}
+        {/* Workflow indicator beside the persona select. DISPLAY-ONLY, and
+            its state is ONLY what graph_status reported for this session
+            (never the workflows list, the persona, or lineage). An UNSEEN
+            read stays undefined — it is never collapsed into a "No
+            workflow" claim for a status we never read. */}
+        {session && session.id !== "draft" && (
+          <WorkflowStatusChip
+            statusView={workflowStatusBySession[session.id]}
+            unavailable={workflowUnavailable}
           />
         )}
         <HeaderIconButton
