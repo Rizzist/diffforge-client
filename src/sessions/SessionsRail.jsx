@@ -28,6 +28,7 @@ import {
 import { SessionAvailabilityAffordance } from "./sessionAvailability.js";
 import { spaceRailRowAuthority } from "./spacesController.js";
 import SpacesRailSection from "./SpacesRailSection.jsx";
+import LoomRailSection from "./LoomRailSection.jsx";
 import { ModelBrandIcon } from "./modelBrand.jsx";
 
 /* Session Deck rail list: a prominent "New chat" compose row on top, then
@@ -64,6 +65,14 @@ export default function SessionsRail({
   onEnterSpace = null,
   onExitSpace = null,
   onSelectSpaceSession = null,
+  loomAgentTypes = [],
+  loomCliPresent = {},
+  loomInstallByType = {},
+  loomListError = "",
+  loomUnavailable = false,
+  onRegisterAgentType = null,
+  onRefreshAgentInstall = null,
+  onRetryAgentInstall = null,
 }) {
   /* Relative times tick once a minute while the rail is mounted. */
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -462,6 +471,16 @@ export default function SessionsRail({
           onExitSpace={onExitSpace}
           onRenameSpace={onRenameSpace}
           spaces={spaces}
+        />
+        <LoomRailSection
+          agentTypes={loomAgentTypes}
+          cliPresent={loomCliPresent}
+          installByType={loomInstallByType}
+          listError={loomListError}
+          onRefreshInstall={onRefreshAgentInstall}
+          onRegister={onRegisterAgentType}
+          onRetryInstall={onRetryAgentInstall}
+          unavailable={loomUnavailable}
         />
         {pinned.length > 0 && (
           <SessionGroup>

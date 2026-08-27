@@ -37,6 +37,7 @@ import SessionsRail from "../sessions/SessionsRail.jsx";
 import SessionSurface from "../sessions/SessionSurface.jsx";
 import SpaceSurface from "../sessions/SpaceSurface.jsx";
 import { useSpaces } from "../sessions/useSpaces.js";
+import { useLoom } from "../sessions/useLoom.js";
 import {
   rosterWithConfirmedSession,
 } from "../sessions/spacesController.js";
@@ -18893,6 +18894,11 @@ export default function App() {
     restoreActiveSpaceAtBoot,
     trackWindowBreakout: trackSpaceWindowBreakoutOp,
   } = spacesApi;
+  /* Loom agent types: registry rail section + per-session persona binding.
+     The hook carries daemon facts through loomModel verbatim (tri-state
+     cli_present, raw install states); the select receipt is the only
+     binding truth the surface shows. */
+  const loomApi = useLoom({ enabled: authState === "authenticated" });
   const selectUnavailableSessionTab = useCallback((sessionRef) => {
     if (!sessionRef) return;
     workspaceViewPendingTargetRef.current = null;
@@ -25339,6 +25345,14 @@ export default function App() {
                           onEnterSpace={enterSpaceFromRail}
                           onExitSpace={spacesApi.exitSpace}
                           onSelectSpaceSession={selectSpaceSessionFromRail}
+                          loomAgentTypes={loomApi.agentTypes}
+                          loomCliPresent={loomApi.cliPresent}
+                          loomInstallByType={loomApi.installByType}
+                          loomListError={loomApi.error}
+                          loomUnavailable={loomApi.unavailable}
+                          onRegisterAgentType={loomApi.register}
+                          onRefreshAgentInstall={loomApi.installStatus}
+                          onRetryAgentInstall={loomApi.retry}
                         />
                       )}
                     </WorkspaceList>
@@ -25824,6 +25838,9 @@ export default function App() {
                           openSessions={openSessions}
                           planKey={String(planLabel || "free").toLowerCase()}
                           sessions={sessions}
+                          loomAgentTypes={loomApi.agentTypes}
+                          loomPersonaBySession={loomApi.personaBySession}
+                          onSelectPersona={loomApi.select}
                         />
                       )
                   )}

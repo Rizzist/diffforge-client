@@ -60,6 +60,7 @@ import {
   initialSessionBindingState,
   sessionBindingAnnouncement,
 } from "./sessionTerminalBinding.js";
+import SessionPersonaSelect from "./SessionPersonaSelect.jsx";
 import SessionTerminal from "./SessionTerminal.jsx";
 import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
@@ -150,6 +151,9 @@ export default function SessionSurface({
   openSessions,
   planKey = "free",
   sessions = [],
+  loomAgentTypes = [],
+  loomPersonaBySession = {},
+  onSelectPersona = null,
 }) {
   const [viewModes, setViewModes] = useState({});
   /* Spawn discipline: selecting a session never spawns anything — the Shell
@@ -1757,6 +1761,19 @@ export default function SessionSurface({
             <i aria-hidden="true" />
             <span>{availability?.label || statusLine}</span>
           </StatusPill>
+        )}
+        {/* Persona binding control beside the status pill. A binding is NOT
+            readiness: the pill keeps sole authority over run state, and the
+            select's own labeling says persona-only. An UNSEEN receipt stays
+            undefined (binding unknown) — it is never collapsed to null, which
+            would falsely claim "No persona". */}
+        {session && session.id !== "draft" && (
+          <SessionPersonaSelect
+            agentTypes={loomAgentTypes}
+            binding={loomPersonaBySession[session.id]}
+            onSelect={onSelectPersona}
+            sessionId={session.id}
+          />
         )}
         <HeaderIconButton
           aria-label={appThemeIsLight ? "Switch to dark theme" : "Switch to light theme"}
