@@ -6742,6 +6742,8 @@ fn run_app(daemon: bool) {
             haider_rpc_ade::monitor_register,
             haider_rpc_ade::monitor_remove,
             haider_rpc_ade::monitor_watch,
+            haider_rpc_ade::session_descendants_attach,
+            haider_rpc_ade::session_descendants_detach,
             haider_rpc_ade::loom_list,
             haider_rpc_ade::loom_register_agent_type,
             haider_rpc_ade::loom_install_status,

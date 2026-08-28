@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         OnceLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -82,6 +82,7 @@ const FEATURE_TYPED_AGENT_INSTALL_V1: &str = "typed_agent_install_v1";
 const FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1: &str = "typed_agent_install_control_v1";
 const FEATURE_SESSION_AGENT_TYPE_SELECT_V1: &str = "session_agent_type_select_v1";
 const FEATURE_SESSION_LINEAGE_V1: &str = "session_lineage_v1";
+const FEATURE_SESSION_DESCENDANT_STREAM_V1: &str = "session_descendant_stream_v1";
 const FEATURE_MONITOR_CONTROL_V1: &str = "monitor_control_v1";
 const FEATURE_MONITOR_DELIVERY_V1: &str = "monitor_delivery_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
@@ -111,6 +112,8 @@ const RESIDENT_SESSION_BINDING_EVENT: &str = "resident-session-binding";
 const TOKENOMICS_UPDATED_EVENT: &str = "diffforge://tokenomics-updated";
 const MONITOR_DELIVERY_EVENT: &str = "monitor-delivery";
 const MONITOR_DELIVERY_CAUGHT_UP_EVENT: &str = "monitor-delivery-caught-up";
+const SESSION_DESCENDANT_STREAM_EVENT: &str = "session-descendant-stream";
+const SESSION_DESCENDANT_REPAIR_EVENT: &str = "session-descendant-repair";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const FEATURE_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
@@ -670,6 +673,154 @@ pub struct SessionFleetSnapshot {
     pub roots: Vec<FleetNodeWire>,
     pub rollup: FleetRollupWire,
     pub truncated: bool,
+}
+
+/// One child-journal reconnect coordinate accepted from Tauri. The decimal
+/// string keeps JavaScript from rounding a sequence above 2^53 before Rust
+/// can checked-parse it for the daemon wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescendantReplayCursor {
+    pub session_id: String,
+    pub agent_id: String,
+    pub after_seq: String,
+}
+
+/// Daemon-facing form of a descendant replay cursor. Both lineage
+/// coordinates remain mandatory and independent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DescendantReplayCursorWire {
+    session_id: String,
+    agent_id: String,
+    after_seq: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescendantIdentity {
+    pub session_id: String,
+    pub agent_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescendantFanout {
+    pub requested_children: u32,
+    pub accepted_children: u32,
+    pub hard_limit: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescendantTruncation {
+    pub truncated: bool,
+    pub streamed_children: u32,
+    pub omitted_children: u32,
+    pub count_complete: bool,
+}
+
+fn descendant_sequence_field(field: &str) -> bool {
+    field == "seq"
+        || field.ends_with("_seq")
+        || field == "sequence"
+        || field.ends_with("_sequence")
+        || field == "cursor"
+        || field.ends_with("_cursor")
+}
+
+/// Preserve deep daemon records as JSON while converting sequence-bearing
+/// unsigned integers at the Tauri boundary. Unknown node states, change
+/// kinds, event variants, and additive fields are otherwise untouched.
+fn descendant_tauri_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(descendant_tauri_value).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(field, value)| {
+                    let value = if descendant_sequence_field(field) {
+                        value
+                            .as_u64()
+                            .map(|sequence| Value::String(sequence.to_string()))
+                            .unwrap_or_else(|| descendant_tauri_value(value))
+                    } else {
+                        descendant_tauri_value(value)
+                    };
+                    (field.clone(), value)
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn serialize_descendant_values<S>(values: &[Value], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    values
+        .iter()
+        .map(descendant_tauri_value)
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+fn serialize_descendant_value<S>(value: &Value, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    descendant_tauri_value(value).serialize(serializer)
+}
+
+fn serialize_descendant_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.collect_str(value)
+}
+
+/// Typed attachment baseline shell. Nodes stay raw so this SDK does not
+/// become a second protocol enum implementation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionDescendantBaseline {
+    pub session_id: String,
+    pub generated_at_ms: u64,
+    pub fanout: DescendantFanout,
+    pub truncation: DescendantTruncation,
+    #[serde(default, serialize_with = "serialize_descendant_values")]
+    pub roots: Vec<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SessionDescendantsAttachment {
+    pub attachment_id: String,
+    pub baseline: SessionDescendantBaseline,
+    /// SDK-local forwarding-loss counter sampled immediately before attach.
+    /// It is not a daemon baseline field and never advances a child cursor.
+    #[serde(serialize_with = "serialize_descendant_u64")]
+    pub lost_events_at_attach: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct SessionDescendantStreamPayload {
+    attachment_id: String,
+    #[serde(serialize_with = "serialize_descendant_value")]
+    event: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionDescendantRepairPayload {
+    attachment_id: String,
+    children: Vec<DescendantIdentity>,
+}
+
+impl Serialize for SessionDescendantRepairPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_json::json!({
+            "attachment_id": &self.attachment_id,
+            "children": &self.children,
+        })
+        .serialize(serializer)
+    }
 }
 
 /// How the daemon delivered one parent-authored child message. Unknown
@@ -2966,6 +3117,15 @@ enum RequestBody {
         after_cursor: u64,
         limit: u32,
     },
+    /// Opens a reconnectable read-only stream over durable descendant
+    /// journals. Every cursor is scoped by both child identities.
+    #[serde(rename = "session.descendants.attach")]
+    SessionDescendantsAttach {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cursors: Vec<DescendantReplayCursorWire>,
+        max_children: u32,
+    },
     #[serde(rename = "monitor.list")]
     MonitorList { session_id: String },
     #[serde(rename = "monitor.register")]
@@ -3335,6 +3495,11 @@ enum ResponseBody {
     },
     #[serde(rename = "workflow.graph.watch")]
     WorkflowGraphWatch { page: WorkflowGraphWatchPageV1 },
+    #[serde(rename = "session.descendants.attach")]
+    SessionDescendantsAttach {
+        attachment_id: String,
+        baseline: SessionDescendantBaseline,
+    },
     #[serde(rename = "monitor.list")]
     MonitorList { receipt: MonitorListReceiptV1 },
     #[serde(rename = "monitor.register")]
@@ -3688,6 +3853,17 @@ enum WireFrame {
         watch_id: String,
         session_id: String,
         high_water_cursor: u64,
+    },
+    /// Raw event records preserve future event/change/state vocabulary.
+    SessionDescendantStream {
+        attachment_id: String,
+        event: Value,
+    },
+    /// Terminal repair identifies children but deliberately carries no
+    /// daemon or client sequence coordinate.
+    SessionDescendantRepairRequired {
+        attachment_id: String,
+        children: Vec<DescendantIdentity>,
     },
     MenuAnswer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4182,6 +4358,88 @@ impl Subscription {
     }
 }
 
+/// Counts connection loss or local emission failures that can invalidate a
+/// previously returned descendant live view. It is sampled before each
+/// attach and is never interpreted as a journal coordinate.
+static DESCENDANT_LOST_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+struct DescendantForwarders {
+    by_attachment: HashMap<String, AppHandle>,
+}
+
+#[cfg(unix)]
+impl DescendantForwarders {
+    fn new() -> Self {
+        Self {
+            by_attachment: HashMap::new(),
+        }
+    }
+
+    fn contains(&self, attachment_id: &str) -> bool {
+        self.by_attachment.contains_key(attachment_id)
+    }
+
+    fn insert(&mut self, attachment_id: String, app: AppHandle) {
+        self.by_attachment.insert(attachment_id, app);
+    }
+
+    fn remove(&mut self, attachment_id: &str) {
+        self.by_attachment.remove(attachment_id);
+    }
+
+    fn emit_stream(&self, attachment_id: String, event: Value) {
+        let Some(app) = self.by_attachment.get(&attachment_id) else {
+            DESCENDANT_LOST_EVENTS.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if app
+            .emit_to(
+                "main",
+                SESSION_DESCENDANT_STREAM_EVENT,
+                SessionDescendantStreamPayload {
+                    attachment_id,
+                    event,
+                },
+            )
+            .is_err()
+        {
+            DESCENDANT_LOST_EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn emit_repair(&mut self, attachment_id: String, children: Vec<DescendantIdentity>) {
+        let Some(app) = self.by_attachment.remove(&attachment_id) else {
+            DESCENDANT_LOST_EVENTS.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if app
+            .emit_to(
+                "main",
+                SESSION_DESCENDANT_REPAIR_EVENT,
+                SessionDescendantRepairPayload {
+                    attachment_id,
+                    children,
+                },
+            )
+            .is_err()
+        {
+            DESCENDANT_LOST_EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DescendantForwarders {
+    fn drop(&mut self) {
+        if !self.by_attachment.is_empty() {
+            // A connection ended while one or more live views still existed.
+            // One monotonic gap signal is sufficient; it is not a loss count.
+            DESCENDANT_LOST_EVENTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 #[cfg(unix)]
 type RpcReply = oneshot::Sender<Option<Result<ResponseBody, String>>>;
 
@@ -4202,6 +4460,26 @@ enum RpcErrorStyle {
 
 #[cfg(unix)]
 type PendingRpcRequest = (RpcReply, RpcErrorStyle);
+
+#[cfg(unix)]
+type DescendantAttachReply = oneshot::Sender<Result<SessionDescendantsAttachment, String>>;
+
+#[cfg(unix)]
+type DescendantDetachReply = oneshot::Sender<Result<(), String>>;
+
+#[cfg(unix)]
+struct PendingDescendantAttach {
+    app: AppHandle,
+    session_id: String,
+    lost_events_at_attach: u64,
+    reply: DescendantAttachReply,
+}
+
+#[cfg(unix)]
+struct PendingDescendantDetach {
+    attachment_id: String,
+    reply: DescendantDetachReply,
+}
 
 #[cfg(unix)]
 enum ActorCommand {
@@ -4226,6 +4504,17 @@ enum ActorCommand {
         features: FeatureGate,
         error_style: RpcErrorStyle,
         reply: RpcReply,
+    },
+    DescendantAttach {
+        app: AppHandle,
+        session_id: String,
+        cursors: Vec<DescendantReplayCursorWire>,
+        max_children: u32,
+        reply: DescendantAttachReply,
+    },
+    DescendantDetach {
+        attachment_id: String,
+        reply: DescendantDetachReply,
     },
     MenuAnswer {
         command_id: String,
@@ -5422,6 +5711,90 @@ fn monitor_list_request(session_id: String) -> RequestBody {
     RequestBody::MonitorList { session_id }
 }
 
+fn parse_descendant_after_seq(after_seq: &str) -> Result<u64, String> {
+    if after_seq.is_empty() || !after_seq.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(
+            "session.descendants.attach after_seq must be a decimal u64 string".to_string(),
+        );
+    }
+    after_seq.parse::<u64>().map_err(|_| {
+        "session.descendants.attach after_seq must be a decimal u64 string".to_string()
+    })
+}
+
+fn descendant_replay_cursors_wire(
+    cursors: Vec<DescendantReplayCursor>,
+) -> Result<Vec<DescendantReplayCursorWire>, String> {
+    cursors
+        .into_iter()
+        .map(|cursor| {
+            if cursor.session_id.is_empty() || cursor.agent_id.is_empty() {
+                return Err(
+                    "session.descendants.attach cursors require session_id and agent_id"
+                        .to_string(),
+                );
+            }
+            Ok(DescendantReplayCursorWire {
+                session_id: cursor.session_id,
+                agent_id: cursor.agent_id,
+                after_seq: parse_descendant_after_seq(&cursor.after_seq)?,
+            })
+        })
+        .collect()
+}
+
+fn session_descendants_attach_request(
+    session_id: String,
+    cursors: Vec<DescendantReplayCursorWire>,
+    max_children: u32,
+) -> RequestBody {
+    RequestBody::SessionDescendantsAttach {
+        session_id,
+        cursors,
+        max_children,
+    }
+}
+
+fn session_descendants_attach_response(
+    body: ResponseBody,
+    expected_session_id: &str,
+    lost_events_at_attach: u64,
+) -> Result<SessionDescendantsAttachment, String> {
+    match body {
+        ResponseBody::SessionDescendantsAttach {
+            attachment_id,
+            baseline,
+        } if baseline.session_id == expected_session_id => Ok(SessionDescendantsAttachment {
+            attachment_id,
+            baseline,
+            lost_events_at_attach,
+        }),
+        ResponseBody::SessionDescendantsAttach { .. } => {
+            Err("session.descendants.attach response baseline session mismatch".to_string())
+        }
+        ResponseBody::Error { code, .. } => Err(code),
+        _ => Err("session.descendants.attach response method mismatch".to_string()),
+    }
+}
+
+fn session_descendants_detach_response(
+    body: ResponseBody,
+    expected_attachment_id: &str,
+) -> Result<(), String> {
+    match body {
+        ResponseBody::SessionDetach { attachment_id }
+            if attachment_id == expected_attachment_id =>
+        {
+            Ok(())
+        }
+        ResponseBody::SessionDetach { .. } => {
+            Err("session.detach response attachment mismatch".to_string())
+        }
+        ResponseBody::Error { code, .. } => Err(code),
+        _ => Err("session.detach response method mismatch".to_string()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn monitor_register_request(
     command_id: String,
@@ -6213,6 +6586,79 @@ pub async fn session_fleet(session_id: String) -> Result<SessionFleetSnapshot, S
     {
         let _ = session_id;
         Err("session.fleet unavailable on this platform".to_string())
+    }
+}
+
+/// Attach the invoking webview to the daemon's reconnectable descendant
+/// stream. Registration happens in the socket actor before the correlated
+/// response is released, so buffered pushes cannot overtake the forwarder.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_descendants_attach(
+    app: AppHandle,
+    session_id: String,
+    cursors: Vec<DescendantReplayCursor>,
+    max_children: u32,
+) -> Result<SessionDescendantsAttachment, String> {
+    if max_children == 0 {
+        return Err("session.descendants.attach max_children must be positive".to_string());
+    }
+    let cursors = descendant_replay_cursors_wire(cursors)?;
+    #[cfg(unix)]
+    {
+        let session_id = fleet_provider_session_id(session_id).await?;
+        let (reply, answer) = oneshot::channel();
+        actor_handle()
+            .commands
+            .send(ActorCommand::DescendantAttach {
+                app,
+                session_id,
+                cursors,
+                max_children,
+                reply,
+            })
+            .map_err(|_| "session.descendants.attach actor is unavailable".to_string())?;
+        return match tokio::time::timeout(COMMAND_REPLY_TIMEOUT, answer).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(
+                "session.descendants.attach actor dropped its response confirmation".to_string(),
+            ),
+            Err(_) => Err("session.descendants.attach did not respond in time".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, session_id, cursors, max_children);
+        Err("session.descendants.attach unavailable on this platform".to_string())
+    }
+}
+
+/// End a descendant attachment owned by this ADE connection. The actor keeps
+/// forwarding until the daemon's detach barrier echoes the same id, then
+/// removes the local attachment bookkeeping before returning.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_descendants_detach(attachment_id: String) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let (reply, answer) = oneshot::channel();
+        actor_handle()
+            .commands
+            .send(ActorCommand::DescendantDetach {
+                attachment_id,
+                reply,
+            })
+            .map_err(|_| "session_descendants_detach actor is unavailable".to_string())?;
+        return match tokio::time::timeout(COMMAND_REPLY_TIMEOUT, answer).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                Err("session_descendants_detach actor dropped its confirmation".to_string())
+            }
+            Err(_) => Err("session_descendants_detach did not respond in time".to_string()),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = attachment_id;
+        Err("session_descendants_detach unavailable on this platform".to_string())
     }
 }
 
@@ -9787,6 +10233,16 @@ fn apply_disconnected_command(
         ActorCommand::RpcRequest { reply, .. } => {
             let _ = reply.send(None);
         }
+        ActorCommand::DescendantAttach { reply, .. } => {
+            let _ = reply.send(Err(
+                "session.descendants.attach unavailable: no ADE connection".to_string(),
+            ));
+        }
+        ActorCommand::DescendantDetach { reply, .. } => {
+            let _ = reply.send(Err(
+                "session_descendants_detach unavailable: no ADE connection".to_string(),
+            ));
+        }
         ActorCommand::MenuAnswer { reply, .. } => {
             let _ = reply.send(None);
         }
@@ -9832,6 +10288,9 @@ async fn run_connected(
     let mut unacked_pings: VecDeque<(u64, Instant)> = VecDeque::new();
     let mut pending_requests: HashMap<String, PendingRpcRequest> = HashMap::new();
     let mut pending_queue_attaches: HashMap<String, String> = HashMap::new();
+    let mut pending_descendant_attaches: HashMap<String, PendingDescendantAttach> = HashMap::new();
+    let mut pending_descendant_detaches: HashMap<String, PendingDescendantDetach> = HashMap::new();
+    let mut descendant_forwarders = DescendantForwarders::new();
     let mut pending_account_roster_watch = None;
     let mut account_roster_watch_waiters = Vec::new();
     let mut decoder = StreamingFrameDecoder::default();
@@ -9919,6 +10378,9 @@ async fn run_connected(
                             account_roster_window,
                             &mut pending_requests,
                             &mut pending_queue_attaches,
+                            &mut pending_descendant_attaches,
+                            &mut pending_descendant_detaches,
+                            &mut descendant_forwarders,
                             &mut pending_account_roster_watch,
                             &mut account_roster_watch_waiters,
                             next_request,
@@ -9970,7 +10432,9 @@ async fn run_connected(
                     let state = match account_watch_state_from_response(body) {
                         Ok(state) => state,
                         Err(reason) => {
-                            eprintln!("[ade-rpc] dropping malformed account.list_watch response: {reason}");
+                            eprintln!(
+                                "[ade-rpc] dropping malformed account.list_watch response: {reason}"
+                            );
                             AccountRosterWatchState::unavailable(reason)
                         }
                     };
@@ -9986,6 +10450,50 @@ async fn run_connected(
                 }
                 if let Some(session_id) = pending_queue_attaches.remove(&request_id) {
                     finish_queue_watch(subscriptions, session_id, body);
+                    continue;
+                }
+                if let Some(pending) = pending_descendant_attaches.remove(&request_id) {
+                    let cleanup_attachment_id = match &body {
+                        ResponseBody::SessionDescendantsAttach {
+                            attachment_id,
+                            baseline,
+                        } if baseline.session_id != pending.session_id => {
+                            Some(attachment_id.clone())
+                        }
+                        _ => None,
+                    };
+                    let result = session_descendants_attach_response(
+                        body,
+                        &pending.session_id,
+                        pending.lost_events_at_attach,
+                    );
+                    if let Ok(attachment) = &result {
+                        // This registration precedes resolving the command,
+                        // and therefore precedes the next buffered push.
+                        descendant_forwarders.insert(attachment.attachment_id.clone(), pending.app);
+                    }
+                    if let Some(attachment_id) = cleanup_attachment_id {
+                        let cleanup = WireFrame::Request {
+                            request_id: self::request_id(next_request),
+                            body: RequestBody::SessionDetach { attachment_id },
+                        };
+                        if write_frame(stream, &cleanup, connection.frame_limit, encoding)
+                            .await
+                            .is_err()
+                        {
+                            let _ = pending.reply.send(result);
+                            return;
+                        }
+                    }
+                    let _ = pending.reply.send(result);
+                    continue;
+                }
+                if let Some(pending) = pending_descendant_detaches.remove(&request_id) {
+                    let result = session_descendants_detach_response(body, &pending.attachment_id);
+                    if result.is_ok() {
+                        descendant_forwarders.remove(&pending.attachment_id);
+                    }
+                    let _ = pending.reply.send(result);
                     continue;
                 }
                 if let ResponseBody::SessionSurfaceWatching {
@@ -10119,6 +10627,28 @@ async fn run_connected(
                     }
                 }
             }
+            WireFrame::SessionDescendantStream {
+                attachment_id,
+                event,
+            } => {
+                if connection
+                    .features
+                    .contains(FEATURE_SESSION_DESCENDANT_STREAM_V1)
+                {
+                    descendant_forwarders.emit_stream(attachment_id, event);
+                }
+            }
+            WireFrame::SessionDescendantRepairRequired {
+                attachment_id,
+                children,
+            } => {
+                if connection
+                    .features
+                    .contains(FEATURE_SESSION_DESCENDANT_STREAM_V1)
+                {
+                    descendant_forwarders.emit_repair(attachment_id, children);
+                }
+            }
             WireFrame::Ping { nonce } => {
                 if write_frame(
                     stream,
@@ -10160,6 +10690,9 @@ async fn apply_connected_command(
     account_roster_window: &mut Option<tauri::WebviewWindow>,
     pending_requests: &mut HashMap<String, PendingRpcRequest>,
     pending_queue_attaches: &mut HashMap<String, String>,
+    pending_descendant_attaches: &mut HashMap<String, PendingDescendantAttach>,
+    pending_descendant_detaches: &mut HashMap<String, PendingDescendantDetach>,
+    descendant_forwarders: &mut DescendantForwarders,
     pending_account_roster_watch: &mut Option<String>,
     account_roster_watch_waiters: &mut Vec<AccountRosterWatchReply>,
     next_request: &mut u64,
@@ -10326,6 +10859,98 @@ async fn apply_connected_command(
                 return false;
             }
             pending_requests.insert(request_id, (reply, error_style));
+            true
+        }
+        ActorCommand::DescendantAttach {
+            app,
+            session_id,
+            cursors,
+            max_children,
+            reply,
+        } => {
+            if !connection.grants(Capability::View) {
+                let _ = reply.send(Err("capability_denied".to_string()));
+                return true;
+            }
+            if !connection
+                .features
+                .contains(FEATURE_SESSION_DESCENDANT_STREAM_V1)
+            {
+                let _ = reply.send(Err(format!(
+                    "missing_feature: daemon does not advertise {FEATURE_SESSION_DESCENDANT_STREAM_V1}"
+                )));
+                return true;
+            }
+            let lost_events_at_attach = DESCENDANT_LOST_EVENTS.load(Ordering::Relaxed);
+            let request_id = request_id(next_request);
+            let request = WireFrame::Request {
+                request_id: request_id.clone(),
+                body: session_descendants_attach_request(session_id.clone(), cursors, max_children),
+            };
+            if write_frame(stream, &request, connection.frame_limit, encoding)
+                .await
+                .is_err()
+            {
+                let _ = reply.send(Err(
+                    "session.descendants.attach request could not be written".to_string(),
+                ));
+                return false;
+            }
+            pending_descendant_attaches.insert(
+                request_id,
+                PendingDescendantAttach {
+                    app,
+                    session_id,
+                    lost_events_at_attach,
+                    reply,
+                },
+            );
+            true
+        }
+        ActorCommand::DescendantDetach {
+            attachment_id,
+            reply,
+        } => {
+            if !connection.grants(Capability::View) {
+                let _ = reply.send(Err("capability_denied".to_string()));
+                return true;
+            }
+            if !connection
+                .features
+                .contains(FEATURE_SESSION_DESCENDANT_STREAM_V1)
+            {
+                let _ = reply.send(Err(format!(
+                    "missing_feature: daemon does not advertise {FEATURE_SESSION_DESCENDANT_STREAM_V1}"
+                )));
+                return true;
+            }
+            if !descendant_forwarders.contains(&attachment_id) {
+                let _ = reply.send(Err("not_found".to_string()));
+                return true;
+            }
+            let request_id = request_id(next_request);
+            let request = WireFrame::Request {
+                request_id: request_id.clone(),
+                body: RequestBody::SessionDetach {
+                    attachment_id: attachment_id.clone(),
+                },
+            };
+            if write_frame(stream, &request, connection.frame_limit, encoding)
+                .await
+                .is_err()
+            {
+                let _ = reply.send(Err(
+                    "session_descendants_detach request could not be written".to_string(),
+                ));
+                return false;
+            }
+            pending_descendant_detaches.insert(
+                request_id,
+                PendingDescendantDetach {
+                    attachment_id,
+                    reply,
+                },
+            );
             true
         }
         ActorCommand::MenuAnswer {
@@ -10941,6 +11566,8 @@ fn wire_frame_kind(frame: &WireFrame) -> &'static str {
         WireFrame::ResidentSessionBinding { .. } => "resident_session_binding",
         WireFrame::MonitorDelivery { .. } => "monitor_delivery",
         WireFrame::MonitorDeliveryCaughtUp { .. } => "monitor_delivery_caught_up",
+        WireFrame::SessionDescendantStream { .. } => "session_descendant_stream",
+        WireFrame::SessionDescendantRepairRequired { .. } => "session_descendant_repair_required",
         WireFrame::MenuAnswer { .. } => "menu_answer",
         WireFrame::Ping { .. } => "ping",
         WireFrame::Pong { .. } => "pong",
@@ -11299,6 +11926,11 @@ mod graph_tests;
 #[allow(clippy::expect_used)]
 #[path = "haider_rpc_ade_monitor_tests.rs"]
 mod monitor_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_descendant_tests.rs"]
+mod descendant_tests;
 
 #[cfg(test)]
 mod tests {
