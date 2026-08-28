@@ -40,6 +40,7 @@ import { useSpaces } from "../sessions/useSpaces.js";
 import { useLoom } from "../sessions/useLoom.js";
 import { useWorkflow } from "../sessions/useWorkflow.js";
 import { useFleet } from "../sessions/useFleet.js";
+import { useDescendantStream } from "../sessions/useDescendantStream.js";
 import { useMonitor } from "../sessions/useMonitor.js";
 import { useWorkflowGraph } from "../sessions/useWorkflowGraph.js";
 import {
@@ -18890,6 +18891,9 @@ export default function App() {
      reads are on-view only (no polling) and the hook settles once into
      unavailable on a feature-gated daemon. */
   const fleetApi = useFleet({ enabled: authState === "authenticated" });
+  /* Live descendant upgrade for Fleet. The snapshot hook above remains the
+     explicitly labeled fallback and continues to own drilldown/dispatch. */
+  const descendantApi = useDescendantStream({ enabled: authState === "authenticated" });
   /* Monitor manager (P4): the per-session registry and delivery watch for
      the surface's Monitors view. All four monitor invokes live in
      useMonitor.js and the feature-gated daemon settles unavailable once. */
@@ -25860,6 +25864,15 @@ export default function App() {
                           onObserveFleetChild={fleetApi.observeChild}
                           onObserveFleetBatch={fleetApi.observeBatch}
                           onSendAgentMessage={fleetApi.sendMessage}
+                          descendantEntry={descendantApi.entry}
+                          descendantError={descendantApi.error}
+                          descendantLoading={descendantApi.loading}
+                          descendantMode={descendantApi.mode}
+                          descendantRepair={descendantApi.repair}
+                          descendantSessionId={descendantApi.sessionId}
+                          onReconnectDescendantStream={descendantApi.reconnect}
+                          onStartDescendantStream={descendantApi.start}
+                          onStopDescendantStream={descendantApi.stop}
                           monitorBySession={monitorApi.bySession}
                           monitorDeliveries={monitorApi.deliveries}
                           monitorCursor={monitorApi.cursor}

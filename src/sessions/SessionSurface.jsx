@@ -174,6 +174,15 @@ export default function SessionSurface({
   onObserveFleetChild = null,
   onObserveFleetBatch = null,
   onSendAgentMessage = null,
+  descendantEntry = null,
+  descendantError = "",
+  descendantLoading = false,
+  descendantMode = "unavailable",
+  descendantRepair = null,
+  descendantSessionId = "",
+  onReconnectDescendantStream = null,
+  onStartDescendantStream = null,
+  onStopDescendantStream = null,
   monitorBySession = {},
   monitorDeliveries = [],
   monitorCursor = null,
@@ -1131,6 +1140,26 @@ export default function SessionSurface({
     if ((viewModes[id] || "ui") !== "fleet") return;
     onLoadFleet?.(id);
   }, [activeSessionId, viewModes, onLoadFleet]);
+
+  /* The live attachment follows Fleet-view ownership exactly. The snapshot
+     read above remains mounted as the honest fallback; leaving or switching
+     sessions always detaches the live stream. */
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft" || (viewModes[id] || "ui") !== "fleet") {
+      void onStopDescendantStream?.();
+      return undefined;
+    }
+    void onStartDescendantStream?.(id);
+    return () => {
+      void onStopDescendantStream?.();
+    };
+  }, [
+    activeSessionId,
+    viewModes,
+    onStartDescendantStream,
+    onStopDescendantStream,
+  ]);
 
   /* Monitor manager (P4): entering the view reads the authoritative
      registry and starts its delivery watch. Leaving, switching sessions,
@@ -2145,7 +2174,11 @@ export default function SessionSurface({
                       agent.message composer. Presentational components only —
                       every invoke lives in useFleet.js (AppShell-owned). */}
                   {mode === "fleet" && session.id !== "draft" && (() => {
-                    const fleetEntry = fleetBySession[session.id];
+                    const snapshotEntry = fleetBySession[session.id];
+                    const liveForSession = descendantMode === "live"
+                      && descendantSessionId === session.id
+                      && descendantEntry;
+                    const fleetEntry = liveForSession ? descendantEntry : snapshotEntry;
                     const fleetSelectedAgentId = fleetSelected[session.id] || "";
                     const fleetSelectedNode = fleetEntry
                       ? findFleetNode(fleetEntry.tree, fleetSelectedAgentId)
@@ -2155,6 +2188,7 @@ export default function SessionSurface({
                         <FleetPanel
                           entry={fleetEntry}
                           error={fleetError}
+                          fallbackEntry={snapshotEntry}
                           loading={fleetLoading}
                           onObserveAll={() => {
                             if (!fleetEntry) return;
@@ -2164,6 +2198,7 @@ export default function SessionSurface({
                             );
                           }}
                           onRefresh={() => onLoadFleet?.(session.id)}
+                          onReconnect={() => onReconnectDescendantStream?.(session.id)}
                           onSelectNode={(node) => {
                             setFleetSelected((current) => ({
                               ...current,
@@ -2179,6 +2214,14 @@ export default function SessionSurface({
                             onSendAgentMessage?.(node.parentSessionId, node.agentId, text)
                           )}
                           selectedAgentId={fleetSelectedAgentId}
+                          streamError={descendantError}
+                          streamLoading={descendantLoading}
+                          streamMode={descendantSessionId === session.id
+                            ? descendantMode
+                            : "unavailable"}
+                          streamRepair={descendantSessionId === session.id
+                            ? descendantRepair
+                            : null}
                           unavailable={fleetUnavailable}
                         />
                         {fleetSelectedNode && (

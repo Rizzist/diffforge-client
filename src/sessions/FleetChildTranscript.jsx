@@ -30,6 +30,12 @@ export default function FleetChildTranscript({
 }) {
   if (!node) return null;
   const label = nodeLabel(node);
+  const stateKind = node.state?.kind ?? "unknown";
+  const stateLabel = node.state == null
+    ? "state not published"
+    : node.state.kind === "unknown"
+      ? `unrecognized state: ${node.state.label || "(unnamed)"}`
+      : node.state.label;
   return (
     <ChildWrap aria-label="Subagent transcript">
       <LineageBar>
@@ -51,7 +57,7 @@ export default function FleetChildTranscript({
             via agent {node.parentAgentId}
           </LineageFact>
         )}
-        <LineageState data-state={node.state.kind}>{node.state.label}</LineageState>
+        <LineageState data-state={stateKind}>{stateLabel}</LineageState>
       </LineageBar>
 
       <TranscriptHost>

@@ -42,18 +42,24 @@ function compactJson(value) {
 
 function FleetNodeRows({ node, level, selectedAgentId, onSelectNode }) {
   const label = nodeLabel(node);
+  const stateKind = node.state?.kind ?? "unknown";
+  const stateLabel = node.state == null
+    ? "state not published"
+    : node.state.kind === "unknown"
+      ? `unrecognized state: ${node.state.label || "(unnamed)"}`
+      : node.state.label;
   return (
     <>
       <NodeRow
         data-bounded={node.bounded ? "true" : undefined}
         data-selected={node.agentId === selectedAgentId ? "true" : undefined}
-        data-state={node.state.kind}
+        data-state={stateKind}
         onClick={() => onSelectNode?.(node)}
         style={{ "--fleet-indent": `${level * 16}px` }}
         title="Open this subagent's nested transcript"
         type="button"
       >
-        <NodeStateDot aria-hidden="true" data-state={node.state.kind} />
+        <NodeStateDot aria-hidden="true" data-state={stateKind} />
         {label.fallback ? (
           <NodeFallbackId title="No daemon callsign — showing the agent id (client fallback)">
             id:{label.text || "unknown"}
@@ -62,7 +68,7 @@ function FleetNodeRows({ node, level, selectedAgentId, onSelectNode }) {
           <NodeCallsign>{label.text}</NodeCallsign>
         )}
         <NodeTask>{node.task}</NodeTask>
-        <NodeState data-state={node.state.kind}>{node.state.label}</NodeState>
+        <NodeState data-state={stateKind}>{stateLabel}</NodeState>
       </NodeRow>
       {node.children.map((child) => (
         <FleetNodeRows
@@ -85,13 +91,19 @@ function FleetNodeRows({ node, level, selectedAgentId, onSelectNode }) {
 export default function FleetPanel({
   entry = undefined,
   error = "",
+  fallbackEntry = undefined,
   loading = false,
   unavailable = false,
   selectedAgentId = "",
   onSelectNode = null,
   onRefresh = null,
+  onReconnect = null,
   onObserveAll = null,
   onSendMessage = null,
+  streamError = "",
+  streamLoading = false,
+  streamMode = "unavailable",
+  streamRepair = null,
 }) {
   const [messageText, setMessageText] = useState("");
   const [sending, setSending] = useState(false);
@@ -114,25 +126,49 @@ export default function FleetPanel({
     }
   }, [messageText, onSendMessage, selectedNode, sending]);
 
-  if (unavailable) {
+  const isLive = streamMode === "live" && entry != null;
+
+  if (unavailable && !isLive) {
     return (
       <FleetSection aria-label="Subagents">
         <FleetHeader>
           <FleetTitle>Subagents</FleetTitle>
+          <StreamBadge data-mode="snapshot">
+            {streamMode === "snapshot"
+              ? "Point-in-time snapshot — live stream unavailable"
+              : "Point-in-time snapshot — live stream not connected"}
+          </StreamBadge>
         </FleetHeader>
+        {streamError && <FleetErrorLine role="alert">{streamError}</FleetErrorLine>}
         <FleetMutedHint>Subagent fleet is unavailable on this daemon.</FleetMutedHint>
       </FleetSection>
     );
   }
 
-  const rollup = entry?.rollup || null;
-  const truncation = entry?.truncation || null;
+  /* Live baselines do not publish P2 metrics. If a snapshot rollup is
+     available beside live data, it stays visibly labeled point-in-time. */
+  const rollup = isLive ? fallbackEntry?.rollup || null : entry?.rollup || null;
+  const truncation = isLive ? null : entry?.truncation || null;
+  const fanout = isLive ? entry?.fanout || null : null;
+  const streamTruncation = isLive ? entry?.truncation || null : null;
   const roots = entry?.tree?.roots || [];
+  const unknownEvents = isLive && Array.isArray(entry?.tree?.unrecognizedEvents)
+    ? entry.tree.unrecognizedEvents
+    : [];
 
   return (
     <FleetSection aria-label="Subagents">
       <FleetHeader>
         <FleetTitle>Subagents</FleetTitle>
+        <StreamBadge data-mode={isLive ? "live" : "snapshot"}>
+          {isLive
+            ? "Live descendant stream"
+            : streamLoading
+              ? "Connecting live stream — tree below is a point-in-time snapshot"
+              : streamMode === "snapshot"
+                ? "Point-in-time snapshot — live stream unavailable"
+                : "Point-in-time snapshot — live stream not connected"}
+        </StreamBadge>
         <FleetHeaderActions>
           {entry && roots.length > 0 && (
             <FleetHeaderButton
@@ -144,6 +180,16 @@ export default function FleetPanel({
             </FleetHeaderButton>
           )}
           <FleetHeaderButton
+            disabled={streamLoading}
+            onClick={() => onReconnect?.()}
+            title={isLive
+              ? "Detach and reconnect the live descendant stream from held per-child cursors"
+              : "Try to attach the live descendant stream"}
+            type="button"
+          >
+            {streamLoading ? "Connecting…" : isLive ? "Reconnect live" : "Retry live"}
+          </FleetHeaderButton>
+          <FleetHeaderButton
             disabled={loading}
             onClick={() => onRefresh?.()}
             title="Re-read the fleet snapshot (session.fleet)"
@@ -154,7 +200,48 @@ export default function FleetPanel({
         </FleetHeaderActions>
       </FleetHeader>
 
+      {streamError && <FleetErrorLine role="alert">{streamError}</FleetErrorLine>}
       {error && <FleetErrorLine role="alert">{error}</FleetErrorLine>}
+
+      {isLive && fanout && (
+        <LiveNotice data-warn={fanout.limited ? "true" : undefined}>
+          Fan-out: requested children {fanout.requestedChildren ?? "unknown"}; accepted children{" "}
+          {fanout.acceptedChildren ?? "unknown"}; hard limit {fanout.hardLimit ?? "unknown"}.
+          {fanout.limited && (
+            <> Accepted is below requested; some requested children were not streamed.</>
+          )}
+        </LiveNotice>
+      )}
+
+      {isLive && streamTruncation && (
+        <LiveNotice data-warn={streamTruncation.truncated ? "true" : undefined}>
+          {streamTruncation.truncated === true ? (
+            streamTruncation.omittedCountTrusted ? (
+              <>Truncation: truncated — streamed children {streamTruncation.streamedChildren ?? "unknown"}; omitted children {streamTruncation.omittedChildren ?? "unknown"}.</>
+            ) : (
+              <>Truncation: truncated — streamed children {streamTruncation.streamedChildren ?? "unknown"}; omitted total unknown (count incomplete, so it is not a trustworthy total).</>
+            )
+          ) : streamTruncation.truncated === false ? (
+            <>Truncation: not truncated — streamed children {streamTruncation.streamedChildren ?? "unknown"}.</>
+          ) : (
+            <>Truncation status not published — streamed children {streamTruncation.streamedChildren ?? "unknown"}.</>
+          )}
+        </LiveNotice>
+      )}
+
+      {streamRepair && (
+        <RepairNotice>
+          Repair reattached after a reported gap using this client&apos;s held per-child cursors.
+          The repair frame made no sequence claim. Resumed {streamRepair.resumedChildren} of{" "}
+          {streamRepair.namedChildren.length} named children; any child without a held cursor remains an explicit gap.
+        </RepairNotice>
+      )}
+
+      {unknownEvents.slice(-3).map((fact, index) => (
+        <LiveNotice key={`${fact.sessionId}:${fact.agentId}:${fact.seq ?? index}`} data-warn="true">
+          Unrecognized live change preserved: {fact.kindRaw ?? "unnamed kind"}.
+        </LiveNotice>
+      ))}
 
       {!entry && !error && (
         <FleetMutedHint>
@@ -166,6 +253,11 @@ export default function FleetPanel({
         <>
           {rollup && (
             <RollupRow aria-label="Fleet rollup">
+              {isLive && (
+                <RollupChip data-warn="true" title="These totals came from the separate fallback snapshot, not the live stream">
+                  point-in-time snapshot rollup
+                </RollupChip>
+              )}
               <RollupChip title="Nodes returned in this snapshot">
                 nodes {rollup.nodeCount ?? "no data"}
               </RollupChip>
@@ -324,6 +416,20 @@ const FleetTitle = styled.span`
   letter-spacing: 0.05em;
 `;
 
+const StreamBadge = styled.span`
+  padding: 2px 7px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: var(--forge-surface);
+  font-size: 10px;
+  white-space: nowrap;
+
+  &[data-mode="live"] {
+    color: var(--forge-accent, #6a6);
+  }
+`;
+
 const FleetHeaderActions = styled.div`
   display: inline-flex;
   gap: 6px;
@@ -398,6 +504,26 @@ const BoundedBanner = styled.p`
   color: var(--forge-text-muted);
   background: var(--forge-surface);
   font-size: 11px;
+`;
+
+const LiveNotice = styled.p`
+  margin: 0;
+  padding: 5px 9px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 6px;
+  color: var(--forge-text-muted);
+  background: var(--forge-surface);
+  font-size: 11px;
+
+  &[data-warn="true"] {
+    color: var(--forge-warning, #ca4);
+    border-style: dashed;
+  }
+`;
+
+const RepairNotice = styled(LiveNotice)`
+  color: var(--forge-warning, #ca4);
+  border-style: dashed;
 `;
 
 const FleetTree = styled.div`
