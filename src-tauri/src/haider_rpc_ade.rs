@@ -92,6 +92,7 @@ const FEATURE_SESSION_RENAME_V1: &str = "session_rename_v1";
 const FEATURE_CONTEXT_COMPACTION_V1: &str = "context_compaction_v1";
 const FEATURE_SESSION_FORK_V1: &str = "session_fork_v1";
 const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
+const FEATURE_CHECKPOINT_V1: &str = "checkpoint_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
 const HAIDER_NEEDS_INPUT_NO_CONNECTION: &str = "haider_needs_input_no_connection";
@@ -2300,6 +2301,384 @@ pub struct LifecycleCommandError {
     pub data: Option<Value>,
 }
 
+fn serialize_checkpoint_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.collect_str(value)
+}
+
+/// A Tauri-safe checkpoint list cursor. The daemon wire is a JSON `u64`, but
+/// JavaScript only ever sees and supplies its exact decimal spelling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointCursorV1(pub u64);
+
+impl Serialize for CheckpointCursorV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serialize_checkpoint_u64(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CheckpointCursorV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let decimal = String::deserialize(deserializer)?;
+        if decimal.is_empty() || !decimal.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(serde::de::Error::custom(
+                "checkpoint cursor must be a decimal u64 string",
+            ));
+        }
+        decimal
+            .parse::<u64>()
+            .map(Self)
+            .map_err(|_| serde::de::Error::custom("checkpoint cursor must be a decimal u64 string"))
+    }
+}
+
+/// Forward-compatible checkpoint mutation category. Unknown daemon values
+/// remain their exact wire strings instead of being coerced to a known kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckpointKindV1 {
+    Edit,
+    Write,
+    Create,
+    Delete,
+    Move,
+    Unknown(String),
+}
+
+impl CheckpointKindV1 {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::Edit => "edit",
+            Self::Write => "write",
+            Self::Create => "create",
+            Self::Delete => "delete",
+            Self::Move => "move",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for CheckpointKindV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CheckpointKindV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "edit" => Self::Edit,
+            "write" => Self::Write,
+            "create" => Self::Create,
+            "delete" => Self::Delete,
+            "move" => Self::Move,
+            raw => Self::Unknown(raw.to_string()),
+        })
+    }
+}
+
+/// Forward-compatible origin of a checkpoint record.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CheckpointOriginV1 {
+    #[default]
+    Tool,
+    Undo,
+    Redo,
+    RollbackTurn,
+    Unknown(String),
+}
+
+impl CheckpointOriginV1 {
+    fn as_wire_str(&self) -> &str {
+        match self {
+            Self::Tool => "tool",
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+            Self::RollbackTurn => "rollback_turn",
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl Serialize for CheckpointOriginV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CheckpointOriginV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "tool" => Self::Tool,
+            "undo" => Self::Undo,
+            "redo" => Self::Redo,
+            "rollback_turn" => Self::RollbackTurn,
+            raw => Self::Unknown(raw.to_string()),
+        })
+    }
+}
+
+/// Exact before/after state for one workspace-relative path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointPathV1 {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_reason: Option<String>,
+}
+
+/// Tauri projection of one daemon-authored checkpoint fact. Numeric daemon
+/// coordinates serialize as decimal strings; identity and digest absence is
+/// kept typed rather than filled with sentinels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CheckpointRecordedV1 {
+    pub checkpoint_id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
+    pub run_id: String,
+    pub effect_id: String,
+    pub call_id: String,
+    #[serde(serialize_with = "serialize_checkpoint_u64")]
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_revision: Option<String>,
+    pub kind: CheckpointKindV1,
+    pub origin: CheckpointOriginV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_checkpoint_id: Option<String>,
+    pub paths: Vec<CheckpointPathV1>,
+    pub post_digest: String,
+    #[serde(serialize_with = "serialize_checkpoint_u64")]
+    pub recorded_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CheckpointListPageV1 {
+    pub checkpoints: Vec<CheckpointRecordedV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<CheckpointCursorV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CheckpointMutationReceiptV1 {
+    pub checkpoint: CheckpointRecordedV1,
+    pub restored_checkpoint_ids: Vec<String>,
+    #[serde(serialize_with = "serialize_checkpoint_u64")]
+    pub worker_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointConflictV1 {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointRollbackConflictV1 {
+    pub verified: Vec<String>,
+    pub conflicts: Vec<CheckpointConflictV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointBranchMismatchV1 {
+    pub checkpoint_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_branch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_branch_id: Option<String>,
+}
+
+/// Typed machine-readable checkpoint failure coordinates. Unknown future
+/// variants remain raw JSON, but conflicts never collapse into a message.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CheckpointErrorDataV1 {
+    CheckpointConflict(CheckpointConflictV1),
+    CheckpointRollbackConflict(CheckpointRollbackConflictV1),
+    CheckpointBranchMismatch(CheckpointBranchMismatchV1),
+    Unknown(Value),
+}
+
+impl Serialize for CheckpointErrorDataV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::CheckpointConflict(conflict) => serde_json::json!({
+                "kind": "checkpoint_conflict",
+                "conflict": conflict,
+            })
+            .serialize(serializer),
+            Self::CheckpointRollbackConflict(conflict) => serde_json::json!({
+                "kind": "checkpoint_rollback_conflict",
+                "conflict": conflict,
+            })
+            .serialize(serializer),
+            Self::CheckpointBranchMismatch(conflict) => serde_json::json!({
+                "kind": "checkpoint_branch_mismatch",
+                "checkpoint_id": conflict.checkpoint_id,
+                "checkpoint_branch_id": conflict.checkpoint_branch_id,
+                "requested_branch_id": conflict.requested_branch_id,
+            })
+            .serialize(serializer),
+            Self::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CheckpointErrorDataV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("kind").and_then(Value::as_str) {
+            Some("checkpoint_conflict") => {
+                #[derive(Deserialize)]
+                struct Fields {
+                    conflict: CheckpointConflictV1,
+                }
+                let fields: Fields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::CheckpointConflict(fields.conflict))
+            }
+            Some("checkpoint_rollback_conflict") => {
+                #[derive(Deserialize)]
+                struct Fields {
+                    conflict: CheckpointRollbackConflictV1,
+                }
+                let fields: Fields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::CheckpointRollbackConflict(fields.conflict))
+            }
+            Some("checkpoint_branch_mismatch") => serde_json::from_value(raw)
+                .map(Self::CheckpointBranchMismatch)
+                .map_err(<D::Error as serde::de::Error>::custom),
+            _ => Ok(Self::Unknown(raw)),
+        }
+    }
+}
+
+/// Structured checkpoint rejection returned through Tauri.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CheckpointCommandError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<CheckpointErrorDataV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct CheckpointCursorWire(u64);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointRecordedWire {
+    checkpoint_id: String,
+    session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+    run_id: String,
+    effect_id: String,
+    call_id: String,
+    seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_revision: Option<String>,
+    kind: CheckpointKindV1,
+    #[serde(default)]
+    origin: CheckpointOriginV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_checkpoint_id: Option<String>,
+    paths: Vec<CheckpointPathV1>,
+    post_digest: String,
+    recorded_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointListPageWire {
+    checkpoints: Vec<CheckpointRecordedWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<CheckpointCursorWire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointMutationReceiptWire {
+    checkpoint: CheckpointRecordedWire,
+    restored_checkpoint_ids: Vec<String>,
+    worker_generation: u64,
+}
+
+impl From<CheckpointRecordedWire> for CheckpointRecordedV1 {
+    fn from(record: CheckpointRecordedWire) -> Self {
+        Self {
+            checkpoint_id: record.checkpoint_id,
+            session_id: record.session_id,
+            branch_id: record.branch_id,
+            run_id: record.run_id,
+            effect_id: record.effect_id,
+            call_id: record.call_id,
+            seq: record.seq,
+            workspace_revision: record.workspace_revision,
+            kind: record.kind,
+            origin: record.origin,
+            source_checkpoint_id: record.source_checkpoint_id,
+            paths: record.paths,
+            post_digest: record.post_digest,
+            recorded_at_ms: record.recorded_at_ms,
+        }
+    }
+}
+
+impl From<CheckpointListPageWire> for CheckpointListPageV1 {
+    fn from(page: CheckpointListPageWire) -> Self {
+        Self {
+            checkpoints: page.checkpoints.into_iter().map(Into::into).collect(),
+            next_cursor: page
+                .next_cursor
+                .map(|checkpoint_cursor| CheckpointCursorV1(checkpoint_cursor.0)),
+        }
+    }
+}
+
+impl From<CheckpointMutationReceiptWire> for CheckpointMutationReceiptV1 {
+    fn from(receipt: CheckpointMutationReceiptWire) -> Self {
+        Self {
+            checkpoint: receipt.checkpoint.into(),
+            restored_checkpoint_ids: receipt.restored_checkpoint_ids,
+            worker_generation: receipt.worker_generation,
+        }
+    }
+}
+
 fn serialize_lifecycle_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -3334,6 +3713,42 @@ enum RequestBody {
         #[serde(default, skip_serializing_if = "is_false")]
         metadata_only: bool,
     },
+    #[serde(rename = "checkpoint.list")]
+    CheckpointList {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<CheckpointCursorWire>,
+        limit: u16,
+    },
+    #[serde(rename = "checkpoint.undo")]
+    CheckpointUndo {
+        command_id: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<String>,
+        worker_generation: u64,
+        target: String,
+    },
+    #[serde(rename = "checkpoint.redo")]
+    CheckpointRedo {
+        command_id: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<String>,
+        worker_generation: u64,
+        target: String,
+    },
+    #[serde(rename = "checkpoint.rollback_turn")]
+    CheckpointRollbackTurn {
+        command_id: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<String>,
+        worker_generation: u64,
+        run_id: String,
+    },
     #[serde(rename = "session.fleet")]
     SessionFleet { session_id: String },
     #[serde(rename = "session.attach")]
@@ -3735,6 +4150,20 @@ enum ResponseBody {
     SessionObserve { digest: Value },
     #[serde(rename = "session.observe_batch")]
     SessionObserveBatch { digests: Vec<Value> },
+    #[serde(rename = "checkpoint.list")]
+    CheckpointList { page: CheckpointListPageWire },
+    #[serde(rename = "checkpoint.undo")]
+    CheckpointUndo {
+        receipt: CheckpointMutationReceiptWire,
+    },
+    #[serde(rename = "checkpoint.redo")]
+    CheckpointRedo {
+        receipt: CheckpointMutationReceiptWire,
+    },
+    #[serde(rename = "checkpoint.rollback_turn")]
+    CheckpointRollbackTurn {
+        receipt: CheckpointMutationReceiptWire,
+    },
     #[serde(rename = "session.fleet")]
     SessionFleet { snapshot: SessionFleetSnapshot },
     #[serde(rename = "session.attach")]
@@ -6282,6 +6711,172 @@ fn graph_inspect_response(body: ResponseBody) -> Result<GraphInspectResult, Stri
     }
 }
 
+impl CheckpointCommandError {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "unavailable".to_string(),
+            message: message.into(),
+            retryable: true,
+            data: None,
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.into(),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn from_daemon(code: String, message: String, retryable: bool, data: Option<Value>) -> Self {
+        Self {
+            code,
+            message,
+            retryable,
+            data: data.map(|raw| {
+                serde_json::from_value(raw.clone()).unwrap_or(CheckpointErrorDataV1::Unknown(raw))
+            }),
+        }
+    }
+
+    #[cfg(unix)]
+    fn from_workflow(error: WorkflowCommandError) -> Self {
+        let data = error
+            .data
+            .and_then(|data| serde_json::to_value(data).ok())
+            .map(|raw| {
+                serde_json::from_value(raw.clone()).unwrap_or(CheckpointErrorDataV1::Unknown(raw))
+            });
+        Self {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+            data,
+        }
+    }
+}
+
+fn checkpoint_response_error(body: ResponseBody, mismatch: &'static str) -> CheckpointCommandError {
+    match body {
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => CheckpointCommandError::from_daemon(code, message, retryable, data),
+        _ => CheckpointCommandError::protocol(mismatch),
+    }
+}
+
+fn checkpoint_list_response(
+    body: ResponseBody,
+) -> Result<CheckpointListPageV1, CheckpointCommandError> {
+    match body {
+        ResponseBody::CheckpointList { page } => Ok(page.into()),
+        response => Err(checkpoint_response_error(
+            response,
+            "checkpoint.list response method mismatch",
+        )),
+    }
+}
+
+fn checkpoint_undo_response(
+    body: ResponseBody,
+) -> Result<CheckpointMutationReceiptV1, CheckpointCommandError> {
+    match body {
+        ResponseBody::CheckpointUndo { receipt } => Ok(receipt.into()),
+        response => Err(checkpoint_response_error(
+            response,
+            "checkpoint.undo response method mismatch",
+        )),
+    }
+}
+
+fn checkpoint_redo_response(
+    body: ResponseBody,
+) -> Result<CheckpointMutationReceiptV1, CheckpointCommandError> {
+    match body {
+        ResponseBody::CheckpointRedo { receipt } => Ok(receipt.into()),
+        response => Err(checkpoint_response_error(
+            response,
+            "checkpoint.redo response method mismatch",
+        )),
+    }
+}
+
+fn checkpoint_rollback_turn_response(
+    body: ResponseBody,
+) -> Result<CheckpointMutationReceiptV1, CheckpointCommandError> {
+    match body {
+        ResponseBody::CheckpointRollbackTurn { receipt } => Ok(receipt.into()),
+        response => Err(checkpoint_response_error(
+            response,
+            "checkpoint.rollback_turn response method mismatch",
+        )),
+    }
+}
+
+fn checkpoint_list_request(
+    session_id: String,
+    branch_id: Option<String>,
+    cursor: Option<CheckpointCursorV1>,
+    limit: u16,
+) -> RequestBody {
+    RequestBody::CheckpointList {
+        session_id,
+        branch_id,
+        cursor: cursor.map(|cursor| CheckpointCursorWire(cursor.0)),
+        limit,
+    }
+}
+
+#[cfg(unix)]
+fn checkpoint_undo_request(
+    attachment: &WorkflowControlAttachment,
+    branch_id: Option<String>,
+    target: String,
+) -> RequestBody {
+    RequestBody::CheckpointUndo {
+        command_id: config_command_id("checkpoint-undo"),
+        session_id: attachment.session_id.clone(),
+        branch_id,
+        worker_generation: attachment.worker_generation,
+        target,
+    }
+}
+
+#[cfg(unix)]
+fn checkpoint_redo_request(
+    attachment: &WorkflowControlAttachment,
+    branch_id: Option<String>,
+    target: String,
+) -> RequestBody {
+    RequestBody::CheckpointRedo {
+        command_id: config_command_id("checkpoint-redo"),
+        session_id: attachment.session_id.clone(),
+        branch_id,
+        worker_generation: attachment.worker_generation,
+        target,
+    }
+}
+
+#[cfg(unix)]
+fn checkpoint_rollback_turn_request(
+    attachment: &WorkflowControlAttachment,
+    branch_id: Option<String>,
+    run_id: String,
+) -> RequestBody {
+    RequestBody::CheckpointRollbackTurn {
+        command_id: config_command_id("checkpoint-rollback-turn"),
+        session_id: attachment.session_id.clone(),
+        branch_id,
+        worker_generation: attachment.worker_generation,
+        run_id,
+    }
+}
+
 impl WorkflowCommandError {
     fn unavailable(message: impl Into<String>) -> Self {
         Self {
@@ -6559,6 +7154,72 @@ async fn workflow_request(
             "The workflow RPC request did not receive a response.",
         )),
     }
+}
+
+#[cfg(unix)]
+fn checkpoint_transport_error(error: String) -> CheckpointCommandError {
+    if error.starts_with("missing_feature:") {
+        CheckpointCommandError {
+            code: "missing_feature".to_string(),
+            message: error,
+            retryable: false,
+            data: None,
+        }
+    } else if error == "capability_denied" {
+        CheckpointCommandError {
+            code: error,
+            message: "The current Haider RPC connection lacks the required capability.".to_string(),
+            retryable: false,
+            data: None,
+        }
+    } else {
+        CheckpointCommandError::unavailable(error)
+    }
+}
+
+#[cfg(unix)]
+async fn checkpoint_request(
+    body: RequestBody,
+    capability: Capability,
+) -> Result<ResponseBody, CheckpointCommandError> {
+    match rpc_request_with_feature_gate(
+        body,
+        capability,
+        FeatureGate::all(BTreeSet::from([FEATURE_CHECKPOINT_V1.to_string()])),
+        RpcErrorStyle::Passthrough,
+    )
+    .await
+    {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) => Err(checkpoint_transport_error(error)),
+        None => Err(CheckpointCommandError::unavailable(
+            "The checkpoint RPC request did not receive a response.",
+        )),
+    }
+}
+
+#[cfg(unix)]
+async fn checkpoint_provider_session_id(
+    session_id: String,
+) -> Result<String, CheckpointCommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        super::session_provider_session_id_blocking(&session_id)
+    })
+    .await
+    .map_err(|error| CheckpointCommandError::protocol(format!("Session lookup failed: {error}")))?
+    .map_err(|error| CheckpointCommandError::protocol(format!("Session lookup failed: {error}")))
+}
+
+#[cfg(unix)]
+async fn checkpoint_control_attachment(
+    session_id: &str,
+) -> Result<WorkflowControlAttachment, CheckpointCommandError> {
+    workflow_control_attachment(
+        session_id,
+        &BTreeSet::from([FEATURE_CHECKPOINT_V1.to_string()]),
+    )
+    .await
+    .map_err(CheckpointCommandError::from_workflow)
 }
 
 #[cfg(unix)]
@@ -7810,6 +8471,122 @@ pub async fn monitor_watch(
     {
         let _ = (session_id, after_cursor);
         Err("monitor.watch unavailable on this platform".to_string())
+    }
+}
+
+/// List daemon-authored checkpoints newest first. The optional cursor crosses
+/// Tauri as an exact decimal string and is checked before becoming wire `u64`.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn checkpoint_list(
+    session_id: String,
+    branch_id: Option<String>,
+    cursor: Option<CheckpointCursorV1>,
+    limit: u16,
+) -> Result<CheckpointListPageV1, CheckpointCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = checkpoint_provider_session_id(session_id).await?;
+        return checkpoint_list_response(
+            checkpoint_request(
+                checkpoint_list_request(provider_session_id, branch_id, cursor, limit),
+                Capability::View,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, branch_id, cursor, limit);
+        Err(CheckpointCommandError::unavailable(
+            "checkpoint.list unavailable on this platform",
+        ))
+    }
+}
+
+/// Restore one checkpoint pre-image using fresh Control attachment fences.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn checkpoint_undo(
+    session_id: String,
+    branch_id: Option<String>,
+    target: String,
+) -> Result<CheckpointMutationReceiptV1, CheckpointCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = checkpoint_provider_session_id(session_id).await?;
+        let attachment = checkpoint_control_attachment(&provider_session_id).await?;
+        let result = checkpoint_request(
+            checkpoint_undo_request(&attachment, branch_id, target),
+            Capability::Control,
+        )
+        .await
+        .and_then(checkpoint_undo_response);
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, branch_id, target);
+        Err(CheckpointCommandError::unavailable(
+            "checkpoint.undo unavailable on this platform",
+        ))
+    }
+}
+
+/// Reapply an append-only undo/rollback checkpoint with daemon digest guards.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn checkpoint_redo(
+    session_id: String,
+    branch_id: Option<String>,
+    target: String,
+) -> Result<CheckpointMutationReceiptV1, CheckpointCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = checkpoint_provider_session_id(session_id).await?;
+        let attachment = checkpoint_control_attachment(&provider_session_id).await?;
+        let result = checkpoint_request(
+            checkpoint_redo_request(&attachment, branch_id, target),
+            Capability::Control,
+        )
+        .await
+        .and_then(checkpoint_redo_response);
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, branch_id, target);
+        Err(CheckpointCommandError::unavailable(
+            "checkpoint.redo unavailable on this platform",
+        ))
+    }
+}
+
+/// Atomically roll back every checkpoint from one turn after full preflight.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn checkpoint_rollback_turn(
+    session_id: String,
+    branch_id: Option<String>,
+    run_id: String,
+) -> Result<CheckpointMutationReceiptV1, CheckpointCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = checkpoint_provider_session_id(session_id).await?;
+        let attachment = checkpoint_control_attachment(&provider_session_id).await?;
+        let result = checkpoint_request(
+            checkpoint_rollback_turn_request(&attachment, branch_id, run_id),
+            Capability::Control,
+        )
+        .await
+        .and_then(checkpoint_rollback_turn_response);
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, branch_id, run_id);
+        Err(CheckpointCommandError::unavailable(
+            "checkpoint.rollback_turn unavailable on this platform",
+        ))
     }
 }
 
@@ -12758,6 +13535,11 @@ mod descendant_tests;
 #[allow(clippy::expect_used)]
 #[path = "haider_rpc_ade_lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_checkpoint_tests.rs"]
+mod checkpoint_tests;
 
 #[cfg(test)]
 mod tests {
