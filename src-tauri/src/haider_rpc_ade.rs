@@ -8,8 +8,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -103,8 +103,16 @@ const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overri
 const FEATURE_AUTONOMOUS_INTERACTION_V1: &str = "autonomous_interaction_v1";
 const FEATURE_SESSION_RENAME_V1: &str = "session_rename_v1";
 const FEATURE_CONTEXT_COMPACTION_V1: &str = "context_compaction_v1";
+const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
 const FEATURE_SESSION_FORK_V1: &str = "session_fork_v1";
+const FEATURE_SESSION_PROMPT_FORK_V1: &str = "session_prompt_fork_v1";
 const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
+const FEATURE_RUN_BUDGET_V1: &str = "run_budget_v1";
+const FEATURE_HEADLESS_RUN_V1: &str = "headless_run_v1";
+const FEATURE_SESSION_ATTACH_SEALED_V1: &str = "session_attach_sealed_v1";
+const FEATURE_COMPUTER_PERMISSION_ACTIONS_V1: &str = "computer_permission_actions_v1";
+const FEATURE_TRANSCRIPTION_V1: &str = "transcription_v1";
+const FEATURE_ACCOUNT_LABEL_V1: &str = "account_label_v1";
 const FEATURE_CHECKPOINT_V1: &str = "checkpoint_v1";
 const FEATURE_PEER_MESSAGING_V1: &str = "peer_messaging_v1";
 const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
@@ -151,6 +159,7 @@ const SHELL_OPENED_EVENT: &str = "shell-opened";
 const SHELL_STATE_EVENT: &str = "shell-state";
 const SHELL_CLOSED_EVENT: &str = "shell-closed";
 const SHELL_OUTPUT_EVENT: &str = "shell-output";
+const ADE_DURABLE_FACT_EVENT: &str = "session-durable-fact";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const FEATURE_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
@@ -181,6 +190,7 @@ pub(crate) struct ResidentTurnSubmit {
     pub run_id: String,
     pub accepted_seq: u64,
     pub disposition: SubmitDisposition,
+    pub branch_id: Option<String>,
 }
 
 /// Render-complete row returned by the daemon-owned held-message queue.
@@ -2969,6 +2979,93 @@ where
     serializer.collect_str(value)
 }
 
+/// Daemon-enforced limits for one accepted run. This record is optional at
+/// every SDK boundary; omission is unbounded and the client never invents a
+/// default limit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunBudgetV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_microusd: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_time_ms: Option<u64>,
+}
+
+impl RunBudgetV1 {
+    fn is_empty(&self) -> bool {
+        self.max_tokens.is_none() && self.max_cost_microusd.is_none() && self.max_time_ms.is_none()
+    }
+}
+
+/// The limit dimension in a durable budget-exhaustion fact. Future strings
+/// stay available to JavaScript instead of being collapsed to a sentinel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunBudgetDimensionV1 {
+    Tokens,
+    Cost,
+    Time,
+    Unknown(String),
+}
+
+impl Serialize for RunBudgetDimensionV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Tokens => "tokens",
+            Self::Cost => "cost",
+            Self::Time => "time",
+            Self::Unknown(raw) => raw,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RunBudgetDimensionV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "tokens" => Self::Tokens,
+            "cost" => Self::Cost,
+            "time" => Self::Time,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadlessRunUsageV1 {
+    pub logical_input_tokens: u64,
+    pub billed_output_tokens: u64,
+    pub additional_reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_microusd: Option<u64>,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunBudgetExhaustedV1 {
+    pub dimension: RunBudgetDimensionV1,
+    pub limit: u64,
+    pub usage: HeadlessRunUsageV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<Value>,
+}
+
+/// JavaScript supplies prompt-fork sequences as decimal strings so values
+/// above 2^53 never pass through an imprecise number.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkPromptSelectorV1 {
+    pub seq: String,
+}
+
 /// Daemon-issued durable coordinates of `session.create`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SessionCreateReceipt {
@@ -3006,6 +3103,23 @@ pub struct SessionCompactReceipt {
     pub branch_id: Option<String>,
 }
 
+/// Stable, secret-free coordinates of an atomic named-branch creation.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BranchCreateReceipt {
+    pub session_id: String,
+    pub branch_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_branch_id: Option<String>,
+    pub fork_node_id: String,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub fork_seq: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub created_seq: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub worker_generation: u64,
+    pub name: String,
+}
+
 /// Stable coordinates of a complete daemon-owned session fork.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SessionForkReceipt {
@@ -3040,6 +3154,93 @@ pub struct RunRetryReceipt {
     pub accepted_seq: u64,
     #[serde(serialize_with = "serialize_lifecycle_u64")]
     pub worker_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HeadlessRunStartReceiptV1 {
+    pub session_id: String,
+    pub run_id: String,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub accepted_seq: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub worker_generation: u64,
+    pub disposition: SubmitDisposition,
+}
+
+/// Journal-derived lifecycle for one detached run. The complete execution
+/// spec remains verbatim so future deep policy fields are not discarded.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HeadlessRunStatusV1 {
+    pub session_id: String,
+    pub run_id: String,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub worker_generation: u64,
+    pub state: RunStateWire,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub head_seq: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_agent_cancel_terminal_seq"
+    )]
+    pub terminal_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_exhausted: Option<RunBudgetExhaustedV1>,
+    pub spec: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HeadlessRunStopReceiptV1 {
+    pub session_id: String,
+    pub run_id: String,
+    pub status: AgentCancelStatusV1,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_agent_cancel_terminal_seq"
+    )]
+    pub terminal_seq: Option<u64>,
+}
+
+/// Forward-compatible OS permission name. The action response and durable
+/// grant card both retain future daemon strings exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SystemPermissionV1 {
+    ScreenRecording,
+    Accessibility,
+    Unknown(String),
+}
+
+impl Serialize for SystemPermissionV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::ScreenRecording => "screen_recording",
+            Self::Accessibility => "accessibility",
+            Self::Unknown(raw) => raw,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemPermissionV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "screen_recording" => Self::ScreenRecording,
+            "accessibility" => Self::Accessibility,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ComputerPermissionOpenSettingsResultV1 {
+    pub permission: SystemPermissionV1,
 }
 
 /// Agent-type registry plus point-in-time CLI inventory. Map absence is the
@@ -5043,7 +5244,7 @@ struct SurfaceStatusWire {
 /// A secret value is serialised as the daemon's transparent `SecretWire`, but
 /// remains redacted in diagnostics and is zeroized when the request is done.
 /// It must only be used on the authenticated local UDS actor path.
-struct SecretWire(Zeroizing<String>);
+pub struct SecretWire(Zeroizing<String>);
 
 impl SecretWire {
     fn new(secret: String) -> Self {
@@ -5090,6 +5291,82 @@ impl<'de> Deserialize<'de> for SecretWire {
         D: serde::Deserializer<'de>,
     {
         String::deserialize(deserializer).map(Self::new)
+    }
+}
+
+/// One-shot secret response. The value remains in `SecretWire` until Tauri
+/// serializes it once for JavaScript, then its backing allocation is wiped.
+#[derive(Serialize)]
+pub struct TranscriptionSecretGetResultV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret: Option<SecretWire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TranscriptionSecretSetResultV1 {
+    pub present: bool,
+}
+
+/// Secret-safe command failure. Only static client text or daemon error codes
+/// enter this object; request bytes and secret values never do.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TranscriptionCommandErrorV1 {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl TranscriptionCommandErrorV1 {
+    fn invalid_argument(message: &'static str) -> Self {
+        Self {
+            code: "invalid_argument".to_string(),
+            message: message.to_string(),
+            retryable: false,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            code: "unavailable".to_string(),
+            message: "The transcription secret RPC is unavailable.".to_string(),
+            retryable: true,
+        }
+    }
+
+    fn protocol(message: &'static str) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.to_string(),
+            retryable: false,
+        }
+    }
+
+    fn transport(code: String) -> Self {
+        if code.starts_with("missing_feature:") {
+            return Self {
+                code: "missing_feature".to_string(),
+                message: format!("The daemon does not advertise {FEATURE_TRANSCRIPTION_V1}."),
+                retryable: false,
+            };
+        }
+        if code == "capability_denied" {
+            return Self {
+                code,
+                message: "The current Haider RPC connection lacks Control capability.".to_string(),
+                retryable: false,
+            };
+        }
+        if code == "unavailable" {
+            return Self::unavailable();
+        }
+        // Do not reflect an arbitrary daemon string across a secret-bearing
+        // command boundary. Even a malformed/hostile error code therefore
+        // cannot become a secret echo path.
+        Self {
+            code: "rejected".to_string(),
+            message: "The transcription secret RPC was rejected.".to_string(),
+            retryable: false,
+        }
     }
 }
 
@@ -5227,7 +5504,7 @@ enum RequestBody {
     ComputerPermissionOpenSettings {
         session_id: String,
         request_id: String,
-        permission: String,
+        permission: SystemPermissionV1,
     },
     #[serde(rename = "session.list")]
     SessionList {
@@ -5616,11 +5893,23 @@ enum RequestBody {
         session_id: String,
         after_seq: u64,
         mode: AttachMode,
-        #[serde(default, skip_serializing_if = "is_false")]
-        sealed_replay: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sealed_replay: Option<bool>,
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: String },
+    #[serde(rename = "branch.create")]
+    BranchCreate {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch_id: Option<String>,
+        fork_node_id: String,
+        fork_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     #[serde(rename = "session.rename")]
     SessionRename {
         command_id: String,
@@ -5648,6 +5937,8 @@ enum RequestBody {
         fork_node_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fork_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<SessionForkPromptSelectorWire>,
     },
     #[serde(rename = "run.retry")]
     RunRetry {
@@ -5728,10 +6019,28 @@ enum RequestBody {
         command_id: String,
         session_id: String,
         worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<String>,
         text: String,
         attachments: Vec<Value>,
         mode: DeliveryMode,
     },
+    #[serde(rename = "headless.run.start")]
+    HeadlessRunStart {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachments: Option<Vec<Value>>,
+        spec: Value,
+        #[serde(default)]
+        trust_hooks: bool,
+    },
+    #[serde(rename = "headless.run.status")]
+    HeadlessRunStatus { run_id: String },
+    #[serde(rename = "headless.run.stop")]
+    HeadlessRunStop { command_id: String, run_id: String },
     #[serde(rename = "queue.list")]
     QueueList { session_id: String },
     #[serde(rename = "queue.remove")]
@@ -5803,6 +6112,10 @@ enum RequestBody {
     },
     #[serde(rename = "account.refresh")]
     AccountRefresh { alias: String },
+    #[serde(rename = "transcription.secret_get")]
+    TranscriptionSecretGet,
+    #[serde(rename = "transcription.secret_set")]
+    TranscriptionSecretSet { secret: SecretWire, clear: bool },
     #[serde(rename = "account.set_active")]
     AccountSetActive {
         command_id: String,
@@ -6174,6 +6487,18 @@ enum ResponseBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: String },
+    #[serde(rename = "branch.create")]
+    BranchCreate {
+        session_id: String,
+        branch_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch_id: Option<String>,
+        fork_node_id: String,
+        fork_seq: u64,
+        created_seq: u64,
+        worker_generation: u64,
+        name: String,
+    },
     #[serde(rename = "session.rename")]
     SessionRename {
         session_id: String,
@@ -6295,6 +6620,44 @@ enum ResponseBody {
         worker_generation: u64,
         disposition: SubmitDisposition,
     },
+    #[serde(rename = "turn.submit.on_branch")]
+    TurnSubmitOnBranch {
+        session_id: String,
+        run_id: String,
+        accepted_seq: u64,
+        worker_generation: u64,
+        disposition: SubmitDisposition,
+        branch_id: String,
+    },
+    #[serde(rename = "headless.run.start")]
+    HeadlessRunStart {
+        session_id: String,
+        run_id: String,
+        accepted_seq: u64,
+        worker_generation: u64,
+        disposition: SubmitDisposition,
+    },
+    #[serde(rename = "headless.run.status")]
+    HeadlessRunStatus {
+        session_id: String,
+        run_id: String,
+        worker_generation: u64,
+        state: RunStateWire,
+        head_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_exhausted: Option<RunBudgetExhaustedV1>,
+        spec: Value,
+    },
+    #[serde(rename = "headless.run.stop")]
+    HeadlessRunStop {
+        session_id: String,
+        run_id: String,
+        status: AgentCancelStatusV1,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_seq: Option<u64>,
+    },
     #[serde(rename = "queue.list")]
     QueueList {
         session_id: String,
@@ -6317,7 +6680,7 @@ enum ResponseBody {
     #[serde(rename = "menu.answer")]
     MenuAnswer { resolution_seq: u64 },
     #[serde(rename = "computer.permission_open_settings")]
-    ComputerPermissionOpenSettings { permission: String },
+    ComputerPermissionOpenSettings { permission: SystemPermissionV1 },
     #[serde(rename = "account.list")]
     AccountList {
         #[serde(default)]
@@ -6383,6 +6746,13 @@ enum ResponseBody {
     AccountImportDevice { descriptor: Value, revision: u64 },
     #[serde(rename = "account.refresh")]
     AccountRefresh { descriptor: Value, revision: u64 },
+    #[serde(rename = "transcription.secret_get")]
+    TranscriptionSecretGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<SecretWire>,
+    },
+    #[serde(rename = "transcription.secret_set")]
+    TranscriptionSecretSet { present: bool },
     #[serde(rename = "turn.cancel")]
     TurnCancel {
         session_id: String,
@@ -6729,6 +7099,11 @@ enum AttachMode {
     Control,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionForkPromptSelectorWire {
+    seq: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeliveryMode {
@@ -6737,15 +7112,44 @@ pub(crate) enum DeliveryMode {
     Subturn,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SubmitDisposition {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitDisposition {
     Started,
     Queued,
     SteerPending,
     SubturnPending,
-    #[serde(other)]
-    Unknown,
+    Unknown(String),
+}
+
+impl Serialize for SubmitDisposition {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Started => "started",
+            Self::Queued => "queued",
+            Self::SteerPending => "steer_pending",
+            Self::SubturnPending => "subturn_pending",
+            Self::Unknown(raw) => raw,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for SubmitDisposition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "started" => Self::Started,
+            "queued" => Self::Queued,
+            "steer_pending" => Self::SteerPending,
+            "subturn_pending" => Self::SubturnPending,
+            _ => Self::Unknown(raw),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6764,6 +7168,90 @@ struct RawEnvelopeWire {
     seq: u64,
     session_id: String,
     payload: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionGrantActionV1 {
+    OpenSettings,
+    Retry,
+    RestartDaemon,
+    Unknown(String),
+}
+
+impl Serialize for PermissionGrantActionV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::OpenSettings => "open_settings",
+            Self::Retry => "retry",
+            Self::RestartDaemon => "restart_daemon",
+            Self::Unknown(raw) => raw,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for PermissionGrantActionV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "open_settings" => Self::OpenSettings,
+            "retry" => Self::Retry,
+            "restart_daemon" => Self::RestartDaemon,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionGrantNeededV1 {
+    pub request_id: String,
+    pub menu_id: String,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub request_seq: u64,
+    pub opening_generation: u64,
+    pub call_id: String,
+    pub effect_id: String,
+    pub permission: SystemPermissionV1,
+    pub pane_name: String,
+    pub settings_url: String,
+    #[serde(default)]
+    pub actions: Vec<PermissionGrantActionV1>,
+    #[serde(default)]
+    pub auto_restart_pending: bool,
+    pub poll_timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunFailedBudgetExhaustedV1 {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<Value>,
+}
+
+/// Typed additive facts recognized on the durable Event door already owned
+/// by the reconnectable session attachment. Other future payloads remain
+/// ignored here and available to raw readers.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AdeDurableFactV1 {
+    RunBudgetExhausted(RunBudgetExhaustedV1),
+    RunFailed(RunFailedBudgetExhaustedV1),
+    PermissionGrantNeeded(PermissionGrantNeededV1),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AdeDurableFactEnvelopeV1 {
+    pub session_id: String,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub seq: u64,
+    pub fact: AdeDurableFactV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6909,9 +7397,24 @@ fn decode_body_with_encoding(
 /// Cancellation-safe UDS frame extraction. Reads append bytes here before
 /// decoding, so a competing `select!` branch can never discard a prefix or a
 /// partially read body.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct StreamingFrameDecoder {
     buffered: Vec<u8>,
+}
+
+impl std::fmt::Debug for StreamingFrameDecoder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamingFrameDecoder")
+            .field("buffered_bytes", &self.buffered.len())
+            .finish()
+    }
+}
+
+impl Drop for StreamingFrameDecoder {
+    fn drop(&mut self) {
+        self.buffered.zeroize();
+    }
 }
 
 impl StreamingFrameDecoder {
@@ -6936,9 +7439,12 @@ impl StreamingFrameDecoder {
         if self.buffered.len() < frame_len {
             return Ok(None);
         }
-        let body = self.buffered[4..frame_len].to_vec();
+        let mut body = self.buffered[4..frame_len].to_vec();
+        self.buffered[..frame_len].zeroize();
         self.buffered.drain(..frame_len);
-        decode_body_with_encoding(&body, frame_limit, encoding).map(Some)
+        let decoded = decode_body_with_encoding(&body, frame_limit, encoding);
+        body.zeroize();
+        decoded.map(Some)
     }
 }
 
@@ -7163,6 +7669,10 @@ struct Subscription {
     queue_cursor: u64,
     queue_attachment_id: Option<String>,
     queue_attach_pending: bool,
+    /// `true` may omit superseded item deltas only during the initial store
+    /// replay. It is not a lossless transcript mode; buffered/live delivery
+    /// after AttachCaughtUp remains unfiltered.
+    sealed_replay: Option<bool>,
     queue_watch_waiters: Vec<QueueWatchReply>,
 }
 
@@ -7177,6 +7687,7 @@ impl Subscription {
                 .unwrap_or(0),
             queue_attachment_id: None,
             queue_attach_pending: false,
+            sealed_replay: None,
             queue_watch_waiters: Vec::new(),
         }
     }
@@ -7427,6 +7938,7 @@ enum ActorCommand {
     Attach {
         app: AppHandle,
         session_id: String,
+        sealed_replay: Option<bool>,
         reply: oneshot::Sender<SurfaceCommandStatus>,
     },
     Detach {
@@ -7644,10 +8156,15 @@ pub async fn account_list_watch(window: tauri::WebviewWindow) -> AccountRosterWa
 }
 
 /// Starts (or refreshes) a local subscription for one provider session.
+/// `sealed_replay: Some(true)` may omit superseded item deltas only during
+/// the initial durable store replay; it is not a lossless replay mode, and
+/// buffered/live delivery after `AttachCaughtUp` remains unfiltered. `None`
+/// preserves the shipped attach wire bytes exactly.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn surface_attach(
     app: AppHandle,
     session_id: String,
+    sealed_replay: Option<bool>,
 ) -> Result<SurfaceCommandStatus, String> {
     #[cfg(unix)]
     {
@@ -7658,6 +8175,7 @@ pub async fn surface_attach(
             .send(ActorCommand::Attach {
                 app,
                 session_id,
+                sealed_replay,
                 reply,
             })
             .is_err()
@@ -7668,7 +8186,7 @@ pub async fn surface_attach(
     }
     #[cfg(not(unix))]
     {
-        let _ = (app, session_id);
+        let _ = (app, session_id, sealed_replay);
         Ok(SurfaceCommandStatus::inactive(false))
     }
 }
@@ -7782,8 +8300,8 @@ pub(crate) async fn session_roster_snapshot_rpc() -> Option<Result<Vec<Value>, S
 /// Fetches one complete roster fenced to the Welcome that began the current
 /// socket connection. The bridge uses the returned identity to ensure a
 /// roster from an older connection can never lift the bootstrap barrier.
-pub(crate) async fn session_roster_snapshot_for_bootstrap_rpc(
-) -> Option<Result<CompleteSessionRosterSnapshot, String>> {
+pub(crate) async fn session_roster_snapshot_for_bootstrap_rpc()
+-> Option<Result<CompleteSessionRosterSnapshot, String>> {
     #[cfg(unix)]
     {
         let connection = actor_handle().connection.borrow().clone();
@@ -7868,6 +8386,15 @@ impl QueueCommandError {
         Self {
             code: "unsupported".to_string(),
             message: format!("The daemon does not advertise {FEATURE_QUEUE_CONTROL_V1}."),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn unsupported_sealed_replay() -> Self {
+        Self {
+            code: "unsupported".to_string(),
+            message: format!("The daemon does not advertise {FEATURE_SESSION_ATTACH_SEALED_V1}."),
             retryable: false,
             data: None,
         }
@@ -10915,7 +11442,7 @@ async fn workflow_control_attachment(
             session_id: session_id.to_string(),
             after_seq: head_seq,
             mode: AttachMode::Control,
-            sealed_replay: false,
+            sealed_replay: None,
         },
         Capability::Control,
         features,
@@ -11133,7 +11660,51 @@ fn session_compact_response(
     }
 }
 
-fn session_fork_response(body: ResponseBody) -> Result<SessionForkReceipt, LifecycleCommandError> {
+fn branch_create_response(
+    body: ResponseBody,
+) -> Result<BranchCreateReceipt, LifecycleCommandError> {
+    match body {
+        ResponseBody::BranchCreate {
+            session_id,
+            branch_id,
+            source_branch_id,
+            fork_node_id,
+            fork_seq,
+            created_seq,
+            worker_generation,
+            name,
+        } => Ok(BranchCreateReceipt {
+            session_id,
+            branch_id,
+            source_branch_id,
+            fork_node_id,
+            fork_seq,
+            created_seq,
+            worker_generation,
+            name,
+        }),
+        response => Err(lifecycle_response_error(
+            response,
+            "branch.create response method mismatch",
+        )),
+    }
+}
+
+fn stringify_sequence_field(record: &mut Value, field: &str) -> Result<(), LifecycleCommandError> {
+    let value = record
+        .get_mut(field)
+        .ok_or_else(|| LifecycleCommandError::protocol(format!("{field} was missing")))?;
+    let sequence = value
+        .as_u64()
+        .ok_or_else(|| LifecycleCommandError::protocol(format!("{field} was not a u64")))?;
+    *value = Value::String(sequence.to_string());
+    Ok(())
+}
+
+fn session_fork_response_with_prompt(
+    body: ResponseBody,
+    prompt_expected: bool,
+) -> Result<SessionForkReceipt, LifecycleCommandError> {
     match body {
         ResponseBody::SessionFork {
             session_id,
@@ -11144,23 +11715,115 @@ fn session_fork_response(body: ResponseBody) -> Result<SessionForkReceipt, Lifec
             created_seq,
             worker_generation,
             metadata,
-            forked_from,
+            mut forked_from,
             draft,
-        } => Ok(SessionForkReceipt {
-            session_id,
-            source_session_id,
-            source_branch_id,
-            fork_node_id,
-            fork_seq,
-            created_seq,
-            worker_generation,
-            metadata,
-            forked_from,
-            draft,
-        }),
+        } => {
+            if prompt_expected && (forked_from.is_none() || draft.is_none()) {
+                return Err(LifecycleCommandError::protocol(
+                    "session.fork prompt response omitted forked_from or draft",
+                ));
+            }
+            if prompt_expected {
+                if let Some(provenance) = forked_from.as_mut() {
+                    stringify_sequence_field(provenance, "seq")?;
+                }
+            }
+            Ok(SessionForkReceipt {
+                session_id,
+                source_session_id,
+                source_branch_id,
+                fork_node_id,
+                fork_seq,
+                created_seq,
+                worker_generation,
+                metadata,
+                forked_from,
+                draft,
+            })
+        }
         response => Err(lifecycle_response_error(
             response,
             "session.fork response method mismatch",
+        )),
+    }
+}
+
+fn session_fork_response(body: ResponseBody) -> Result<SessionForkReceipt, LifecycleCommandError> {
+    session_fork_response_with_prompt(body, false)
+}
+
+fn headless_run_start_response(
+    body: ResponseBody,
+) -> Result<HeadlessRunStartReceiptV1, LifecycleCommandError> {
+    match body {
+        ResponseBody::HeadlessRunStart {
+            session_id,
+            run_id,
+            accepted_seq,
+            worker_generation,
+            disposition,
+        } => Ok(HeadlessRunStartReceiptV1 {
+            session_id,
+            run_id,
+            accepted_seq,
+            worker_generation,
+            disposition,
+        }),
+        response => Err(lifecycle_response_error(
+            response,
+            "headless.run.start response method mismatch",
+        )),
+    }
+}
+
+fn headless_run_status_response(
+    body: ResponseBody,
+) -> Result<HeadlessRunStatusV1, LifecycleCommandError> {
+    match body {
+        ResponseBody::HeadlessRunStatus {
+            session_id,
+            run_id,
+            worker_generation,
+            state,
+            head_seq,
+            terminal_seq,
+            budget_exhausted,
+            spec,
+        } => Ok(HeadlessRunStatusV1 {
+            session_id,
+            run_id,
+            worker_generation,
+            state,
+            head_seq,
+            terminal_seq,
+            budget_exhausted,
+            spec,
+        }),
+        response => Err(lifecycle_response_error(
+            response,
+            "headless.run.status response method mismatch",
+        )),
+    }
+}
+
+fn headless_run_stop_response(
+    body: ResponseBody,
+) -> Result<HeadlessRunStopReceiptV1, LifecycleCommandError> {
+    match body {
+        ResponseBody::HeadlessRunStop {
+            session_id,
+            run_id,
+            status,
+            terminal_seq,
+        } => Ok(HeadlessRunStopReceiptV1 {
+            session_id,
+            run_id,
+            status,
+            terminal_seq,
+        }),
+        response => Err(lifecycle_response_error(
+            response,
+            "headless.run.stop response method mismatch",
         )),
     }
 }
@@ -11298,11 +11961,31 @@ fn session_compact_request(
 }
 
 #[cfg(unix)]
-fn session_fork_request(
+fn branch_create_request(
+    attachment: &WorkflowControlAttachment,
+    source_branch_id: Option<String>,
+    fork_node_id: String,
+    fork_seq: u64,
+    name: Option<String>,
+) -> RequestBody {
+    RequestBody::BranchCreate {
+        command_id: config_command_id("branch-create"),
+        session_id: attachment.session_id.clone(),
+        worker_generation: attachment.worker_generation,
+        source_branch_id,
+        fork_node_id,
+        fork_seq,
+        name,
+    }
+}
+
+#[cfg(unix)]
+fn session_fork_request_with_prompt(
     attachment: &WorkflowControlAttachment,
     source_branch_id: Option<String>,
     fork_node_id: Option<String>,
     fork_seq: Option<u64>,
+    prompt: Option<SessionForkPromptSelectorWire>,
 ) -> RequestBody {
     RequestBody::SessionFork {
         command_id: config_command_id("session-fork"),
@@ -11311,6 +11994,47 @@ fn session_fork_request(
         source_branch_id,
         fork_node_id,
         fork_seq,
+        prompt,
+    }
+}
+
+#[cfg(unix)]
+fn session_fork_request(
+    attachment: &WorkflowControlAttachment,
+    source_branch_id: Option<String>,
+    fork_node_id: Option<String>,
+    fork_seq: Option<u64>,
+) -> RequestBody {
+    session_fork_request_with_prompt(attachment, source_branch_id, fork_node_id, fork_seq, None)
+}
+
+#[cfg(unix)]
+fn headless_run_start_request(
+    attachment: &WorkflowControlAttachment,
+    text: String,
+    attachments: Option<Vec<Value>>,
+    spec: Value,
+    trust_hooks: bool,
+) -> RequestBody {
+    RequestBody::HeadlessRunStart {
+        command_id: config_command_id("headless-run-start"),
+        session_id: attachment.session_id.clone(),
+        worker_generation: attachment.worker_generation,
+        text,
+        attachments,
+        spec,
+        trust_hooks,
+    }
+}
+
+fn headless_run_status_request(run_id: String) -> RequestBody {
+    RequestBody::HeadlessRunStatus { run_id }
+}
+
+fn headless_run_stop_request(run_id: String) -> RequestBody {
+    RequestBody::HeadlessRunStop {
+        command_id: config_command_id("headless-run-stop"),
+        run_id,
     }
 }
 
@@ -11321,6 +12045,50 @@ fn run_retry_request(attachment: &WorkflowControlAttachment) -> RequestBody {
         session_id: attachment.session_id.clone(),
         worker_generation: attachment.worker_generation,
     }
+}
+
+fn parse_decimal_sequence(
+    decimal: &str,
+    field: &'static str,
+) -> Result<u64, LifecycleCommandError> {
+    if decimal.is_empty() || !decimal.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(LifecycleCommandError::invalid_argument(format!(
+            "{field} must be a decimal u64 string"
+        )));
+    }
+    decimal.parse::<u64>().map_err(|_| {
+        LifecycleCommandError::invalid_argument(format!("{field} must be a decimal u64 string"))
+    })
+}
+
+fn headless_spec_features(spec: &Value) -> Result<(BTreeSet<String>, bool), LifecycleCommandError> {
+    let object = spec.as_object().ok_or_else(|| {
+        LifecycleCommandError::invalid_argument("headless run spec must be an object")
+    })?;
+    let trust_hooks = match object.get("trust_hooks") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            LifecycleCommandError::invalid_argument("headless run spec trust_hooks must be a bool")
+        })?,
+    };
+    let mut features = lifecycle_features(FEATURE_HEADLESS_RUN_V1);
+    if let Some(budget) = object.get("budget") {
+        let budget = budget.as_object().ok_or_else(|| {
+            LifecycleCommandError::invalid_argument("headless run budget must be an object")
+        })?;
+        features.insert(FEATURE_RUN_BUDGET_V1.to_string());
+        for field in ["max_tokens", "max_cost_microusd", "max_time_ms"] {
+            let Some(limit) = budget.get(field) else {
+                continue;
+            };
+            if limit.as_u64().is_none_or(|limit| limit == 0) {
+                return Err(LifecycleCommandError::invalid_argument(format!(
+                    "headless run budget {field} must be a positive u64"
+                )));
+            }
+        }
+    }
+    Ok((features, trust_hooks))
 }
 
 #[cfg(unix)]
@@ -11361,6 +12129,28 @@ async fn lifecycle_request(
         Some(Err(error)) => Err(lifecycle_transport_error(error)),
         None => Err(LifecycleCommandError::unavailable(
             "The lifecycle RPC request did not receive a response.",
+        )),
+    }
+}
+
+#[cfg(unix)]
+async fn headless_request(
+    body: RequestBody,
+    capability: Capability,
+    features: &BTreeSet<String>,
+) -> Result<ResponseBody, LifecycleCommandError> {
+    match rpc_request_with_feature_gate(
+        body,
+        capability,
+        FeatureGate::all(features.clone()),
+        RpcErrorStyle::Passthrough,
+    )
+    .await
+    {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) => Err(lifecycle_transport_error(error)),
+        None => Err(LifecycleCommandError::unavailable(
+            "The headless run RPC request did not receive a response.",
         )),
     }
 }
@@ -11600,7 +12390,10 @@ pub async fn session_compact(
     #[cfg(unix)]
     {
         let provider_session_id = lifecycle_provider_session_id(session_id).await?;
-        let features = lifecycle_features(FEATURE_CONTEXT_COMPACTION_V1);
+        let mut features = lifecycle_features(FEATURE_CONTEXT_COMPACTION_V1);
+        if branch_id.is_some() {
+            features.insert(FEATURE_BRANCH_CREATE_V1.to_string());
+        }
         let attachment = lifecycle_control_attachment(&provider_session_id, &features).await?;
         let result = lifecycle_request(session_compact_request(&attachment, branch_id), &features)
             .await
@@ -11617,19 +12410,76 @@ pub async fn session_compact(
     }
 }
 
-/// Fork an exact journal node into a new daemon-minted session. When supplied,
-/// the numeric cut is resolved from the daemon journal and never accepted from
-/// JavaScript. Omitted selectors remain omitted for daemon-side shape checks.
+/// Create one named branch at the exact committed node resolved from the
+/// attached source snapshot. JavaScript never supplies the numeric cut.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn session_fork(
+pub async fn branch_create(
     session_id: String,
     source_branch_id: Option<String>,
-    fork_node_id: Option<String>,
-) -> Result<SessionForkReceipt, LifecycleCommandError> {
+    fork_node_id: String,
+    name: Option<String>,
+) -> Result<BranchCreateReceipt, LifecycleCommandError> {
     #[cfg(unix)]
     {
         let provider_session_id = lifecycle_provider_session_id(session_id).await?;
-        let features = lifecycle_features(FEATURE_SESSION_FORK_V1);
+        let features = lifecycle_features(FEATURE_BRANCH_CREATE_V1);
+        let attachment = lifecycle_control_attachment(&provider_session_id, &features).await?;
+        let result = async {
+            let fork_seq = lifecycle_fork_seq(&attachment, &fork_node_id, &features).await?;
+            lifecycle_request(
+                branch_create_request(&attachment, source_branch_id, fork_node_id, fork_seq, name),
+                &features,
+            )
+            .await
+            .and_then(branch_create_response)
+        }
+        .await;
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, source_branch_id, fork_node_id, name);
+        Err(LifecycleCommandError::unavailable(
+            "branch.create unavailable on this platform",
+        ))
+    }
+}
+
+/// Fork an exact journal node into a new daemon-minted session. When supplied,
+/// the numeric cut is resolved from the daemon journal and never accepted from
+/// JavaScript. Omitted selectors remain omitted for daemon-side shape checks.
+#[tauri::command(rename = "session_fork", rename_all = "snake_case")]
+pub async fn session_fork_with_prompt(
+    session_id: String,
+    source_branch_id: Option<String>,
+    fork_node_id: Option<String>,
+    prompt: Option<SessionForkPromptSelectorV1>,
+) -> Result<SessionForkReceipt, LifecycleCommandError> {
+    if fork_node_id.is_some() == prompt.is_some() {
+        return Err(LifecycleCommandError::invalid_argument(
+            "session.fork requires exactly one of fork_node_id or prompt",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let provider_session_id = lifecycle_provider_session_id(session_id).await?;
+        let mut features = lifecycle_features(FEATURE_SESSION_FORK_V1);
+        let prompt = prompt
+            .map(|prompt| {
+                let seq = parse_decimal_sequence(&prompt.seq, "session.fork prompt.seq")?;
+                if seq == 0 {
+                    return Err(LifecycleCommandError::invalid_argument(
+                        "session.fork prompt.seq must be greater than zero",
+                    ));
+                }
+                Ok(SessionForkPromptSelectorWire { seq })
+            })
+            .transpose()?;
+        let prompt_expected = prompt.is_some();
+        if prompt_expected {
+            features.insert(FEATURE_SESSION_PROMPT_FORK_V1.to_string());
+        }
         let attachment = lifecycle_control_attachment(&provider_session_id, &features).await?;
         let result = async {
             let fork_seq = match fork_node_id.as_deref() {
@@ -11639,11 +12489,17 @@ pub async fn session_fork(
                 None => None,
             };
             lifecycle_request(
-                session_fork_request(&attachment, source_branch_id, fork_node_id, fork_seq),
+                session_fork_request_with_prompt(
+                    &attachment,
+                    source_branch_id,
+                    fork_node_id,
+                    fork_seq,
+                    prompt,
+                ),
                 &features,
             )
             .await
-            .and_then(session_fork_response)
+            .and_then(|response| session_fork_response_with_prompt(response, prompt_expected))
         }
         .await;
         workflow_detach(attachment.attachment_id).await;
@@ -11651,11 +12507,22 @@ pub async fn session_fork(
     }
     #[cfg(not(unix))]
     {
-        let _ = (session_id, source_branch_id, fork_node_id);
+        let _ = (session_id, source_branch_id, fork_node_id, prompt);
         Err(LifecycleCommandError::unavailable(
             "session.fork unavailable on this platform",
         ))
     }
+}
+
+/// Rust compatibility entry point for the shipped exact-node fork SDK. The
+/// registered JavaScript command above remains named `session_fork` and adds
+/// the prompt selector without changing this legacy Rust call shape.
+pub async fn session_fork(
+    session_id: String,
+    source_branch_id: Option<String>,
+    fork_node_id: Option<String>,
+) -> Result<SessionForkReceipt, LifecycleCommandError> {
+    session_fork_with_prompt(session_id, source_branch_id, fork_node_id, None).await
 }
 
 /// Retry the latest failed main-timeline turn or wake the current backoff.
@@ -11677,6 +12544,103 @@ pub async fn run_retry(session_id: String) -> Result<RunRetryReceipt, LifecycleC
         let _ = session_id;
         Err(LifecycleCommandError::unavailable(
             "run.retry unavailable on this platform",
+        ))
+    }
+}
+
+/// Durably accepts a detached run using the exact caller-supplied execution
+/// spec. Deep spec and attachment records remain verbatim; only the daemon's
+/// session/generation coordinates are filled by this SDK.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn headless_run_start(
+    session_id: String,
+    text: String,
+    attachments: Option<Vec<Value>>,
+    spec: Value,
+) -> Result<HeadlessRunStartReceiptV1, LifecycleCommandError> {
+    let (features, trust_hooks) = headless_spec_features(&spec)?;
+    #[cfg(unix)]
+    {
+        let provider_session_id = lifecycle_provider_session_id(session_id).await?;
+        let attachment = lifecycle_control_attachment(&provider_session_id, &features).await?;
+        let result = headless_request(
+            headless_run_start_request(&attachment, text, attachments, spec, trust_hooks),
+            Capability::Control,
+            &features,
+        )
+        .await
+        .and_then(headless_run_start_response);
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, text, attachments, spec, features, trust_hooks);
+        Err(LifecycleCommandError::unavailable(
+            "headless.run.start unavailable on this platform",
+        ))
+    }
+}
+
+/// Read the daemon's journal-derived lifecycle snapshot by globally unique
+/// run id. This is a View operation and does not create an attachment.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn headless_run_status(
+    run_id: String,
+) -> Result<HeadlessRunStatusV1, LifecycleCommandError> {
+    #[cfg(unix)]
+    {
+        let features = lifecycle_features(FEATURE_HEADLESS_RUN_V1);
+        return headless_request(
+            headless_run_status_request(run_id),
+            Capability::View,
+            &features,
+        )
+        .await
+        .and_then(headless_run_status_response);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = run_id;
+        Err(LifecycleCommandError::unavailable(
+            "headless.run.status unavailable on this platform",
+        ))
+    }
+}
+
+/// Idempotently request cancellation of a detached run. Status resolves the
+/// daemon session first; the mutation then borrows a fresh Control attachment
+/// and never accepts a caller-supplied session or generation coordinate.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn headless_run_stop(
+    run_id: String,
+) -> Result<HeadlessRunStopReceiptV1, LifecycleCommandError> {
+    #[cfg(unix)]
+    {
+        let features = lifecycle_features(FEATURE_HEADLESS_RUN_V1);
+        let status = headless_request(
+            headless_run_status_request(run_id.clone()),
+            Capability::View,
+            &features,
+        )
+        .await
+        .and_then(headless_run_status_response)?;
+        let attachment = lifecycle_control_attachment(&status.session_id, &features).await?;
+        let result = headless_request(
+            headless_run_stop_request(run_id),
+            Capability::Control,
+            &features,
+        )
+        .await
+        .and_then(headless_run_stop_response);
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = run_id;
+        Err(LifecycleCommandError::unavailable(
+            "headless.run.stop unavailable on this platform",
         ))
     }
 }
@@ -13773,7 +14737,7 @@ async fn session_select_agent_type_inner(
             session_id: session_id.clone(),
             after_seq: head_seq,
             mode: AttachMode::Control,
-            sealed_replay: false,
+            sealed_replay: None,
         },
         Capability::Control,
         &[FEATURE_SESSION_AGENT_TYPE_SELECT_V1],
@@ -13903,6 +14867,98 @@ async fn stage_api_key(secret: &SecretWire) -> Result<String, String> {
             Err("vault.stage response stage_id mismatch".to_string())
         }
         _ => Err("vault.stage response method mismatch".to_string()),
+    }
+}
+
+fn validate_transcription_secret(secret: &SecretWire, clear: bool) -> Result<(), &'static str> {
+    if clear {
+        return secret
+            .0
+            .is_empty()
+            .then_some(())
+            .ok_or("transcription.secret_set requires an empty secret when clear is true");
+    }
+    if secret.0.is_empty() {
+        return Err("transcription.secret_set requires a non-empty secret");
+    }
+    if secret.0.chars().count() > 512 {
+        return Err("transcription.secret_set secret exceeds 512 characters");
+    }
+    if secret.0.chars().any(char::is_control) {
+        return Err("transcription.secret_set secret contains a control character");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn transcription_request(
+    body: RequestBody,
+) -> Result<ResponseBody, TranscriptionCommandErrorV1> {
+    match rpc_request_with_feature_gate(
+        body,
+        Capability::Control,
+        FeatureGate::all(BTreeSet::from([FEATURE_TRANSCRIPTION_V1.to_string()])),
+        RpcErrorStyle::Code,
+    )
+    .await
+    {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(code)) => Err(TranscriptionCommandErrorV1::transport(code)),
+        None => Err(TranscriptionCommandErrorV1::unavailable()),
+    }
+}
+
+/// Reads the profile-scoped transcription secret once over the authenticated
+/// local UDS. The result is never cached and its backing string is wiped after
+/// the single Tauri serialization into JavaScript.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn transcription_secret_get()
+-> Result<TranscriptionSecretGetResultV1, TranscriptionCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return match transcription_request(RequestBody::TranscriptionSecretGet).await? {
+            ResponseBody::TranscriptionSecretGet { secret } => {
+                Ok(TranscriptionSecretGetResultV1 { secret })
+            }
+            _ => Err(TranscriptionCommandErrorV1::protocol(
+                "transcription.secret_get response method mismatch",
+            )),
+        };
+    }
+    #[cfg(not(unix))]
+    Err(TranscriptionCommandErrorV1::unavailable())
+}
+
+/// Stores or clears the profile-scoped transcription secret. The only
+/// successful fact returned is whether a value is now present.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn transcription_secret_set(
+    mut secret: SecretWire,
+    clear: Option<bool>,
+) -> Result<TranscriptionSecretSetResultV1, TranscriptionCommandErrorV1> {
+    let clear = clear.unwrap_or(false);
+    if let Err(message) = validate_transcription_secret(&secret, clear) {
+        secret.wipe();
+        return Err(TranscriptionCommandErrorV1::invalid_argument(message));
+    }
+    #[cfg(unix)]
+    {
+        return match transcription_request(RequestBody::TranscriptionSecretSet { secret, clear })
+            .await?
+        {
+            ResponseBody::TranscriptionSecretSet { present } => {
+                Ok(TranscriptionSecretSetResultV1 { present })
+            }
+            _ => Err(TranscriptionCommandErrorV1::protocol(
+                "transcription.secret_set response method mismatch",
+            )),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        secret.wipe();
+        let _ = clear;
+        Err(TranscriptionCommandErrorV1::unavailable())
     }
 }
 
@@ -14484,8 +15540,8 @@ pub async fn haider_account_import_device(
     }
 }
 
-/// Sets or clears an operator-chosen display label for an account. Plain
-/// management class: Control, no UDS, and deliberately NO command_id — a
+/// Sets or clears an operator-chosen display label for an account. The
+/// `account_label_v1` Control door deliberately has NO command_id — a
 /// label is idempotent by value, so a receipt would be ceremony without
 /// safety and a retry is naturally safe.
 ///
@@ -14506,7 +15562,7 @@ pub async fn account_set_label(
         let response = account_request(
             RequestBody::AccountSetLabel { alias, label },
             Capability::Control,
-            account_feature_gate(&[FEATURE_ACCOUNT_MANAGEMENT_V1]),
+            account_feature_gate(&[FEATURE_ACCOUNT_LABEL_V1]),
         )
         .await?;
         return match response {
@@ -14824,10 +15880,13 @@ async fn config_request(
 }
 
 #[cfg(unix)]
-fn resident_turn_submit_features(explicit_mode: bool) -> BTreeSet<String> {
+fn resident_turn_submit_features(explicit_mode: bool, branch_scoped: bool) -> BTreeSet<String> {
     let mut features = BTreeSet::from([FEATURE_RESIDENT_TURN_SUBMIT_V1.to_string()]);
     if explicit_mode {
         features.insert(FEATURE_QUEUE_CONTROL_V1.to_string());
+    }
+    if branch_scoped {
+        features.insert(FEATURE_BRANCH_CREATE_V1.to_string());
     }
     features
 }
@@ -14836,11 +15895,12 @@ fn resident_turn_submit_features(explicit_mode: bool) -> BTreeSet<String> {
 async fn resident_turn_submit_request(
     body: RequestBody,
     explicit_mode: bool,
+    branch_scoped: bool,
 ) -> Result<Option<ResponseBody>, String> {
     match rpc_request(
         body,
         Capability::Control,
-        resident_turn_submit_features(explicit_mode),
+        resident_turn_submit_features(explicit_mode, branch_scoped),
     )
     .await
     {
@@ -14925,12 +15985,14 @@ async fn config_session_summary(
 async fn resident_turn_submit_session_summary(
     session_id: &str,
     explicit_mode: bool,
+    branch_scoped: bool,
 ) -> Result<Option<Value>, String> {
     let mut cursor = None;
     loop {
         let Some(response) = resident_turn_submit_request(
             RequestBody::SessionList { cursor, limit: 256 },
             explicit_mode,
+            branch_scoped,
         )
         .await?
         else {
@@ -15237,7 +16299,7 @@ async fn session_config_set_rpc_inner(
             session_id: session_id.clone(),
             after_seq: head_seq,
             mode: AttachMode::Control,
-            sealed_replay: false,
+            sealed_replay: None,
         },
         Capability::Control,
         &[],
@@ -15744,7 +16806,7 @@ async fn session_answer_menu_rpc_inner(
         session_id: session_id.clone(),
         after_seq: head_seq,
         mode: AttachMode::Control,
-        sealed_replay: false,
+        sealed_replay: None,
     })
     .await
     .map_err(SessionAnswerMenuRpcError::BeforeAnswer)?
@@ -15846,7 +16908,7 @@ async fn session_cancel_turn_rpc(
         session_id: session_id.clone(),
         after_seq: head_seq,
         mode: AttachMode::Control,
-        sealed_replay: false,
+        sealed_replay: None,
     })
     .await?
     else {
@@ -15900,96 +16962,48 @@ async fn session_cancel_turn_rpc(
 /// the machine running the DAEMON — the one whose permission is missing —
 /// which stays correct when the UI is somewhere else entirely.
 ///
-/// The daemon keys the request by the FULL menu id (worker.rs stores
-/// `request_id: menu.id`), and derives the pane itself; no client ever sends a
-/// URL. Needs a control attachment, so it borrows one for the call.
+/// The durable grant fact supplies a request id distinct from its menu id.
+/// This SDK carries that request id verbatim and derives neither it nor a URL.
+/// A fresh control attachment supplies the authoritative session coordinate.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn computer_permission_open_settings(
     session_id: String,
-    menu_id: String,
-    permission: String,
-) -> Result<Value, String> {
+    request_id: String,
+    permission: SystemPermissionV1,
+) -> Result<ComputerPermissionOpenSettingsResultV1, LifecycleCommandError> {
     #[cfg(unix)]
     {
-        if !session_needs_input_available(&actor_handle().connection.borrow()) {
-            return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
-        }
-        let context_session_id = session_id.clone();
-        let provider_session_id = tauri::async_runtime::spawn_blocking(move || {
-            let connection = super::sessions_open_database()?;
-            let row = super::sessions_row_by_id(&connection, context_session_id.trim())?;
-            let provider_session_id = row.provider_session_id.trim();
-            if provider_session_id.is_empty() {
-                return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
-            }
-            Ok::<String, String>(provider_session_id.to_string())
-        })
+        let provider_session_id = lifecycle_provider_session_id(session_id).await?;
+        let features = lifecycle_features(FEATURE_COMPUTER_PERMISSION_ACTIONS_V1);
+        let attachment = lifecycle_control_attachment(&provider_session_id, &features).await?;
+        let result = lifecycle_request(
+            RequestBody::ComputerPermissionOpenSettings {
+                session_id: attachment.session_id.clone(),
+                request_id,
+                permission,
+            },
+            &features,
+        )
         .await
-        .map_err(|error| format!("Permission settings worker failed: {error}"))??;
-        return computer_permission_open_settings_rpc(provider_session_id, menu_id, permission)
-            .await;
+        .and_then(|response| match response {
+            ResponseBody::ComputerPermissionOpenSettings { permission } => {
+                Ok(ComputerPermissionOpenSettingsResultV1 { permission })
+            }
+            response => Err(lifecycle_response_error(
+                response,
+                "computer.permission_open_settings response method mismatch",
+            )),
+        });
+        workflow_detach(attachment.attachment_id).await;
+        return result;
     }
     #[cfg(not(unix))]
     {
-        let _ = (session_id, menu_id, permission);
-        Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string())
+        let _ = (session_id, request_id, permission);
+        Err(LifecycleCommandError::unavailable(
+            "computer.permission_open_settings unavailable on this platform",
+        ))
     }
-}
-
-#[cfg(unix)]
-async fn computer_permission_open_settings_rpc(
-    session_id: String,
-    menu_id: String,
-    permission: String,
-) -> Result<Value, String> {
-    let Some(summary) = session_needs_input_summary(&session_id).await? else {
-        return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
-    };
-    let head_seq = config_u64(summary.get("head_seq"))
-        .ok_or_else(|| "session summary head_seq was missing".to_string())?;
-    let Some(response) = session_needs_input_request(RequestBody::SessionAttach {
-        session_id: session_id.clone(),
-        after_seq: head_seq,
-        mode: AttachMode::Control,
-        sealed_replay: false,
-    })
-    .await?
-    else {
-        return Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string());
-    };
-    let ResponseBody::SessionAttach {
-        attachment_id,
-        attach_state,
-    } = response
-    else {
-        return Err("session.attach response method mismatch".to_string());
-    };
-    if attach_state.session_id != session_id {
-        let _ = session_needs_input_request(RequestBody::SessionDetach { attachment_id }).await;
-        return Err("session.attach response session mismatch".to_string());
-    }
-
-    let opened = async {
-        match session_needs_input_request(RequestBody::ComputerPermissionOpenSettings {
-            session_id,
-            request_id: menu_id,
-            permission,
-        })
-        .await?
-        {
-            Some(ResponseBody::ComputerPermissionOpenSettings { permission }) => {
-                Ok(serde_json::json!({ "permission": permission }))
-            }
-            Some(_) => {
-                Err("computer.permission_open_settings response method mismatch".to_string())
-            }
-            None => Err(HAIDER_NEEDS_INPUT_UNAVAILABLE.to_string()),
-        }
-    }
-    .await;
-
-    let _ = session_needs_input_request(RequestBody::SessionDetach { attachment_id }).await;
-    opened
 }
 
 /// Resolves a daemon-owned needs-input card using the exact staleness fence
@@ -16059,8 +17073,11 @@ async fn resident_turn_submit_rpc_inner(
     prompt: String,
     mode: DeliveryMode,
     explicit_mode: bool,
+    branch_id: Option<String>,
 ) -> Result<Option<ResidentTurnSubmit>, String> {
-    let Some(summary) = resident_turn_submit_session_summary(&session_id, explicit_mode).await?
+    let branch_scoped = branch_id.is_some();
+    let Some(summary) =
+        resident_turn_submit_session_summary(&session_id, explicit_mode, branch_scoped).await?
     else {
         return Ok(None);
     };
@@ -16071,9 +17088,10 @@ async fn resident_turn_submit_rpc_inner(
             session_id: session_id.clone(),
             after_seq: head_seq,
             mode: AttachMode::Control,
-            sealed_replay: false,
+            sealed_replay: None,
         },
         explicit_mode,
+        branch_scoped,
     )
     .await?
     else {
@@ -16090,6 +17108,7 @@ async fn resident_turn_submit_rpc_inner(
         let _ = resident_turn_submit_request(
             RequestBody::SessionDetach { attachment_id },
             explicit_mode,
+            branch_scoped,
         )
         .await;
         return Err("session.attach response session mismatch".to_string());
@@ -16101,10 +17120,12 @@ async fn resident_turn_submit_rpc_inner(
                 resident_turn_submit_command_id(),
                 session_id.clone(),
                 attach_state.worker_generation,
+                branch_id.clone(),
                 prompt,
                 mode,
             ),
             explicit_mode,
+            branch_scoped,
         )
         .await?
         else {
@@ -16117,23 +17138,50 @@ async fn resident_turn_submit_rpc_inner(
                 accepted_seq,
                 worker_generation: _,
                 disposition,
-            } if accepted_session == session_id => Ok(Some(ResidentTurnSubmit {
+            } if accepted_session == session_id && branch_id.is_none() => {
+                Ok(Some(ResidentTurnSubmit {
+                    session_id: accepted_session,
+                    run_id,
+                    accepted_seq,
+                    disposition,
+                    branch_id: None,
+                }))
+            }
+            ResponseBody::TurnSubmitOnBranch {
                 session_id: accepted_session,
                 run_id,
                 accepted_seq,
+                worker_generation: _,
                 disposition,
-            })),
+                branch_id: accepted_branch,
+            } if accepted_session == session_id
+                && branch_id.as_deref() == Some(accepted_branch.as_str()) =>
+            {
+                Ok(Some(ResidentTurnSubmit {
+                    session_id: accepted_session,
+                    run_id,
+                    accepted_seq,
+                    disposition,
+                    branch_id: Some(accepted_branch),
+                }))
+            }
             ResponseBody::TurnSubmit { .. } => {
                 Err("turn.submit response session mismatch".to_string())
+            }
+            ResponseBody::TurnSubmitOnBranch { .. } => {
+                Err("turn.submit.on_branch response scope mismatch".to_string())
             }
             _ => Err("turn.submit response method mismatch".to_string()),
         }
     }
     .await;
 
-    let _ =
-        resident_turn_submit_request(RequestBody::SessionDetach { attachment_id }, explicit_mode)
-            .await;
+    let _ = resident_turn_submit_request(
+        RequestBody::SessionDetach { attachment_id },
+        explicit_mode,
+        branch_scoped,
+    )
+    .await;
     submit
 }
 
@@ -16141,6 +17189,7 @@ fn resident_turn_submit_body(
     command_id: String,
     session_id: String,
     worker_generation: u64,
+    branch_id: Option<String>,
     text: String,
     mode: DeliveryMode,
 ) -> RequestBody {
@@ -16148,6 +17197,7 @@ fn resident_turn_submit_body(
         command_id,
         session_id,
         worker_generation,
+        branch_id,
         text,
         attachments: Vec::new(),
         mode,
@@ -16163,6 +17213,18 @@ pub(crate) async fn resident_turn_submit_rpc(
     attachments: &[String],
     mode: Option<DeliveryMode>,
 ) -> Option<Result<ResidentTurnSubmit, String>> {
+    resident_turn_submit_rpc_scoped(session_id, prompt, attachments, mode, None).await
+}
+
+/// Additive named-branch form of the existing resident submit path. The
+/// legacy wrapper above passes `None`, preserving its request bytes exactly.
+pub(crate) async fn resident_turn_submit_rpc_scoped(
+    session_id: String,
+    prompt: String,
+    attachments: &[String],
+    mode: Option<DeliveryMode>,
+    branch_id: Option<String>,
+) -> Option<Result<ResidentTurnSubmit, String>> {
     #[cfg(unix)]
     {
         if attachments
@@ -16177,6 +17239,7 @@ pub(crate) async fn resident_turn_submit_rpc(
             prompt,
             mode.unwrap_or(DeliveryMode::Queue),
             explicit_mode,
+            branch_id,
         )
         .await
         {
@@ -16187,7 +17250,7 @@ pub(crate) async fn resident_turn_submit_rpc(
     }
     #[cfg(not(unix))]
     {
-        let _ = (session_id, prompt, attachments, mode);
+        let _ = (session_id, prompt, attachments, mode, branch_id);
         None
     }
 }
@@ -16203,7 +17266,7 @@ async fn session_seen_rpc_inner(session_id: String) -> Result<Option<SessionSeen
         session_id: session_id.clone(),
         after_seq: head_seq,
         mode: AttachMode::Control,
-        sealed_replay: false,
+        sealed_replay: None,
     })
     .await?
     else {
@@ -16658,12 +17721,20 @@ fn apply_disconnected_command(
         ActorCommand::Attach {
             app,
             session_id,
+            sealed_replay,
             reply,
         } => {
             subscriptions
                 .entry(session_id.clone())
-                .and_modify(|subscription| subscription.app = app.clone())
-                .or_insert_with(|| Subscription::new(app, &session_id));
+                .and_modify(|subscription| {
+                    subscription.app = app.clone();
+                    subscription.sealed_replay = sealed_replay;
+                })
+                .or_insert_with(|| {
+                    let mut subscription = Subscription::new(app, &session_id);
+                    subscription.sealed_replay = sealed_replay;
+                    subscription
+                });
             let _ = reply.send(SurfaceCommandStatus::inactive(true));
         }
         ActorCommand::Detach { session_id, reply } => {
@@ -16758,6 +17829,14 @@ async fn run_connected(
     }
     if connection.can_watch_queue() {
         for session_id in subscriptions.keys().cloned().collect::<Vec<_>>() {
+            if subscriptions.get(&session_id).is_some_and(|subscription| {
+                subscription.sealed_replay.is_some()
+                    && !connection
+                        .features
+                        .contains(FEATURE_SESSION_ATTACH_SEALED_V1)
+            }) {
+                continue;
+            }
             if send_queue_watch(
                 stream,
                 connection.frame_limit,
@@ -16814,6 +17893,7 @@ async fn run_connected(
                             return;
                         }
                         decoder.push(&scratch[..read]);
+                        scratch[..read].zeroize();
                     }
                     _ = heartbeat.tick() => {
                         if unacked_pings
@@ -16950,9 +18030,15 @@ async fn run_connected(
                     session_id,
                     input,
                     status,
-                } = body.clone()
+                } = &body
                 {
-                    emit_surface(subscriptions, &connection, session_id, input, status);
+                    emit_surface(
+                        subscriptions,
+                        &connection,
+                        session_id.clone(),
+                        input.clone(),
+                        status.clone(),
+                    );
                 }
                 if let Some((reply, error_style)) = pending_requests.remove(&request_id) {
                     let _ = reply.send(Some(response_result(body, error_style)));
@@ -16995,7 +18081,13 @@ async fn run_connected(
                 session_id,
                 envelope,
             } => {
-                if !handle_queue_event(subscriptions, attachment_id, session_id, envelope) {
+                if !handle_queue_event(
+                    subscriptions,
+                    &connection.features,
+                    attachment_id,
+                    session_id,
+                    envelope,
+                ) {
                     return;
                 }
             }
@@ -17251,6 +18343,15 @@ async fn apply_connected_command(
 
             if let Err(error) = queue_watch_preflight(connection) {
                 let _ = reply.send(Err(error));
+                return true;
+            }
+            if subscriptions.get(&session_id).is_some_and(|subscription| {
+                subscription.sealed_replay.is_some()
+                    && !connection
+                        .features
+                        .contains(FEATURE_SESSION_ATTACH_SEALED_V1)
+            }) {
+                let _ = reply.send(Err(QueueCommandError::unsupported_sealed_replay()));
                 return true;
             }
 
@@ -17569,12 +18670,33 @@ async fn apply_connected_command(
         ActorCommand::Attach {
             app,
             session_id,
+            sealed_replay,
             reply,
         } => {
+            if sealed_replay.is_some()
+                && !connection
+                    .features
+                    .contains(FEATURE_SESSION_ATTACH_SEALED_V1)
+            {
+                let _ = reply.send(SurfaceCommandStatus::inactive(false));
+                return true;
+            }
+            let sealed_replay_changed =
+                subscriptions.get(&session_id).is_some_and(|subscription| {
+                    subscription.queue_attachment_id.is_some()
+                        && subscription.sealed_replay != sealed_replay
+                });
             subscriptions
                 .entry(session_id.clone())
-                .and_modify(|subscription| subscription.app = app.clone())
-                .or_insert_with(|| Subscription::new(app, &session_id));
+                .and_modify(|subscription| {
+                    subscription.app = app.clone();
+                    subscription.sealed_replay = sealed_replay;
+                })
+                .or_insert_with(|| {
+                    let mut subscription = Subscription::new(app, &session_id);
+                    subscription.sealed_replay = sealed_replay;
+                    subscription
+                });
             let active = connection.can_watch_surfaces();
             let written = !active
                 || send_surface_watch(
@@ -17608,7 +18730,7 @@ async fn apply_connected_command(
             let _ = reply.send(SurfaceCommandStatus::from_connection(
                 connection, active, written,
             ));
-            written && queue_written
+            written && queue_written && !sealed_replay_changed
         }
         ActorCommand::Detach { session_id, reply } => {
             subscriptions.remove(&session_id);
@@ -17815,6 +18937,39 @@ fn parse_queue_changed_payload_owned(
     Ok(Some(delta))
 }
 
+fn parse_ade_durable_fact(
+    features: &BTreeSet<String>,
+    payload: &Value,
+) -> Result<Option<AdeDurableFactV1>, String> {
+    let payload_type = payload.get("type").and_then(Value::as_str);
+    match payload_type {
+        Some("run_budget_exhausted") if features.contains(FEATURE_RUN_BUDGET_V1) => {
+            serde_json::from_value(payload.clone())
+                .map(AdeDurableFactV1::RunBudgetExhausted)
+                .map(Some)
+                .map_err(|error| format!("invalid RunBudgetExhausted payload: {error}"))
+        }
+        Some("run_failed")
+            if features.contains(FEATURE_RUN_BUDGET_V1)
+                && payload.get("code").and_then(Value::as_str) == Some("budget_exhausted") =>
+        {
+            serde_json::from_value(payload.clone())
+                .map(AdeDurableFactV1::RunFailed)
+                .map(Some)
+                .map_err(|error| format!("invalid budget-exhausted RunFailed payload: {error}"))
+        }
+        Some("permission_grant_needed")
+            if features.contains(FEATURE_COMPUTER_PERMISSION_ACTIONS_V1) =>
+        {
+            serde_json::from_value(payload.clone())
+                .map(AdeDurableFactV1::PermissionGrantNeeded)
+                .map(Some)
+                .map_err(|error| format!("invalid PermissionGrantNeeded payload: {error}"))
+        }
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 fn parse_queue_changed_payload(
     envelope_seq: u64,
@@ -17911,6 +19066,7 @@ fn finish_queue_watch(
 #[cfg(unix)]
 fn handle_queue_event(
     subscriptions: &mut HashMap<String, Subscription>,
+    features: &BTreeSet<String>,
     attachment_id: String,
     frame_session_id: String,
     envelope: RawEnvelopeWire,
@@ -17941,6 +19097,21 @@ fn handle_queue_event(
         eprintln!("[ade-rpc] {reason}");
         emit_queue_watch_failure_for_session(subscription, &expected_session_id, &reason, true);
         return false;
+    }
+
+    match parse_ade_durable_fact(features, &envelope.payload) {
+        Ok(Some(fact)) => {
+            let _ = subscription.app.emit(
+                ADE_DURABLE_FACT_EVENT,
+                AdeDurableFactEnvelopeV1 {
+                    session_id: frame_session_id.clone(),
+                    seq: envelope.seq,
+                    fact,
+                },
+            );
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("[ade-rpc] dropping malformed durable fact: {error}"),
     }
 
     let parsed = parse_queue_changed_payload_owned(envelope.seq, envelope.payload);
@@ -18031,6 +19202,9 @@ async fn send_queue_watch(
     else {
         return Ok(());
     };
+    let sealed_replay = subscriptions
+        .get(&session_id)
+        .and_then(|subscription| subscription.sealed_replay);
     let request_id = request_id(next_request);
     let request = WireFrame::Request {
         request_id: request_id.clone(),
@@ -18038,7 +19212,7 @@ async fn send_queue_watch(
             session_id: session_id.clone(),
             after_seq,
             mode: AttachMode::Control,
-            sealed_replay: false,
+            sealed_replay,
         },
     };
     write_frame(stream, &request, frame_limit, encoding).await?;
@@ -18179,7 +19353,9 @@ async fn read_frame(stream: &mut UnixStream, frame_limit: usize) -> std::io::Res
     }
     let mut body = vec![0_u8; body_len];
     stream.read_exact(&mut body).await?;
-    decode_body(&body, frame_limit)
+    let decoded = decode_body(&body, frame_limit);
+    body.zeroize();
+    decoded
 }
 
 /// Resolves only the deterministic endpoint published by the client
@@ -18547,6 +19723,11 @@ mod shell_tests;
 mod capability_tests;
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_bits_tests.rs"]
+mod bits_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -18765,10 +19946,12 @@ mod tests {
         let bytes = encode_framed(&frame, DEFAULT_FRAME_LIMIT).unwrap();
         let mut decoder = StreamingFrameDecoder::default();
         decoder.push(&bytes[..3]);
-        assert!(decoder
-            .next(DEFAULT_FRAME_LIMIT, WireEncoding::Json)
-            .unwrap()
-            .is_none());
+        assert!(
+            decoder
+                .next(DEFAULT_FRAME_LIMIT, WireEncoding::Json)
+                .unwrap()
+                .is_none()
+        );
         decoder.push(&bytes[3..]);
         assert_eq!(
             decoder
@@ -18776,10 +19959,12 @@ mod tests {
                 .unwrap(),
             Some(frame)
         );
-        assert!(decoder
-            .next(DEFAULT_FRAME_LIMIT, WireEncoding::Json)
-            .unwrap()
-            .is_none());
+        assert!(
+            decoder
+                .next(DEFAULT_FRAME_LIMIT, WireEncoding::Json)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -18791,10 +19976,12 @@ mod tests {
         // The first chunk stands in for a read completed before another
         // select! branch wins. The owned decoder retains it for the retry.
         decoder.push(&bytes[..6]);
-        assert!(decoder
-            .next(DEFAULT_FRAME_LIMIT, WireEncoding::Msgpack)
-            .unwrap()
-            .is_none());
+        assert!(
+            decoder
+                .next(DEFAULT_FRAME_LIMIT, WireEncoding::Msgpack)
+                .unwrap()
+                .is_none()
+        );
         decoder.push(&bytes[6..]);
         assert_eq!(
             decoder
@@ -19076,6 +20263,7 @@ mod tests {
                 "diffforge-resident-turn-test".to_owned(),
                 "session-1".to_owned(),
                 7,
+                None,
                 "continue the work".to_owned(),
                 DeliveryMode::Subturn,
             ),
@@ -19099,12 +20287,12 @@ mod tests {
     #[test]
     fn resident_turn_submit_features_require_queue_control_only_for_explicit_modes() {
         assert_eq!(
-            resident_turn_submit_features(false),
+            resident_turn_submit_features(false, false),
             BTreeSet::from([FEATURE_RESIDENT_TURN_SUBMIT_V1.to_string()]),
             "implicit legacy submissions must not require queue_control_v1",
         );
         assert_eq!(
-            resident_turn_submit_features(true),
+            resident_turn_submit_features(true, false),
             BTreeSet::from([
                 FEATURE_QUEUE_CONTROL_V1.to_string(),
                 FEATURE_RESIDENT_TURN_SUBMIT_V1.to_string(),
@@ -20438,7 +21626,7 @@ mod tests {
                     session_id: "session-1".to_string(),
                     after_seq: 42,
                     mode: AttachMode::Control,
-                    sealed_replay: false,
+                    sealed_replay: None,
                 },
             }),
             r#"{"v":1,"kind":"request","request_id":"req-attach","body":{"method":"session.attach","session_id":"session-1","after_seq":42,"mode":"control"}}"#
@@ -20520,8 +21708,8 @@ mod tests {
         );
         assert!(fresh.is_some());
 
-        assert!(gate
-            .accept(
+        assert!(
+            gate.accept(
                 Some(SurfaceInputWire {
                     text: "equal".to_owned(),
                     attachments: Vec::new(),
@@ -20536,7 +21724,8 @@ mod tests {
                     owner: "tui".to_owned(),
                 }),
             )
-            .is_none());
+            .is_none()
+        );
 
         let (input, status) = gate
             .accept(
@@ -20804,12 +21993,14 @@ mod tests {
 
     #[test]
     fn resident_session_binding_frames_require_the_advertised_feature() {
-        assert!(resident_binding_snapshot_for_frame(
-            &BTreeSet::new(),
-            Some("session-legacy".to_string()),
-            128,
-        )
-        .is_none());
+        assert!(
+            resident_binding_snapshot_for_frame(
+                &BTreeSet::new(),
+                Some("session-legacy".to_string()),
+                128,
+            )
+            .is_none()
+        );
 
         let features = BTreeSet::from([FEATURE_RESIDENT_SESSION_BINDING_V1.to_string()]);
         let bound = resident_binding_snapshot_for_frame(
