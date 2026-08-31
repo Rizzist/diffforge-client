@@ -43,6 +43,9 @@ const FEATURE_SESSION_OBSERVE_V1: &str = "session_observe_v1";
 const FEATURE_SESSION_OBSERVE_BATCH_V1: &str = "session_observe_batch_v1";
 const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
 const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
+const FEATURE_AGENT_CANCEL_V1: &str = "agent_cancel_v1";
+const FEATURE_SESSION_CREATE_ADMISSION_V1: &str = "session_create_admission_v1";
+const FEATURE_STATUS_SNAPSHOT_V1: &str = "status_snapshot_v1";
 const FEATURE_SESSION_MODEL_SELECT_V1: &str = "session_model_select_v1";
 const FEATURE_SESSION_EFFORT_SELECT_V1: &str = "session_effort_select_v1";
 const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
@@ -651,6 +654,10 @@ pub struct FleetNodeWire {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callsign: Option<String>,
+    /// Spawn-time provider projected from the durable child manifest.
+    /// Absence is authoritative and is never filled from the parent session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub task: String,
     pub depth: u32,
     pub parent_session_id: String,
@@ -1057,6 +1064,87 @@ pub struct AgentMessageReceipt {
     pub delivery: AgentMessageDeliveryWire,
     pub child_run_id: String,
     pub child_run_state: RunStateWire,
+}
+
+/// Forward-compatible result of a durable direct-child cancellation.
+/// Future strings remain their exact wire spelling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentCancelStatusV1 {
+    Accepted,
+    AlreadyTerminal,
+    Unknown(String),
+}
+
+impl Serialize for AgentCancelStatusV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Accepted => "accepted",
+            Self::AlreadyTerminal => "already_terminal",
+            Self::Unknown(raw) => raw,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentCancelStatusV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "accepted" => Self::Accepted,
+            "already_terminal" => Self::AlreadyTerminal,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+fn serialize_agent_cancel_terminal_seq<S>(
+    terminal_seq: &Option<u64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    terminal_seq
+        .as_ref()
+        .map(u64::to_string)
+        .serialize(serializer)
+}
+
+/// Tauri-safe `agent.cancel` receipt. The optional journal sequence crosses
+/// the JavaScript boundary only as its exact decimal spelling.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCancelReceiptV1 {
+    pub agent: String,
+    pub child_session_id: String,
+    pub child_run_id: String,
+    pub status: AgentCancelStatusV1,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_agent_cancel_terminal_seq"
+    )]
+    pub terminal_seq: Option<u64>,
+}
+
+/// Narrow runtime view assembled from one `status.snapshot` response and the
+/// Welcome that authorized it. `runtime_dir` remains absent because 967 does
+/// not publish that path over RPC; the SDK never derives it from socket text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StatusSnapshotV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub ready: bool,
+    pub version: String,
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_dir: Option<String>,
 }
 
 /// One daemon-owned Loom agent-type registry record. Every authoring field
@@ -2325,6 +2413,175 @@ pub struct LifecycleCommandError {
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+/// Optional daemon-owned admission settings for `ade_session_create`.
+/// Every field remains optional at the Tauri boundary. A present object opts
+/// into `session_create_admission_v1`; false resolve flags retain legacy wire
+/// bytes by encoding as the protocol default (omitted).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCreateAdmissionV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_provider: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolve_model: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
+}
+
+/// Structured admission data carried by the ordinary correlated error body.
+/// 967 defines no separate admission response kind; unknown future data is
+/// retained as a complete JSON value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SessionCreateAdmissionDataV1 {
+    ProviderUnavailable {
+        provider: String,
+    },
+    ModelUnknown {
+        provider: String,
+        model: String,
+        inventory_age_ms: Option<u64>,
+    },
+    EffortUnsupported {
+        provider: String,
+        model: String,
+        effort: String,
+        supported: Vec<String>,
+    },
+    FastUnsupported {
+        provider: String,
+        model: String,
+    },
+    Unknown(Value),
+}
+
+impl Serialize for SessionCreateAdmissionDataV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let raw = match self {
+            Self::ProviderUnavailable { provider } => serde_json::json!({
+                "kind": "provider_unavailable",
+                "provider": provider,
+            }),
+            Self::ModelUnknown {
+                provider,
+                model,
+                inventory_age_ms,
+            } => {
+                let mut raw = serde_json::json!({
+                    "kind": "model_unknown",
+                    "provider": provider,
+                    "model": model,
+                });
+                if let Some(inventory_age_ms) = inventory_age_ms {
+                    raw["inventory_age"] = serde_json::json!(inventory_age_ms);
+                }
+                raw
+            }
+            Self::EffortUnsupported {
+                provider,
+                model,
+                effort,
+                supported,
+            } => serde_json::json!({
+                "kind": "effort_unsupported",
+                "provider": provider,
+                "model": model,
+                "effort": effort,
+                "supported": supported,
+            }),
+            Self::FastUnsupported { provider, model } => serde_json::json!({
+                "kind": "fast_unsupported",
+                "provider": provider,
+                "model": model,
+            }),
+            Self::Unknown(raw) => raw.clone(),
+        };
+        raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionCreateAdmissionDataV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ProviderFields {
+            provider: String,
+        }
+        #[derive(Deserialize)]
+        struct ModelFields {
+            provider: String,
+            model: String,
+            #[serde(rename = "inventory_age", default)]
+            inventory_age_ms: Option<u64>,
+        }
+        #[derive(Deserialize)]
+        struct EffortFields {
+            provider: String,
+            model: String,
+            effort: String,
+            #[serde(default)]
+            supported: Vec<String>,
+        }
+
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("kind").and_then(Value::as_str) {
+            Some("provider_unavailable") => {
+                let fields: ProviderFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::ProviderUnavailable {
+                    provider: fields.provider,
+                })
+            }
+            Some("model_unknown") => {
+                let fields: ModelFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::ModelUnknown {
+                    provider: fields.provider,
+                    model: fields.model,
+                    inventory_age_ms: fields.inventory_age_ms,
+                })
+            }
+            Some("effort_unsupported") => {
+                let fields: EffortFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::EffortUnsupported {
+                    provider: fields.provider,
+                    model: fields.model,
+                    effort: fields.effort,
+                    supported: fields.supported,
+                })
+            }
+            Some("fast_unsupported") => {
+                let fields: ModelFields =
+                    serde_json::from_value(raw).map_err(<D::Error as serde::de::Error>::custom)?;
+                Ok(Self::FastUnsupported {
+                    provider: fields.provider,
+                    model: fields.model,
+                })
+            }
+            _ => Ok(Self::Unknown(raw)),
+        }
+    }
+}
+
+/// Typed `session.create` failure. Admission rejection remains an error
+/// outcome and retains code, retryability, and optional structured data.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SessionCreateCommandErrorV1 {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<SessionCreateAdmissionDataV1>,
 }
 
 fn serialize_checkpoint_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
@@ -4952,6 +5209,16 @@ enum RequestBody {
         cache_policy: Option<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interaction_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_alias: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        resolve_provider: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        resolve_model: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast: Option<bool>,
     },
     /// Opens the System Settings pane for an unresolved OS permission park.
     /// The daemon knows the pane; no URL is ever sent by a client. It opens on
@@ -4968,6 +5235,8 @@ enum RequestBody {
         cursor: Option<String>,
         limit: u32,
     },
+    #[serde(rename = "status.snapshot")]
+    StatusSnapshot {},
     #[serde(rename = "session.list_watch")]
     SessionListWatch {},
     #[serde(rename = "session.read")]
@@ -5437,6 +5706,13 @@ enum RequestBody {
         agent: String,
         text: String,
     },
+    #[serde(rename = "agent.cancel")]
+    AgentCancel {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        agent: String,
+    },
     #[serde(rename = "session.surface_publish")]
     SessionSurfacePublish {
         session_id: String,
@@ -5598,6 +5874,22 @@ enum ResponseBody {
         created_seq: u64,
         worker_generation: u64,
         metadata: Value,
+    },
+    #[serde(rename = "status.snapshot")]
+    StatusSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_account: Option<Value>,
+        session_count: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        adoption_available: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid_file_path: Option<String>,
+        #[serde(default)]
+        ready: bool,
     },
     #[serde(rename = "session.list")]
     SessionList {
@@ -5970,6 +6262,15 @@ enum ResponseBody {
     },
     #[serde(rename = "agent.message")]
     AgentMessage { receipt: AgentMessageReceipt },
+    #[serde(rename = "agent.cancel")]
+    AgentCancel {
+        agent: String,
+        child_session_id: String,
+        child_run_id: String,
+        status: AgentCancelStatusV1,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_seq: Option<u64>,
+    },
     #[serde(rename = "session.surface_publish")]
     SessionSurfacePublished {
         session_id: String,
@@ -6772,6 +7073,7 @@ struct ConnectionSnapshot {
     connected: bool,
     roster_watch_active: bool,
     roster_identity: Option<RosterConnectionIdentity>,
+    daemon_version: Option<String>,
     features: BTreeSet<String>,
     capabilities_granted: BTreeSet<Capability>,
     frame_limit: usize,
@@ -8662,6 +8964,53 @@ fn agent_message_response(body: ResponseBody) -> Result<AgentMessageReceipt, Str
     }
 }
 
+fn agent_cancel_response(body: ResponseBody) -> Result<AgentCancelReceiptV1, String> {
+    match body {
+        ResponseBody::AgentCancel {
+            agent,
+            child_session_id,
+            child_run_id,
+            status,
+            terminal_seq,
+        } => Ok(AgentCancelReceiptV1 {
+            agent,
+            child_session_id,
+            child_run_id,
+            status,
+            terminal_seq,
+        }),
+        _ => Err("agent.cancel response method mismatch".to_string()),
+    }
+}
+
+fn status_snapshot_response(
+    body: ResponseBody,
+    version: String,
+    generation: u64,
+) -> Result<StatusSnapshotV1, String> {
+    match body {
+        ResponseBody::StatusSnapshot {
+            daemon_pid,
+            socket_path,
+            ready,
+            ..
+        } => Ok(StatusSnapshotV1 {
+            pid: daemon_pid,
+            ready,
+            version,
+            generation,
+            socket_path,
+            runtime_dir: None,
+        }),
+        ResponseBody::Error { code, .. } => Err(code),
+        _ => Err("status.snapshot response method mismatch".to_string()),
+    }
+}
+
+fn status_snapshot_features() -> BTreeSet<String> {
+    BTreeSet::from([FEATURE_STATUS_SNAPSHOT_V1.to_string()])
+}
+
 fn session_observe_response(body: ResponseBody) -> Result<Value, String> {
     match body {
         ResponseBody::SessionObserve { digest } => Ok(digest),
@@ -8716,6 +9065,16 @@ fn agent_message_request(
         worker_generation,
         agent,
         text,
+    }
+}
+
+#[cfg(unix)]
+fn agent_cancel_request(attachment: &WorkflowControlAttachment, agent: String) -> RequestBody {
+    RequestBody::AgentCancel {
+        command_id: config_command_id("agent-cancel"),
+        session_id: attachment.session_id.clone(),
+        worker_generation: attachment.worker_generation,
+        agent,
     }
 }
 
@@ -10649,9 +11008,47 @@ fn lifecycle_response_error(body: ResponseBody, mismatch: &'static str) -> Lifec
     }
 }
 
+impl SessionCreateCommandErrorV1 {
+    fn data(raw: Option<Value>) -> Option<SessionCreateAdmissionDataV1> {
+        raw.map(|raw| {
+            serde_json::from_value(raw.clone())
+                .unwrap_or(SessionCreateAdmissionDataV1::Unknown(raw))
+        })
+    }
+
+    fn from_daemon(code: String, message: String, retryable: bool, data: Option<Value>) -> Self {
+        Self {
+            code,
+            message,
+            retryable,
+            data: Self::data(data),
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.into(),
+            retryable: false,
+            data: None,
+        }
+    }
+}
+
+impl From<LifecycleCommandError> for SessionCreateCommandErrorV1 {
+    fn from(error: LifecycleCommandError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+            data: Self::data(error.data),
+        }
+    }
+}
+
 fn session_create_response(
     body: ResponseBody,
-) -> Result<SessionCreateReceipt, LifecycleCommandError> {
+) -> Result<SessionCreateReceipt, SessionCreateCommandErrorV1> {
     match body {
         ResponseBody::SessionCreate {
             session_id,
@@ -10664,8 +11061,15 @@ fn session_create_response(
             worker_generation,
             metadata,
         }),
-        response => Err(lifecycle_response_error(
-            response,
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => Err(SessionCreateCommandErrorV1::from_daemon(
+            code, message, retryable, data,
+        )),
+        _ => Err(SessionCreateCommandErrorV1::protocol(
             "session.create response method mismatch",
         )),
     }
@@ -10799,6 +11203,30 @@ fn session_create_request(
     cache_policy: Option<Value>,
     interaction_mode: Option<String>,
 ) -> Result<(RequestBody, BTreeSet<String>), LifecycleCommandError> {
+    session_create_request_with_admission(
+        cwd,
+        provider,
+        model,
+        max_tokens,
+        permission_overrides,
+        cache_policy,
+        interaction_mode,
+        None,
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn session_create_request_with_admission(
+    cwd: String,
+    provider: String,
+    model: String,
+    max_tokens: u64,
+    permission_overrides: Option<Value>,
+    cache_policy: Option<Value>,
+    interaction_mode: Option<String>,
+    admission: Option<SessionCreateAdmissionV1>,
+) -> Result<(RequestBody, BTreeSet<String>), LifecycleCommandError> {
     let mut features = lifecycle_features(FEATURE_SESSION_MUTATION_V1);
     if permission_overrides.is_some() {
         features.insert(FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_string());
@@ -10815,6 +11243,14 @@ fn session_create_request(
             )));
         }
     };
+    let admission_present = admission.is_some();
+    let admission = admission.unwrap_or_default();
+    if admission_present {
+        features.insert(FEATURE_SESSION_CREATE_ADMISSION_V1.to_string());
+    }
+    if admission.account_alias.is_some() {
+        features.insert(FEATURE_SESSION_ACCOUNT_SELECT_V1.to_string());
+    }
     Ok((
         RequestBody::SessionCreate {
             command_id: config_command_id("session-create"),
@@ -10825,6 +11261,11 @@ fn session_create_request(
             permission_overrides,
             cache_policy,
             interaction_mode,
+            account_alias: admission.account_alias,
+            resolve_provider: admission.resolve_provider.unwrap_or(false),
+            resolve_model: admission.resolve_model.unwrap_or(false),
+            effort: admission.effort,
+            fast: admission.fast,
         },
         features,
     ))
@@ -11025,10 +11466,34 @@ pub async fn session_create(
     permission_overrides: Option<Value>,
     cache_policy: Option<Value>,
     interaction_mode: Option<String>,
-) -> Result<SessionCreateReceipt, LifecycleCommandError> {
+) -> Result<SessionCreateReceipt, SessionCreateCommandErrorV1> {
+    session_create_with_admission(
+        cwd,
+        provider,
+        model,
+        max_tokens,
+        permission_overrides,
+        cache_policy,
+        interaction_mode,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn session_create_with_admission(
+    cwd: String,
+    provider: String,
+    model: String,
+    max_tokens: u64,
+    permission_overrides: Option<Value>,
+    cache_policy: Option<Value>,
+    interaction_mode: Option<String>,
+    admission: Option<SessionCreateAdmissionV1>,
+) -> Result<SessionCreateReceipt, SessionCreateCommandErrorV1> {
     #[cfg(unix)]
     {
-        let (request, features) = session_create_request(
+        let (request, features) = session_create_request_with_admission(
             cwd,
             provider,
             model,
@@ -11036,8 +11501,14 @@ pub async fn session_create(
             permission_overrides,
             cache_policy,
             interaction_mode,
-        )?;
-        return session_create_response(lifecycle_request(request, &features).await?);
+            admission,
+        )
+        .map_err(SessionCreateCommandErrorV1::from)?;
+        return session_create_response(
+            lifecycle_request(request, &features)
+                .await
+                .map_err(SessionCreateCommandErrorV1::from)?,
+        );
     }
     #[cfg(not(unix))]
     {
@@ -11049,9 +11520,10 @@ pub async fn session_create(
             permission_overrides,
             cache_policy,
             interaction_mode,
+            admission,
         );
-        Err(LifecycleCommandError::unavailable(
-            "session.create unavailable on this platform",
+        Err(SessionCreateCommandErrorV1::from(
+            LifecycleCommandError::unavailable("session.create unavailable on this platform"),
         ))
     }
 }
@@ -11069,8 +11541,9 @@ pub async fn lifecycle_session_create_command(
     permission_overrides: Option<Value>,
     cache_policy: Option<Value>,
     interaction_mode: Option<String>,
-) -> Result<SessionCreateReceipt, LifecycleCommandError> {
-    session_create(
+    admission: Option<SessionCreateAdmissionV1>,
+) -> Result<SessionCreateReceipt, SessionCreateCommandErrorV1> {
+    session_create_with_admission(
         cwd,
         provider,
         model,
@@ -11078,6 +11551,7 @@ pub async fn lifecycle_session_create_command(
         permission_overrides,
         cache_policy,
         interaction_mode,
+        admission,
     )
     .await
 }
@@ -11265,6 +11739,49 @@ pub async fn session_fleet(session_id: String) -> Result<SessionFleetSnapshot, S
     }
 }
 
+/// Read the scalar daemon runtime door. PID/readiness/socket are returned by
+/// `status.snapshot`; version/generation are copied from the same negotiated
+/// connection. 967 does not publish runtime_dir, so it remains typed absence.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn status_snapshot() -> Result<StatusSnapshotV1, String> {
+    #[cfg(unix)]
+    {
+        let handle = actor_handle();
+        let before = handle.connection.borrow().clone();
+        if !before.connected {
+            return Err("status.snapshot connection is unavailable".to_string());
+        }
+        let identity = before
+            .roster_identity
+            .clone()
+            .ok_or_else(|| "status.snapshot connection identity is unavailable".to_string())?;
+        let version = before
+            .daemon_version
+            .clone()
+            .ok_or_else(|| "status.snapshot daemon version is unavailable".to_string())?;
+        let features = status_snapshot_features();
+        let response = rpc_request_with_feature_gate(
+            RequestBody::StatusSnapshot {},
+            Capability::View,
+            FeatureGate::all(features),
+            RpcErrorStyle::Passthrough,
+        )
+        .await
+        .ok_or_else(|| "status.snapshot did not receive a response".to_string())??;
+        let after = handle.connection.borrow().clone();
+        if !after.connected || after.roster_identity.as_ref() != Some(&identity) {
+            return Err(
+                "status.snapshot connection changed before correlation completed".to_string(),
+            );
+        }
+        return status_snapshot_response(response, version, identity.daemon_generation);
+    }
+    #[cfg(not(unix))]
+    {
+        Err("status.snapshot unavailable on this platform".to_string())
+    }
+}
+
 /// Attach the invoking webview to the daemon's reconnectable descendant
 /// stream. Registration happens in the socket actor before the correlated
 /// response is released, so buffered pushes cannot overtake the forwarder.
@@ -11439,6 +11956,39 @@ pub async fn agent_message(
     {
         let _ = (session_id, agent, text);
         Err("agent.message unavailable on this platform".to_string())
+    }
+}
+
+/// Cancel one owned direct child through the same fresh Control attachment
+/// path as `agent.message`. Command identity and generation are never accepted
+/// from JavaScript; `already_terminal` is returned as an ordinary receipt.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn agent_cancel(
+    session_id: String,
+    agent: String,
+) -> Result<AgentCancelReceiptV1, String> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = fleet_provider_session_id(session_id).await?;
+        let features = BTreeSet::from([FEATURE_AGENT_CANCEL_V1.to_string()]);
+        let attachment = workflow_control_attachment(&provider_session_id, &features)
+            .await
+            .map_err(|error| error.message)?;
+        let response = fleet_request(
+            "agent.cancel",
+            agent_cancel_request(&attachment, agent),
+            Capability::Control,
+            FEATURE_AGENT_CANCEL_V1,
+        )
+        .await;
+        let result = response.and_then(agent_cancel_response);
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, agent);
+        Err("agent.cancel unavailable on this platform".to_string())
     }
 }
 
@@ -15878,6 +16428,7 @@ async fn run_actor(
             connected: true,
             roster_watch_active: false,
             roster_identity: Some(roster_identity.clone()),
+            daemon_version: Some(welcome.daemon_version.clone()),
             features: welcome.features.clone(),
             capabilities_granted: welcome.capabilities_granted.clone(),
             frame_limit: (welcome.frame_limit as usize).min(DEFAULT_FRAME_LIMIT),
@@ -16008,6 +16559,7 @@ fn publish_disconnected(connection_tx: &watch::Sender<ConnectionSnapshot>) {
     snapshot.connected = false;
     snapshot.roster_watch_active = false;
     snapshot.roster_identity = None;
+    snapshot.daemon_version = None;
     ROSTER_WATCH_ACTIVE.store(false, Ordering::Release);
     publish_connection(connection_tx, snapshot);
 }
@@ -17948,6 +18500,11 @@ mod workflow_tests;
 #[allow(clippy::expect_used)]
 #[path = "haider_rpc_ade_fleet_tests.rs"]
 mod fleet_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_cancel_tests.rs"]
+mod cancel_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
