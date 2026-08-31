@@ -100,6 +100,11 @@ const FEATURE_SESSION_FORK_V1: &str = "session_fork_v1";
 const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
 const FEATURE_CHECKPOINT_V1: &str = "checkpoint_v1";
 const FEATURE_PEER_MESSAGING_V1: &str = "peer_messaging_v1";
+const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
+const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
+const FEATURE_USER_COMMAND_V1: &str = "user_command_v1";
+const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
+const FEATURE_SHELL_REGISTRY_V1: &str = "shell_registry_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
 const HAIDER_NEEDS_INPUT_NO_CONNECTION: &str = "haider_needs_input_no_connection";
@@ -133,6 +138,10 @@ const LOOM_REGISTRY_DELTA_EVENT: &str = "loom-registry-delta";
 const LOOM_REGISTRY_CAUGHT_UP_EVENT: &str = "loom-registry-caught-up";
 const PEER_MESSAGE_RECEIVED_EVENT: &str = "peer-message-received";
 const PEER_DELIVERY_CHANGED_EVENT: &str = "peer-delivery-changed";
+const SHELL_OPENED_EVENT: &str = "shell-opened";
+const SHELL_STATE_EVENT: &str = "shell-state";
+const SHELL_CLOSED_EVENT: &str = "shell-closed";
+const SHELL_OUTPUT_EVENT: &str = "shell-output";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const FEATURE_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2882,6 +2891,473 @@ raw_string_enum!(PeerDeliveryReasonV1 {
     InvalidMessage => "invalid_message",
 });
 
+raw_string_enum!(ShellKindIdentityV1 {
+    Local => "local",
+    Ssh => "ssh",
+});
+
+raw_string_enum!(ShellStatusIdentityV1 {
+    Starting => "starting",
+    Running => "running",
+    Exited => "exited",
+    Closed => "closed",
+});
+
+raw_string_enum!(ShellOutputStreamV1 {
+    Stdout => "stdout",
+    Stderr => "stderr",
+});
+
+raw_string_enum!(SshReachabilityV1 {
+    Reachable => "reachable",
+    Unreachable => "unreachable",
+});
+
+/// `shell.output` is CONNECTION-TRANSIENT terminal data. It is delivered
+/// only on the opening connection, is not durable or replayable, and has no
+/// recovery cursor. If delivery is missed, that output gap is unrecoverable;
+/// the SDK never synthesizes bytes that the connection did not deliver.
+pub const SHELL_OUTPUT_REPLAYABLE: bool = false;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellOutputDeliveryV1 {
+    ConnectionTransient,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellOutputGapV1 {
+    Unrecoverable,
+}
+
+/// Deep `ShellWire` projection. The complete daemon record is serialized
+/// verbatim while the shell identity and lifecycle discriminants stay typed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ShellRecordV1 {
+    pub id: String,
+    pub kind: ShellKindIdentityV1,
+    pub status: ShellStatusIdentityV1,
+    pub ssh_profile: Option<String>,
+    pub exit_code: Option<i32>,
+    /// Unix epoch milliseconds; it intentionally remains a JSON number.
+    pub created_at_ms: u64,
+    /// Unix epoch milliseconds; it intentionally remains a JSON number.
+    pub last_activity_ms: u64,
+    /// Byte counter, not a cursor or sequence.
+    pub bytes_out: u64,
+    raw: Value,
+}
+
+impl std::fmt::Debug for ShellRecordV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShellRecordV1")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("status", &self.status)
+            .field("ssh_profile", &self.ssh_profile)
+            .field("exit_code", &self.exit_code)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("last_activity_ms", &self.last_activity_ms)
+            .field("bytes_out", &self.bytes_out)
+            .finish()
+    }
+}
+
+impl Serialize for ShellRecordV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ShellRecordV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        Self::from_value(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ShellRecordV1 {
+    fn from_value(raw: Value) -> Result<Self, &'static str> {
+        let id = raw
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("ShellWire.id must be a string")?
+            .to_string();
+        let kind_record = raw
+            .get("kind")
+            .and_then(Value::as_object)
+            .ok_or("ShellWire.kind must be an object")?;
+        let kind_raw = kind_record
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or("ShellWire.kind.kind must be a string")?;
+        let kind = match kind_raw {
+            "local" => ShellKindIdentityV1::Local,
+            "ssh" => ShellKindIdentityV1::Ssh,
+            other => ShellKindIdentityV1::Unknown(other.to_string()),
+        };
+        let ssh_profile = kind_record
+            .get("profile")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let status_record = raw
+            .get("status")
+            .and_then(Value::as_object)
+            .ok_or("ShellWire.status must be an object")?;
+        let status_raw = status_record
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or("ShellWire.status.status must be a string")?;
+        let status = match status_raw {
+            "starting" => ShellStatusIdentityV1::Starting,
+            "running" => ShellStatusIdentityV1::Running,
+            "exited" => ShellStatusIdentityV1::Exited,
+            "closed" => ShellStatusIdentityV1::Closed,
+            other => ShellStatusIdentityV1::Unknown(other.to_string()),
+        };
+        let exit_code = match status_record.get("code") {
+            Some(Value::Null) | None => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .and_then(|code| i32::try_from(code).ok())
+                    .ok_or("ShellWire.status.code must be an i32")?,
+            ),
+        };
+        let created_at_ms = raw
+            .get("created_at_ms")
+            .and_then(Value::as_u64)
+            .ok_or("ShellWire.created_at_ms must be a u64 JSON number")?;
+        let last_activity_ms = raw
+            .get("last_activity_ms")
+            .and_then(Value::as_u64)
+            .ok_or("ShellWire.last_activity_ms must be a u64 JSON number")?;
+        let bytes_out = raw
+            .get("bytes_out")
+            .and_then(Value::as_u64)
+            .ok_or("ShellWire.bytes_out must be a u64 JSON number")?;
+        Ok(Self {
+            id,
+            kind,
+            status,
+            ssh_profile,
+            exit_code,
+            created_at_ms,
+            last_activity_ms,
+            bytes_out,
+            raw,
+        })
+    }
+}
+
+fn ssh_public_field_is_secret(field: &str) -> bool {
+    matches!(
+        field.to_ascii_lowercase().as_str(),
+        "auth"
+            | "password"
+            | "private_key"
+            | "private_key_bytes"
+            | "key_material"
+            | "key_file"
+            | "path"
+            | "passphrase"
+            | "passphrase_vault_reference"
+            | "vault_alias"
+            | "vault_reference"
+            | "secret"
+    )
+}
+
+fn ssh_public_value_is_secret_free(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => fields.iter().all(|(field, value)| {
+            !ssh_public_field_is_secret(field) && ssh_public_value_is_secret_free(value)
+        }),
+        Value::Array(values) => values.iter().all(ssh_public_value_is_secret_free),
+        _ => true,
+    }
+}
+
+/// Verbatim public SSH profile row. Construction fails closed if a daemon
+/// ever tries to place authentication, password, key-path, or staged-vault
+/// material in the public projection.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SshProfileRecordV1 {
+    pub name: String,
+    /// `None` is typed absence. The SDK never assumes a missing scope fact.
+    pub in_scope: Option<bool>,
+    raw: Value,
+}
+
+impl std::fmt::Debug for SshProfileRecordV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SshProfileRecordV1")
+            .field("name", &self.name)
+            .field("in_scope", &self.in_scope)
+            .finish()
+    }
+}
+
+impl Serialize for SshProfileRecordV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SshProfileRecordV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        Self::from_value(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl SshProfileRecordV1 {
+    fn from_value(raw: Value) -> Result<Self, &'static str> {
+        if !ssh_public_value_is_secret_free(&raw) {
+            return Err("SSH public profile contained a forbidden secret-bearing field");
+        }
+        let name = raw
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("SSH public profile name must be a string")?
+            .to_string();
+        let in_scope = match raw.get("in_scope") {
+            Some(Value::Bool(in_scope)) => Some(*in_scope),
+            Some(Value::Null) | None => None,
+            Some(_) => return Err("SSH public profile in_scope must be a boolean"),
+        };
+        Ok(Self {
+            name,
+            in_scope,
+            raw,
+        })
+    }
+}
+
+/// Secret-capability-bearing request record. It serializes verbatim only
+/// toward the daemon; diagnostics deliberately expose no fields or values.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct SshRequestValue(Value);
+
+impl std::fmt::Debug for SshRequestValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SshRequestValue([REDACTED])")
+    }
+}
+
+/// Verbatim PTY dimensions. Omitted pixel dimensions remain omitted rather
+/// than acquiring client-created defaults.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct SshPtySizeValue(Value);
+
+impl std::fmt::Debug for SshPtySizeValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("SshPtySizeValue")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+/// Base64 terminal output can echo sensitive input. It is serializable only
+/// for the transient event boundary; Debug redacts it and Drop wipes it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct TerminalOutputWireV1(String);
+
+impl std::fmt::Debug for TerminalOutputWireV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TerminalOutputWireV1([REDACTED])")
+    }
+}
+
+impl Drop for TerminalOutputWireV1 {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// Explicit session routing fact returned by `session.set_ssh_scope`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SshScopeV1 {
+    All,
+    Allow { names: Vec<String> },
+    None,
+    Unknown(Value),
+}
+
+impl std::fmt::Debug for SshScopeV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => formatter.write_str("All"),
+            Self::Allow { names } => formatter
+                .debug_struct("Allow")
+                .field("names", names)
+                .finish(),
+            Self::None => formatter.write_str("None"),
+            Self::Unknown(_) => formatter.write_str("Unknown([REDACTED])"),
+        }
+    }
+}
+
+impl Serialize for SshScopeV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::All => serde_json::json!({"kind": "all"}).serialize(serializer),
+            Self::Allow { names } => {
+                serde_json::json!({"kind": "allow", "names": names}).serialize(serializer)
+            }
+            Self::None => serde_json::json!({"kind": "none"}).serialize(serializer),
+            Self::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SshScopeV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        Ok(match raw.get("kind").and_then(Value::as_str) {
+            Some("all") => Self::All,
+            Some("allow") => {
+                let names = raw
+                    .get("names")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(serde::de::Error::custom)?
+                    .unwrap_or_default();
+                Self::Allow { names }
+            }
+            Some("none") => Self::None,
+            _ => Self::Unknown(raw),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SshTestResultWireV1 {
+    profile: SshProfileRecordV1,
+    connected: bool,
+    host_key_pinned: bool,
+}
+
+/// Typed reachability result. `outcome` is derived only from the daemon's
+/// published `connected` fact, never from the absence of an RPC error.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SshTestReceiptV1 {
+    pub outcome: SshReachabilityV1,
+    pub profile: SshProfileRecordV1,
+    pub host_key_pinned: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshShellResultV1 {
+    pub profile: String,
+    pub stdout: String,
+    pub stderr: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stdout_truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stderr_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+}
+
+impl std::fmt::Debug for SshShellResultV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SshShellResultV1")
+            .field("profile", &self.profile)
+            .field("stdout", &"[REDACTED OUTPUT]")
+            .field("stderr", &"[REDACTED OUTPUT]")
+            .field("stdout_truncated", &self.stdout_truncated)
+            .field("stderr_truncated", &self.stderr_truncated)
+            .field("exit_code", &self.exit_code)
+            .field("timed_out", &self.timed_out)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ShellListResultV1 {
+    pub shells: Vec<ShellRecordV1>,
+}
+
+/// A successful close receipt. A row already in typed `closed` state is a
+/// normal idempotent success; the SDK never invents an already-closed error.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ShellCloseReceiptV1 {
+    pub shell: ShellRecordV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SshProfileListResultV1 {
+    pub profiles: Vec<SshProfileRecordV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SshScopeReceiptV1 {
+    pub session_id: String,
+    /// Required published fact. There is no absent-means-local default.
+    pub scope: SshScopeV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ShellCommandErrorV1 {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+/// SSH errors are intentionally detail-free at the webview boundary. Daemon
+/// messages/data can never echo request auth paths, staged references, key
+/// material, passwords, passphrases, or terminal input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SshCommandErrorV1 {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ShellExecReceiptV1 {
+    pub session_id: String,
+    /// Typed absence from an older daemon stays `None`; no run id is made up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub item_id: String,
+    #[serde(serialize_with = "serialize_checkpoint_u64")]
+    pub accepted_seq: u64,
+    pub worker_generation: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerDescriptorV1 {
     pub id: String,
@@ -4379,6 +4855,73 @@ enum RequestBody {
     },
     #[serde(rename = "peer.name")]
     PeerName { name: String },
+    /// Direct-user mutation. `command_id`, authoritative session id, and
+    /// worker generation are filled only from a fresh Control attachment.
+    #[serde(rename = "shell.exec")]
+    ShellExec {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    #[serde(rename = "ssh.list")]
+    SshList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    #[serde(rename = "ssh.add")]
+    SshAdd { profile: SshRequestValue },
+    #[serde(rename = "ssh.update")]
+    SshUpdate {
+        name: String,
+        changes: SshRequestValue,
+    },
+    #[serde(rename = "ssh.remove")]
+    SshRemove { name: String },
+    #[serde(rename = "ssh.test")]
+    SshTest {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_s: Option<u32>,
+    },
+    #[serde(rename = "session.set_ssh_scope")]
+    SessionSetSshScope {
+        session_id: String,
+        scope: SshScopeV1,
+    },
+    #[serde(rename = "ssh.shell")]
+    SshShell {
+        name: String,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_s: Option<u32>,
+    },
+    #[serde(rename = "ssh.shell_open")]
+    SshShellOpen {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        term: String,
+        size: SshPtySizeValue,
+    },
+    #[serde(rename = "ssh.shell_input")]
+    SshShellInput { id: String, data_b64: SecretWire },
+    #[serde(rename = "ssh.shell_resize")]
+    SshShellResize { id: String, size: SshPtySizeValue },
+    #[serde(rename = "ssh.shell_eof")]
+    SshShellEof { id: String },
+    #[serde(rename = "shell.list")]
+    ShellList {},
+    #[serde(rename = "shell.close")]
+    ShellClose { id: String },
     #[serde(rename = "session.fleet")]
     SessionFleet { session_id: String },
     #[serde(rename = "session.attach")]
@@ -4834,6 +5377,44 @@ enum ResponseBody {
     PeerSend { receipt: PeerReceiptV1 },
     #[serde(rename = "peer.name")]
     PeerName { agent: PeerDescriptorV1 },
+    #[serde(rename = "shell.exec")]
+    ShellExec {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        item_id: String,
+        accepted_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "ssh.list")]
+    SshList { profiles: Vec<SshProfileRecordV1> },
+    #[serde(rename = "ssh.add")]
+    SshAdd { profile: SshProfileRecordV1 },
+    #[serde(rename = "ssh.update")]
+    SshUpdate { profile: SshProfileRecordV1 },
+    #[serde(rename = "ssh.remove")]
+    SshRemove { removed: String },
+    #[serde(rename = "ssh.test")]
+    SshTest { result: SshTestResultWireV1 },
+    #[serde(rename = "session.set_ssh_scope")]
+    SessionSetSshScope {
+        session_id: String,
+        scope: SshScopeV1,
+    },
+    #[serde(rename = "ssh.shell")]
+    SshShell { result: SshShellResultV1 },
+    #[serde(rename = "ssh.shell_open")]
+    SshShellOpen { shell: ShellRecordV1 },
+    #[serde(rename = "ssh.shell_input")]
+    SshShellInput { shell: ShellRecordV1 },
+    #[serde(rename = "ssh.shell_resize")]
+    SshShellResize { shell: ShellRecordV1 },
+    #[serde(rename = "ssh.shell_eof")]
+    SshShellEof { shell: ShellRecordV1 },
+    #[serde(rename = "shell.list")]
+    ShellList { shells: Vec<ShellRecordV1> },
+    #[serde(rename = "shell.close")]
+    ShellClose { shell: ShellRecordV1 },
     #[serde(rename = "session.fleet")]
     SessionFleet { snapshot: SessionFleetSnapshot },
     #[serde(rename = "session.attach")]
@@ -5169,6 +5750,34 @@ enum WireFrame {
     PeerDeliveryChanged {
         receipt: Value,
     },
+    #[serde(rename = "shell.opened")]
+    ShellOpened {
+        shell: ShellRecordV1,
+        #[serde(default, flatten)]
+        extra: BTreeMap<String, Value>,
+    },
+    #[serde(rename = "shell.state")]
+    ShellState {
+        shell: ShellRecordV1,
+        #[serde(default, flatten)]
+        extra: BTreeMap<String, Value>,
+    },
+    #[serde(rename = "shell.closed")]
+    ShellClosed {
+        shell: ShellRecordV1,
+        #[serde(default, flatten)]
+        extra: BTreeMap<String, Value>,
+    },
+    /// CONNECTION-TRANSIENT: opening-connection-only output. There is no
+    /// cursor, replay lane, or synthetic recovery for a missed chunk.
+    #[serde(rename = "shell.output")]
+    ShellOutput {
+        id: String,
+        stream: ShellOutputStreamV1,
+        chunk_b64: TerminalOutputWireV1,
+        #[serde(default, flatten)]
+        extra: BTreeMap<String, Value>,
+    },
     /// Raw event records preserve future event/change/state vocabulary.
     SessionDescendantStream {
         attachment_id: String,
@@ -5227,6 +5836,107 @@ fn emit_peer_webview_event(app: &AppHandle, event: PeerWebviewEventV1) {
             let _ = app.emit_to("main", event_name, payload);
         }
         PeerWebviewEventV1::DeliveryChanged(payload) => {
+            let _ = app.emit_to("main", event_name, payload);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ShellRecordEventPayloadV1 {
+    /// Complete `ShellWire`, including additive fields, is forwarded exactly.
+    shell: ShellRecordV1,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ShellOutputEventPayloadV1 {
+    id: String,
+    stream: ShellOutputStreamV1,
+    /// Only the bytes actually delivered on this connection are forwarded.
+    /// A missing chunk is an unrecoverable gap and is never synthesized.
+    chunk_b64: TerminalOutputWireV1,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ShellWebviewEventV1 {
+    Opened(ShellRecordEventPayloadV1),
+    State(ShellRecordEventPayloadV1),
+    Closed(ShellRecordEventPayloadV1),
+    Output(ShellOutputEventPayloadV1),
+}
+
+impl ShellWebviewEventV1 {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Opened(_) => SHELL_OPENED_EVENT,
+            Self::State(_) => SHELL_STATE_EVENT,
+            Self::Closed(_) => SHELL_CLOSED_EVENT,
+            Self::Output(_) => SHELL_OUTPUT_EVENT,
+        }
+    }
+
+    fn advertised_by(&self, features: &BTreeSet<String>) -> bool {
+        match self {
+            Self::Output(_) => features.contains(FEATURE_SSH_PROFILES_V1),
+            Self::Opened(_) | Self::State(_) | Self::Closed(_) => {
+                features.contains(FEATURE_SHELL_REGISTRY_V1)
+            }
+        }
+    }
+}
+
+/// Separates shell pushes without turning transient output into a journal.
+/// Non-shell frames return unchanged to the ordinary dispatcher.
+fn shell_event_from_frame(frame: WireFrame) -> Result<ShellWebviewEventV1, WireFrame> {
+    match frame {
+        WireFrame::ShellOpened { shell, extra } => {
+            Ok(ShellWebviewEventV1::Opened(ShellRecordEventPayloadV1 {
+                shell,
+                extra,
+            }))
+        }
+        WireFrame::ShellState { shell, extra } => {
+            Ok(ShellWebviewEventV1::State(ShellRecordEventPayloadV1 {
+                shell,
+                extra,
+            }))
+        }
+        WireFrame::ShellClosed { shell, extra } => {
+            Ok(ShellWebviewEventV1::Closed(ShellRecordEventPayloadV1 {
+                shell,
+                extra,
+            }))
+        }
+        WireFrame::ShellOutput {
+            id,
+            stream,
+            chunk_b64,
+            extra,
+        } => Ok(ShellWebviewEventV1::Output(ShellOutputEventPayloadV1 {
+            id,
+            stream,
+            chunk_b64,
+            extra,
+        })),
+        frame => Err(frame),
+    }
+}
+
+#[cfg(unix)]
+fn emit_shell_webview_event(app: &AppHandle, event: ShellWebviewEventV1) {
+    let event_name = event.name();
+    match event {
+        ShellWebviewEventV1::Opened(payload)
+        | ShellWebviewEventV1::State(payload)
+        | ShellWebviewEventV1::Closed(payload) => {
+            let _ = app.emit_to("main", event_name, payload);
+        }
+        ShellWebviewEventV1::Output(payload) => {
+            // Emit failure cannot be repaired: ShellOutput has no replay
+            // coordinate. Never manufacture a replacement chunk or cursor.
             let _ = app.emit_to("main", event_name, payload);
         }
     }
@@ -5906,6 +6616,15 @@ enum ActorCommand {
         app: AppHandle,
         body: RequestBody,
         capability: Capability,
+        reply: RpcReply,
+    },
+    /// Shell/SSH request that installs the webview destination before the
+    /// write, so an immediately buffered shell push cannot overtake it.
+    ShellRequest {
+        app: AppHandle,
+        body: RequestBody,
+        capability: Capability,
+        feature: &'static str,
         reply: RpcReply,
     },
     DescendantAttach {
@@ -7933,6 +8652,496 @@ fn peer_name_response(body: ResponseBody) -> Result<PeerDescriptorV1, PeerComman
     }
 }
 
+fn shell_exec_features() -> BTreeSet<String> {
+    BTreeSet::from([
+        FEATURE_SHELL_EXEC_V1.to_string(),
+        FEATURE_TURN_CONTROL_V1.to_string(),
+        FEATURE_USER_COMMAND_V1.to_string(),
+    ])
+}
+
+#[cfg(unix)]
+fn shell_exec_request(
+    attachment: &WorkflowControlAttachment,
+    branch_id: Option<String>,
+    agent_id: Option<String>,
+    command: String,
+    cwd: Option<String>,
+) -> RequestBody {
+    RequestBody::ShellExec {
+        command_id: config_command_id("shell-exec"),
+        session_id: attachment.session_id.clone(),
+        worker_generation: attachment.worker_generation,
+        branch_id,
+        agent_id,
+        command,
+        cwd,
+    }
+}
+
+impl ShellCommandErrorV1 {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "unavailable".to_string(),
+            message: message.into(),
+            retryable: true,
+            data: None,
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.into(),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn from_daemon(code: String, message: String, retryable: bool, data: Option<Value>) -> Self {
+        Self {
+            code,
+            message,
+            retryable,
+            data,
+        }
+    }
+
+    #[cfg(unix)]
+    fn from_workflow(error: WorkflowCommandError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+            data: error.data.and_then(|data| serde_json::to_value(data).ok()),
+        }
+    }
+}
+
+fn shell_response_error(body: ResponseBody, mismatch: &'static str) -> ShellCommandErrorV1 {
+    match body {
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => ShellCommandErrorV1::from_daemon(code, message, retryable, data),
+        _ => ShellCommandErrorV1::protocol(mismatch),
+    }
+}
+
+#[cfg(unix)]
+fn shell_exec_response(
+    body: ResponseBody,
+    attachment: &WorkflowControlAttachment,
+) -> Result<ShellExecReceiptV1, ShellCommandErrorV1> {
+    match body {
+        ResponseBody::ShellExec {
+            session_id,
+            run_id,
+            item_id,
+            accepted_seq,
+            worker_generation,
+        } if session_id == attachment.session_id
+            && worker_generation == attachment.worker_generation =>
+        {
+            Ok(ShellExecReceiptV1 {
+                session_id,
+                run_id,
+                item_id,
+                accepted_seq,
+                worker_generation,
+            })
+        }
+        ResponseBody::ShellExec { .. } => Err(ShellCommandErrorV1::protocol(
+            "shell.exec response coordinates did not match the Control attachment",
+        )),
+        response => Err(shell_response_error(
+            response,
+            "shell.exec response method mismatch",
+        )),
+    }
+}
+
+fn shell_list_request() -> RequestBody {
+    RequestBody::ShellList {}
+}
+
+fn shell_close_request(id: String) -> RequestBody {
+    RequestBody::ShellClose { id }
+}
+
+fn shell_list_response(body: ResponseBody) -> Result<ShellListResultV1, ShellCommandErrorV1> {
+    match body {
+        ResponseBody::ShellList { shells } => Ok(ShellListResultV1 { shells }),
+        response => Err(shell_response_error(
+            response,
+            "shell.list response method mismatch",
+        )),
+    }
+}
+
+fn shell_close_response(body: ResponseBody) -> Result<ShellCloseReceiptV1, ShellCommandErrorV1> {
+    match body {
+        // `closed` includes the normal idempotent already-closed case. Do not
+        // turn that typed row into a client-created error.
+        ResponseBody::ShellClose { shell } => Ok(ShellCloseReceiptV1 { shell }),
+        response => Err(shell_response_error(
+            response,
+            "shell.close response method mismatch",
+        )),
+    }
+}
+
+impl SshCommandErrorV1 {
+    fn invalid_argument(message: &'static str) -> Self {
+        Self {
+            code: "invalid_argument".to_string(),
+            message: message.to_string(),
+            retryable: false,
+        }
+    }
+
+    fn protocol(message: &'static str) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.to_string(),
+            retryable: false,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            code: "unavailable".to_string(),
+            message: "The SSH RPC connection is unavailable; sensitive details were redacted."
+                .to_string(),
+            retryable: true,
+        }
+    }
+}
+
+fn ssh_response_error(body: ResponseBody, mismatch: &'static str) -> SshCommandErrorV1 {
+    match body {
+        ResponseBody::Error {
+            code, retryable, ..
+        } => SshCommandErrorV1 {
+            code,
+            message: "The SSH RPC was rejected; sensitive details were redacted.".to_string(),
+            retryable,
+        },
+        _ => SshCommandErrorV1::protocol(mismatch),
+    }
+}
+
+fn ssh_request_record(
+    value: Value,
+    message: &'static str,
+) -> Result<SshRequestValue, SshCommandErrorV1> {
+    if value.is_object() {
+        Ok(SshRequestValue(value))
+    } else {
+        Err(SshCommandErrorV1::invalid_argument(message))
+    }
+}
+
+fn ssh_pty_size_record(value: Value) -> Result<SshPtySizeValue, SshCommandErrorV1> {
+    let Some(size) = value.as_object() else {
+        return Err(SshCommandErrorV1::invalid_argument(
+            "SSH PTY size must be an object.",
+        ));
+    };
+    for required in ["cols", "rows"] {
+        if !size
+            .get(required)
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value <= u32::MAX.into())
+        {
+            return Err(SshCommandErrorV1::invalid_argument(
+                "SSH PTY rows and columns must be u32 JSON numbers.",
+            ));
+        }
+    }
+    for optional in ["pixel_width", "pixel_height"] {
+        if size
+            .get(optional)
+            .is_some_and(|value| !value.as_u64().is_some_and(|value| value <= u32::MAX.into()))
+        {
+            return Err(SshCommandErrorV1::invalid_argument(
+                "SSH PTY pixel dimensions must be u32 JSON numbers when present.",
+            ));
+        }
+    }
+    Ok(SshPtySizeValue(value))
+}
+
+fn ssh_list_request(session_id: Option<String>) -> RequestBody {
+    RequestBody::SshList { session_id }
+}
+
+fn ssh_add_request(profile: Value) -> Result<RequestBody, SshCommandErrorV1> {
+    Ok(RequestBody::SshAdd {
+        profile: ssh_request_record(profile, "SSH profile input must be an object.")?,
+    })
+}
+
+fn ssh_update_request(name: String, changes: Value) -> Result<RequestBody, SshCommandErrorV1> {
+    Ok(RequestBody::SshUpdate {
+        name,
+        changes: ssh_request_record(changes, "SSH profile changes must be an object.")?,
+    })
+}
+
+fn ssh_remove_request(name: String) -> RequestBody {
+    RequestBody::SshRemove { name }
+}
+
+fn ssh_test_request(name: String, timeout_s: Option<u32>) -> RequestBody {
+    RequestBody::SshTest { name, timeout_s }
+}
+
+fn ssh_set_scope_request(
+    session_id: String,
+    scope: Value,
+) -> Result<RequestBody, SshCommandErrorV1> {
+    let scope = serde_json::from_value(scope).map_err(|_| {
+        SshCommandErrorV1::invalid_argument("SSH session scope must be a tagged object.")
+    })?;
+    Ok(RequestBody::SessionSetSshScope { session_id, scope })
+}
+
+fn ssh_shell_request(
+    name: String,
+    command: String,
+    cwd: Option<String>,
+    timeout_s: Option<u32>,
+) -> RequestBody {
+    RequestBody::SshShell {
+        name,
+        command,
+        cwd,
+        timeout_s,
+    }
+}
+
+fn ssh_shell_open_request(
+    name: String,
+    session_id: Option<String>,
+    term: String,
+    size: Value,
+) -> Result<RequestBody, SshCommandErrorV1> {
+    Ok(RequestBody::SshShellOpen {
+        name,
+        session_id,
+        term,
+        size: ssh_pty_size_record(size)?,
+    })
+}
+
+fn ssh_shell_input_request(id: String, data_b64: String) -> RequestBody {
+    RequestBody::SshShellInput {
+        id,
+        data_b64: SecretWire::new(data_b64),
+    }
+}
+
+fn ssh_shell_resize_request(id: String, size: Value) -> Result<RequestBody, SshCommandErrorV1> {
+    Ok(RequestBody::SshShellResize {
+        id,
+        size: ssh_pty_size_record(size)?,
+    })
+}
+
+fn ssh_shell_eof_request(id: String) -> RequestBody {
+    RequestBody::SshShellEof { id }
+}
+
+fn ssh_list_response(body: ResponseBody) -> Result<SshProfileListResultV1, SshCommandErrorV1> {
+    match body {
+        ResponseBody::SshList { profiles } => Ok(SshProfileListResultV1 { profiles }),
+        response => Err(ssh_response_error(
+            response,
+            "ssh.list response method mismatch",
+        )),
+    }
+}
+
+fn ssh_add_response(body: ResponseBody) -> Result<SshProfileRecordV1, SshCommandErrorV1> {
+    match body {
+        ResponseBody::SshAdd { profile } => Ok(profile),
+        response => Err(ssh_response_error(
+            response,
+            "ssh.add response method mismatch",
+        )),
+    }
+}
+
+fn ssh_update_response(body: ResponseBody) -> Result<SshProfileRecordV1, SshCommandErrorV1> {
+    match body {
+        ResponseBody::SshUpdate { profile } => Ok(profile),
+        response => Err(ssh_response_error(
+            response,
+            "ssh.update response method mismatch",
+        )),
+    }
+}
+
+fn ssh_remove_response(body: ResponseBody) -> Result<String, SshCommandErrorV1> {
+    match body {
+        ResponseBody::SshRemove { removed } => Ok(removed),
+        response => Err(ssh_response_error(
+            response,
+            "ssh.remove response method mismatch",
+        )),
+    }
+}
+
+fn ssh_test_response(body: ResponseBody) -> Result<SshTestReceiptV1, SshCommandErrorV1> {
+    match body {
+        ResponseBody::SshTest { result } => Ok(SshTestReceiptV1 {
+            outcome: if result.connected {
+                SshReachabilityV1::Reachable
+            } else {
+                SshReachabilityV1::Unreachable
+            },
+            profile: result.profile,
+            host_key_pinned: result.host_key_pinned,
+        }),
+        response => Err(ssh_response_error(
+            response,
+            "ssh.test response method mismatch",
+        )),
+    }
+}
+
+fn ssh_set_scope_response(
+    body: ResponseBody,
+    expected_session_id: &str,
+) -> Result<SshScopeReceiptV1, SshCommandErrorV1> {
+    match body {
+        ResponseBody::SessionSetSshScope { session_id, scope }
+            if session_id == expected_session_id =>
+        {
+            Ok(SshScopeReceiptV1 { session_id, scope })
+        }
+        ResponseBody::SessionSetSshScope { .. } => Err(SshCommandErrorV1::protocol(
+            "session.set_ssh_scope response session mismatch",
+        )),
+        response => Err(ssh_response_error(
+            response,
+            "session.set_ssh_scope response method mismatch",
+        )),
+    }
+}
+
+fn ssh_shell_response(body: ResponseBody) -> Result<SshShellResultV1, SshCommandErrorV1> {
+    match body {
+        ResponseBody::SshShell { result } => Ok(result),
+        response => Err(ssh_response_error(
+            response,
+            "ssh.shell response method mismatch",
+        )),
+    }
+}
+
+macro_rules! ssh_shell_record_response {
+    ($name:ident, $variant:ident, $mismatch:literal) => {
+        fn $name(body: ResponseBody) -> Result<ShellRecordV1, SshCommandErrorV1> {
+            match body {
+                ResponseBody::$variant { shell } => Ok(shell),
+                response => Err(ssh_response_error(response, $mismatch)),
+            }
+        }
+    };
+}
+
+ssh_shell_record_response!(
+    ssh_shell_open_response,
+    SshShellOpen,
+    "ssh.shell_open response method mismatch"
+);
+ssh_shell_record_response!(
+    ssh_shell_input_response,
+    SshShellInput,
+    "ssh.shell_input response method mismatch"
+);
+ssh_shell_record_response!(
+    ssh_shell_resize_response,
+    SshShellResize,
+    "ssh.shell_resize response method mismatch"
+);
+ssh_shell_record_response!(
+    ssh_shell_eof_response,
+    SshShellEof,
+    "ssh.shell_eof response method mismatch"
+);
+
+#[cfg(unix)]
+async fn shell_family_request(
+    app: AppHandle,
+    body: RequestBody,
+    capability: Capability,
+    feature: &'static str,
+) -> Result<ResponseBody, String> {
+    let (reply, answer) = oneshot::channel();
+    actor_handle()
+        .commands
+        .send(ActorCommand::ShellRequest {
+            app,
+            body,
+            capability,
+            feature,
+            reply,
+        })
+        .map_err(|_| "The shell RPC actor is unavailable.".to_string())?;
+    match tokio::time::timeout(COMMAND_REPLY_TIMEOUT, answer).await {
+        Ok(Ok(Some(Ok(response)))) => Ok(response),
+        Ok(Ok(Some(Err(error)))) => Err(error),
+        Ok(Ok(None)) => Err("The shell RPC connection is unavailable.".to_string()),
+        Ok(Err(_)) => Err("The shell RPC actor dropped its response.".to_string()),
+        Err(_) => Err("The shell RPC request timed out.".to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn shell_transport_error(error: String) -> ShellCommandErrorV1 {
+    if error.starts_with("missing_feature:") {
+        ShellCommandErrorV1 {
+            code: "missing_feature".to_string(),
+            message: error,
+            retryable: false,
+            data: None,
+        }
+    } else if error == "capability_denied" {
+        ShellCommandErrorV1 {
+            code: error,
+            message: "The current Haider RPC connection lacks the required capability.".to_string(),
+            retryable: false,
+            data: None,
+        }
+    } else {
+        ShellCommandErrorV1::unavailable(error)
+    }
+}
+
+#[cfg(unix)]
+fn ssh_transport_error(error: String) -> SshCommandErrorV1 {
+    if error.starts_with("missing_feature:") {
+        SshCommandErrorV1 {
+            code: "missing_feature".to_string(),
+            message: "The daemon does not advertise the SSH profile feature.".to_string(),
+            retryable: false,
+        }
+    } else if error == "capability_denied" {
+        SshCommandErrorV1 {
+            code: "capability_denied".to_string(),
+            message: "The current Haider RPC connection lacks the required capability.".to_string(),
+            retryable: false,
+        }
+    } else {
+        SshCommandErrorV1::unavailable()
+    }
+}
+
 #[cfg(unix)]
 fn peer_transport_error(error: String) -> PeerCommandErrorV1 {
     if error.starts_with("missing_feature:") {
@@ -9719,6 +10928,410 @@ pub async fn peer_name(
         Err(PeerCommandErrorV1::unavailable(
             "peer.name unavailable on this platform",
         ))
+    }
+}
+
+/// Receipt-backed direct-user shell mutation. JavaScript supplies neither
+/// `command_id` nor `worker_generation`; both come from a fresh Control
+/// attachment. `run_id: None` is returned as typed absence.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn shell_exec(
+    session_id: String,
+    branch_id: Option<String>,
+    agent_id: Option<String>,
+    command: String,
+    cwd: Option<String>,
+) -> Result<ShellExecReceiptV1, ShellCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = graph_provider_session_id(session_id)
+            .await
+            .map_err(ShellCommandErrorV1::protocol)?;
+        let features = shell_exec_features();
+        let attachment = workflow_control_attachment(&provider_session_id, &features)
+            .await
+            .map_err(ShellCommandErrorV1::from_workflow)?;
+        let result = workflow_request(
+            shell_exec_request(&attachment, branch_id, agent_id, command, cwd),
+            Capability::Control,
+            &features,
+        )
+        .await
+        .map_err(ShellCommandErrorV1::from_workflow)
+        .and_then(|body| shell_exec_response(body, &attachment));
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, branch_id, agent_id, command, cwd);
+        Err(ShellCommandErrorV1::unavailable(
+            "shell.exec unavailable on this platform",
+        ))
+    }
+}
+
+/// Read the unified daemon shell registry and opt this connection into exact
+/// shell lifecycle push forwarding.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn shell_list(app: AppHandle) -> Result<ShellListResultV1, ShellCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return shell_list_response(
+            shell_family_request(
+                app,
+                shell_list_request(),
+                Capability::View,
+                FEATURE_SHELL_REGISTRY_V1,
+            )
+            .await
+            .map_err(shell_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = app;
+        Err(ShellCommandErrorV1::unavailable(
+            "shell.list unavailable on this platform",
+        ))
+    }
+}
+
+/// Idempotently close a local process or SSH channel. A daemon-published
+/// already-closed row is returned as normal success.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn shell_close(
+    app: AppHandle,
+    id: String,
+) -> Result<ShellCloseReceiptV1, ShellCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return shell_close_response(
+            shell_family_request(
+                app,
+                shell_close_request(id),
+                Capability::Control,
+                FEATURE_SHELL_REGISTRY_V1,
+            )
+            .await
+            .map_err(shell_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, id);
+        Err(ShellCommandErrorV1::unavailable(
+            "shell.close unavailable on this platform",
+        ))
+    }
+}
+
+fn ssh_session_lookup_error() -> SshCommandErrorV1 {
+    SshCommandErrorV1::protocol("SSH session lookup failed; sensitive details were redacted.")
+}
+
+/// List secret-free public SSH profiles. Omitted `session_id` stays omitted;
+/// when present it is mapped to the daemon identity before sending.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_list(
+    app: AppHandle,
+    session_id: Option<String>,
+) -> Result<SshProfileListResultV1, SshCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        let session_id = match session_id {
+            Some(session_id) => Some(
+                fleet_provider_session_id(session_id)
+                    .await
+                    .map_err(|_| ssh_session_lookup_error())?,
+            ),
+            None => None,
+        };
+        return ssh_list_response(
+            shell_family_request(
+                app,
+                ssh_list_request(session_id),
+                Capability::View,
+                FEATURE_SSH_PROFILES_V1,
+            )
+            .await
+            .map_err(ssh_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, session_id);
+        Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+/// Add a profile. The verbatim request wrapper is redacted in Debug, and the
+/// only accepted response type is the validated secret-free public row.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_add(
+    app: AppHandle,
+    profile: Value,
+) -> Result<SshProfileRecordV1, SshCommandErrorV1> {
+    let request = ssh_add_request(profile)?;
+    #[cfg(unix)]
+    {
+        return ssh_add_response(
+            shell_family_request(app, request, Capability::Control, FEATURE_SSH_PROFILES_V1)
+                .await
+                .map_err(ssh_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, request);
+        Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+/// Apply verbatim partial changes. Missing nested keys mean unchanged; JSON
+/// null retains the daemon's typed clear semantics.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_update(
+    app: AppHandle,
+    name: String,
+    changes: Value,
+) -> Result<SshProfileRecordV1, SshCommandErrorV1> {
+    let request = ssh_update_request(name, changes)?;
+    #[cfg(unix)]
+    {
+        return ssh_update_response(
+            shell_family_request(app, request, Capability::Control, FEATURE_SSH_PROFILES_V1)
+                .await
+                .map_err(ssh_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, request);
+        Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_remove(app: AppHandle, name: String) -> Result<String, SshCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return ssh_remove_response(
+            shell_family_request(
+                app,
+                ssh_remove_request(name),
+                Capability::Control,
+                FEATURE_SSH_PROFILES_V1,
+            )
+            .await
+            .map_err(ssh_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, name);
+        Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+/// Test profile reachability. Successful RPC completion is not interpreted;
+/// only the published `connected` fact selects the typed outcome.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_test(
+    app: AppHandle,
+    name: String,
+    timeout_s: Option<u32>,
+) -> Result<SshTestReceiptV1, SshCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return ssh_test_response(
+            shell_family_request(
+                app,
+                ssh_test_request(name, timeout_s),
+                Capability::Control,
+                FEATURE_SSH_PROFILES_V1,
+            )
+            .await
+            .map_err(ssh_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, name, timeout_s);
+        Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+/// Publish the explicit all/allow/none session routing scope. The response's
+/// scope is required and never defaulted to local execution.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_set_session_scope(
+    app: AppHandle,
+    session_id: String,
+    scope: Value,
+) -> Result<SshScopeReceiptV1, SshCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = fleet_provider_session_id(session_id)
+            .await
+            .map_err(|_| ssh_session_lookup_error())?;
+        let request = ssh_set_scope_request(provider_session_id.clone(), scope)?;
+        return ssh_set_scope_response(
+            shell_family_request(app, request, Capability::Control, FEATURE_SSH_PROFILES_V1)
+                .await
+                .map_err(ssh_transport_error)?,
+            &provider_session_id,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, session_id, scope);
+        Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+/// Human Control one-shot remote shell door. Output is returned exactly as
+/// the daemon publishes it and is never used as authentication material.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_shell(
+    app: AppHandle,
+    name: String,
+    command: String,
+    cwd: Option<String>,
+    timeout_s: Option<u32>,
+) -> Result<SshShellResultV1, SshCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return ssh_shell_response(
+            shell_family_request(
+                app,
+                ssh_shell_request(name, command, cwd, timeout_s),
+                Capability::Control,
+                FEATURE_SSH_PROFILES_V1,
+            )
+            .await
+            .map_err(ssh_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, name, command, cwd, timeout_s);
+        Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+/// Open an interactive PTY. If scoped to a session, the daemon session id
+/// and authorization fence come from a borrowed Control attachment.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_shell_open(
+    app: AppHandle,
+    name: String,
+    session_id: Option<String>,
+    term: String,
+    size: Value,
+) -> Result<ShellRecordV1, SshCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        let features = BTreeSet::from([FEATURE_SSH_PROFILES_V1.to_string()]);
+        let attachment = match session_id {
+            Some(session_id) => {
+                let provider_session_id = fleet_provider_session_id(session_id)
+                    .await
+                    .map_err(|_| ssh_session_lookup_error())?;
+                Some(
+                    workflow_control_attachment(&provider_session_id, &features)
+                        .await
+                        .map_err(|_| ssh_session_lookup_error())?,
+                )
+            }
+            None => None,
+        };
+        let provider_session_id = attachment
+            .as_ref()
+            .map(|attachment| attachment.session_id.clone());
+        let request = ssh_shell_open_request(name, provider_session_id, term, size)?;
+        let result =
+            shell_family_request(app, request, Capability::Control, FEATURE_SSH_PROFILES_V1)
+                .await
+                .map_err(ssh_transport_error)
+                .and_then(ssh_shell_open_response);
+        if let Some(attachment) = attachment {
+            workflow_detach(attachment.attachment_id).await;
+        }
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, name, session_id, term, size);
+        Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+/// Daemon-ward-only base64 PTY input. `SecretWire` redacts diagnostics and
+/// zeroizes the allocation; no response or error type can carry it back.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_shell_input(
+    app: AppHandle,
+    id: String,
+    data_b64: String,
+) -> Result<ShellRecordV1, SshCommandErrorV1> {
+    let request = ssh_shell_input_request(id, data_b64);
+    #[cfg(unix)]
+    {
+        return ssh_shell_input_response(
+            shell_family_request(app, request, Capability::Control, FEATURE_SSH_PROFILES_V1)
+                .await
+                .map_err(ssh_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, request);
+        Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_shell_resize(
+    app: AppHandle,
+    id: String,
+    size: Value,
+) -> Result<ShellRecordV1, SshCommandErrorV1> {
+    let request = ssh_shell_resize_request(id, size)?;
+    #[cfg(unix)]
+    {
+        return ssh_shell_resize_response(
+            shell_family_request(app, request, Capability::Control, FEATURE_SSH_PROFILES_V1)
+                .await
+                .map_err(ssh_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, request);
+        Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn ssh_shell_eof(app: AppHandle, id: String) -> Result<ShellRecordV1, SshCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return ssh_shell_eof_response(
+            shell_family_request(
+                app,
+                ssh_shell_eof_request(id),
+                Capability::Control,
+                FEATURE_SSH_PROFILES_V1,
+            )
+            .await
+            .map_err(ssh_transport_error)?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, id);
+        Err(SshCommandErrorV1::unavailable())
     }
 }
 
@@ -13373,6 +14986,11 @@ fn apply_disconnected_command(
         ActorCommand::PeerRequest { reply, .. } => {
             let _ = reply.send(None);
         }
+        ActorCommand::ShellRequest { reply, .. } => {
+            // ShellOutput is connection-transient. An offline command cannot
+            // queue a subscription or promise replay after reconnect.
+            let _ = reply.send(None);
+        }
         ActorCommand::DescendantAttach { reply, .. } => {
             let _ = reply.send(Err(
                 "session.descendants.attach unavailable: no ADE connection".to_string(),
@@ -13439,6 +15057,9 @@ async fn run_connected(
     let mut pending_loom_watches: HashMap<String, PendingLoomWatch> = HashMap::new();
     let mut loom_registry_forwarders = LoomRegistryForwarders::new();
     let mut peer_event_app = None;
+    // Deliberately connection-scoped: transient terminal output is never
+    // resumed or replayed onto a replacement connection.
+    let mut shell_event_app = None;
     let mut pending_account_roster_watch = None;
     let mut account_roster_watch_waiters = Vec::new();
     let mut decoder = StreamingFrameDecoder::default();
@@ -13524,6 +15145,7 @@ async fn run_connected(
                             last_published_revision,
                             roster_app,
                             &mut peer_event_app,
+                            &mut shell_event_app,
                             account_roster_window,
                             &mut pending_requests,
                             &mut pending_queue_attaches,
@@ -13578,6 +15200,17 @@ async fn run_connected(
                 if connection.features.contains(FEATURE_PEER_MESSAGING_V1) {
                     if let Some(app) = peer_event_app.as_ref() {
                         emit_peer_webview_event(app, event);
+                    }
+                }
+                continue;
+            }
+            Err(frame) => frame,
+        };
+        let frame = match shell_event_from_frame(frame) {
+            Ok(event) => {
+                if event.advertised_by(&connection.features) {
+                    if let Some(app) = shell_event_app.as_ref() {
+                        emit_shell_webview_event(app, event);
                     }
                 }
                 continue;
@@ -13872,6 +15505,7 @@ async fn apply_connected_command(
     last_published_revision: &mut HashMap<String, u64>,
     roster_app: &mut Option<AppHandle>,
     peer_event_app: &mut Option<AppHandle>,
+    shell_event_app: &mut Option<AppHandle>,
     account_roster_window: &mut Option<tauri::WebviewWindow>,
     pending_requests: &mut HashMap<String, PendingRpcRequest>,
     pending_queue_attaches: &mut HashMap<String, String>,
@@ -14067,6 +15701,42 @@ async fn apply_connected_command(
             // Install the destination before writing the opt-in request. The
             // next buffered frame may already be a peer notification.
             *peer_event_app = Some(app);
+            let request_id = request_id(next_request);
+            let request = WireFrame::Request {
+                request_id: request_id.clone(),
+                body,
+            };
+            if write_frame(stream, &request, connection.frame_limit, encoding)
+                .await
+                .is_err()
+            {
+                let _ = reply.send(None);
+                return false;
+            }
+            pending_requests.insert(request_id, (reply, RpcErrorStyle::Passthrough));
+            true
+        }
+        ActorCommand::ShellRequest {
+            app,
+            body,
+            capability,
+            feature,
+            reply,
+        } => {
+            if !connection.grants(capability) {
+                let _ = reply.send(Some(Err("capability_denied".to_string())));
+                return true;
+            }
+            if !connection.features.contains(feature) {
+                let _ = reply.send(Some(Err(format!(
+                    "missing_feature: daemon does not advertise {feature}"
+                ))));
+                return true;
+            }
+
+            // Install before write. A ShellOpened or ShellOutput frame may be
+            // the next buffered frame and must not overtake command setup.
+            *shell_event_app = Some(app);
             let request_id = request_id(next_request);
             let request = WireFrame::Request {
                 request_id: request_id.clone(),
@@ -14825,6 +16495,10 @@ fn wire_frame_kind(frame: &WireFrame) -> &'static str {
         WireFrame::LoomRegistryCaughtUp { .. } => "loom_registry_caught_up",
         WireFrame::PeerMessageReceived { .. } => "peer_message_received",
         WireFrame::PeerDeliveryChanged { .. } => "peer_delivery_changed",
+        WireFrame::ShellOpened { .. } => "shell.opened",
+        WireFrame::ShellState { .. } => "shell.state",
+        WireFrame::ShellClosed { .. } => "shell.closed",
+        WireFrame::ShellOutput { .. } => "shell.output",
         WireFrame::SessionDescendantStream { .. } => "session_descendant_stream",
         WireFrame::SessionDescendantRepairRequired { .. } => "session_descendant_repair_required",
         WireFrame::MenuAnswer { .. } => "menu_answer",
@@ -15210,6 +16884,11 @@ mod checkpoint_tests;
 #[allow(clippy::expect_used)]
 #[path = "haider_rpc_ade_peer_tests.rs"]
 mod peer_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_shell_tests.rs"]
+mod shell_tests;
 
 #[cfg(test)]
 mod tests {
