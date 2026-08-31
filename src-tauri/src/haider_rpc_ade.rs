@@ -61,9 +61,13 @@ const FEATURE_ACCOUNT_OAUTH_DEVICE_V1: &str = "account_oauth_device_v1";
 const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
 const FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1: &str = "account_oauth_import_sources_v1";
 const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
+const FEATURE_ACCOUNT_IDENTITY_V1: &str = "account_identity_v1";
 const FEATURE_VAULT_STAGE_V1: &str = "vault_stage_v1";
 const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
+const FEATURE_PROVIDER_CONFIGURE_V1: &str = "provider_configure_v1";
+const FEATURE_PROVIDER_REMOVE_V1: &str = "provider_remove_v1";
 const FEATURE_PROVIDER_MODELS_V1: &str = "provider_models_v1";
+const FEATURE_PROVIDER_LOCKDOWN_V1: &str = "provider_lockdown_v1";
 const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
 const FEATURE_USAGE_HISTORY_V1: &str = "usage_history_v1";
 const FEATURE_HAIDER_CODE_PLAN_STATUS_V1: &str = "haider_code_plan_status_v1";
@@ -101,6 +105,8 @@ const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
 const FEATURE_CHECKPOINT_V1: &str = "checkpoint_v1";
 const FEATURE_PEER_MESSAGING_V1: &str = "peer_messaging_v1";
 const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
+const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
+const FEATURE_HOOKS_V1: &str = "hooks_v1";
 const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
 const FEATURE_USER_COMMAND_V1: &str = "user_command_v1";
 const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
@@ -2891,6 +2897,377 @@ raw_string_enum!(PeerDeliveryReasonV1 {
     InvalidMessage => "invalid_message",
 });
 
+raw_string_enum!(ProviderApiFamilyV1 {
+    AnthropicMessages => "anthropic_messages",
+    OpenAiResponses => "openai_responses",
+    OpenAiChatCompletions => "openai_chat_completions",
+    GeminiGenerateContent => "gemini_generate_content",
+});
+
+raw_string_enum!(ProviderAuthRequirementV1 {
+    ApiKey => "api_key",
+    OAuth => "o_auth",
+    None => "none",
+});
+
+// Security state is deliberately raw-preserving. A future spelling remains
+// Unknown(raw), never Full.
+raw_string_enum!(ProviderTrustV1 {
+    Full => "full",
+    Lockdown => "lockdown",
+});
+
+raw_string_enum!(ProviderAvailabilityV1 {
+    Available => "available",
+    Unavailable => "unavailable",
+});
+
+raw_string_enum!(ModelInventoryAuthorityV1 {
+    Authoritative => "authoritative",
+    Advisory => "advisory",
+});
+
+raw_string_enum!(LockdownActivationV1 {
+    Configured => "configured",
+    AutoHermetic => "auto_hermetic",
+    AutoHermeticEligible => "auto_hermetic_eligible",
+});
+
+raw_string_enum!(HookTrustStateV1 {
+    Trusted => "trusted",
+    Untrusted => "untrusted",
+    RevokedByEdit => "revoked_by_edit",
+});
+
+raw_string_enum!(ProviderRemoveRefusalReasonV1 {
+    NotFound => "not_found",
+    ReleaseOwned => "release_owned",
+    BlockingAccounts => "blocking_accounts",
+});
+
+/// Tauri-safe monotonic management revision. Daemon frames use JSON `u64`,
+/// while JavaScript receives and supplies the exact decimal spelling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityRevisionV1(pub u64);
+
+impl Serialize for CapabilityRevisionV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityRevisionV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let decimal = String::deserialize(deserializer)?;
+        if decimal.is_empty() || !decimal.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(serde::de::Error::custom(
+                "capability revision must be a decimal u64 string",
+            ));
+        }
+        decimal.parse::<u64>().map(Self).map_err(|_| {
+            serde::de::Error::custom("capability revision must be a decimal u64 string")
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolManifestV1 {
+    pub name: String,
+    pub description: String,
+    /// Effect classes are daemon-owned tagged values, not a client policy.
+    pub effects: Vec<Value>,
+    /// Dispatch is inventory data and remains unknown-tolerant.
+    pub dispatch: Value,
+    /// Tool input schemas are deliberately opaque and round-trip unchanged.
+    pub input_schema: Value,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolInventoryEntryV1 {
+    pub manifest: ToolManifestV1,
+    /// Permission defaults are daemon facts, never client authorization.
+    pub default: Value,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RememberedSessionGrantV1 {
+    pub class: Value,
+    pub scope: Value,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolInventorySnapshotV1 {
+    #[serde(default)]
+    pub tools: Vec<ToolInventoryEntryV1>,
+    #[serde(default)]
+    pub remembered_grants: Vec<RememberedSessionGrantV1>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolsInventoryResultV1 {
+    pub session_id: String,
+    pub inventory: ToolInventorySnapshotV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct HookSummaryWireV1 {
+    name: String,
+    digest: String,
+    source: String,
+    /// Missing remains missing; the SDK never derives kind from other facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    event: String,
+    #[serde(default)]
+    trusted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trust_state: Option<HookTrustStateV1>,
+    decision: bool,
+    timeout_ms: u64,
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+/// Fail-closed hook summary. Only an explicit daemon `trust_state: trusted`
+/// produces `trusted: true`; the legacy boolean cannot upgrade absent or
+/// unknown typed trust.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookSummaryV1 {
+    pub name: String,
+    pub digest: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub event: String,
+    pub trusted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_state: Option<HookTrustStateV1>,
+    pub decision: bool,
+    pub timeout_ms: u64,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl From<HookSummaryWireV1> for HookSummaryV1 {
+    fn from(hook: HookSummaryWireV1) -> Self {
+        let trusted = matches!(hook.trust_state, Some(HookTrustStateV1::Trusted));
+        Self {
+            name: hook.name,
+            digest: hook.digest,
+            source: hook.source,
+            kind: hook.kind,
+            event: hook.event,
+            trusted,
+            trust_state: hook.trust_state,
+            decision: hook.decision,
+            timeout_ms: hook.timeout_ms,
+            extra: hook.extra,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HooksListResultV1 {
+    pub policy: String,
+    pub revision: CapabilityRevisionV1,
+    #[serde(default)]
+    pub hooks: Vec<HookSummaryV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookTrustReceiptV1 {
+    pub digest: String,
+    pub trusted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModelDetailV1 {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_speeds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_thinking_type: Option<bool>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSummaryV1 {
+    pub provider: String,
+    pub api_family: ProviderApiFamilyV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_open_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_idle_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_progress_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub model_details: Vec<ProviderModelDetailV1>,
+    /// Unix epoch milliseconds stay a JSON number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_fetched_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_authority: Option<ModelInventoryAuthorityV1>,
+    #[serde(default)]
+    pub auth_methods: Vec<Value>,
+    pub availability: ProviderAvailabilityV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    pub enabled: bool,
+    /// Absence stays unknown; an unknown spelling survives as Unknown(raw).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<ProviderTrustV1>,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderMutationResultV1 {
+    pub provider: ProviderSummaryV1,
+    pub revision: CapabilityRevisionV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRemoveResultV1 {
+    pub provider: String,
+    pub revision: CapabilityRevisionV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LockdownStatusV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Absence is unknown, never evidence that lockdown is inactive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<LockdownActivationV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub tools_allowed: Vec<String>,
+    pub quota_used: u64,
+    pub quota_limit: u64,
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AccountRefreshResultV1 {
+    /// Credential descriptors remain opaque so identity additions survive.
+    pub descriptor: Value,
+    pub revision: CapabilityRevisionV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRevisionConflictV1 {
+    pub expected_revision: CapabilityRevisionV1,
+    pub current_revision: CapabilityRevisionV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRemoveRefusedV1 {
+    pub provider: String,
+    pub reason: ProviderRemoveRefusalReasonV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocking_aliases: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CapabilityErrorDataV1 {
+    RevisionConflict(ProviderRevisionConflictV1),
+    ProviderRemoveRefused(ProviderRemoveRefusedV1),
+    Unknown(Value),
+}
+
+impl Serialize for CapabilityErrorDataV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::RevisionConflict(conflict) => serde_json::json!({
+                "kind": "revision_conflict",
+                "expected_revision": conflict.expected_revision,
+                "current_revision": conflict.current_revision,
+            })
+            .serialize(serializer),
+            Self::ProviderRemoveRefused(refusal) => serde_json::json!({
+                "kind": "provider_remove_refused",
+                "provider": refusal.provider,
+                "reason": refusal.reason,
+                "blocking_aliases": refusal.blocking_aliases,
+            })
+            .serialize(serializer),
+            Self::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+fn capability_revision_field(raw: &Value, field: &str) -> Result<CapabilityRevisionV1, String> {
+    raw.get(field)
+        .and_then(Value::as_u64)
+        .or_else(|| raw.get(field).and_then(Value::as_str)?.parse::<u64>().ok())
+        .map(CapabilityRevisionV1)
+        .ok_or_else(|| format!("{field} must be a decimal u64"))
+}
+
+impl<'de> Deserialize<'de> for CapabilityErrorDataV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("kind").and_then(Value::as_str) {
+            Some("revision_conflict") => Ok(Self::RevisionConflict(ProviderRevisionConflictV1 {
+                expected_revision: capability_revision_field(&raw, "expected_revision")
+                    .map_err(serde::de::Error::custom)?,
+                current_revision: capability_revision_field(&raw, "current_revision")
+                    .map_err(serde::de::Error::custom)?,
+            })),
+            Some("provider_remove_refused") => serde_json::from_value(raw)
+                .map(Self::ProviderRemoveRefused)
+                .map_err(serde::de::Error::custom),
+            _ => Ok(Self::Unknown(raw)),
+        }
+    }
+}
+
+/// Structured capability/provider rejection. Revision conflicts preserve both
+/// daemon coordinates and are never converted into display text or retried.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CapabilityCommandErrorV1 {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<CapabilityErrorDataV1>,
+}
+
 raw_string_enum!(ShellKindIdentityV1 {
     Local => "local",
     Ssh => "ssh",
@@ -4603,6 +4980,39 @@ enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    #[serde(rename = "provider.configure")]
+    ProviderConfigure {
+        command_id: String,
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_family: Option<ProviderApiFamilyV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_requirement: Option<ProviderAuthRequirementV1>,
+        enabled: bool,
+        #[serde(default)]
+        models: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_open_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_idle_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        semantic_progress_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        probe_vault_reference: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trust: Option<ProviderTrustV1>,
+        expected_revision: u64,
+    },
+    #[serde(rename = "provider.remove")]
+    ProviderRemove {
+        command_id: String,
+        provider: String,
+        expected_revision: u64,
+    },
     #[serde(rename = "usage.report")]
     UsageReport {},
     /// Request authority: `crates/haider-rpc/src/frame.rs:2361-2367`.
@@ -4703,6 +5113,12 @@ enum RequestBody {
         after_cursor: u64,
         limit: u32,
     },
+    #[serde(rename = "hooks.list")]
+    HooksList { cwd: String },
+    #[serde(rename = "hooks.trust")]
+    HooksTrust { command_id: String, digest: String },
+    #[serde(rename = "hooks.revoke")]
+    HooksRevoke { command_id: String, digest: String },
     /// Opens a reconnectable read-only stream over durable descendant
     /// journals. Every cursor is scoped by both child identities.
     #[serde(rename = "session.descendants.attach")]
@@ -4870,6 +5286,8 @@ enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
+    #[serde(rename = "tools.inventory")]
+    ToolsInventory { session_id: String },
     #[serde(rename = "ssh.list")]
     SshList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5107,6 +5525,8 @@ enum RequestBody {
         command_id: String,
         candidate: String,
     },
+    #[serde(rename = "account.refresh")]
+    AccountRefresh { alias: String },
     #[serde(rename = "account.set_active")]
     AccountSetActive {
         command_id: String,
@@ -5144,6 +5564,20 @@ enum RequestBody {
         model: String,
         expected_revision: u64,
     },
+    #[serde(rename = "provider.set_trust")]
+    ProviderSetTrust {
+        command_id: String,
+        name: String,
+        trust: ProviderTrustV1,
+        expected_revision: u64,
+    },
+    #[serde(rename = "lockdown.status")]
+    LockdownStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    #[serde(rename = "lockdown.set_quota")]
+    LockdownSetQuota { command_id: String, bytes: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5184,6 +5618,13 @@ enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         availability: Option<SnapshotAvailabilityWire>,
     },
+    #[serde(rename = "provider.configure")]
+    ProviderConfigure {
+        provider: ProviderSummaryV1,
+        revision: u64,
+    },
+    #[serde(rename = "provider.remove")]
+    ProviderRemove { provider: String, revision: u64 },
     #[serde(rename = "usage.report")]
     UsageReport {
         report: Value,
@@ -5270,6 +5711,18 @@ enum ResponseBody {
     },
     #[serde(rename = "workflow.graph.watch")]
     WorkflowGraphWatch { page: WorkflowGraphWatchPageV1 },
+    #[serde(rename = "hooks.list")]
+    HooksList {
+        policy: String,
+        #[serde(default)]
+        revision: u64,
+        #[serde(default)]
+        hooks: Vec<HookSummaryWireV1>,
+    },
+    #[serde(rename = "hooks.trust")]
+    HooksTrust { digest: String, trusted: bool },
+    #[serde(rename = "hooks.revoke")]
+    HooksRevoke { digest: String, trusted: bool },
     #[serde(rename = "session.descendants.attach")]
     SessionDescendantsAttach {
         attachment_id: String,
@@ -5385,6 +5838,11 @@ enum ResponseBody {
         item_id: String,
         accepted_seq: u64,
         worker_generation: u64,
+    },
+    #[serde(rename = "tools.inventory")]
+    ToolsInventory {
+        session_id: String,
+        inventory: ToolInventorySnapshotV1,
     },
     #[serde(rename = "ssh.list")]
     SshList { profiles: Vec<SshProfileRecordV1> },
@@ -5622,6 +6080,8 @@ enum ResponseBody {
     },
     #[serde(rename = "account.import_device")]
     AccountImportDevice { descriptor: Value, revision: u64 },
+    #[serde(rename = "account.refresh")]
+    AccountRefresh { descriptor: Value, revision: u64 },
     #[serde(rename = "turn.cancel")]
     TurnCancel {
         session_id: String,
@@ -5653,6 +6113,15 @@ enum ResponseBody {
         provider_summary: Value,
         revision: u64,
     },
+    #[serde(rename = "provider.set_trust")]
+    ProviderSetTrust {
+        provider: ProviderSummaryV1,
+        revision: u64,
+    },
+    #[serde(rename = "lockdown.status")]
+    LockdownStatus { status: LockdownStatusV1 },
+    #[serde(rename = "lockdown.set_quota")]
+    LockdownSetQuota { status: LockdownStatusV1 },
     #[serde(rename = "error")]
     Error {
         code: String,
@@ -8456,6 +8925,286 @@ fn graph_inspect_response(body: ResponseBody) -> Result<GraphInspectResult, Stri
     }
 }
 
+fn tools_inventory_request(session_id: String) -> RequestBody {
+    RequestBody::ToolsInventory { session_id }
+}
+
+fn hooks_list_request(cwd: String) -> RequestBody {
+    RequestBody::HooksList { cwd }
+}
+
+fn hooks_trust_request(command_id: String, digest: String) -> RequestBody {
+    RequestBody::HooksTrust { command_id, digest }
+}
+
+fn hooks_revoke_request(command_id: String, digest: String) -> RequestBody {
+    RequestBody::HooksRevoke { command_id, digest }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provider_configure_request(
+    command_id: String,
+    provider: String,
+    api_family: Option<ProviderApiFamilyV1>,
+    origin: Option<String>,
+    auth_requirement: Option<ProviderAuthRequirementV1>,
+    enabled: bool,
+    models: Vec<String>,
+    default_model: Option<String>,
+    response_open_timeout_ms: Option<u64>,
+    chunk_idle_timeout_ms: Option<u64>,
+    semantic_progress_timeout_ms: Option<u64>,
+    probe_vault_reference: Option<String>,
+    trust: Option<ProviderTrustV1>,
+    expected_revision: u64,
+) -> RequestBody {
+    RequestBody::ProviderConfigure {
+        command_id,
+        provider,
+        api_family,
+        origin,
+        auth_requirement,
+        enabled,
+        models,
+        default_model,
+        response_open_timeout_ms,
+        chunk_idle_timeout_ms,
+        semantic_progress_timeout_ms,
+        probe_vault_reference,
+        trust,
+        expected_revision,
+    }
+}
+
+fn provider_remove_request(
+    command_id: String,
+    provider: String,
+    expected_revision: u64,
+) -> RequestBody {
+    RequestBody::ProviderRemove {
+        command_id,
+        provider,
+        expected_revision,
+    }
+}
+
+fn provider_set_trust_request(
+    command_id: String,
+    name: String,
+    trust: ProviderTrustV1,
+    expected_revision: u64,
+) -> RequestBody {
+    RequestBody::ProviderSetTrust {
+        command_id,
+        name,
+        trust,
+        expected_revision,
+    }
+}
+
+fn lockdown_status_request(provider: Option<String>) -> RequestBody {
+    RequestBody::LockdownStatus { provider }
+}
+
+fn lockdown_set_quota_request(command_id: String, bytes: u64) -> RequestBody {
+    RequestBody::LockdownSetQuota { command_id, bytes }
+}
+
+fn account_refresh_request(alias: String) -> RequestBody {
+    RequestBody::AccountRefresh { alias }
+}
+
+impl CapabilityCommandErrorV1 {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "unavailable".to_string(),
+            message: message.into(),
+            retryable: true,
+            data: None,
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.into(),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn from_daemon(code: String, message: String, retryable: bool, data: Option<Value>) -> Self {
+        Self {
+            code,
+            message,
+            retryable,
+            data: data.map(|raw| {
+                serde_json::from_value(raw.clone()).unwrap_or(CapabilityErrorDataV1::Unknown(raw))
+            }),
+        }
+    }
+}
+
+fn capability_response_error(
+    body: ResponseBody,
+    mismatch: &'static str,
+) -> CapabilityCommandErrorV1 {
+    match body {
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => CapabilityCommandErrorV1::from_daemon(code, message, retryable, data),
+        _ => CapabilityCommandErrorV1::protocol(mismatch),
+    }
+}
+
+fn tools_inventory_response(
+    body: ResponseBody,
+) -> Result<ToolsInventoryResultV1, CapabilityCommandErrorV1> {
+    match body {
+        ResponseBody::ToolsInventory {
+            session_id,
+            inventory,
+        } => Ok(ToolsInventoryResultV1 {
+            session_id,
+            inventory,
+        }),
+        response => Err(capability_response_error(
+            response,
+            "tools.inventory response method mismatch",
+        )),
+    }
+}
+
+fn hooks_list_response(body: ResponseBody) -> Result<HooksListResultV1, CapabilityCommandErrorV1> {
+    match body {
+        ResponseBody::HooksList {
+            policy,
+            revision,
+            hooks,
+        } => Ok(HooksListResultV1 {
+            policy,
+            revision: CapabilityRevisionV1(revision),
+            hooks: hooks.into_iter().map(HookSummaryV1::from).collect(),
+        }),
+        response => Err(capability_response_error(
+            response,
+            "hooks.list response method mismatch",
+        )),
+    }
+}
+
+fn hook_trust_response(
+    body: ResponseBody,
+    trust: bool,
+) -> Result<HookTrustReceiptV1, CapabilityCommandErrorV1> {
+    match body {
+        ResponseBody::HooksTrust { digest, trusted } if trust => {
+            Ok(HookTrustReceiptV1 { digest, trusted })
+        }
+        ResponseBody::HooksRevoke { digest, trusted } if !trust => {
+            Ok(HookTrustReceiptV1 { digest, trusted })
+        }
+        response => Err(capability_response_error(
+            response,
+            if trust {
+                "hooks.trust response method mismatch"
+            } else {
+                "hooks.revoke response method mismatch"
+            },
+        )),
+    }
+}
+
+fn provider_configure_response(
+    body: ResponseBody,
+) -> Result<ProviderMutationResultV1, CapabilityCommandErrorV1> {
+    match body {
+        ResponseBody::ProviderConfigure { provider, revision } => Ok(ProviderMutationResultV1 {
+            provider,
+            revision: CapabilityRevisionV1(revision),
+        }),
+        response => Err(capability_response_error(
+            response,
+            "provider.configure response method mismatch",
+        )),
+    }
+}
+
+fn provider_remove_response(
+    body: ResponseBody,
+) -> Result<ProviderRemoveResultV1, CapabilityCommandErrorV1> {
+    match body {
+        ResponseBody::ProviderRemove { provider, revision } => Ok(ProviderRemoveResultV1 {
+            provider,
+            revision: CapabilityRevisionV1(revision),
+        }),
+        response => Err(capability_response_error(
+            response,
+            "provider.remove response method mismatch",
+        )),
+    }
+}
+
+fn provider_set_trust_response(
+    body: ResponseBody,
+) -> Result<ProviderMutationResultV1, CapabilityCommandErrorV1> {
+    match body {
+        ResponseBody::ProviderSetTrust { provider, revision } => Ok(ProviderMutationResultV1 {
+            provider,
+            revision: CapabilityRevisionV1(revision),
+        }),
+        response => Err(capability_response_error(
+            response,
+            "provider.set_trust response method mismatch",
+        )),
+    }
+}
+
+fn lockdown_status_response(
+    body: ResponseBody,
+) -> Result<LockdownStatusV1, CapabilityCommandErrorV1> {
+    match body {
+        ResponseBody::LockdownStatus { status } => Ok(status),
+        response => Err(capability_response_error(
+            response,
+            "lockdown.status response method mismatch",
+        )),
+    }
+}
+
+fn lockdown_set_quota_response(
+    body: ResponseBody,
+) -> Result<LockdownStatusV1, CapabilityCommandErrorV1> {
+    match body {
+        ResponseBody::LockdownSetQuota { status } => Ok(status),
+        response => Err(capability_response_error(
+            response,
+            "lockdown.set_quota response method mismatch",
+        )),
+    }
+}
+
+fn account_refresh_response(
+    body: ResponseBody,
+) -> Result<AccountRefreshResultV1, CapabilityCommandErrorV1> {
+    match body {
+        ResponseBody::AccountRefresh {
+            descriptor,
+            revision,
+        } => Ok(AccountRefreshResultV1 {
+            descriptor,
+            revision: CapabilityRevisionV1(revision),
+        }),
+        response => Err(capability_response_error(
+            response,
+            "account.refresh response method mismatch",
+        )),
+    }
+}
+
 impl CheckpointCommandError {
     fn unavailable(message: impl Into<String>) -> Self {
         Self {
@@ -9573,6 +10322,61 @@ async fn checkpoint_request(
             "The checkpoint RPC request did not receive a response.",
         )),
     }
+}
+
+#[cfg(unix)]
+fn capability_transport_error(error: String) -> CapabilityCommandErrorV1 {
+    if error.starts_with("missing_feature:") {
+        CapabilityCommandErrorV1 {
+            code: "missing_feature".to_string(),
+            message: error,
+            retryable: false,
+            data: None,
+        }
+    } else if error == "capability_denied" {
+        CapabilityCommandErrorV1 {
+            code: error,
+            message: "The current Haider RPC connection lacks the required capability.".to_string(),
+            retryable: false,
+            data: None,
+        }
+    } else {
+        CapabilityCommandErrorV1::unavailable(error)
+    }
+}
+
+#[cfg(unix)]
+async fn capability_request(
+    body: RequestBody,
+    capability: Capability,
+    feature: &'static str,
+) -> Result<ResponseBody, CapabilityCommandErrorV1> {
+    match rpc_request_with_feature_gate(
+        body,
+        capability,
+        FeatureGate::all(BTreeSet::from([feature.to_string()])),
+        RpcErrorStyle::Passthrough,
+    )
+    .await
+    {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) => Err(capability_transport_error(error)),
+        None => Err(CapabilityCommandErrorV1::unavailable(
+            "The capability RPC request did not receive a response.",
+        )),
+    }
+}
+
+#[cfg(unix)]
+async fn tools_inventory_provider_session_id(
+    session_id: String,
+) -> Result<String, CapabilityCommandErrorV1> {
+    tauri::async_runtime::spawn_blocking(move || {
+        super::session_provider_session_id_blocking(&session_id)
+    })
+    .await
+    .map_err(|error| CapabilityCommandErrorV1::protocol(format!("Session lookup failed: {error}")))?
+    .map_err(|error| CapabilityCommandErrorV1::protocol(format!("Session lookup failed: {error}")))
 }
 
 #[cfg(unix)]
@@ -11332,6 +12136,296 @@ pub async fn ssh_shell_eof(app: AppHandle, id: String) -> Result<ShellRecordV1, 
     {
         let _ = (app, id);
         Err(SshCommandErrorV1::unavailable())
+    }
+}
+
+/// Read canonical tool manifests, permission defaults, and remembered grants
+/// for the target session. Input schemas remain opaque JSON values.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tools_inventory(
+    session_id: String,
+) -> Result<ToolsInventoryResultV1, CapabilityCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        let session_id = tools_inventory_provider_session_id(session_id).await?;
+        return tools_inventory_response(
+            capability_request(
+                tools_inventory_request(session_id),
+                Capability::View,
+                FEATURE_TOOL_INVENTORY_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session_id;
+        Err(CapabilityCommandErrorV1::unavailable(
+            "tools.inventory unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn hooks_list(cwd: String) -> Result<HooksListResultV1, CapabilityCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return hooks_list_response(
+            capability_request(hooks_list_request(cwd), Capability::View, FEATURE_HOOKS_V1).await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cwd;
+        Err(CapabilityCommandErrorV1::unavailable(
+            "hooks.list unavailable on this platform",
+        ))
+    }
+}
+
+/// Trust the daemon-published digest exactly; neither Rust nor JavaScript
+/// supplies the internal command id or computes a replacement digest.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn hooks_trust(digest: String) -> Result<HookTrustReceiptV1, CapabilityCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return hook_trust_response(
+            capability_request(
+                hooks_trust_request(config_command_id("hooks-trust"), digest),
+                Capability::Control,
+                FEATURE_HOOKS_V1,
+            )
+            .await?,
+            true,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = digest;
+        Err(CapabilityCommandErrorV1::unavailable(
+            "hooks.trust unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn hooks_revoke(digest: String) -> Result<HookTrustReceiptV1, CapabilityCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return hook_trust_response(
+            capability_request(
+                hooks_revoke_request(config_command_id("hooks-revoke"), digest),
+                Capability::Control,
+                FEATURE_HOOKS_V1,
+            )
+            .await?,
+            false,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = digest;
+        Err(CapabilityCommandErrorV1::unavailable(
+            "hooks.revoke unavailable on this platform",
+        ))
+    }
+}
+
+/// Create or update one provider under the exact daemon-observed management
+/// revision. Omitted fields stay omitted and therefore retain daemon meaning.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn provider_configure(
+    provider: String,
+    api_family: Option<ProviderApiFamilyV1>,
+    origin: Option<String>,
+    auth_requirement: Option<ProviderAuthRequirementV1>,
+    enabled: bool,
+    models: Vec<String>,
+    default_model: Option<String>,
+    response_open_timeout_ms: Option<u64>,
+    chunk_idle_timeout_ms: Option<u64>,
+    semantic_progress_timeout_ms: Option<u64>,
+    probe_vault_reference: Option<String>,
+    trust: Option<ProviderTrustV1>,
+    expected_revision: CapabilityRevisionV1,
+) -> Result<ProviderMutationResultV1, CapabilityCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return provider_configure_response(
+            capability_request(
+                provider_configure_request(
+                    config_command_id("provider-configure"),
+                    provider,
+                    api_family,
+                    origin,
+                    auth_requirement,
+                    enabled,
+                    models,
+                    default_model,
+                    response_open_timeout_ms,
+                    chunk_idle_timeout_ms,
+                    semantic_progress_timeout_ms,
+                    probe_vault_reference,
+                    trust,
+                    expected_revision.0,
+                ),
+                Capability::Control,
+                FEATURE_PROVIDER_CONFIGURE_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            provider,
+            api_family,
+            origin,
+            auth_requirement,
+            enabled,
+            models,
+            default_model,
+            response_open_timeout_ms,
+            chunk_idle_timeout_ms,
+            semantic_progress_timeout_ms,
+            probe_vault_reference,
+            trust,
+            expected_revision,
+        );
+        Err(CapabilityCommandErrorV1::unavailable(
+            "provider.configure unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn provider_remove(
+    provider: String,
+    expected_revision: CapabilityRevisionV1,
+) -> Result<ProviderRemoveResultV1, CapabilityCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return provider_remove_response(
+            capability_request(
+                provider_remove_request(
+                    config_command_id("provider-remove"),
+                    provider,
+                    expected_revision.0,
+                ),
+                Capability::Control,
+                FEATURE_PROVIDER_REMOVE_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (provider, expected_revision);
+        Err(CapabilityCommandErrorV1::unavailable(
+            "provider.remove unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn provider_set_trust(
+    name: String,
+    trust: ProviderTrustV1,
+    expected_revision: CapabilityRevisionV1,
+) -> Result<ProviderMutationResultV1, CapabilityCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return provider_set_trust_response(
+            capability_request(
+                provider_set_trust_request(
+                    config_command_id("provider-set-trust"),
+                    name,
+                    trust,
+                    expected_revision.0,
+                ),
+                Capability::Control,
+                FEATURE_PROVIDER_LOCKDOWN_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (name, trust, expected_revision);
+        Err(CapabilityCommandErrorV1::unavailable(
+            "provider.set_trust unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn lockdown_status(
+    provider: Option<String>,
+) -> Result<LockdownStatusV1, CapabilityCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return lockdown_status_response(
+            capability_request(
+                lockdown_status_request(provider),
+                Capability::View,
+                FEATURE_PROVIDER_LOCKDOWN_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = provider;
+        Err(CapabilityCommandErrorV1::unavailable(
+            "lockdown.status unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn lockdown_set_quota(bytes: u64) -> Result<LockdownStatusV1, CapabilityCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return lockdown_set_quota_response(
+            capability_request(
+                lockdown_set_quota_request(config_command_id("lockdown-set-quota"), bytes),
+                Capability::Control,
+                FEATURE_PROVIDER_LOCKDOWN_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = bytes;
+        Err(CapabilityCommandErrorV1::unavailable(
+            "lockdown.set_quota unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn account_refresh(
+    alias: String,
+) -> Result<AccountRefreshResultV1, CapabilityCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return account_refresh_response(
+            capability_request(
+                account_refresh_request(alias),
+                Capability::Control,
+                FEATURE_ACCOUNT_IDENTITY_V1,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = alias;
+        Err(CapabilityCommandErrorV1::unavailable(
+            "account.refresh unavailable on this platform",
+        ))
     }
 }
 
@@ -16889,6 +17983,11 @@ mod peer_tests;
 #[allow(clippy::expect_used)]
 #[path = "haider_rpc_ade_shell_tests.rs"]
 mod shell_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_capability_tests.rs"]
+mod capability_tests;
 
 #[cfg(test)]
 mod tests {
