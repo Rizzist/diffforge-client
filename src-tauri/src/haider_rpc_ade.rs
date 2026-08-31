@@ -80,6 +80,12 @@ const FEATURE_WORKFLOW_GRAPH_V1: &str = "workflow_graph_v1";
 const FEATURE_SESSION_WORKFLOW_STATE_V1: &str = "session_workflow_state_v1";
 const FEATURE_TYPED_AGENT_INSTALL_V1: &str = "typed_agent_install_v1";
 const FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1: &str = "typed_agent_install_control_v1";
+const FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1: &str = "typed_agent_install_cancel_v1";
+const FEATURE_LOOM_AUTHORING_V1: &str = "loom_authoring_v1";
+const FEATURE_LOOM_REGISTRY_CAS_V1: &str = "loom_registry_cas_v1";
+const FEATURE_LOOM_REGISTRY_ARCHIVE_V1: &str = "loom_registry_archive_v1";
+const FEATURE_LOOM_VALIDATION_V1: &str = "loom_validation_v1";
+const FEATURE_LOOM_REGISTRY_WATCH_V1: &str = "loom_registry_watch_v1";
 const FEATURE_SESSION_AGENT_TYPE_SELECT_V1: &str = "session_agent_type_select_v1";
 const FEATURE_SESSION_LINEAGE_V1: &str = "session_lineage_v1";
 const FEATURE_SESSION_DESCENDANT_STREAM_V1: &str = "session_descendant_stream_v1";
@@ -122,6 +128,8 @@ const MONITOR_DELIVERY_EVENT: &str = "monitor-delivery";
 const MONITOR_DELIVERY_CAUGHT_UP_EVENT: &str = "monitor-delivery-caught-up";
 const SESSION_DESCENDANT_STREAM_EVENT: &str = "session-descendant-stream";
 const SESSION_DESCENDANT_REPAIR_EVENT: &str = "session-descendant-repair";
+const LOOM_REGISTRY_DELTA_EVENT: &str = "loom-registry-delta";
+const LOOM_REGISTRY_CAUGHT_UP_EVENT: &str = "loom-registry-caught-up";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const FEATURE_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2771,6 +2779,14 @@ pub struct LoomListResult {
     pub cli_present: BTreeMap<String, bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_catalog: Option<Vec<WorkflowCatalogEntryV1>>,
+    /// SDK request fact: only an explicit inclusive read can make an empty
+    /// archive inventory authoritative. Omission preserves the shipped shape.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_archived: bool,
+    /// Exact daemon-owned entry coordinates from an inclusive read. `None`
+    /// means archive state was not requested, never that no entries exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_entries: Option<Vec<Value>>,
 }
 
 impl LoomListResult {
@@ -2778,6 +2794,363 @@ impl LoomListResult {
     pub fn cli_presence(&self, program: &str) -> Option<bool> {
         self.cli_present.get(program).copied()
     }
+}
+
+macro_rules! raw_string_enum {
+    ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum $name {
+            $($variant,)+
+            Unknown(String),
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(match self {
+                    $(Self::$variant => $wire,)+
+                    Self::Unknown(raw) => raw,
+                })
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let raw = String::deserialize(deserializer)?;
+                Ok(match raw.as_str() {
+                    $($wire => Self::$variant,)+
+                    _ => Self::Unknown(raw),
+                })
+            }
+        }
+    };
+}
+
+raw_string_enum!(LoomAuthorKind {
+    AgentType => "agent_type",
+    Workflow => "workflow",
+});
+
+raw_string_enum!(LoomRegistryEntryKind {
+    AgentType => "agent_type",
+    Workflow => "workflow",
+});
+
+raw_string_enum!(TypedAgentInstallTerminalStateV1 {
+    Succeeded => "succeeded",
+    Failed => "failed",
+    Cancelled => "cancelled",
+});
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomAuthorLocation {
+    /// Daemon coordinates are one-based and cross the SDK unchanged.
+    pub line: u32,
+    pub column: u32,
+    pub field: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomAuthorValidationError {
+    pub code: String,
+    pub message: String,
+    pub location: LoomAuthorLocation,
+}
+
+/// Deep authoring records stay opaque so this client does not reimplement
+/// the independently versioned protocol document schemas.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoomAuthorDraftResult {
+    pub draft: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoomAuthorConfirmResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<LoomAuthorValidationError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomValidateResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<LoomAuthorValidationError>,
+    /// A non-mutating preview only. It is never promoted into a stored fact
+    /// or reused by the SDK as a later mutation fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomRevisionExpectation {
+    pub rev: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomRevisionConflict {
+    pub expected: LoomRevisionExpectation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_rev: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomAuthorRevisionConflict {
+    pub expected_revision: u64,
+    pub current_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoomErrorData {
+    LoomRevisionConflict(LoomRevisionConflict),
+    AuthorRevisionConflict(LoomAuthorRevisionConflict),
+    Unknown(Value),
+}
+
+impl Serialize for LoomErrorData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::LoomRevisionConflict(conflict) => {
+                #[derive(Serialize)]
+                struct Wire<'a> {
+                    kind: &'static str,
+                    #[serde(flatten)]
+                    conflict: &'a LoomRevisionConflict,
+                }
+                Wire {
+                    kind: "loom_revision_conflict",
+                    conflict,
+                }
+                .serialize(serializer)
+            }
+            Self::AuthorRevisionConflict(conflict) => serde_json::json!({
+                "kind": "revision_conflict",
+                "expected_revision": conflict.expected_revision,
+                "current_revision": conflict.current_revision,
+            })
+            .serialize(serializer),
+            Self::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LoomErrorData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("kind").and_then(Value::as_str) {
+            Some("loom_revision_conflict") => serde_json::from_value(raw)
+                .map(Self::LoomRevisionConflict)
+                .map_err(serde::de::Error::custom),
+            Some("revision_conflict") => serde_json::from_value(raw)
+                .map(Self::AuthorRevisionConflict)
+                .map_err(serde::de::Error::custom),
+            _ => Ok(Self::Unknown(raw)),
+        }
+    }
+}
+
+/// Typed Loom rejection returned through Tauri. CAS conflicts keep their
+/// expected/current coordinates instead of collapsing into display text.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LoomCommandError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<LoomErrorData>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoomArchiveOutcome {
+    Changed { entry: Value },
+    Already { entry: Value },
+    NotFound,
+    Unknown { raw: Value },
+}
+
+impl Serialize for LoomArchiveOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Changed { entry } => serde_json::json!({"status": "changed", "entry": entry}),
+            Self::Already { entry } => serde_json::json!({"status": "already", "entry": entry}),
+            Self::NotFound => serde_json::json!({"status": "not_found"}),
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LoomArchiveOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("status").and_then(Value::as_str) {
+            Some("changed") => Ok(Self::Changed {
+                entry: raw
+                    .get("entry")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::missing_field("entry"))?,
+            }),
+            Some("already") => Ok(Self::Already {
+                entry: raw
+                    .get("entry")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::missing_field("entry"))?,
+            }),
+            Some("not_found") => Ok(Self::NotFound),
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoomArchiveReceipt {
+    pub kind: LoomRegistryEntryKind,
+    pub id: String,
+    pub outcome: LoomArchiveOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypedAgentInstallCancelOutcome {
+    Cancelled,
+    AlreadyTerminal {
+        state: TypedAgentInstallTerminalStateV1,
+    },
+    Unknown {
+        raw: Value,
+    },
+}
+
+impl Serialize for TypedAgentInstallCancelOutcome {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Cancelled => serde_json::json!({"status": "cancelled"}),
+            Self::AlreadyTerminal { state } => {
+                serde_json::json!({"status": "already_terminal", "state": state})
+            }
+            Self::Unknown { raw } => raw.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TypedAgentInstallCancelOutcome {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        match raw.get("status").and_then(Value::as_str) {
+            Some("cancelled") => Ok(Self::Cancelled),
+            Some("already_terminal") => {
+                let state = raw
+                    .get("state")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::missing_field("state"))?;
+                Ok(Self::AlreadyTerminal {
+                    state: serde_json::from_value(state).map_err(serde::de::Error::custom)?,
+                })
+            }
+            _ => Ok(Self::Unknown { raw }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TypedAgentInstallCancelReceipt {
+    pub install_job_id: String,
+    pub outcome: TypedAgentInstallCancelOutcome,
+}
+
+fn loom_registry_cursor_field(field: &str) -> bool {
+    field == "cursor" || field.ends_with("_cursor")
+}
+
+/// Preserve registry records and future fields while making every daemon
+/// cursor safe at the JavaScript boundary.
+fn loom_registry_tauri_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(loom_registry_tauri_value).collect())
+        }
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(field, value)| {
+                    let value = if loom_registry_cursor_field(field) {
+                        value
+                            .as_u64()
+                            .map(|cursor| Value::String(cursor.to_string()))
+                            .unwrap_or_else(|| loom_registry_tauri_value(value))
+                    } else {
+                        loom_registry_tauri_value(value)
+                    };
+                    (field.clone(), value)
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn serialize_loom_registry_value<S>(value: &Value, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    loom_registry_tauri_value(value).serialize(serializer)
+}
+
+fn serialize_loom_cursor<S>(cursor: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.collect_str(cursor)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LoomWatchResult {
+    pub watch_id: String,
+    #[serde(serialize_with = "serialize_loom_cursor")]
+    pub requested_after_cursor: u64,
+    #[serde(serialize_with = "serialize_loom_registry_value")]
+    pub baseline: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct LoomRegistryDeltaEvent {
+    watch_id: String,
+    #[serde(serialize_with = "serialize_loom_registry_value")]
+    delta: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct LoomRegistryCaughtUpEvent {
+    watch_id: String,
+    #[serde(serialize_with = "serialize_loom_cursor")]
+    high_water_cursor: u64,
 }
 
 /// Flattened client receipt for `loom.register_agent_type`. The daemon's
@@ -3520,6 +3893,7 @@ pub enum CommandInvokeOutcomeWire {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method")]
+#[allow(unreachable_patterns)]
 enum RequestBody {
     #[serde(rename = "command.list")]
     CommandList {
@@ -3585,11 +3959,80 @@ enum RequestBody {
     #[serde(rename = "usage.history_range")]
     UsageHistoryRange { through_date: String, days: u16 },
     #[serde(rename = "loom.list")]
-    LoomList {},
+    LoomList {
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_archived: bool,
+    },
+    #[cfg(test)]
     #[serde(rename = "loom.register_agent_type")]
     LoomRegisterAgentType { record: LoomAgentType },
+    /// Additive CAS form kept separate so the shipped unit-level legacy
+    /// constructor retains its exact source and serialized byte shape.
+    #[serde(rename = "loom.register_agent_type")]
+    LoomRegisterAgentTypeCas {
+        record: LoomAgentType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
+    #[cfg(test)]
     #[serde(rename = "loom.register_workflow")]
     LoomRegisterWorkflow { source: String },
+    #[serde(rename = "loom.register_workflow")]
+    LoomRegisterWorkflowCas {
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
+    #[serde(rename = "loom.author.draft")]
+    LoomAuthorDraft {
+        session_id: String,
+        kind: LoomAuthorKind,
+        prose: String,
+    },
+    #[serde(rename = "loom.author.revise")]
+    LoomAuthorRevise {
+        authoring_id: String,
+        expected_revision: u64,
+        kind: LoomAuthorKind,
+        text: String,
+    },
+    #[serde(rename = "loom.author.confirm")]
+    LoomAuthorConfirm {
+        authoring_id: String,
+        expected_revision: u64,
+        kind: LoomAuthorKind,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
+    #[serde(rename = "loom.install.cancel")]
+    LoomInstallCancel { install_job_id: String },
+    #[serde(rename = "loom.archive")]
+    LoomArchive {
+        kind: LoomRegistryEntryKind,
+        id: String,
+        expected_rev: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
+    #[serde(rename = "loom.unarchive")]
+    LoomUnarchive {
+        kind: LoomRegistryEntryKind,
+        id: String,
+        expected_rev: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
+    #[serde(rename = "loom.validate")]
+    LoomValidate { kind: LoomAuthorKind, text: String },
+    #[serde(rename = "loom.watch")]
+    LoomWatch { after_cursor: u64 },
     #[serde(rename = "workflow.instance")]
     WorkflowInstance {
         workflow_id: String,
@@ -4044,12 +4487,46 @@ enum ResponseBody {
         cli_present: BTreeMap<String, bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow_catalog: Option<Vec<WorkflowCatalogEntryV1>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived_entries: Option<Vec<Value>>,
     },
     #[serde(rename = "loom.registered")]
     LoomRegistered {
         registration: LoomRegistrationWire,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         install_job_id: Option<String>,
+    },
+    #[serde(rename = "loom.author.draft")]
+    LoomAuthorDraft { draft: Value },
+    #[serde(rename = "loom.author.revise")]
+    LoomAuthorRevise { draft: Value },
+    #[serde(rename = "loom.author.confirm")]
+    LoomAuthorConfirm {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed: Option<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        errors: Vec<LoomAuthorValidationError>,
+    },
+    #[serde(rename = "loom.install.cancel")]
+    LoomInstallCancel {
+        receipt: TypedAgentInstallCancelReceipt,
+    },
+    #[serde(rename = "loom.archive")]
+    LoomArchive { receipt: LoomArchiveReceipt },
+    #[serde(rename = "loom.unarchive")]
+    LoomUnarchive { receipt: LoomArchiveReceipt },
+    #[serde(rename = "loom.validate")]
+    LoomValidate {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        errors: Vec<LoomAuthorValidationError>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canonical_digest: Option<String>,
+    },
+    #[serde(rename = "loom.watch")]
+    LoomWatch {
+        watch_id: String,
+        requested_after_cursor: u64,
+        baseline: Value,
     },
     #[serde(rename = "workflow.instance")]
     WorkflowInstance {
@@ -4482,6 +4959,15 @@ enum WireFrame {
     MonitorDeliveryCaughtUp {
         watch_id: String,
         session_id: String,
+        high_water_cursor: u64,
+    },
+    LoomRegistryDelta {
+        watch_id: String,
+        /// The complete tagged registry event remains daemon-owned JSON.
+        delta: Value,
+    },
+    LoomRegistryCaughtUp {
+        watch_id: String,
         high_water_cursor: u64,
     },
     /// Raw event records preserve future event/change/state vocabulary.
@@ -5071,6 +5557,49 @@ impl Drop for DescendantForwarders {
 }
 
 #[cfg(unix)]
+struct LoomRegistryForwarders {
+    by_watch: HashMap<String, AppHandle>,
+}
+
+#[cfg(unix)]
+impl LoomRegistryForwarders {
+    fn new() -> Self {
+        Self {
+            by_watch: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, watch_id: String, app: AppHandle) {
+        self.by_watch.insert(watch_id, app);
+    }
+
+    fn emit_delta(&self, watch_id: String, delta: Value) {
+        let Some(app) = self.by_watch.get(&watch_id) else {
+            return;
+        };
+        let _ = app.emit_to(
+            "main",
+            LOOM_REGISTRY_DELTA_EVENT,
+            LoomRegistryDeltaEvent { watch_id, delta },
+        );
+    }
+
+    fn emit_caught_up(&self, watch_id: String, high_water_cursor: u64) {
+        let Some(app) = self.by_watch.get(&watch_id) else {
+            return;
+        };
+        let _ = app.emit_to(
+            "main",
+            LOOM_REGISTRY_CAUGHT_UP_EVENT,
+            LoomRegistryCaughtUpEvent {
+                watch_id,
+                high_water_cursor,
+            },
+        );
+    }
+}
+
+#[cfg(unix)]
 type RpcReply = oneshot::Sender<Option<Result<ResponseBody, String>>>;
 
 #[cfg(unix)]
@@ -5098,6 +5627,9 @@ type DescendantAttachReply = oneshot::Sender<Result<SessionDescendantsAttachment
 type DescendantDetachReply = oneshot::Sender<Result<(), String>>;
 
 #[cfg(unix)]
+type LoomWatchReply = oneshot::Sender<Result<LoomWatchResult, LoomCommandError>>;
+
+#[cfg(unix)]
 struct PendingDescendantAttach {
     app: AppHandle,
     session_id: String,
@@ -5109,6 +5641,12 @@ struct PendingDescendantAttach {
 struct PendingDescendantDetach {
     attachment_id: String,
     reply: DescendantDetachReply,
+}
+
+#[cfg(unix)]
+struct PendingLoomWatch {
+    app: AppHandle,
+    reply: LoomWatchReply,
 }
 
 #[cfg(unix)]
@@ -5145,6 +5683,11 @@ enum ActorCommand {
     DescendantDetach {
         attachment_id: String,
         reply: DescendantDetachReply,
+    },
+    LoomWatch {
+        app: AppHandle,
+        after_cursor: u64,
+        reply: LoomWatchReply,
     },
     MenuAnswer {
         command_id: String,
@@ -6278,17 +6821,27 @@ fn account_list_response(
 }
 
 fn loom_list_response(body: ResponseBody) -> Result<LoomListResult, String> {
+    loom_list_response_for_request(body, false)
+}
+
+fn loom_list_response_for_request(
+    body: ResponseBody,
+    include_archived: bool,
+) -> Result<LoomListResult, String> {
     match body {
         ResponseBody::LoomList {
             agent_types,
             workflows,
             cli_present,
             workflow_catalog,
+            archived_entries,
         } => Ok(LoomListResult {
             agent_types,
             workflows,
             cli_present,
             workflow_catalog,
+            include_archived,
+            archived_entries: include_archived.then(|| archived_entries.unwrap_or_default()),
         }),
         _ => Err("loom.list response method mismatch".to_string()),
     }
@@ -6334,6 +6887,172 @@ fn loom_install_watch_response(
     match body {
         ResponseBody::LoomInstallWatch { receipt } => Ok(receipt),
         _ => Err("loom.install.watch response method mismatch".to_string()),
+    }
+}
+
+impl LoomCommandError {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "unavailable".to_string(),
+            message: message.into(),
+            retryable: true,
+            data: None,
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.into(),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn from_daemon(code: String, message: String, retryable: bool, data: Option<Value>) -> Self {
+        let data = data
+            .map(|raw| serde_json::from_value(raw.clone()).unwrap_or(LoomErrorData::Unknown(raw)));
+        Self {
+            code,
+            message,
+            retryable,
+            data,
+        }
+    }
+}
+
+fn loom_response_error(body: ResponseBody, mismatch: &'static str) -> LoomCommandError {
+    match body {
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => LoomCommandError::from_daemon(code, message, retryable, data),
+        _ => LoomCommandError::protocol(mismatch),
+    }
+}
+
+fn loom_cas_registration_response(
+    body: ResponseBody,
+    mismatch: &'static str,
+) -> Result<LoomRegistrationReceipt, LoomCommandError> {
+    match body {
+        ResponseBody::LoomRegistered {
+            registration,
+            install_job_id,
+        } => Ok(LoomRegistrationReceipt {
+            id: registration.id,
+            rev: registration.rev,
+            digest: registration.digest,
+            updated: registration.updated,
+            install_job_id,
+        }),
+        response => Err(loom_response_error(response, mismatch)),
+    }
+}
+
+fn loom_author_draft_response(
+    body: ResponseBody,
+) -> Result<LoomAuthorDraftResult, LoomCommandError> {
+    match body {
+        ResponseBody::LoomAuthorDraft { draft } => Ok(LoomAuthorDraftResult { draft }),
+        response => Err(loom_response_error(
+            response,
+            "loom.author.draft response method mismatch",
+        )),
+    }
+}
+
+fn loom_author_revise_response(
+    body: ResponseBody,
+) -> Result<LoomAuthorDraftResult, LoomCommandError> {
+    match body {
+        ResponseBody::LoomAuthorRevise { draft } => Ok(LoomAuthorDraftResult { draft }),
+        response => Err(loom_response_error(
+            response,
+            "loom.author.revise response method mismatch",
+        )),
+    }
+}
+
+fn loom_author_confirm_response(
+    body: ResponseBody,
+) -> Result<LoomAuthorConfirmResult, LoomCommandError> {
+    match body {
+        ResponseBody::LoomAuthorConfirm { confirmed, errors } => {
+            Ok(LoomAuthorConfirmResult { confirmed, errors })
+        }
+        response => Err(loom_response_error(
+            response,
+            "loom.author.confirm response method mismatch",
+        )),
+    }
+}
+
+fn loom_install_cancel_response(
+    body: ResponseBody,
+) -> Result<TypedAgentInstallCancelReceipt, LoomCommandError> {
+    match body {
+        ResponseBody::LoomInstallCancel { receipt } => Ok(receipt),
+        response => Err(loom_response_error(
+            response,
+            "loom.install.cancel response method mismatch",
+        )),
+    }
+}
+
+fn loom_archive_response(body: ResponseBody) -> Result<LoomArchiveReceipt, LoomCommandError> {
+    match body {
+        ResponseBody::LoomArchive { receipt } => Ok(receipt),
+        response => Err(loom_response_error(
+            response,
+            "loom.archive response method mismatch",
+        )),
+    }
+}
+
+fn loom_unarchive_response(body: ResponseBody) -> Result<LoomArchiveReceipt, LoomCommandError> {
+    match body {
+        ResponseBody::LoomUnarchive { receipt } => Ok(receipt),
+        response => Err(loom_response_error(
+            response,
+            "loom.unarchive response method mismatch",
+        )),
+    }
+}
+
+fn loom_validate_response(body: ResponseBody) -> Result<LoomValidateResult, LoomCommandError> {
+    match body {
+        ResponseBody::LoomValidate {
+            errors,
+            canonical_digest,
+        } => Ok(LoomValidateResult {
+            errors,
+            canonical_digest,
+        }),
+        response => Err(loom_response_error(
+            response,
+            "loom.validate response method mismatch",
+        )),
+    }
+}
+
+fn loom_watch_response(body: ResponseBody) -> Result<LoomWatchResult, LoomCommandError> {
+    match body {
+        ResponseBody::LoomWatch {
+            watch_id,
+            requested_after_cursor,
+            baseline,
+        } => Ok(LoomWatchResult {
+            watch_id,
+            requested_after_cursor,
+            baseline,
+        }),
+        response => Err(loom_response_error(
+            response,
+            "loom.watch response method mismatch",
+        )),
     }
 }
 
@@ -6621,6 +7340,78 @@ async fn loom_request(
         Some(Err(error)) => Err(error),
         None => Err(format!("{method} unavailable: no ADE connection")),
     }
+}
+
+#[cfg(unix)]
+fn loom_typed_transport_error(error: String) -> LoomCommandError {
+    if error.starts_with("missing_feature:") {
+        LoomCommandError {
+            code: "missing_feature".to_string(),
+            message: error,
+            retryable: false,
+            data: None,
+        }
+    } else if error == "capability_denied" {
+        LoomCommandError {
+            code: error,
+            message: "The current Haider RPC connection lacks the required capability.".to_string(),
+            retryable: false,
+            data: None,
+        }
+    } else {
+        LoomCommandError::unavailable(error)
+    }
+}
+
+#[cfg(unix)]
+async fn loom_typed_request(
+    body: RequestBody,
+    capability: Capability,
+    features: &[&str],
+) -> Result<ResponseBody, LoomCommandError> {
+    let features = FeatureGate::all(
+        features
+            .iter()
+            .map(|feature| (*feature).to_string())
+            .collect(),
+    );
+    match rpc_request_with_feature_gate(body, capability, features, RpcErrorStyle::Passthrough)
+        .await
+    {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) => Err(loom_typed_transport_error(error)),
+        None => Err(LoomCommandError::unavailable(
+            "The Loom RPC request did not receive a response.",
+        )),
+    }
+}
+
+fn loom_author_revise_request(
+    authoring_id: String,
+    expected_revision: u64,
+    kind: LoomAuthorKind,
+    text: String,
+) -> RequestBody {
+    RequestBody::LoomAuthorRevise {
+        authoring_id,
+        expected_revision,
+        kind,
+        text,
+    }
+}
+
+fn parse_loom_watch_after_cursor(after_cursor: Option<&str>) -> Result<u64, LoomCommandError> {
+    let Some(after_cursor) = after_cursor else {
+        return Ok(0);
+    };
+    if after_cursor.is_empty() || !after_cursor.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(LoomCommandError::protocol(
+            "loom.watch after_cursor must be a decimal u64 string",
+        ));
+    }
+    after_cursor.parse::<u64>().map_err(|_| {
+        LoomCommandError::protocol("loom.watch after_cursor must be a decimal u64 string")
+    })
 }
 
 #[cfg(unix)]
@@ -8029,21 +8820,33 @@ pub async fn run_retry(session_id: String) -> Result<RunRetryReceipt, LifecycleC
 /// Read only the P0.3 agent-type registry and advisory CLI-presence map.
 /// Workflow records are deliberately left to P0.4.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn loom_list() -> Result<LoomListResult, String> {
+pub async fn loom_list(include_archived: Option<bool>) -> Result<LoomListResult, LoomCommandError> {
+    let include_archived = include_archived.unwrap_or(false);
     #[cfg(unix)]
     {
-        return loom_list_response(
-            loom_request(
-                "loom.list",
-                RequestBody::LoomList {},
+        let features = if include_archived {
+            &[FEATURE_LOOM_V1, FEATURE_LOOM_REGISTRY_ARCHIVE_V1][..]
+        } else {
+            &[FEATURE_LOOM_V1][..]
+        };
+        return loom_list_response_for_request(
+            loom_typed_request(
+                RequestBody::LoomList { include_archived },
                 Capability::View,
-                FEATURE_LOOM_V1,
+                features,
             )
             .await?,
-        );
+            include_archived,
+        )
+        .map_err(LoomCommandError::protocol);
     }
     #[cfg(not(unix))]
-    Err("loom.list unavailable on this platform".to_string())
+    {
+        let _ = include_archived;
+        Err(LoomCommandError::unavailable(
+            "loom.list unavailable on this platform",
+        ))
+    }
 }
 
 /// Read the daemon's bounded descendant tree. An available empty snapshot is
@@ -8808,25 +9611,269 @@ pub async fn graph_run_set_open(
     }
 }
 
+/// Start one connection-scoped editable Loom authoring session. The returned
+/// draft remains opaque editor data; only the daemon-issued revision is a
+/// later authoring fence.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn loom_register_workflow(
-    source: String,
-) -> Result<LoomRegistrationReceipt, WorkflowCommandError> {
+pub async fn loom_author_draft(
+    session_id: String,
+    kind: LoomAuthorKind,
+    prose: String,
+) -> Result<LoomAuthorDraftResult, LoomCommandError> {
     #[cfg(unix)]
     {
-        let features = BTreeSet::from([FEATURE_LOOM_V1.to_string()]);
-        let response = workflow_request(
-            RequestBody::LoomRegisterWorkflow { source },
-            Capability::Control,
-            &features,
-        )
-        .await?;
-        return loom_workflow_registration_response(response);
+        return loom_author_draft_response(
+            loom_typed_request(
+                RequestBody::LoomAuthorDraft {
+                    session_id,
+                    kind,
+                    prose,
+                },
+                Capability::Control,
+                &[FEATURE_LOOM_AUTHORING_V1],
+            )
+            .await?,
+        );
     }
     #[cfg(not(unix))]
     {
-        let _ = source;
-        Err(WorkflowCommandError::unavailable(
+        let _ = (session_id, kind, prose);
+        Err(LoomCommandError::unavailable(
+            "loom.author.draft unavailable on this platform",
+        ))
+    }
+}
+
+/// Re-parse an exact editor revision. The authoring fence is transmitted
+/// verbatim and a stale value is returned as typed conflict data.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_author_revise(
+    authoring_id: String,
+    expected_revision: u64,
+    kind: LoomAuthorKind,
+    text: String,
+) -> Result<LoomAuthorDraftResult, LoomCommandError> {
+    #[cfg(unix)]
+    {
+        return loom_author_revise_response(
+            loom_typed_request(
+                loom_author_revise_request(authoring_id, expected_revision, kind, text),
+                Capability::View,
+                &[FEATURE_LOOM_AUTHORING_V1],
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (authoring_id, expected_revision, kind, text);
+        Err(LoomCommandError::unavailable(
+            "loom.author.revise unavailable on this platform",
+        ))
+    }
+}
+
+/// Confirm an exact authoring revision under the caller-observed registry
+/// fence. `confirmed: None` is a complete validation outcome, not success.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_author_confirm(
+    authoring_id: String,
+    expected_revision: u64,
+    kind: LoomAuthorKind,
+    text: String,
+    expected_rev: Option<u32>,
+    expected_digest: Option<String>,
+) -> Result<LoomAuthorConfirmResult, LoomCommandError> {
+    #[cfg(unix)]
+    {
+        return loom_author_confirm_response(
+            loom_typed_request(
+                RequestBody::LoomAuthorConfirm {
+                    authoring_id,
+                    expected_revision,
+                    kind,
+                    text,
+                    expected_rev,
+                    expected_digest,
+                },
+                Capability::Control,
+                &[FEATURE_LOOM_AUTHORING_V1, FEATURE_LOOM_REGISTRY_CAS_V1],
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            authoring_id,
+            expected_revision,
+            kind,
+            text,
+            expected_rev,
+            expected_digest,
+        );
+        Err(LoomCommandError::unavailable(
+            "loom.author.confirm unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_validate(
+    kind: LoomAuthorKind,
+    text: String,
+) -> Result<LoomValidateResult, LoomCommandError> {
+    #[cfg(unix)]
+    {
+        return loom_validate_response(
+            loom_typed_request(
+                RequestBody::LoomValidate { kind, text },
+                Capability::View,
+                &[FEATURE_LOOM_VALIDATION_V1],
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (kind, text);
+        Err(LoomCommandError::unavailable(
+            "loom.validate unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_archive(
+    kind: LoomRegistryEntryKind,
+    id: String,
+    expected_rev: u32,
+    expected_digest: Option<String>,
+) -> Result<LoomArchiveReceipt, LoomCommandError> {
+    #[cfg(unix)]
+    {
+        return loom_archive_response(
+            loom_typed_request(
+                RequestBody::LoomArchive {
+                    kind,
+                    id,
+                    expected_rev,
+                    expected_digest,
+                },
+                Capability::Control,
+                &[
+                    FEATURE_LOOM_REGISTRY_ARCHIVE_V1,
+                    FEATURE_LOOM_REGISTRY_CAS_V1,
+                ],
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (kind, id, expected_rev, expected_digest);
+        Err(LoomCommandError::unavailable(
+            "loom.archive unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_unarchive(
+    kind: LoomRegistryEntryKind,
+    id: String,
+    expected_rev: u32,
+    expected_digest: Option<String>,
+) -> Result<LoomArchiveReceipt, LoomCommandError> {
+    #[cfg(unix)]
+    {
+        return loom_unarchive_response(
+            loom_typed_request(
+                RequestBody::LoomUnarchive {
+                    kind,
+                    id,
+                    expected_rev,
+                    expected_digest,
+                },
+                Capability::Control,
+                &[
+                    FEATURE_LOOM_REGISTRY_ARCHIVE_V1,
+                    FEATURE_LOOM_REGISTRY_CAS_V1,
+                ],
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (kind, id, expected_rev, expected_digest);
+        Err(LoomCommandError::unavailable(
+            "loom.unarchive unavailable on this platform",
+        ))
+    }
+}
+
+/// Install one archive-aware registry baseline plus its durable pushed tail.
+/// JavaScript supplies and receives cursors only as exact decimal strings.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_watch(
+    app: AppHandle,
+    after_cursor: Option<String>,
+) -> Result<LoomWatchResult, LoomCommandError> {
+    let after_cursor = parse_loom_watch_after_cursor(after_cursor.as_deref())?;
+    #[cfg(unix)]
+    {
+        let (reply, answer) = oneshot::channel();
+        actor_handle()
+            .commands
+            .send(ActorCommand::LoomWatch {
+                app,
+                after_cursor,
+                reply,
+            })
+            .map_err(|_| LoomCommandError::unavailable("loom.watch actor is unavailable"))?;
+        return tokio::time::timeout(COMMAND_REPLY_TIMEOUT, answer)
+            .await
+            .map_err(|_| LoomCommandError::unavailable("loom.watch response timed out"))?
+            .map_err(|_| LoomCommandError::unavailable("loom.watch connection closed"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, after_cursor);
+        Err(LoomCommandError::unavailable(
+            "loom.watch unavailable on this platform",
+        ))
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_register_workflow(
+    source: String,
+    expected_rev: Option<u32>,
+    expected_digest: Option<String>,
+) -> Result<LoomRegistrationReceipt, LoomCommandError> {
+    #[cfg(unix)]
+    {
+        let response = loom_typed_request(
+            RequestBody::LoomRegisterWorkflowCas {
+                source,
+                expected_rev,
+                expected_digest,
+            },
+            Capability::Control,
+            &[FEATURE_LOOM_V1, FEATURE_LOOM_REGISTRY_CAS_V1],
+        )
+        .await?;
+        return loom_cas_registration_response(
+            response,
+            "loom.register_workflow response method mismatch",
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source, expected_rev, expected_digest);
+        Err(LoomCommandError::unavailable(
             "loom.register_workflow unavailable on this platform",
         ))
     }
@@ -8846,7 +9893,9 @@ pub async fn loom_register_agent_type(
     scripts: Vec<String>,
     color: String,
     glyph: String,
-) -> Result<LoomRegistrationReceipt, String> {
+    expected_rev: Option<u32>,
+    expected_digest: Option<String>,
+) -> Result<LoomRegistrationReceipt, LoomCommandError> {
     #[cfg(unix)]
     {
         let record = LoomAgentType {
@@ -8866,22 +9915,40 @@ pub async fn loom_register_agent_type(
             // authoritative positive revision in its receipt and list rows.
             rev: 0,
         };
-        return loom_registration_response(
-            loom_request(
-                "loom.register_agent_type",
-                RequestBody::LoomRegisterAgentType { record },
+        return loom_cas_registration_response(
+            loom_typed_request(
+                RequestBody::LoomRegisterAgentTypeCas {
+                    record,
+                    expected_rev,
+                    expected_digest,
+                },
                 Capability::Control,
-                FEATURE_LOOM_V1,
+                &[FEATURE_LOOM_V1, FEATURE_LOOM_REGISTRY_CAS_V1],
             )
             .await?,
+            "loom.register_agent_type response method mismatch",
         );
     }
     #[cfg(not(unix))]
     {
         let _ = (
-            id, name, job, in_type, out_type, clis, apis, skills, scripts, color, glyph,
+            id,
+            name,
+            job,
+            in_type,
+            out_type,
+            clis,
+            apis,
+            skills,
+            scripts,
+            color,
+            glyph,
+            expected_rev,
+            expected_digest,
         );
-        Err("loom.register_agent_type unavailable on this platform".to_string())
+        Err(LoomCommandError::unavailable(
+            "loom.register_agent_type unavailable on this platform",
+        ))
     }
 }
 
@@ -8931,6 +9998,32 @@ pub async fn loom_install_retry(
     {
         let _ = install_job_id;
         Err("loom.install.retry unavailable on this platform".to_string())
+    }
+}
+
+/// Cancel one exact durable install job. Future status variants are returned
+/// as raw unknown outcomes rather than coerced into cancellation success.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn loom_install_cancel(
+    install_job_id: String,
+) -> Result<TypedAgentInstallCancelReceipt, LoomCommandError> {
+    #[cfg(unix)]
+    {
+        return loom_install_cancel_response(
+            loom_typed_request(
+                RequestBody::LoomInstallCancel { install_job_id },
+                Capability::Control,
+                &[FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1],
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = install_job_id;
+        Err(LoomCommandError::unavailable(
+            "loom.install.cancel unavailable on this platform",
+        ))
     }
 }
 
@@ -11842,6 +12935,11 @@ fn apply_disconnected_command(
                 "session_descendants_detach unavailable: no ADE connection".to_string(),
             ));
         }
+        ActorCommand::LoomWatch { reply, .. } => {
+            let _ = reply.send(Err(LoomCommandError::unavailable(
+                "loom.watch unavailable: no ADE connection",
+            )));
+        }
         ActorCommand::MenuAnswer { reply, .. } => {
             let _ = reply.send(None);
         }
@@ -11890,6 +12988,8 @@ async fn run_connected(
     let mut pending_descendant_attaches: HashMap<String, PendingDescendantAttach> = HashMap::new();
     let mut pending_descendant_detaches: HashMap<String, PendingDescendantDetach> = HashMap::new();
     let mut descendant_forwarders = DescendantForwarders::new();
+    let mut pending_loom_watches: HashMap<String, PendingLoomWatch> = HashMap::new();
+    let mut loom_registry_forwarders = LoomRegistryForwarders::new();
     let mut pending_account_roster_watch = None;
     let mut account_roster_watch_waiters = Vec::new();
     let mut decoder = StreamingFrameDecoder::default();
@@ -11980,6 +13080,7 @@ async fn run_connected(
                             &mut pending_descendant_attaches,
                             &mut pending_descendant_detaches,
                             &mut descendant_forwarders,
+                            &mut pending_loom_watches,
                             &mut pending_account_roster_watch,
                             &mut account_roster_watch_waiters,
                             next_request,
@@ -12091,6 +13192,16 @@ async fn run_connected(
                     let result = session_descendants_detach_response(body, &pending.attachment_id);
                     if result.is_ok() {
                         descendant_forwarders.remove(&pending.attachment_id);
+                    }
+                    let _ = pending.reply.send(result);
+                    continue;
+                }
+                if let Some(pending) = pending_loom_watches.remove(&request_id) {
+                    let result = loom_watch_response(body);
+                    if let Ok(watch) = &result {
+                        // Register before resolving the command so the next
+                        // already-buffered registry push cannot overtake it.
+                        loom_registry_forwarders.insert(watch.watch_id.clone(), pending.app);
                     }
                     let _ = pending.reply.send(result);
                     continue;
@@ -12226,6 +13337,19 @@ async fn run_connected(
                     }
                 }
             }
+            WireFrame::LoomRegistryDelta { watch_id, delta } => {
+                if connection.features.contains(FEATURE_LOOM_REGISTRY_WATCH_V1) {
+                    loom_registry_forwarders.emit_delta(watch_id, delta);
+                }
+            }
+            WireFrame::LoomRegistryCaughtUp {
+                watch_id,
+                high_water_cursor,
+            } => {
+                if connection.features.contains(FEATURE_LOOM_REGISTRY_WATCH_V1) {
+                    loom_registry_forwarders.emit_caught_up(watch_id, high_water_cursor);
+                }
+            }
             WireFrame::SessionDescendantStream {
                 attachment_id,
                 event,
@@ -12292,6 +13416,7 @@ async fn apply_connected_command(
     pending_descendant_attaches: &mut HashMap<String, PendingDescendantAttach>,
     pending_descendant_detaches: &mut HashMap<String, PendingDescendantDetach>,
     descendant_forwarders: &mut DescendantForwarders,
+    pending_loom_watches: &mut HashMap<String, PendingLoomWatch>,
     pending_account_roster_watch: &mut Option<String>,
     account_roster_watch_waiters: &mut Vec<AccountRosterWatchReply>,
     next_request: &mut u64,
@@ -12550,6 +13675,40 @@ async fn apply_connected_command(
                     reply,
                 },
             );
+            true
+        }
+        ActorCommand::LoomWatch {
+            app,
+            after_cursor,
+            reply,
+        } => {
+            if !connection.grants(Capability::View) {
+                let _ = reply.send(Err(loom_typed_transport_error(
+                    "capability_denied".to_string(),
+                )));
+                return true;
+            }
+            if !connection.features.contains(FEATURE_LOOM_REGISTRY_WATCH_V1) {
+                let _ = reply.send(Err(loom_typed_transport_error(format!(
+                    "missing_feature: daemon does not advertise {FEATURE_LOOM_REGISTRY_WATCH_V1}"
+                ))));
+                return true;
+            }
+            let request_id = request_id(next_request);
+            let request = WireFrame::Request {
+                request_id: request_id.clone(),
+                body: RequestBody::LoomWatch { after_cursor },
+            };
+            if write_frame(stream, &request, connection.frame_limit, encoding)
+                .await
+                .is_err()
+            {
+                let _ = reply.send(Err(LoomCommandError::unavailable(
+                    "loom.watch request could not be written",
+                )));
+                return false;
+            }
+            pending_loom_watches.insert(request_id, PendingLoomWatch { app, reply });
             true
         }
         ActorCommand::MenuAnswer {
@@ -13165,6 +14324,8 @@ fn wire_frame_kind(frame: &WireFrame) -> &'static str {
         WireFrame::ResidentSessionBinding { .. } => "resident_session_binding",
         WireFrame::MonitorDelivery { .. } => "monitor_delivery",
         WireFrame::MonitorDeliveryCaughtUp { .. } => "monitor_delivery_caught_up",
+        WireFrame::LoomRegistryDelta { .. } => "loom_registry_delta",
+        WireFrame::LoomRegistryCaughtUp { .. } => "loom_registry_caught_up",
         WireFrame::SessionDescendantStream { .. } => "session_descendant_stream",
         WireFrame::SessionDescendantRepairRequired { .. } => "session_descendant_repair_required",
         WireFrame::MenuAnswer { .. } => "menu_answer",
@@ -13505,6 +14666,11 @@ fn blake3_g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u3
 #[cfg(test)]
 #[path = "haider_rpc_ade_loom_tests.rs"]
 mod loom_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_loom_p5_tests.rs"]
+mod loom_p5_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
