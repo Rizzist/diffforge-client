@@ -68,13 +68,28 @@ export default function SessionsRail({
   onExitSpace = null,
   onSelectSpaceSession = null,
   loomAgentTypes = [],
+  loomWorkflowEntries = [],
+  loomArchivedEntries = null,
   loomCliPresent = {},
   loomInstallByType = {},
+  loomCancelByJob = {},
+  loomRegistryCursor = null,
   loomListError = "",
   loomUnavailable = false,
+  loomFeatureUnavailable = {},
+  loomFeatureErrors = {},
+  loomAuthoringConflict = null,
   onRegisterAgentType = null,
+  onRefreshLoomRegistry = null,
+  onListArchivedLoom = null,
+  onValidateLoom = null,
+  onDraftLoom = null,
+  onReviseLoom = null,
+  onConfirmLoom = null,
+  onSetLoomArchived = null,
   onRefreshAgentInstall = null,
   onRetryAgentInstall = null,
+  onCancelAgentInstall = null,
   workflowCatalog = { kind: "unread", entries: [] },
   workflowRecords = [],
   workflowInstanceById = {},
@@ -511,13 +526,29 @@ export default function SessionsRail({
           spaces={spaces}
         />
         <LoomRailSection
+          activeSessionId={activeSessionId}
           agentTypes={loomAgentTypes}
+          workflowEntries={loomWorkflowEntries}
+          archivedEntries={loomArchivedEntries}
           cliPresent={loomCliPresent}
           installByType={loomInstallByType}
+          cancelByJob={loomCancelByJob}
+          registryCursor={loomRegistryCursor}
           listError={loomListError}
+          featureUnavailable={loomFeatureUnavailable}
+          featureErrors={loomFeatureErrors}
+          authoringConflict={loomAuthoringConflict}
+          onListArchived={onListArchivedLoom}
+          onValidate={onValidateLoom}
+          onAuthorDraft={onDraftLoom}
+          onAuthorRevise={onReviseLoom}
+          onAuthorConfirm={onConfirmLoom}
+          onSetArchived={onSetLoomArchived}
           onRefreshInstall={onRefreshAgentInstall}
+          onRefreshRegistry={onRefreshLoomRegistry}
           onRegister={onRegisterAgentType}
           onRetryInstall={onRetryAgentInstall}
+          onCancelInstall={onCancelAgentInstall}
           unavailable={loomUnavailable}
         />
         <WorkflowRailSection

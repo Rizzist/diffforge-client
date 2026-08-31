@@ -1,16 +1,111 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+import { HAIDER_ROSTER_BOOTSTRAP_CHANGED_EVENT } from "./sessionsRosterBootstrap.js";
 
 import {
-  agentTypeView,
+  archiveOutcomeView,
+  cancelOutcomeView,
+  confirmOutcomeView,
+  draftFenceFor,
+  draftView,
   installItemView,
   installJobView,
+  LOOM_CURSOR_BASELINE,
+  loomConflictView,
+  loomCursorAdvances,
+  loomCursorOrNull,
   loomUnavailableFromError,
   personaBindingView,
+  registryDeltaView,
+  registryEntryView,
+  registryFenceFor,
+  registryListView,
+  registryWatchView,
   registrationReceiptView,
   retryOutcomeView,
+  validationView,
   watchOutcomeView,
 } from "./loomModel.js";
+
+/* These are the Tauri event names registered by the Loom SDK bridge. A gap
+   or reconnect is a baseline-re-read signal; neither is reduced locally. */
+export const LOOM_REGISTRY_DELTA_EVENT = "loom-registry-delta";
+export const LOOM_REGISTRY_CAUGHT_UP_EVENT = "loom-registry-caught-up";
+
+const NEW_FEATURES = Object.freeze([
+  "validate",
+  "authoring",
+  "archive",
+  "watch",
+  "cancel",
+]);
+
+const EMPTY_FEATURE_FLAGS = Object.freeze(Object.fromEntries(
+  NEW_FEATURES.map((feature) => [feature, false]),
+));
+
+const EMPTY_FEATURE_ERRORS = Object.freeze(Object.fromEntries(
+  NEW_FEATURES.map((feature) => [feature, ""]),
+));
+
+function entryMatches(entry, registryKind, id) {
+  return entry?.registryKind === registryKind && entry?.id === id;
+}
+
+function entryFromDelta(delta, fallback = null) {
+  if (delta.entry && typeof delta.entry === "object") {
+    const registryKind = delta.registryKind
+      ?? (delta.entry.kind === "workflow" ? "workflow" : fallback?.registryKind)
+      ?? "agent_type";
+    return registryEntryView(delta.entry, registryKind, delta.kind === "archived");
+  }
+  return fallback;
+}
+
+/* Apply only known, cursor-validated deltas. A fact the delta does not carry
+   is retained; an unknown action is handled by re-baselining in the effect. */
+function applyRegistryDelta(current, delta) {
+  const registryKind = delta.registryKind
+    ?? (delta.entry?.kind === "workflow" ? "workflow" : "agent_type");
+  const id = delta.id ?? delta.entry?.id ?? null;
+  if (!id) return current;
+  const activeKey = registryKind === "workflow" ? "activeWorkflows" : "activeAgentTypes";
+  const active = current[activeKey];
+  const activeExisting = active.find((entry) => entryMatches(entry, registryKind, id)) ?? null;
+  const archived = Array.isArray(current.archivedEntries) ? current.archivedEntries : [];
+  const archivedExisting = archived.find((entry) => entryMatches(entry, registryKind, id)) ?? null;
+  const withoutActive = active.filter((entry) => !entryMatches(entry, registryKind, id));
+  const withoutArchived = archived.filter((entry) => !entryMatches(entry, registryKind, id));
+
+  if (delta.kind === "removed") {
+    return {
+      ...current,
+      [activeKey]: withoutActive,
+      archivedEntries: current.archivedEntries == null ? null : withoutArchived,
+    };
+  }
+  if (delta.kind === "archived") {
+    const entry = entryFromDelta(delta, activeExisting ?? archivedExisting);
+    if (!entry) return current;
+    return {
+      ...current,
+      [activeKey]: withoutActive,
+      archivedEntries: [...withoutArchived, { ...entry, archived: true }],
+    };
+  }
+  if (["unarchived", "upserted", "registered", "updated"].includes(delta.kind)) {
+    const entry = entryFromDelta(delta, archivedExisting ?? activeExisting);
+    if (!entry) return current;
+    return {
+      ...current,
+      [activeKey]: [...withoutActive, { ...entry, archived: false }],
+      archivedEntries: current.archivedEntries == null ? null : withoutArchived,
+    };
+  }
+  return current;
+}
 
 /* React seam for the Loom agent-type registry. The hook carries daemon facts
    through the loomModel transforms and adds nothing of its own: cli_present
@@ -21,9 +116,13 @@ import {
    spam. */
 
 export function useLoom({ enabled = true } = {}) {
-  const [agentTypes, setAgentTypes] = useState([]);
-  /* Verbatim wire map { program: bool }. A missing key means "not probed". */
-  const [cliPresent, setCliPresent] = useState({});
+  const [registry, setRegistry] = useState({
+    activeAgentTypes: [],
+    activeWorkflows: [],
+    /* null = archived excluded by default / not explicitly read. */
+    archivedEntries: null,
+    cliPresent: {},
+  });
   /* agentTypeId -> { jobs: installJobView[], items: installItemView[], error } */
   const [installByType, setInstallByType] = useState({});
   /* sessionId -> personaBindingView. ONLY receipts populate this: a session
@@ -32,8 +131,15 @@ export function useLoom({ enabled = true } = {}) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [unavailable, setUnavailable] = useState(false);
+  const [featureUnavailable, setFeatureUnavailable] = useState(EMPTY_FEATURE_FLAGS);
+  const [featureErrors, setFeatureErrors] = useState(EMPTY_FEATURE_ERRORS);
+  const [authoringConflict, setAuthoringConflict] = useState(null);
+  const [cancelByJob, setCancelByJob] = useState({});
+  const [registryWatchId, setRegistryWatchId] = useState(null);
+  const [registryCursor, setRegistryCursor] = useState(null);
 
   const unavailableRef = useRef(false);
+  const featureUnavailableRef = useRef({ ...EMPTY_FEATURE_FLAGS });
   const markUnavailable = useCallback(() => {
     unavailableRef.current = true;
     setUnavailable(true);
@@ -48,6 +154,40 @@ export function useLoom({ enabled = true } = {}) {
     return false;
   }, [markUnavailable]);
 
+  const markFeatureUnavailable = useCallback((feature) => {
+    featureUnavailableRef.current[feature] = true;
+    setFeatureUnavailable((current) => ({ ...current, [feature]: true }));
+  }, []);
+
+  const clearFeatureError = useCallback((feature) => {
+    setFeatureErrors((current) => (
+      current[feature] ? { ...current, [feature]: "" } : current
+    ));
+  }, []);
+
+  const settleFeatureError = useCallback((feature, thrown, fallback) => {
+    if (loomUnavailableFromError(thrown)) {
+      markFeatureUnavailable(feature);
+      return true;
+    }
+    setFeatureErrors((current) => ({
+      ...current,
+      [feature]: String(thrown?.message ?? thrown ?? fallback),
+    }));
+    return false;
+  }, [markFeatureUnavailable]);
+
+  const installRegistryView = useCallback((view) => {
+    setRegistry((current) => ({
+      activeAgentTypes: view.activeAgentTypes,
+      activeWorkflows: view.activeWorkflows,
+      archivedEntries: view.archivedIncluded
+        ? view.archivedEntries
+        : current.archivedEntries,
+      cliPresent: view.cliPresentPublished ? view.cliPresent : current.cliPresent,
+    }));
+  }, []);
+
   const list = useCallback(async () => {
     /* An unavailable daemon stays unavailable for this hook's lifetime —
        never poll a feature the daemon told us it does not have. */
@@ -55,12 +195,12 @@ export function useLoom({ enabled = true } = {}) {
     setLoading(true);
     try {
       const result = await invoke("loom_list");
-      setAgentTypes(Array.isArray(result?.agent_types)
-        ? result.agent_types.map(agentTypeView)
-        : []);
-      setCliPresent(result?.cli_present && typeof result.cli_present === "object"
-        ? result.cli_present
-        : {});
+      /* registryListView applies the shipped agentTypeView and keeps the
+         default read's archived set UNKNOWN rather than manufacturing []. */
+      installRegistryView(registryListView(result, { includeArchived: false }));
+      setAuthoringConflict((current) => (
+        current?.source === "archive" ? null : current
+      ));
       setError("");
       return true;
     } catch (thrown) {
@@ -69,7 +209,23 @@ export function useLoom({ enabled = true } = {}) {
     } finally {
       setLoading(false);
     }
-  }, [settleError]);
+  }, [installRegistryView, settleError]);
+
+  /* Only this explicit read is allowed to establish an empty archived set.
+     Its feature gate is independent of the default registry list. */
+  const listArchived = useCallback(async () => {
+    if (!enabled || featureUnavailableRef.current.archive) return null;
+    try {
+      const result = await invoke("loom_list", { include_archived: true });
+      const view = registryListView(result, { includeArchived: true });
+      installRegistryView(view);
+      clearFeatureError("archive");
+      return view;
+    } catch (thrown) {
+      settleFeatureError("archive", thrown, "Unable to read archived registry entries.");
+      return null;
+    }
+  }, [clearFeatureError, enabled, installRegistryView, settleFeatureError]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -188,6 +344,309 @@ export function useLoom({ enabled = true } = {}) {
     }
   }, [settleError]);
 
+  const validate = useCallback(async (kind, text) => {
+    if (!enabled || featureUnavailableRef.current.validate) return null;
+    try {
+      const receipt = await invoke("loom_validate", { kind, text });
+      const view = validationView(receipt);
+      clearFeatureError("validate");
+      return view;
+    } catch (thrown) {
+      settleFeatureError("validate", thrown, "Unable to validate this draft.");
+      return null;
+    }
+  }, [clearFeatureError, enabled, settleFeatureError]);
+
+  const authorDraft = useCallback(async (sessionId, kind, prose) => {
+    if (!enabled || !sessionId || featureUnavailableRef.current.authoring) return null;
+    setAuthoringConflict(null);
+    try {
+      const receipt = await invoke("loom_author_draft", {
+        session_id: sessionId,
+        kind,
+        prose,
+      });
+      const view = draftView(receipt?.draft);
+      clearFeatureError("authoring");
+      return view;
+    } catch (thrown) {
+      const conflict = loomConflictView(thrown);
+      if (conflict) setAuthoringConflict({ ...conflict, source: "authoring" });
+      settleFeatureError("authoring", thrown, "Unable to draft this registry entry.");
+      return null;
+    }
+  }, [clearFeatureError, enabled, settleFeatureError]);
+
+  const authorRevise = useCallback(async (draft, kind, text) => {
+    if (!enabled || featureUnavailableRef.current.authoring) return null;
+    const fence = draftFenceFor(draft);
+    if (fence == null) {
+      setFeatureErrors((current) => ({
+        ...current,
+        authoring: "Re-read the authoring draft before revising; its fence was not published.",
+      }));
+      return null;
+    }
+    setAuthoringConflict(null);
+    try {
+      const receipt = await invoke("loom_author_revise", {
+        authoring_id: fence.authoring_id,
+        expected_revision: fence.expected_revision,
+        kind,
+        text,
+      });
+      const view = draftView(receipt?.draft);
+      clearFeatureError("authoring");
+      return view;
+    } catch (thrown) {
+      const conflict = loomConflictView(thrown);
+      if (conflict) setAuthoringConflict({ ...conflict, source: "authoring" });
+      /* Conflict is terminal for this attempt: never resubmit with the
+         daemon's current value. An explicit new draft read is required. */
+      settleFeatureError("authoring", thrown, "Unable to revise this authoring draft.");
+      return null;
+    }
+  }, [clearFeatureError, enabled, settleFeatureError]);
+
+  const authorConfirm = useCallback(async (draft, kind, text, listedEntry = null) => {
+    if (!enabled || featureUnavailableRef.current.authoring) return null;
+    const authoringFence = draftFenceFor(draft);
+    if (authoringFence == null) {
+      setFeatureErrors((current) => ({
+        ...current,
+        authoring: "Re-read the authoring draft before confirming; its fence was not published.",
+      }));
+      return null;
+    }
+    /* expected_rev/expected_digest come from an entry the client listed, or
+       from the returned draft when it explicitly carried those values. */
+    const registryFence = registryFenceFor(listedEntry) ?? registryFenceFor(draft);
+    const payload = {
+      authoring_id: authoringFence.authoring_id,
+      expected_revision: authoringFence.expected_revision,
+      kind,
+      text,
+    };
+    if (registryFence != null) {
+      payload.expected_rev = registryFence.expected_rev;
+      payload.expected_digest = registryFence.expected_digest;
+    }
+    setAuthoringConflict(null);
+    try {
+      const receipt = await invoke("loom_author_confirm", payload);
+      const outcome = confirmOutcomeView(receipt);
+      clearFeatureError("authoring");
+      if (outcome.kind === "confirmed") {
+        await list();
+        if (registry.archivedEntries != null) void listArchived();
+      }
+      return outcome;
+    } catch (thrown) {
+      const conflict = loomConflictView(thrown);
+      if (conflict) setAuthoringConflict({ ...conflict, source: "authoring" });
+      /* Never auto-retry a confirm with current_rev/current_digest. */
+      settleFeatureError("authoring", thrown, "Unable to confirm this authoring draft.");
+      return null;
+    }
+  }, [clearFeatureError, enabled, list, listArchived, registry.archivedEntries, settleFeatureError]);
+
+  const setArchived = useCallback(async (entry, shouldArchive) => {
+    if (!enabled || featureUnavailableRef.current.archive) return null;
+    const kind = entry?.registryKind;
+    const id = entry?.id;
+    const fence = registryFenceFor(entry);
+    if (!kind || !id || fence == null || fence.expected_rev == null) {
+      setFeatureErrors((current) => ({
+        ...current,
+        archive: "Re-read this registry entry before changing its archive state; its CAS fence was not published.",
+      }));
+      return null;
+    }
+    const payload = {
+      kind,
+      id,
+      expected_rev: fence.expected_rev,
+    };
+    if (fence.expected_digest != null) {
+      payload.expected_digest = fence.expected_digest;
+    }
+    setAuthoringConflict(null);
+    try {
+      const receipt = shouldArchive
+        ? await invoke("loom_archive", payload)
+        : await invoke("loom_unarchive", payload);
+      const outcome = archiveOutcomeView(receipt);
+      clearFeatureError("archive");
+      if (["changed", "already", "not_found"].includes(outcome.kind)) {
+        await list();
+        if (registry.archivedEntries != null || shouldArchive) void listArchived();
+      }
+      return outcome;
+    } catch (thrown) {
+      const conflict = loomConflictView(thrown);
+      if (conflict) setAuthoringConflict({ ...conflict, source: "archive" });
+      /* Current fences are display-only; an explicit list read is required. */
+      settleFeatureError("archive", thrown, "Unable to change this entry's archive state.");
+      return null;
+    }
+  }, [clearFeatureError, enabled, list, listArchived, registry.archivedEntries, settleFeatureError]);
+
+  const cancelInstall = useCallback(async (installJobId) => {
+    if (!enabled || !installJobId || featureUnavailableRef.current.cancel) return null;
+    try {
+      const receipt = await invoke("loom_install_cancel", { install_job_id: installJobId });
+      const outcome = cancelOutcomeView(receipt);
+      setCancelByJob((current) => ({ ...current, [installJobId]: outcome }));
+      clearFeatureError("cancel");
+      if (outcome.kind === "cancelled" || outcome.kind === "already_terminal") {
+        const owner = Object.entries(installByType).find(([, bucket]) => (
+          bucket?.jobs?.some((job) => job.jobId === installJobId)
+        ));
+        if (owner) void installStatus(owner[0]);
+      }
+      return outcome;
+    } catch (thrown) {
+      settleFeatureError("cancel", thrown, "Unable to cancel this install job.");
+      return null;
+    }
+  }, [clearFeatureError, enabled, installByType, installStatus, settleFeatureError]);
+
+  /* One registry watch registration. after_cursor is a validated decimal
+     STRING and advances only from daemon-published string cursors. */
+  const registryWatch = useCallback(async (afterCursor) => {
+    if (!enabled || featureUnavailableRef.current.watch) return null;
+    const position = loomCursorOrNull(afterCursor) ?? LOOM_CURSOR_BASELINE;
+    try {
+      const receipt = await invoke("loom_watch", { after_cursor: position });
+      const view = registryWatchView(receipt);
+      clearFeatureError("watch");
+      return view;
+    } catch (thrown) {
+      settleFeatureError("watch", thrown, "Unable to watch the Loom registry.");
+      return null;
+    }
+  }, [clearFeatureError, enabled, settleFeatureError]);
+
+  const registryWatchRef = useRef(registryWatch);
+  useEffect(() => {
+    registryWatchRef.current = registryWatch;
+  }, [registryWatch]);
+
+  useEffect(() => {
+    if (!enabled || featureUnavailable.watch) return undefined;
+    let disposed = false;
+    let localWatchId = null;
+    let heldCursor = LOOM_CURSOR_BASELINE;
+    let daemonGeneration = null;
+    let watchEpoch = 0;
+    let rebaselinePromise = null;
+    const pending = [];
+    const pendingCaughtUps = [];
+    const unlisteners = [];
+
+    const rebaseline = () => {
+      if (rebaselinePromise) return rebaselinePromise;
+      const epoch = watchEpoch;
+      const request = registryWatchRef.current(heldCursor).then((view) => {
+        if (!disposed && epoch === watchEpoch && view) {
+          localWatchId = view.watchId;
+          heldCursor = view.cursor ?? LOOM_CURSOR_BASELINE;
+          installRegistryView(view.baseline);
+          setRegistryWatchId(view.watchId);
+          setRegistryCursor(view.cursor);
+          const queued = pending.splice(0);
+          for (const delta of queued) receiveDelta(delta);
+          const queuedCaughtUps = pendingCaughtUps.splice(0);
+          for (const caughtUp of queuedCaughtUps) receiveCaughtUp(caughtUp);
+        }
+        return view;
+      }).finally(() => {
+        if (rebaselinePromise === request) rebaselinePromise = null;
+      });
+      rebaselinePromise = request;
+      return request;
+    };
+
+    const receiveDelta = (payload) => {
+      const delta = registryDeltaView(payload);
+      if (localWatchId == null) {
+        pending.push(payload);
+        return;
+      }
+      if (delta.watchId != null && delta.watchId !== localWatchId) return;
+      if (delta.kind === "rebaseline" || delta.kind === "unknown" || delta.cursor == null) {
+        void rebaseline();
+        return;
+      }
+      /* A published after_cursor that does not equal our held cursor is an
+         explicit gap. Re-read the baseline; do not infer missing deltas. */
+      if (delta.afterCursor != null && delta.afterCursor !== heldCursor) {
+        void rebaseline();
+        return;
+      }
+      if (!loomCursorAdvances(heldCursor, delta.cursor)) return;
+      heldCursor = delta.cursor;
+      setRegistryCursor(delta.cursor);
+      setRegistry((current) => applyRegistryDelta(current, delta));
+    };
+
+    const receiveCaughtUp = (payload) => {
+      if (localWatchId == null) {
+        pendingCaughtUps.push(payload);
+        return;
+      }
+      if (payload?.watch_id != null && payload.watch_id !== localWatchId) return;
+      const highWater = loomCursorOrNull(payload?.high_water_cursor);
+      /* Caught-up above our held cursor proves a missed delta (including a
+         reconnect gap). Re-register for an authoritative baseline. */
+      if (highWater != null && loomCursorAdvances(heldCursor, highWater)) {
+        void rebaseline();
+      }
+    };
+
+    const receiveRosterBootstrap = (payload) => {
+      if (payload?.state !== "reachable" || payload.daemon_generation == null) return;
+      if (daemonGeneration == null) {
+        daemonGeneration = payload.daemon_generation;
+        return;
+      }
+      if (payload.daemon_generation === daemonGeneration) return;
+      /* A new SDK connection invalidates the connection-scoped watch id.
+         Start from the protocol baseline string and accept only the fresh
+         loom.watch baseline; never splice old/new pushed tails together. */
+      daemonGeneration = payload.daemon_generation;
+      watchEpoch += 1;
+      rebaselinePromise = null;
+      localWatchId = null;
+      heldCursor = LOOM_CURSOR_BASELINE;
+      setRegistryWatchId(null);
+      setRegistryCursor(null);
+      void rebaseline();
+    };
+
+    Promise.all([
+      listen(LOOM_REGISTRY_DELTA_EVENT, (event) => receiveDelta(event.payload)),
+      listen(LOOM_REGISTRY_CAUGHT_UP_EVENT, (event) => receiveCaughtUp(event.payload)),
+      listen(HAIDER_ROSTER_BOOTSTRAP_CHANGED_EVENT, (event) => (
+        receiveRosterBootstrap(event.payload)
+      )),
+    ]).then((stops) => {
+      if (disposed) {
+        for (const stop of stops) stop();
+        return;
+      }
+      unlisteners.push(...stops);
+      void rebaseline();
+    }).catch((thrown) => {
+      settleFeatureError("watch", thrown, "Unable to listen for Loom registry updates.");
+    });
+
+    return () => {
+      disposed = true;
+      for (const unlisten of unlisteners) unlisten();
+    };
+  }, [enabled, featureUnavailable.watch, installRegistryView, settleFeatureError]);
+
   /* Persona binding: binds an agent-type persona to the session and NOTHING
      more — no install, no PATH proof, no execution grant. The daemon's
      receipt (not the request) is the binding authority we store. The wire
@@ -212,18 +671,34 @@ export function useLoom({ enabled = true } = {}) {
   }, [settleError]);
 
   return {
-    agentTypes,
-    cliPresent,
+    agentTypes: registry.activeAgentTypes,
+    workflowEntries: registry.activeWorkflows,
+    archivedEntries: registry.archivedEntries,
+    cliPresent: registry.cliPresent,
     installByType,
     personaBySession,
+    cancelByJob,
+    registryWatchId,
+    registryCursor,
     loading,
     error,
     unavailable,
+    featureUnavailable,
+    featureErrors,
+    authoringConflict,
     list,
+    listArchived,
     register,
     installStatus,
     retry,
     watch,
+    validate,
+    authorDraft,
+    authorRevise,
+    authorConfirm,
+    setArchived,
+    cancelInstall,
+    registryWatch,
     select,
   };
 }

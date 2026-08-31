@@ -63,8 +63,12 @@ test("[pin] useLoom shapes every view through loomModel and never synthesizes an
     "an install-status read must be gated on a receipt that names a job");
   assert.doesNotMatch(source, /install_job_id:(?!\s*installJobId\b)/,
     "every install_job_id arg must be the caller's job id verbatim");
-  assert.doesNotMatch(source, /digest/,
-    "the hook must never touch digest (no job id can be derived from it)");
+  const legacyRegistrationPath = source.slice(
+    source.indexOf("const register = useCallback"),
+    source.indexOf("const retry = useCallback"),
+  );
+  assert.doesNotMatch(legacyRegistrationPath, /digest/,
+    "the shipped registration/install-job path must never derive a job id from digest");
   /* Unavailable is settle-once: the guard must precede every invoke. */
   assert.match(source, /if \(unavailableRef\.current\) return/,
     "list must stop polling an unavailable daemon");

@@ -3,17 +3,29 @@ import test from "node:test";
 
 import {
   agentTypeView,
+  archiveOutcomeView,
+  cancelOutcomeView,
   cliPresence,
   cliPresenceLabel,
+  confirmOutcomeView,
+  draftFenceFor,
+  draftView,
   installItemView,
   installJobView,
   installStateView,
+  loomConflictView,
   loomUnavailableFromError,
   personaBindingView,
   personaSelectionView,
+  registryDeltaView,
+  registryEntryView,
+  registryFenceFor,
+  registryListView,
+  registryWatchView,
   registrationReceiptView,
   retryOutcomeView,
   splitCommaList,
+  validationView,
   watchOutcomeView,
 } from "./loomModel.js";
 
@@ -289,4 +301,275 @@ test("splitCommaList trims and drops empties", () => {
   assert.deepEqual(splitCommaList(" rg, jq ,,  fd "), ["rg", "jq", "fd"]);
   assert.deepEqual(splitCommaList(""), []);
   assert.deepEqual(splitCommaList(null), []);
+});
+
+test("[pin] validationView keeps one-based line and column verbatim and labels the digest as preview", () => {
+  const receipt = {
+    errors: [
+      { line: 1, column: 17, field: "job", message: "expected a string" },
+      { line: "3", column: "004", message: "future coordinate encoding" },
+    ],
+    canonical_digest: "sha256:preview-only",
+  };
+  const view = validationView(receipt);
+  assert.deepEqual(view.errors, [
+    { line: 1, column: 17, field: "job", message: "expected a string" },
+    { line: "3", column: "004", field: null, message: "future coordinate encoding" },
+  ]);
+  assert.equal(view.errors[0].line, receipt.errors[0].line,
+    "one-based line must not be re-based");
+  assert.equal(view.errors[0].column, receipt.errors[0].column,
+    "published column must not be rounded away");
+  assert.equal(view.errors[1].column, "004",
+    "even a future coordinate encoding is carried verbatim");
+  assert.equal(view.canonicalDigestPreview, "sha256:preview-only");
+  assert.equal(Object.prototype.hasOwnProperty.call(view, "digest"), false,
+    "the preview must never masquerade as a stored registry digest");
+
+  const sdkNested = validationView({
+    errors: [{
+      code: "invalid_field",
+      message: "bad dependency",
+      location: { line: 7, column: 13, field: "nodes[2].depends_on" },
+    }],
+  });
+  assert.deepEqual(sdkNested.errors[0], {
+    line: 7,
+    column: 13,
+    field: "nodes[2].depends_on",
+    message: "bad dependency",
+  });
+});
+
+test("[pin] draft and registry fence helpers echo read values without computing replacements", () => {
+  const wireDraft = {
+    authoring_id: "author-7",
+    expected_revision: "9007199254740993",
+    kind: "agent_type",
+    id: "researcher",
+    text: "{ agent type draft }",
+    expected_rev: "00041",
+    expected_digest: "digest-read-from-draft",
+  };
+  const draft = draftView(wireDraft);
+  assert.deepEqual(draftFenceFor(draft), {
+    authoring_id: wireDraft.authoring_id,
+    expected_revision: wireDraft.expected_revision,
+  });
+  assert.deepEqual(registryFenceFor(draft), {
+    expected_rev: wireDraft.expected_rev,
+    expected_digest: wireDraft.expected_digest,
+  });
+
+  const listed = registryEntryView({
+    id: "researcher",
+    name: "Researcher",
+    rev: "00041",
+    digest: "digest-read-from-list",
+  });
+  assert.deepEqual(registryFenceFor(listed), {
+    expected_rev: listed.rev,
+    expected_digest: listed.digest,
+  });
+  assert.equal(draftFenceFor(draft).expected_revision, "9007199254740993",
+    "a fence is not incremented or numeric-parsed");
+  assert.equal(registryFenceFor(listed).expected_rev, "00041",
+    "a listed fence keeps its exact representation");
+  assert.equal(registryFenceFor({ rev: null, digest: null }), null,
+    "an unread fence is omitted, never defaulted");
+  assert.deepEqual(registryFenceFor({ rev: 9, digest: null }), { expected_rev: 9 },
+    "an optional unread digest is omitted rather than invented");
+
+  const sdkDraft = draftView({
+    authoring_id: "author-sdk",
+    revision: "9007199254740999",
+    kind: "workflow",
+    text: "workflow text",
+  });
+  assert.equal(draftFenceFor(sdkDraft).expected_revision, "9007199254740999",
+    "the SDK draft's revision field is echoed as expected_revision on revise");
+});
+
+test("[pin] confirmOutcomeView treats confirmed null as not confirmed and fabricates no entry", () => {
+  const wire = { confirmed: null, reason: "registry_revision_conflict" };
+  const view = confirmOutcomeView(wire);
+  assert.equal(view.kind, "not_confirmed");
+  assert.equal(view.confirmed, null);
+  assert.equal(view.reason, "registry_revision_conflict");
+  assert.equal(Object.prototype.hasOwnProperty.call(view, "entry"), false,
+    "no registry row may be fabricated from the submitted draft");
+
+  const confirmed = { id: "researcher", rev: 5, digest: "saved" };
+  assert.deepEqual(confirmOutcomeView({ confirmed }).confirmed, confirmed);
+  assert.equal(confirmOutcomeView({ future: true }).kind, "unknown");
+  const omittedNull = confirmOutcomeView({
+    errors: [{
+      message: "not valid",
+      location: { line: 2, column: 5, field: "id" },
+    }],
+  });
+  assert.equal(omittedNull.kind, "not_confirmed",
+    "SDK Option::None omission plus errors is still not confirmed");
+  assert.equal(omittedNull.errors[0].column, 5);
+});
+
+test("archiveOutcomeView keeps changed, already, not-found, and unknown distinct", () => {
+  assert.deepEqual(
+    archiveOutcomeView({ status: "changed", entry: { id: "a" } }).kind,
+    "changed",
+  );
+  const already = archiveOutcomeView({ status: "already_archived", at: 7 });
+  assert.equal(already.kind, "already");
+  assert.equal(already.state, "already_archived");
+  assert.equal(archiveOutcomeView({ status: "not_found", id: "gone" }).kind, "not_found");
+  const future = { status: "retained_by_policy", policy: "org" };
+  assert.equal(archiveOutcomeView(future).kind, "unknown");
+  assert.deepEqual(archiveOutcomeView(future).raw, future);
+});
+
+test("[pin] cancelOutcomeView preserves already-terminal state and unknown output raw", () => {
+  assert.equal(cancelOutcomeView("cancelled").kind, "cancelled");
+  const terminalWire = { status: "already_terminal", state: "quarantined_future_state" };
+  const terminal = cancelOutcomeView(terminalWire);
+  assert.equal(terminal.kind, "already_terminal");
+  assert.equal(terminal.state, terminalWire.state,
+    "the daemon's terminal state must be shown verbatim");
+
+  const futureWire = { status: "cancel_deferred", retry_after_ms: 500 };
+  const future = cancelOutcomeView(futureWire);
+  assert.equal(future.kind, "unknown");
+  assert.equal(future.raw, futureWire,
+    "unknown cancel output is raw, never coerced into success/failure");
+  const sdkReceipt = {
+    install_job_id: "install-7",
+    outcome: { status: "already_terminal", state: "cancelled" },
+  };
+  assert.equal(cancelOutcomeView(sdkReceipt).state, "cancelled",
+    "the unwrapped SDK receipt's outcome is decoded without losing its state");
+  const sdkFuture = { install_job_id: "install-7", outcome: futureWire };
+  assert.equal(cancelOutcomeView(sdkFuture).raw, futureWire,
+    "an unknown SDK outcome is shown raw without its receipt wrapper");
+});
+
+test("[pin] a default list proves only none active; archived absence needs an explicit read", () => {
+  const defaultRead = registryListView({ agent_types: [], workflows: [] });
+  assert.deepEqual(defaultRead.activeAgentTypes, []);
+  assert.deepEqual(defaultRead.activeWorkflows, []);
+  assert.equal(defaultRead.archivedEntries, null,
+    "default list excludes archived; [] would falsely claim none exist");
+  assert.equal(defaultRead.archivedIncluded, false);
+
+  const explicitRead = registryListView({
+    agent_types: [],
+    workflows: [],
+    archived_agent_types: [],
+    archived_workflows: [],
+  }, { includeArchived: true });
+  assert.deepEqual(explicitRead.archivedEntries, []);
+  assert.equal(explicitRead.archivedIncluded, true);
+
+  const withArchived = registryListView({
+    agent_types: [],
+    archived_entries: [{
+      kind: "agent_type",
+      id: "old-agent",
+      name: "Old agent",
+      rev: 2,
+      digest: "read-digest",
+    }],
+  }, { includeArchived: true });
+  assert.equal(withArchived.archivedEntries[0].archived, true);
+  assert.equal(withArchived.archivedEntries[0].digest, "read-digest");
+});
+
+test("registryDeltaView validates decimal-string cursors and preserves unknown deltas", () => {
+  const wire = {
+    watch_id: "watch-1",
+    delta: {
+      action: "archived",
+      cursor: "9007199254740993",
+      after_cursor: "9007199254740992",
+      registry_kind: "agent_type",
+      entry: { id: "researcher" },
+    },
+  };
+  const delta = registryDeltaView(wire);
+  assert.equal(delta.kind, "archived");
+  assert.equal(delta.cursor, "9007199254740993");
+  assert.equal(delta.afterCursor, "9007199254740992");
+  assert.equal(delta.id, "researcher");
+  assert.equal(registryDeltaView({ cursor: 9007199254740992 }).cursor, null,
+    "numeric cursors are rejected at the boundary");
+  const future = { watch_id: "w", cursor: "9", action: "policy_retained", extra: 1 };
+  const unknown = registryDeltaView(future);
+  assert.equal(unknown.kind, "unknown");
+  assert.equal(unknown.raw, future);
+  assert.equal(registryDeltaView({ action: "gap", cursor: "10" }).kind, "rebaseline");
+  assert.equal(registryDeltaView({
+    change: "revision_added",
+    cursor: "11",
+    entry: { kind: "workflow", id: "review" },
+  }).kind, "updated");
+
+  const watch = registryWatchView({
+    watch_id: "watch-sdk",
+    requested_after_cursor: "9007199254740998",
+    baseline: {
+      through_cursor: "9007199254740999",
+      entries: [
+        {
+          entry: {
+            kind: "workflow",
+            id: "review",
+            rev: 37,
+            digest: "digest-37",
+            archived: false,
+          },
+          record: { name: "Review workflow", future: { opaque: true } },
+        },
+      ],
+    },
+  });
+  assert.equal(watch.cursor, "9007199254740999");
+  assert.equal(watch.baseline.activeWorkflows[0].name, "Review workflow");
+  assert.equal(watch.baseline.activeWorkflows[0].digest, "digest-37");
+  assert.equal(watch.baseline.cliPresentPublished, false,
+    "an entries-only watch baseline must not erase a prior CLI probe map");
+  assert.deepEqual(watch.baseline.archivedEntries, [],
+    "loom.watch is an explicit archive-aware baseline");
+});
+
+test("typed Loom conflicts preserve expected/current coordinates for explicit re-read", () => {
+  const registry = loomConflictView({
+    code: "revision_conflict",
+    message: "registry head moved",
+    data: {
+      kind: "loom_revision_conflict",
+      expected: { rev: 37, digest: "observed-37" },
+      current_rev: 38,
+      current_digest: "current-38",
+    },
+  });
+  assert.deepEqual({
+    expectedRev: registry.expectedRev,
+    currentRev: registry.currentRev,
+    expectedDigest: registry.expectedDigest,
+    currentDigest: registry.currentDigest,
+  }, {
+    expectedRev: 37,
+    currentRev: 38,
+    expectedDigest: "observed-37",
+    currentDigest: "current-38",
+  });
+
+  const authoring = loomConflictView({
+    code: "revision_conflict",
+    data: {
+      kind: "revision_conflict",
+      expected_revision: "9007199254740993",
+      current_revision: "9007199254740994",
+    },
+  });
+  assert.equal(authoring.expectedRevision, "9007199254740993");
+  assert.equal(authoring.currentRevision, "9007199254740994");
 });
