@@ -74,6 +74,7 @@ import FleetChildTranscript from "./FleetChildTranscript.jsx";
 import PeersPanel from "./PeersPanel.jsx";
 import ShellsPanel from "./ShellsPanel.jsx";
 import SshProfilesPanel from "./SshProfilesPanel.jsx";
+import SshPtyTerminal from "./SshPtyTerminal.jsx";
 import CapabilitiesPanel from "./CapabilitiesPanel.jsx";
 import ProviderAdminPanel from "./ProviderAdminPanel.jsx";
 import MonitorPanel from "./MonitorPanel.jsx";
@@ -242,6 +243,18 @@ export default function SessionSurface({
   onRemoveSshProfile = null,
   onTestSshProfile = null,
   onSetSessionSshScope = null,
+  sshPtyOutputByShell = {},
+  sshPtyStateByShell = {},
+  sshPtyClosedByShell = {},
+  sshPtyEofByShell = {},
+  sshPtySubscriptionId = 0,
+  sshPtyOpening = false,
+  sshPtyError = "",
+  sshPtyUnavailable = false,
+  onOpenSshPty = null,
+  onInputSshPty = null,
+  onResizeSshPty = null,
+  onEofSshPty = null,
   capabilityHooksByCwd = {},
   capabilityToolsBySession = {},
   capabilityHookReceiptByDigest = {},
@@ -322,6 +335,9 @@ export default function SessionSurface({
      the CURRENT tree on every render, so a refresh never leaves a stale
      node copy rendered. */
   const [fleetSelected, setFleetSelected] = useState({});
+  /* Public saved-profile name selected for the interactive PTY view. The
+     daemon retains all credentials; no profile object enters this path. */
+  const [sshPtyProfileBySession, setSshPtyProfileBySession] = useState({});
   /* Spawn discipline: selecting a session never spawns anything — the Shell
      PTY mounts (and adopts/spawns) only after the Shell view is first shown
      for that session; from then on it stays warm-mounted. */
@@ -1249,6 +1265,15 @@ export default function SessionSurface({
     }
   }, []);
 
+  const openSshPtyView = useCallback((sessionId, profileName) => {
+    if (!sessionId || typeof profileName !== "string" || !profileName) return;
+    setSshPtyProfileBySession((current) => ({
+      ...current,
+      [sessionId]: profileName,
+    }));
+    setModeFor(sessionId, "sshPty");
+  }, [setModeFor]);
+
   /* Shell keep-warm: viewing a shell reports it warm to the shell, and it
      STAYS mounted until the user turns it off from the rail — so switching
      back never pays xterm re-instantiation + scrollback replay again (the
@@ -2149,8 +2174,8 @@ export default function SessionSurface({
           )}
           {session.id !== "draft" && (
             <SessionViewButton
-              aria-selected={activeTabIsChat && modeFor(session.id) === "sshProfiles"}
-              data-active={activeTabIsChat && modeFor(session.id) === "sshProfiles" ? "true" : undefined}
+              aria-selected={activeTabIsChat && ["sshProfiles", "sshPty"].includes(modeFor(session.id))}
+              data-active={activeTabIsChat && ["sshProfiles", "sshPty"].includes(modeFor(session.id)) ? "true" : undefined}
               onClick={() => selectView("sshProfiles")}
               role="tab"
               title="SSH Profiles"
@@ -2668,6 +2693,7 @@ export default function SessionSurface({
                           onAddSshProfile?.(session.id, profile, clearSecrets)
                         )}
                         onRefresh={() => onLoadSshProfiles?.(session.id)}
+                        onOpenShell={(name) => openSshPtyView(session.id, name)}
                         onRemove={(name) => onRemoveSshProfile?.(session.id, name)}
                         onSetScope={(scope) => onSetSessionSshScope?.(session.id, scope)}
                         onTest={(name) => onTestSshProfile?.(session.id, name)}
@@ -2679,12 +2705,38 @@ export default function SessionSurface({
                         scopeReceipt={sshScopeReceiptBySession[session.id]}
                         sessionId={session.id}
                         settingScope={sshProfileSettingScopeBySession[session.id] === true}
+                        sshPtyOpening={sshPtyOpening}
+                        sshPtyUnavailable={sshPtyUnavailable}
                         testingByName={sshProfileTestingByName}
                         testsByName={sshProfileTestsBySession[session.id]}
                         unavailable={sshProfileUnavailable}
                         updatingByName={sshProfileUpdatingByName}
                       />
                     </SshProfilesHostLayer>
+                  )}
+                  {/* Interactive saved-profile PTY. The sibling terminal
+                      mirrors SessionTerminal's lifecycle and shared helpers;
+                      useSshPty owns every daemon boundary and pushed fact. */}
+                  {mode === "sshPty" && session && session.id !== "draft"
+                    && sshPtyProfileBySession[session.id] && (
+                    <SshPtyHostLayer>
+                      <SshPtyTerminal
+                        closedByShell={sshPtyClosedByShell}
+                        eofByShell={sshPtyEofByShell}
+                        error={sshPtyError}
+                        onBack={() => setModeFor(session.id, "sshProfiles")}
+                        onEof={onEofSshPty}
+                        onInput={onInputSshPty}
+                        onOpen={onOpenSshPty}
+                        onResize={onResizeSshPty}
+                        opening={sshPtyOpening}
+                        outputByShell={sshPtyOutputByShell}
+                        profileName={sshPtyProfileBySession[session.id]}
+                        stateByShell={sshPtyStateByShell}
+                        subscriptionId={sshPtySubscriptionId}
+                        unavailable={sshPtyUnavailable}
+                      />
+                    </SshPtyHostLayer>
                   )}
                   {/* Workspace hook trust + canonical session tools. The
                       panel is presentational; useCapabilities.js owns all
@@ -3280,6 +3332,14 @@ const ShellsHostLayer = styled.div`
 
 /* SSH profile manager host: SshProfilesPanel owns its vertical scroll. */
 const SshProfilesHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+`;
+
+/* Interactive SSH terminal host: SshPtyTerminal owns the measured xterm box. */
+const SshPtyHostLayer = styled.div`
   display: flex;
   min-height: 0;
   flex: 1;

@@ -288,14 +288,18 @@ function ProfileForm({
 function ProfileCard({
   profile,
   outcome,
+  openingShell,
+  ptyUnavailable,
   removing,
   testing,
   updating,
   onEdit,
+  onOpenShell,
   onRemove,
   onTest,
 }) {
   const canAct = profile.name != null && !removing && !testing && !updating;
+  const canOpenShell = canAct && !openingShell && !ptyUnavailable;
   return (
     <ProfileItem>
       <ProfileHeader>
@@ -342,6 +346,17 @@ function ProfileCard({
         </TestReceipt>
       )}
       <ProfileActions>
+        <PrimaryButton
+          disabled={!canOpenShell}
+          onClick={() => onOpenShell?.(profile.name)}
+          type="button"
+        >
+          {ptyUnavailable
+            ? "Shell unavailable"
+            : openingShell
+              ? "Opening shell…"
+              : "Open shell"}
+        </PrimaryButton>
         <QuietButton disabled={!canAct} onClick={onTest} type="button">
           {testing ? "Testing…" : "Test"}
         </QuietButton>
@@ -374,12 +389,15 @@ export default function SshProfilesPanel({
   removingByName = {},
   testingByName = {},
   settingScope = false,
+  sshPtyOpening = false,
+  sshPtyUnavailable = false,
   error = "",
   unavailable = false,
   onRefresh = null,
   onAdd = null,
   onUpdate = null,
   onRemove = null,
+  onOpenShell = null,
   onTest = null,
   onSetScope = null,
 }) {
@@ -594,6 +612,12 @@ export default function SshProfilesPanel({
             </ReceiptNotice>
           )}
 
+          {sshPtyUnavailable && (
+            <MutedState>
+              Interactive SSH shell access is unavailable on this daemon; profile management remains available.
+            </MutedState>
+          )}
+
           {profiles == null && !error && (
             <MutedState>SSH profiles not read yet.</MutedState>
           )}
@@ -611,10 +635,13 @@ export default function SshProfilesPanel({
                   <ProfileCard
                     key={name ?? `profile-without-name:${index}`}
                     onEdit={() => openUpdate(profile)}
+                    onOpenShell={onOpenShell}
                     onRemove={() => onRemove?.(name)}
                     onTest={() => onTest?.(name)}
+                    openingShell={sshPtyOpening}
                     outcome={outcome}
                     profile={profile}
+                    ptyUnavailable={sshPtyUnavailable}
                     removing={name != null && removingByName[name] === true}
                     testing={name != null && testingByName[name] === true}
                     updating={name != null && updatingByName[name] === true}

@@ -44,6 +44,7 @@ import { useDescendantStream } from "../sessions/useDescendantStream.js";
 import { usePeers } from "../sessions/usePeers.js";
 import { useShells } from "../sessions/useShells.js";
 import { useSshProfiles } from "../sessions/useSshProfiles.js";
+import { useSshPty } from "../sessions/useSshPty.js";
 import { useCapabilities } from "../sessions/useCapabilities.js";
 import { useProviderAdmin } from "../sessions/useProviderAdmin.js";
 import { useMonitor } from "../sessions/useMonitor.js";
@@ -18921,6 +18922,9 @@ export default function App() {
      hook owns all six SSH profile commands and clears write-only form
      secrets as soon as their dispatch begins. */
   const sshProfileApi = useSshProfiles({ enabled: authState === "authenticated" });
+  /* Interactive saved-profile PTYs have a separate settle-once feature gate.
+     Their lifecycle and transient bytes remain published-event authority. */
+  const sshPtyApi = useSshPty({ enabled: authState === "authenticated" });
   /* Workspace hook trust and canonical per-session tools (Wave6-UI). The
      hook owns all four commands and keeps hooks/tools independently gated. */
   const capabilityApi = useCapabilities({ enabled: authState === "authenticated" });
@@ -25976,6 +25980,18 @@ export default function App() {
                           onRemoveSshProfile={sshProfileApi.remove}
                           onTestSshProfile={sshProfileApi.test}
                           onSetSessionSshScope={sshProfileApi.setSessionScope}
+                          sshPtyOutputByShell={sshPtyApi.outputByShell}
+                          sshPtyStateByShell={sshPtyApi.stateByShell}
+                          sshPtyClosedByShell={sshPtyApi.closedByShell}
+                          sshPtyEofByShell={sshPtyApi.eofByShell}
+                          sshPtySubscriptionId={sshPtyApi.subscriptionId}
+                          sshPtyOpening={sshPtyApi.opening}
+                          sshPtyError={sshPtyApi.error}
+                          sshPtyUnavailable={sshPtyApi.unavailable}
+                          onOpenSshPty={sshPtyApi.open}
+                          onInputSshPty={sshPtyApi.input}
+                          onResizeSshPty={sshPtyApi.resize}
+                          onEofSshPty={sshPtyApi.eof}
                           capabilityHooksByCwd={capabilityApi.hooksByCwd}
                           capabilityToolsBySession={capabilityApi.toolsBySession}
                           capabilityHookReceiptByDigest={capabilityApi.hookReceiptByDigest}
