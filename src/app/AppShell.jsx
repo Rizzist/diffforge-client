@@ -45,6 +45,7 @@ import { usePeers } from "../sessions/usePeers.js";
 import { useShells } from "../sessions/useShells.js";
 import { useSshProfiles } from "../sessions/useSshProfiles.js";
 import { useCapabilities } from "../sessions/useCapabilities.js";
+import { useProviderAdmin } from "../sessions/useProviderAdmin.js";
 import { useMonitor } from "../sessions/useMonitor.js";
 import { useCheckpoints } from "../sessions/useCheckpoints.js";
 import { useWorkflowGraph } from "../sessions/useWorkflowGraph.js";
@@ -18918,6 +18919,10 @@ export default function App() {
   /* Workspace hook trust and canonical per-session tools (Wave6-UI). The
      hook owns all four commands and keeps hooks/tools independently gated. */
   const capabilityApi = useCapabilities({ enabled: authState === "authenticated" });
+  /* Provider configuration, fenced removal, and trust/lockdown management.
+     The hook owns the five management invokes; SessionSurface lends it the
+     already-shipped provider/model library read after each receipt. */
+  const providerAdminApi = useProviderAdmin({ enabled: authState === "authenticated" });
   /* Monitor manager (P4): the per-session registry and delivery watch for
      the surface's Monitors view. All four monitor invokes live in
      useMonitor.js and the feature-gated daemon settles unavailable once. */
@@ -25978,6 +25983,27 @@ export default function App() {
                           onLoadCapabilityTools={capabilityApi.listTools}
                           onTrustHook={capabilityApi.trust}
                           onRevokeHook={capabilityApi.revoke}
+                          providerAdminLockdownByProvider={providerAdminApi.lockdownByProvider}
+                          providerAdminGlobalLockdown={providerAdminApi.globalLockdown}
+                          providerAdminLastReceipt={providerAdminApi.lastReceipt}
+                          providerAdminConflict={providerAdminApi.conflict}
+                          providerAdminConfigurePending={providerAdminApi.configurePending}
+                          providerAdminRemovePendingByProvider={providerAdminApi.removePendingByProvider}
+                          providerAdminTrustPendingByProvider={providerAdminApi.trustPendingByProvider}
+                          providerAdminQuotaPending={providerAdminApi.quotaPending}
+                          providerAdminLockdownLoading={providerAdminApi.lockdownLoading}
+                          providerAdminConfigureError={providerAdminApi.configureError}
+                          providerAdminRemoveError={providerAdminApi.removeError}
+                          providerAdminLockdownError={providerAdminApi.lockdownError}
+                          providerAdminConfigureUnavailable={providerAdminApi.configureUnavailable}
+                          providerAdminRemoveUnavailable={providerAdminApi.removeUnavailable}
+                          providerAdminLockdownUnavailable={providerAdminApi.lockdownUnavailable}
+                          onLoadProviderAdmin={providerAdminApi.load}
+                          onReadProviderAdmin={providerAdminApi.reread}
+                          onConfigureProvider={providerAdminApi.configure}
+                          onRemoveProvider={providerAdminApi.remove}
+                          onSetProviderTrust={providerAdminApi.setTrust}
+                          onSetLockdownQuota={providerAdminApi.setQuota}
                           monitorBySession={monitorApi.bySession}
                           monitorDeliveries={monitorApi.deliveries}
                           monitorCursor={monitorApi.cursor}

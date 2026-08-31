@@ -75,6 +75,7 @@ import PeersPanel from "./PeersPanel.jsx";
 import ShellsPanel from "./ShellsPanel.jsx";
 import SshProfilesPanel from "./SshProfilesPanel.jsx";
 import CapabilitiesPanel from "./CapabilitiesPanel.jsx";
+import ProviderAdminPanel from "./ProviderAdminPanel.jsx";
 import MonitorPanel from "./MonitorPanel.jsx";
 import CheckpointPanel from "./CheckpointPanel.jsx";
 import WorkflowGraphView from "./WorkflowGraphView.jsx";
@@ -96,6 +97,7 @@ import {
   sessionSyncTransportState,
 } from "./sessionSync.js";
 import { viewportMenuPosition } from "./viewportMenuPosition.js";
+import { providerRowView } from "./providerAdminModel.js";
 import SessionQueuePanel from "./SessionQueuePanel.jsx";
 import {
   applyQueueDelta,
@@ -252,6 +254,27 @@ export default function SessionSurface({
   onLoadCapabilityTools = null,
   onTrustHook = null,
   onRevokeHook = null,
+  providerAdminLockdownByProvider = {},
+  providerAdminGlobalLockdown = undefined,
+  providerAdminLastReceipt = null,
+  providerAdminConflict = null,
+  providerAdminConfigurePending = false,
+  providerAdminRemovePendingByProvider = {},
+  providerAdminTrustPendingByProvider = {},
+  providerAdminQuotaPending = false,
+  providerAdminLockdownLoading = false,
+  providerAdminConfigureError = "",
+  providerAdminRemoveError = "",
+  providerAdminLockdownError = "",
+  providerAdminConfigureUnavailable = false,
+  providerAdminRemoveUnavailable = false,
+  providerAdminLockdownUnavailable = false,
+  onLoadProviderAdmin = null,
+  onReadProviderAdmin = null,
+  onConfigureProvider = null,
+  onRemoveProvider = null,
+  onSetProviderTrust = null,
+  onSetLockdownQuota = null,
   monitorBySession = {},
   monitorDeliveries = [],
   monitorCursor = null,
@@ -485,6 +508,14 @@ export default function SessionSurface({
   }, [refreshLibrary]);
 
   const commandSlots = useMemo(() => buildCommandSlots(library), [library]);
+  const providerAdminRevision = library?.provider_revision == null
+    ? undefined
+    : library.provider_revision;
+  const providerAdminRows = useMemo(() => (
+    Array.isArray(library?.providers)
+      ? library.providers.map((row) => providerRowView(row, providerAdminRevision))
+      : undefined
+  ), [library, providerAdminRevision]);
   const commandSlotsKey = useMemo(() => JSON.stringify(commandSlots), [commandSlots]);
   const commandContextId = draftOpen ? "draft" : activeSessionId;
   const commandInSession = Boolean(commandContextId && commandContextId !== "draft");
@@ -1292,6 +1323,15 @@ export default function SessionSurface({
     onLoadCapabilities?.(activeCapabilityCwd, id);
   }, [activeCapabilityCwd, activeSessionId, viewModes, onLoadCapabilities]);
 
+  /* Provider management reuses the library snapshot already consumed by the
+     model picker. The provider-admin hook performs only lockdown reads and
+     receives this existing authority reader for post-receipt re-listing. */
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft" || (viewModes[id] || "ui") !== "providers") return;
+    onLoadProviderAdmin?.(refreshLibrary);
+  }, [activeSessionId, viewModes, onLoadProviderAdmin, refreshLibrary]);
+
   /* Monitor manager (P4): entering the view reads the authoritative
      registry and starts its delivery watch. Leaving, switching sessions,
      or unmounting stops the watch; all four invokes remain centralized in
@@ -2065,6 +2105,19 @@ export default function SessionSurface({
               <span>SSH Profiles</span>
             </SessionViewButton>
           )}
+          {session.id !== "draft" && (
+            <SessionViewButton
+              aria-selected={activeTabIsChat && modeFor(session.id) === "providers"}
+              data-active={activeTabIsChat && modeFor(session.id) === "providers" ? "true" : undefined}
+              onClick={() => selectView("providers")}
+              role="tab"
+              title="Provider management"
+              type="button"
+            >
+              <Build aria-hidden="true" size={13} />
+              <span>Providers</span>
+            </SessionViewButton>
+          )}
           {session && session.id !== "draft" && (
             <SessionViewButton
               aria-selected={activeTabIsChat && modeFor(session.id) === "monitors"}
@@ -2590,6 +2643,42 @@ export default function SessionSurface({
                       </CapabilitiesHostLayer>
                     );
                   })()}
+                  {/* Provider management is distinct from provider/model
+                      selection. It reuses the existing library snapshot;
+                      useProviderAdmin.js owns the five management invokes. */}
+                  {mode === "providers" && session && session.id !== "draft" && (
+                    <ProviderAdminHostLayer>
+                      <ProviderAdminPanel
+                        configureError={providerAdminConfigureError}
+                        configurePending={providerAdminConfigurePending}
+                        configureUnavailable={providerAdminConfigureUnavailable}
+                        conflict={providerAdminConflict}
+                        globalLockdown={providerAdminGlobalLockdown}
+                        lastReceipt={providerAdminLastReceipt}
+                        lockdownByProvider={providerAdminLockdownByProvider}
+                        lockdownError={providerAdminLockdownError}
+                        lockdownLoading={providerAdminLockdownLoading}
+                        lockdownUnavailable={providerAdminLockdownUnavailable}
+                        onConfigure={(modeName, fields) => (
+                          onConfigureProvider?.(modeName, fields, refreshLibrary)
+                        )}
+                        onRefresh={() => onReadProviderAdmin?.(refreshLibrary)}
+                        onRemove={(row) => onRemoveProvider?.(row, refreshLibrary)}
+                        onSetQuota={(bytes) => onSetLockdownQuota?.(bytes, refreshLibrary)}
+                        onSetTrust={(row, trust) => (
+                          onSetProviderTrust?.(row, trust, refreshLibrary)
+                        )}
+                        providerAvailability={library?.provider_availability}
+                        providerRevision={providerAdminRevision}
+                        providers={providerAdminRows}
+                        quotaPending={providerAdminQuotaPending}
+                        removeError={providerAdminRemoveError}
+                        removePendingByProvider={providerAdminRemovePendingByProvider}
+                        removeUnavailable={providerAdminRemoveUnavailable}
+                        trustPendingByProvider={providerAdminTrustPendingByProvider}
+                      />
+                    </ProviderAdminHostLayer>
+                  )}
                   {/* Monitor manager (P4): per-source availability, the
                       listed registry, register/remove controls, and the
                       live delivery stream. MonitorPanel is presentational;
@@ -3129,6 +3218,14 @@ const SshProfilesHostLayer = styled.div`
 
 /* Workspace capability manager host: CapabilitiesPanel owns its scroll. */
 const CapabilitiesHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+`;
+
+/* Provider administration host: ProviderAdminPanel owns its scroll. */
+const ProviderAdminHostLayer = styled.div`
   display: flex;
   min-height: 0;
   flex: 1;
