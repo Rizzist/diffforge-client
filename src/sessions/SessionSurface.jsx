@@ -12,6 +12,7 @@ import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
 import { Forum } from "@styled-icons/material-rounded/Forum";
+import { History } from "@styled-icons/material-rounded/History";
 import { Language } from "@styled-icons/material-rounded/Language";
 import { Mediation } from "@styled-icons/material-rounded/Mediation";
 import { Memory } from "@styled-icons/material-rounded/Memory";
@@ -70,6 +71,7 @@ import SessionTranscript from "./SessionTranscript.jsx";
 import FleetPanel from "./FleetPanel.jsx";
 import FleetChildTranscript from "./FleetChildTranscript.jsx";
 import MonitorPanel from "./MonitorPanel.jsx";
+import CheckpointPanel from "./CheckpointPanel.jsx";
 import WorkflowGraphView from "./WorkflowGraphView.jsx";
 import SessionLifecycleMenuItems from "./SessionLifecycleMenuItems.jsx";
 import { findFleetNode, fleetSessionIds } from "./fleetModel.js";
@@ -143,6 +145,12 @@ const PANEL_KINDS = {
   video: { label: "AI Video Editor", Icon: Movie },
 };
 
+function publishedCheckpointBranchId(session) {
+  return typeof session?.branch_id === "string" && session.branch_id.length > 0
+    ? session.branch_id
+    : null;
+}
+
 export default function SessionSurface({
   activeSessionId,
   appThemeIsLight = false,
@@ -195,6 +203,18 @@ export default function SessionSurface({
   onRemoveMonitor = null,
   onStartMonitorWatch = null,
   onStopMonitorWatch = null,
+  checkpointBySession = {},
+  checkpointConflictBySession = {},
+  checkpointErrorBySession = {},
+  checkpointLoadingBySession = {},
+  checkpointPendingBySession = {},
+  checkpointReceiptBySession = {},
+  checkpointUnavailable = false,
+  onLoadCheckpoints = null,
+  onLoadMoreCheckpoints = null,
+  onUndoCheckpoint = null,
+  onRedoCheckpoint = null,
+  onRollbackCheckpointTurn = null,
   workflowGraphBySession = {},
   workflowGraphCursor = null,
   workflowGraphEvents = [],
@@ -1114,6 +1134,9 @@ export default function SessionSurface({
   };
 
   const modeFor = (sessionId) => viewModes[sessionId] || "ui";
+  const activeCheckpointBranchId = useMemo(() => publishedCheckpointBranchId(
+    sessions.find((candidate) => candidate.id === activeSessionId),
+  ), [activeSessionId, sessions]);
   const setModeFor = useCallback((sessionId, mode) => {
     setViewModes((current) => ({ ...current, [sessionId]: mode }));
     if (mode === "terminal") {
@@ -1190,6 +1213,15 @@ export default function SessionSurface({
     onStartMonitorWatch,
     onStopMonitorWatch,
   ]);
+
+  /* Checkpoint timeline: one authority read when the per-session view is
+     entered. Pagination and every mutation remain centralized in
+     useCheckpoints.js; a feature-gated daemon settles unavailable once. */
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft" || (viewModes[id] || "ui") !== "checkpoints") return;
+    onLoadCheckpoints?.(id, activeCheckpointBranchId);
+  }, [activeCheckpointBranchId, activeSessionId, viewModes, onLoadCheckpoints]);
 
   /* Live workflow graph view (P6): entering it starts the watch-as-change-
      signal poll for the active session (workflow.graph.watch signals, then
@@ -1893,6 +1925,19 @@ export default function SessionSurface({
               <span>Monitors</span>
             </SessionViewButton>
           )}
+          {session && session.id !== "draft" && (
+            <SessionViewButton
+              aria-selected={activeTabIsChat && modeFor(session.id) === "checkpoints"}
+              data-active={activeTabIsChat && modeFor(session.id) === "checkpoints" ? "true" : undefined}
+              onClick={() => selectView("checkpoints")}
+              role="tab"
+              title="Checkpoint timeline"
+              type="button"
+            >
+              <History aria-hidden="true" size={13} />
+              <span>History</span>
+            </SessionViewButton>
+          )}
           {session.id !== "draft" && (
             <SessionViewButton
               aria-selected={activeTabIsChat && modeFor(session.id) === "graph"}
@@ -2294,6 +2339,47 @@ export default function SessionSurface({
                         watchOutcome={monitorWatchOutcome}
                       />
                     </MonitorHostLayer>
+                  )}
+                  {/* Durable workspace checkpoint timeline (Wave2): newest-
+                      first authority list plus receipt-backed undo, redo,
+                      and turn rollback. CheckpointPanel is presentational;
+                      all four invokes live in useCheckpoints.js. */}
+                  {mode === "checkpoints" && session && session.id !== "draft" && (
+                    <CheckpointHostLayer>
+                      <CheckpointPanel
+                        branchId={publishedCheckpointBranchId(session)}
+                        conflict={checkpointConflictBySession[session.id]}
+                        entry={checkpointBySession[session.id]}
+                        error={checkpointErrorBySession[session.id] || ""}
+                        loading={checkpointLoadingBySession[session.id] === true}
+                        onLoadMore={() => onLoadMoreCheckpoints?.(
+                          session.id,
+                          publishedCheckpointBranchId(session),
+                        )}
+                        onRedo={(target) => onRedoCheckpoint?.(
+                          session.id,
+                          publishedCheckpointBranchId(session),
+                          target,
+                        )}
+                        onRefresh={() => onLoadCheckpoints?.(
+                          session.id,
+                          publishedCheckpointBranchId(session),
+                        )}
+                        onRollbackTurn={(runId) => onRollbackCheckpointTurn?.(
+                          session.id,
+                          publishedCheckpointBranchId(session),
+                          runId,
+                        )}
+                        onUndo={(target) => onUndoCheckpoint?.(
+                          session.id,
+                          publishedCheckpointBranchId(session),
+                          target,
+                        )}
+                        pending={checkpointPendingBySession[session.id]}
+                        receipt={checkpointReceiptBySession[session.id]}
+                        unavailable={checkpointUnavailable}
+                      />
+                    </CheckpointHostLayer>
                   )}
                   {/* Live workflow graph (P6): the workflow_graph_v1
                       projection — topology + per-node runtime state from
@@ -2749,6 +2835,14 @@ const FleetHostLayer = styled.div`
 
 /* Monitor manager host: MonitorPanel owns its vertical scroll. */
 const MonitorHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+`;
+
+/* Checkpoint timeline host: CheckpointPanel owns its vertical scroll. */
+const CheckpointHostLayer = styled.div`
   display: flex;
   min-height: 0;
   flex: 1;

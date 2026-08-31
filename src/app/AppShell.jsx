@@ -42,6 +42,7 @@ import { useWorkflow } from "../sessions/useWorkflow.js";
 import { useFleet } from "../sessions/useFleet.js";
 import { useDescendantStream } from "../sessions/useDescendantStream.js";
 import { useMonitor } from "../sessions/useMonitor.js";
+import { useCheckpoints } from "../sessions/useCheckpoints.js";
 import { useWorkflowGraph } from "../sessions/useWorkflowGraph.js";
 import { useSessionLifecycle } from "../sessions/useSessionLifecycle.js";
 import {
@@ -18903,6 +18904,10 @@ export default function App() {
      the surface's Monitors view. All four monitor invokes live in
      useMonitor.js and the feature-gated daemon settles unavailable once. */
   const monitorApi = useMonitor({ enabled: authState === "authenticated" });
+  /* Durable workspace checkpoints (Wave2): per-session authority list plus
+     receipt-backed undo/redo/turn rollback. All four invokes live in
+     useCheckpoints.js and feature-gated daemons settle unavailable once. */
+  const checkpointApi = useCheckpoints({ enabled: authState === "authenticated" });
   /* Workflow live-runtime graph (P6): the workflow_graph_v1 projection for
      the surface's Graph view. Both invokes (workflow_graph_state +
      workflow_graph_watch) live in useWorkflowGraph.js; the watch is a
@@ -25897,6 +25902,18 @@ export default function App() {
                           onRemoveMonitor={monitorApi.remove}
                           onStartMonitorWatch={monitorApi.startWatch}
                           onStopMonitorWatch={monitorApi.stopWatch}
+                          checkpointBySession={checkpointApi.bySession}
+                          checkpointConflictBySession={checkpointApi.conflictBySession}
+                          checkpointErrorBySession={checkpointApi.errorBySession}
+                          checkpointLoadingBySession={checkpointApi.loadingBySession}
+                          checkpointPendingBySession={checkpointApi.pendingBySession}
+                          checkpointReceiptBySession={checkpointApi.receiptBySession}
+                          checkpointUnavailable={checkpointApi.unavailable}
+                          onLoadCheckpoints={checkpointApi.list}
+                          onLoadMoreCheckpoints={checkpointApi.loadMore}
+                          onUndoCheckpoint={checkpointApi.undo}
+                          onRedoCheckpoint={checkpointApi.redo}
+                          onRollbackCheckpointTurn={checkpointApi.rollbackTurn}
                           workflowGraphBySession={workflowGraphApi.graphBySession}
                           workflowGraphCursor={workflowGraphApi.cursor}
                           workflowGraphEvents={workflowGraphApi.recentEvents}
