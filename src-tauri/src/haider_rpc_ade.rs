@@ -85,6 +85,13 @@ const FEATURE_SESSION_LINEAGE_V1: &str = "session_lineage_v1";
 const FEATURE_SESSION_DESCENDANT_STREAM_V1: &str = "session_descendant_stream_v1";
 const FEATURE_MONITOR_CONTROL_V1: &str = "monitor_control_v1";
 const FEATURE_MONITOR_DELIVERY_V1: &str = "monitor_delivery_v1";
+const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
+const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
+const FEATURE_AUTONOMOUS_INTERACTION_V1: &str = "autonomous_interaction_v1";
+const FEATURE_SESSION_RENAME_V1: &str = "session_rename_v1";
+const FEATURE_CONTEXT_COMPACTION_V1: &str = "context_compaction_v1";
+const FEATURE_SESSION_FORK_V1: &str = "session_fork_v1";
+const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
 const HAIDER_NEEDS_INPUT_NO_CONNECTION: &str = "haider_needs_input_no_connection";
@@ -2282,6 +2289,97 @@ pub struct WorkflowCommandError {
     pub data: Option<WorkflowErrorData>,
 }
 
+/// Structured lifecycle rejection. Feature absence and transport absence stay
+/// distinguishable, while daemon error data remains an opaque authority record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LifecycleCommandError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+fn serialize_lifecycle_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.collect_str(value)
+}
+
+/// Daemon-issued durable coordinates of `session.create`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SessionCreateReceipt {
+    pub session_id: String,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub created_seq: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub worker_generation: u64,
+    /// `SessionMetadataV1` is deliberately not re-mirrored by this SDK.
+    pub metadata: Value,
+}
+
+/// Daemon-normalized result of a receipted title mutation.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SessionRenameReceipt {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub renamed_seq: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub worker_generation: u64,
+}
+
+/// Durable acceptance coordinates for main- or named-branch compaction.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SessionCompactReceipt {
+    pub session_id: String,
+    pub run_id: String,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub accepted_seq: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub worker_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
+}
+
+/// Stable coordinates of a complete daemon-owned session fork.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SessionForkReceipt {
+    pub session_id: String,
+    pub source_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_branch_id: Option<String>,
+    pub fork_node_id: String,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub fork_seq: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub created_seq: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub worker_generation: u64,
+    /// `SessionMetadataV1` and prompt-fork additions remain verbatim records.
+    pub metadata: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<Value>,
+}
+
+/// Durable acceptance coordinates for retrying a failed run or live backoff.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RunRetryReceipt {
+    pub session_id: String,
+    pub run_id: String,
+    pub failed_run_id: String,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub user_seq: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub accepted_seq: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub worker_generation: u64,
+}
+
 /// Agent-type registry plus point-in-time CLI inventory. Map absence is the
 /// third state: no key means not probed, distinct from `Some(false)`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3059,6 +3157,20 @@ enum RequestBody {
     },
     #[serde(rename = "artifact.put")]
     ArtifactPut { data_base64: String },
+    #[serde(rename = "session.create")]
+    SessionCreate {
+        command_id: String,
+        cwd: String,
+        provider: String,
+        model: String,
+        max_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_overrides: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_policy: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interaction_mode: Option<String>,
+    },
     /// Opens the System Settings pane for an unresolved OS permission park.
     /// The daemon knows the pane; no URL is ever sent by a client. It opens on
     /// the machine running the DAEMON, which is the machine needing the grant.
@@ -3234,6 +3346,40 @@ enum RequestBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: String },
+    #[serde(rename = "session.rename")]
+    SessionRename {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    #[serde(rename = "session.compact")]
+    SessionCompact {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<String>,
+    },
+    #[serde(rename = "session.fork")]
+    SessionFork {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork_node_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork_seq: Option<u64>,
+    },
+    #[serde(rename = "run.retry")]
+    RunRetry {
+        command_id: String,
+        session_id: String,
+        worker_generation: u64,
+    },
     #[serde(rename = "session.seen")]
     SessionSeen {
         command_id: String,
@@ -3424,6 +3570,13 @@ enum ResponseBody {
     CommandInvoke { outcome: CommandInvokeOutcomeWire },
     #[serde(rename = "artifact.put")]
     ArtifactPut { artifact: String, bytes: u64 },
+    #[serde(rename = "session.create")]
+    SessionCreate {
+        session_id: String,
+        created_seq: u64,
+        worker_generation: u64,
+        metadata: Value,
+    },
     #[serde(rename = "session.list")]
     SessionList {
         #[serde(default)]
@@ -3591,6 +3744,54 @@ enum ResponseBody {
     },
     #[serde(rename = "session.detach")]
     SessionDetach { attachment_id: String },
+    #[serde(rename = "session.rename")]
+    SessionRename {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        renamed_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "session.compact")]
+    SessionCompact {
+        session_id: String,
+        run_id: String,
+        accepted_seq: u64,
+        worker_generation: u64,
+    },
+    #[serde(rename = "session.compact.on_branch")]
+    SessionCompactOnBranch {
+        session_id: String,
+        run_id: String,
+        accepted_seq: u64,
+        worker_generation: u64,
+        branch_id: String,
+    },
+    #[serde(rename = "session.fork")]
+    SessionFork {
+        session_id: String,
+        source_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch_id: Option<String>,
+        fork_node_id: String,
+        fork_seq: u64,
+        created_seq: u64,
+        worker_generation: u64,
+        metadata: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forked_from: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        draft: Option<Value>,
+    },
+    #[serde(rename = "run.retry")]
+    RunRetry {
+        session_id: String,
+        run_id: String,
+        failed_run_id: String,
+        user_seq: u64,
+        accepted_seq: u64,
+        worker_generation: u64,
+    },
     #[serde(rename = "session.seen")]
     SessionSeen {
         session_id: String,
@@ -6441,6 +6642,7 @@ struct WorkflowControlAttachment {
     attachment_id: String,
     session_id: String,
     worker_generation: u64,
+    replay_through_seq: u64,
 }
 
 #[cfg(unix)]
@@ -6540,7 +6742,627 @@ async fn workflow_control_attachment(
         attachment_id,
         session_id: attach_state.session_id,
         worker_generation: attach_state.worker_generation,
+        replay_through_seq: attach_state.replay_through_seq,
     })
+}
+
+impl LifecycleCommandError {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "unavailable".to_string(),
+            message: message.into(),
+            retryable: true,
+            data: None,
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.into(),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn invalid_argument(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_argument".to_string(),
+            message: message.into(),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn from_daemon(code: String, message: String, retryable: bool, data: Option<Value>) -> Self {
+        Self {
+            code,
+            message,
+            retryable,
+            data,
+        }
+    }
+
+    #[cfg(unix)]
+    fn from_workflow(error: WorkflowCommandError) -> Self {
+        let data = error.data.and_then(|data| serde_json::to_value(data).ok());
+        Self {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+            data,
+        }
+    }
+}
+
+fn lifecycle_response_error(body: ResponseBody, mismatch: &'static str) -> LifecycleCommandError {
+    match body {
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => LifecycleCommandError::from_daemon(code, message, retryable, data),
+        _ => LifecycleCommandError::protocol(mismatch),
+    }
+}
+
+fn session_create_response(
+    body: ResponseBody,
+) -> Result<SessionCreateReceipt, LifecycleCommandError> {
+    match body {
+        ResponseBody::SessionCreate {
+            session_id,
+            created_seq,
+            worker_generation,
+            metadata,
+        } => Ok(SessionCreateReceipt {
+            session_id,
+            created_seq,
+            worker_generation,
+            metadata,
+        }),
+        response => Err(lifecycle_response_error(
+            response,
+            "session.create response method mismatch",
+        )),
+    }
+}
+
+fn session_rename_response(
+    body: ResponseBody,
+) -> Result<SessionRenameReceipt, LifecycleCommandError> {
+    match body {
+        ResponseBody::SessionRename {
+            session_id,
+            title,
+            renamed_seq,
+            worker_generation,
+        } => Ok(SessionRenameReceipt {
+            session_id,
+            title,
+            renamed_seq,
+            worker_generation,
+        }),
+        response => Err(lifecycle_response_error(
+            response,
+            "session.rename response method mismatch",
+        )),
+    }
+}
+
+fn session_compact_response(
+    body: ResponseBody,
+) -> Result<SessionCompactReceipt, LifecycleCommandError> {
+    match body {
+        ResponseBody::SessionCompact {
+            session_id,
+            run_id,
+            accepted_seq,
+            worker_generation,
+        } => Ok(SessionCompactReceipt {
+            session_id,
+            run_id,
+            accepted_seq,
+            worker_generation,
+            branch_id: None,
+        }),
+        ResponseBody::SessionCompactOnBranch {
+            session_id,
+            run_id,
+            accepted_seq,
+            worker_generation,
+            branch_id,
+        } => Ok(SessionCompactReceipt {
+            session_id,
+            run_id,
+            accepted_seq,
+            worker_generation,
+            branch_id: Some(branch_id),
+        }),
+        response => Err(lifecycle_response_error(
+            response,
+            "session.compact response method mismatch",
+        )),
+    }
+}
+
+fn session_fork_response(body: ResponseBody) -> Result<SessionForkReceipt, LifecycleCommandError> {
+    match body {
+        ResponseBody::SessionFork {
+            session_id,
+            source_session_id,
+            source_branch_id,
+            fork_node_id,
+            fork_seq,
+            created_seq,
+            worker_generation,
+            metadata,
+            forked_from,
+            draft,
+        } => Ok(SessionForkReceipt {
+            session_id,
+            source_session_id,
+            source_branch_id,
+            fork_node_id,
+            fork_seq,
+            created_seq,
+            worker_generation,
+            metadata,
+            forked_from,
+            draft,
+        }),
+        response => Err(lifecycle_response_error(
+            response,
+            "session.fork response method mismatch",
+        )),
+    }
+}
+
+fn run_retry_response(body: ResponseBody) -> Result<RunRetryReceipt, LifecycleCommandError> {
+    match body {
+        ResponseBody::RunRetry {
+            session_id,
+            run_id,
+            failed_run_id,
+            user_seq,
+            accepted_seq,
+            worker_generation,
+        } => Ok(RunRetryReceipt {
+            session_id,
+            run_id,
+            failed_run_id,
+            user_seq,
+            accepted_seq,
+            worker_generation,
+        }),
+        response => Err(lifecycle_response_error(
+            response,
+            "run.retry response method mismatch",
+        )),
+    }
+}
+
+fn lifecycle_features(feature: &str) -> BTreeSet<String> {
+    BTreeSet::from([feature.to_string()])
+}
+
+#[cfg(unix)]
+fn session_create_request(
+    cwd: String,
+    provider: String,
+    model: String,
+    max_tokens: u64,
+    permission_overrides: Option<Value>,
+    cache_policy: Option<Value>,
+    interaction_mode: Option<String>,
+) -> Result<(RequestBody, BTreeSet<String>), LifecycleCommandError> {
+    let mut features = lifecycle_features(FEATURE_SESSION_MUTATION_V1);
+    if permission_overrides.is_some() {
+        features.insert(FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_string());
+    }
+    let interaction_mode = match interaction_mode.as_deref() {
+        None | Some("interactive") => None,
+        Some("autonomous") => {
+            features.insert(FEATURE_AUTONOMOUS_INTERACTION_V1.to_string());
+            Some("autonomous".to_string())
+        }
+        Some(other) => {
+            return Err(LifecycleCommandError::invalid_argument(format!(
+                "session.create interaction_mode must be `interactive` or `autonomous`, got `{other}`"
+            )));
+        }
+    };
+    Ok((
+        RequestBody::SessionCreate {
+            command_id: config_command_id("session-create"),
+            cwd,
+            provider,
+            model,
+            max_tokens,
+            permission_overrides,
+            cache_policy,
+            interaction_mode,
+        },
+        features,
+    ))
+}
+
+#[cfg(unix)]
+fn session_rename_request(
+    attachment: &WorkflowControlAttachment,
+    title: Option<String>,
+) -> RequestBody {
+    RequestBody::SessionRename {
+        command_id: config_command_id("session-rename"),
+        session_id: attachment.session_id.clone(),
+        worker_generation: attachment.worker_generation,
+        title,
+    }
+}
+
+#[cfg(unix)]
+fn session_compact_request(
+    attachment: &WorkflowControlAttachment,
+    branch_id: Option<String>,
+) -> RequestBody {
+    RequestBody::SessionCompact {
+        command_id: config_command_id("session-compact"),
+        session_id: attachment.session_id.clone(),
+        worker_generation: attachment.worker_generation,
+        branch_id,
+    }
+}
+
+#[cfg(unix)]
+fn session_fork_request(
+    attachment: &WorkflowControlAttachment,
+    source_branch_id: Option<String>,
+    fork_node_id: Option<String>,
+    fork_seq: Option<u64>,
+) -> RequestBody {
+    RequestBody::SessionFork {
+        command_id: config_command_id("session-fork"),
+        session_id: attachment.session_id.clone(),
+        worker_generation: attachment.worker_generation,
+        source_branch_id,
+        fork_node_id,
+        fork_seq,
+    }
+}
+
+#[cfg(unix)]
+fn run_retry_request(attachment: &WorkflowControlAttachment) -> RequestBody {
+    RequestBody::RunRetry {
+        command_id: config_command_id("run-retry"),
+        session_id: attachment.session_id.clone(),
+        worker_generation: attachment.worker_generation,
+    }
+}
+
+#[cfg(unix)]
+fn lifecycle_transport_error(error: String) -> LifecycleCommandError {
+    if error.starts_with("missing_feature:") {
+        LifecycleCommandError {
+            code: "missing_feature".to_string(),
+            message: error,
+            retryable: false,
+            data: None,
+        }
+    } else if error == "capability_denied" {
+        LifecycleCommandError {
+            code: error,
+            message: "The current Haider RPC connection lacks Control capability.".to_string(),
+            retryable: false,
+            data: None,
+        }
+    } else {
+        LifecycleCommandError::unavailable(error)
+    }
+}
+
+#[cfg(unix)]
+async fn lifecycle_request(
+    body: RequestBody,
+    features: &BTreeSet<String>,
+) -> Result<ResponseBody, LifecycleCommandError> {
+    match rpc_request_with_feature_gate(
+        body,
+        Capability::Control,
+        FeatureGate::all(features.clone()),
+        RpcErrorStyle::Passthrough,
+    )
+    .await
+    {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) => Err(lifecycle_transport_error(error)),
+        None => Err(LifecycleCommandError::unavailable(
+            "The lifecycle RPC request did not receive a response.",
+        )),
+    }
+}
+
+#[cfg(unix)]
+async fn lifecycle_provider_session_id(
+    session_id: String,
+) -> Result<String, LifecycleCommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        super::session_provider_session_id_blocking(&session_id)
+    })
+    .await
+    .map_err(|error| LifecycleCommandError::protocol(format!("Session lookup failed: {error}")))?
+    .map_err(|error| LifecycleCommandError::protocol(format!("Session lookup failed: {error}")))
+}
+
+#[cfg(unix)]
+async fn lifecycle_control_attachment(
+    session_id: &str,
+    features: &BTreeSet<String>,
+) -> Result<WorkflowControlAttachment, LifecycleCommandError> {
+    workflow_control_attachment(session_id, features)
+        .await
+        .map_err(LifecycleCommandError::from_workflow)
+}
+
+fn lifecycle_fork_seq_in_envelopes(
+    envelopes: &[Value],
+    requested_node_id: &str,
+) -> Result<Option<u64>, LifecycleCommandError> {
+    for envelope in envelopes {
+        let payload = envelope.get("payload").unwrap_or(&Value::Null);
+        if payload.get("type").and_then(Value::as_str) != Some("node_committed")
+            || payload
+                .get("node")
+                .and_then(|node| node.get("node"))
+                .and_then(Value::as_str)
+                != Some(requested_node_id)
+        {
+            continue;
+        }
+        return config_u64(envelope.get("seq")).map(Some).ok_or_else(|| {
+            LifecycleCommandError::protocol(format!(
+                "session.read node `{requested_node_id}` omitted its authoritative sequence"
+            ))
+        });
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+async fn lifecycle_fork_seq(
+    attachment: &WorkflowControlAttachment,
+    requested_node_id: &str,
+    features: &BTreeSet<String>,
+) -> Result<u64, LifecycleCommandError> {
+    const PAGE_SIZE: u64 = 1_024;
+    let mut end_seq = attachment.replay_through_seq;
+    while end_seq != 0 {
+        let start_seq = end_seq.saturating_sub(PAGE_SIZE - 1).max(1);
+        let result = match lifecycle_request(
+            RequestBody::SessionRead {
+                session_id: attachment.session_id.clone(),
+                range: SessionReadRange { start_seq, end_seq },
+            },
+            features,
+        )
+        .await?
+        {
+            ResponseBody::SessionRead { result } => result,
+            response => {
+                return Err(lifecycle_response_error(
+                    response,
+                    "session.read response method mismatch while resolving fork cut",
+                ));
+            }
+        };
+        if result.session_id != attachment.session_id {
+            return Err(LifecycleCommandError::protocol(
+                "session.read response session mismatch while resolving fork cut",
+            ));
+        }
+        if let Some(fork_seq) =
+            lifecycle_fork_seq_in_envelopes(&result.envelopes, requested_node_id)?
+        {
+            return Ok(fork_seq);
+        }
+        end_seq = start_seq.saturating_sub(1);
+    }
+    Err(LifecycleCommandError::invalid_argument(format!(
+        "session.fork node `{requested_node_id}` was absent from the attached journal snapshot"
+    )))
+}
+
+/// Create a daemon-owned session. The command id is minted inside the SDK;
+/// there is no pre-existing session from which to obtain a Control attachment.
+#[allow(clippy::too_many_arguments)]
+pub async fn session_create(
+    cwd: String,
+    provider: String,
+    model: String,
+    max_tokens: u64,
+    permission_overrides: Option<Value>,
+    cache_policy: Option<Value>,
+    interaction_mode: Option<String>,
+) -> Result<SessionCreateReceipt, LifecycleCommandError> {
+    #[cfg(unix)]
+    {
+        let (request, features) = session_create_request(
+            cwd,
+            provider,
+            model,
+            max_tokens,
+            permission_overrides,
+            cache_policy,
+            interaction_mode,
+        )?;
+        return session_create_response(lifecycle_request(request, &features).await?);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            cwd,
+            provider,
+            model,
+            max_tokens,
+            permission_overrides,
+            cache_policy,
+            interaction_mode,
+        );
+        Err(LifecycleCommandError::unavailable(
+            "session.create unavailable on this platform",
+        ))
+    }
+}
+
+/// Tauri registration wrapper. Its Rust identifier must differ from the
+/// legacy crate-root `session_create` command because Tauri exports helper
+/// macros by Rust identifier even when the dispatch string is renamed.
+#[tauri::command(rename = "ade_session_create", rename_all = "snake_case")]
+#[allow(clippy::too_many_arguments)]
+pub async fn lifecycle_session_create_command(
+    cwd: String,
+    provider: String,
+    model: String,
+    max_tokens: u64,
+    permission_overrides: Option<Value>,
+    cache_policy: Option<Value>,
+    interaction_mode: Option<String>,
+) -> Result<SessionCreateReceipt, LifecycleCommandError> {
+    session_create(
+        cwd,
+        provider,
+        model,
+        max_tokens,
+        permission_overrides,
+        cache_policy,
+        interaction_mode,
+    )
+    .await
+}
+
+/// Rename or clear a live session title. `None` is passed as an omitted wire
+/// key, which is the daemon-documented clear operation.
+pub async fn session_rename(
+    session_id: String,
+    title: Option<String>,
+) -> Result<SessionRenameReceipt, LifecycleCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = lifecycle_provider_session_id(session_id).await?;
+        let features = lifecycle_features(FEATURE_SESSION_RENAME_V1);
+        let attachment = lifecycle_control_attachment(&provider_session_id, &features).await?;
+        let result = lifecycle_request(session_rename_request(&attachment, title), &features)
+            .await
+            .and_then(session_rename_response);
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, title);
+        Err(LifecycleCommandError::unavailable(
+            "session.rename unavailable on this platform",
+        ))
+    }
+}
+
+/// Collision-free Tauri registration wrapper for the ADE rename SDK.
+#[tauri::command(rename = "ade_session_rename", rename_all = "snake_case")]
+pub async fn lifecycle_session_rename_command(
+    session_id: String,
+    title: Option<String>,
+) -> Result<SessionRenameReceipt, LifecycleCommandError> {
+    session_rename(session_id, title).await
+}
+
+/// Start durable manual context compaction on the main or a named branch.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_compact(
+    session_id: String,
+    branch_id: Option<String>,
+) -> Result<SessionCompactReceipt, LifecycleCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = lifecycle_provider_session_id(session_id).await?;
+        let features = lifecycle_features(FEATURE_CONTEXT_COMPACTION_V1);
+        let attachment = lifecycle_control_attachment(&provider_session_id, &features).await?;
+        let result = lifecycle_request(session_compact_request(&attachment, branch_id), &features)
+            .await
+            .and_then(session_compact_response);
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, branch_id);
+        Err(LifecycleCommandError::unavailable(
+            "session.compact unavailable on this platform",
+        ))
+    }
+}
+
+/// Fork an exact journal node into a new daemon-minted session. When supplied,
+/// the numeric cut is resolved from the daemon journal and never accepted from
+/// JavaScript. Omitted selectors remain omitted for daemon-side shape checks.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn session_fork(
+    session_id: String,
+    source_branch_id: Option<String>,
+    fork_node_id: Option<String>,
+) -> Result<SessionForkReceipt, LifecycleCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = lifecycle_provider_session_id(session_id).await?;
+        let features = lifecycle_features(FEATURE_SESSION_FORK_V1);
+        let attachment = lifecycle_control_attachment(&provider_session_id, &features).await?;
+        let result = async {
+            let fork_seq = match fork_node_id.as_deref() {
+                Some(fork_node_id) => {
+                    Some(lifecycle_fork_seq(&attachment, fork_node_id, &features).await?)
+                }
+                None => None,
+            };
+            lifecycle_request(
+                session_fork_request(&attachment, source_branch_id, fork_node_id, fork_seq),
+                &features,
+            )
+            .await
+            .and_then(session_fork_response)
+        }
+        .await;
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, source_branch_id, fork_node_id);
+        Err(LifecycleCommandError::unavailable(
+            "session.fork unavailable on this platform",
+        ))
+    }
+}
+
+/// Retry the latest failed main-timeline turn or wake the current backoff.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn run_retry(session_id: String) -> Result<RunRetryReceipt, LifecycleCommandError> {
+    #[cfg(unix)]
+    {
+        let provider_session_id = lifecycle_provider_session_id(session_id).await?;
+        let features = lifecycle_features(FEATURE_RUN_RETRY_V1);
+        let attachment = lifecycle_control_attachment(&provider_session_id, &features).await?;
+        let result = lifecycle_request(run_retry_request(&attachment), &features)
+            .await
+            .and_then(run_retry_response);
+        workflow_detach(attachment.attachment_id).await;
+        return result;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session_id;
+        Err(LifecycleCommandError::unavailable(
+            "run.retry unavailable on this platform",
+        ))
+    }
 }
 
 /// Read only the P0.3 agent-type registry and advisory CLI-presence map.
@@ -11931,6 +12753,11 @@ mod monitor_tests;
 #[allow(clippy::expect_used)]
 #[path = "haider_rpc_ade_descendant_tests.rs"]
 mod descendant_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
