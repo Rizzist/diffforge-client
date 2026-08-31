@@ -11,7 +11,6 @@ import {
 import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
-import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Forum } from "@styled-icons/material-rounded/Forum";
 import { Language } from "@styled-icons/material-rounded/Language";
 import { Mediation } from "@styled-icons/material-rounded/Mediation";
@@ -72,6 +71,7 @@ import FleetPanel from "./FleetPanel.jsx";
 import FleetChildTranscript from "./FleetChildTranscript.jsx";
 import MonitorPanel from "./MonitorPanel.jsx";
 import WorkflowGraphView from "./WorkflowGraphView.jsx";
+import SessionLifecycleMenuItems from "./SessionLifecycleMenuItems.jsx";
 import { findFleetNode, fleetSessionIds } from "./fleetModel.js";
 import {
   formatSessionRelativeTime,
@@ -201,6 +201,13 @@ export default function SessionSurface({
   workflowGraphError = "",
   workflowGraphUnavailable = false,
   onWatchWorkflowGraph = null,
+  lifecyclePendingBySession = {},
+  lifecycleErrorBySession = {},
+  lifecycleUnavailableByAction = {},
+  onRenameSession = null,
+  onCompactSession = null,
+  onForkSession = null,
+  onRetrySession = null,
 }) {
   const [viewModes, setViewModes] = useState({});
   /* Fleet drilldown selection: sessionId -> selected agent_id. Only the REAL
@@ -1585,8 +1592,8 @@ export default function SessionSurface({
   ]);
 
   /* Session title chrome: the title is the workspace's first content line;
-     its ellipsis menu carries Pin/Unpin + Rename (the same harness doors the
-     rail's context menu uses). */
+     its ellipsis menu carries Pin/Unpin plus the same receipt-backed
+     lifecycle controls as the rail's context menu. */
   const [titleMenuFor, setTitleMenuFor] = useState("");
   const [titleRenamingId, setTitleRenamingId] = useState("");
   const [titleDraft, setTitleDraft] = useState("");
@@ -1664,15 +1671,31 @@ export default function SessionSurface({
     const id = titleRenamingId;
     const title = titleDraft.trim();
     setTitleRenamingId("");
-    if (!id || !title) {
+    if (!id) {
       return;
     }
-    try {
-      await invoke("session_rename", { session_id: id, title });
-    } catch {
-      // Store predates renaming — leave the daemon title in place.
+    /* Empty is the daemon-defined clear operation. The hook omits title and
+       refreshes the authority; this surface never invents a replacement. */
+    await onRenameSession?.(id, title || undefined);
+  }, [onRenameSession, titleDraft, titleRenamingId]);
+
+  const lifecycleNoticeFor = (sessionId) => {
+    const pending = lifecyclePendingBySession[sessionId] || {};
+    const pendingAction = Object.keys(pending).find((action) => pending[action]);
+    if (pendingAction) {
+      return {
+        kind: "pending",
+        text: {
+          rename: "Renaming…",
+          compact: "Compacting…",
+          fork: "Forking…",
+          retry: "Retrying…",
+        }[pendingAction],
+      };
     }
-  }, [titleDraft, titleRenamingId]);
+    const error = Object.values(lifecycleErrorBySession[sessionId] || {}).find(Boolean);
+    return error ? { kind: "error", text: "Lifecycle action failed", title: error } : null;
+  };
 
   /* ONE header row for every tab: small title + its menu on the left, the
      view cluster (segmented, status pill, theme) on the right; wraps to a
@@ -1687,7 +1710,9 @@ export default function SessionSurface({
     </WorkHeader>
   );
 
-  const renderTitleBlock = (session) => (
+  const renderTitleBlock = (session) => {
+    const lifecycleNotice = lifecycleNoticeFor(session.id);
+    return (
       <TitleRow>
         {titleRenamingId === session.id ? (
           <TitleRenameInput
@@ -1708,6 +1733,15 @@ export default function SessionSurface({
           />
         ) : (
           <h1 title={session.title}>{session.title}</h1>
+        )}
+        {lifecycleNotice && (
+          <LifecycleTitleNotice
+            data-kind={lifecycleNotice.kind}
+            role={lifecycleNotice.kind === "pending" ? "status" : "alert"}
+            title={lifecycleNotice.title}
+          >
+            {lifecycleNotice.text}
+          </LifecycleTitleNotice>
         )}
         <TitleMenuWrap ref={titleMenuFor === session.id ? titleMenuRef : undefined}>
           <HeaderIconButton
@@ -1739,14 +1773,20 @@ export default function SessionSurface({
                 <PushPin aria-hidden="true" />
                 <span>{session.pinned ? "Unpin" : "Pin"}</span>
               </TitleMenuItem>
-              <TitleMenuItem
-                onClick={() => beginTitleRename(session)}
-                role="menuitem"
-                type="button"
-              >
-                <Edit aria-hidden="true" />
-                <span>Rename</span>
-              </TitleMenuItem>
+              {session.id !== "draft" && (
+                <SessionLifecycleMenuItems
+                  errorBySession={lifecycleErrorBySession}
+                  onBeginRename={beginTitleRename}
+                  onCompact={onCompactSession}
+                  onDismiss={() => setTitleMenuFor("")}
+                  onFork={onForkSession}
+                  onForked={(receipt) => onOpenSession?.({ id: receipt.sessionId })}
+                  onRetry={onRetrySession}
+                  pendingBySession={lifecyclePendingBySession}
+                  session={session}
+                  unavailableByAction={lifecycleUnavailableByAction}
+                />
+              )}
             </TitleMenu>,
             document.body,
           )}
@@ -1762,7 +1802,8 @@ export default function SessionSurface({
           </HeaderIconButton>
         )}
       </TitleRow>
-  );
+    );
+  };
 
   /* Floating cluster, top-right of the workspace — ONLY view-scoped chrome:
      the segmented view control (with the session's panel tabs riding it),
@@ -2625,7 +2666,7 @@ const TitleMenu = styled.div`
   left: ${({ $left }) => `${$left ?? 0}px`};
   z-index: 40;
   display: grid;
-  width: 148px;
+  width: 280px;
   max-width: calc(100vw - 16px);
   max-height: calc(100vh - 16px);
   gap: 1px;
@@ -2663,6 +2704,15 @@ const TitleMenuItem = styled.button`
     color: var(--forge-text);
     background: var(--forge-surface-hover);
   }
+`;
+
+const LifecycleTitleNotice = styled.em`
+  flex: 0 0 auto;
+  color: var(--forge-amber);
+  font-size: 9.5px;
+  font-style: normal;
+
+  &[data-kind="error"] { color: var(--forge-red); }
 `;
 
 /* Keep-warm wrappers: the active session's Chat and Shell both stay mounted;

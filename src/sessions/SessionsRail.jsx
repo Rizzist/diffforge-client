@@ -30,13 +30,14 @@ import { spaceRailRowAuthority } from "./spacesController.js";
 import SpacesRailSection from "./SpacesRailSection.jsx";
 import LoomRailSection from "./LoomRailSection.jsx";
 import WorkflowRailSection from "./WorkflowRailSection.jsx";
+import SessionLifecycleMenuItems from "./SessionLifecycleMenuItems.jsx";
 import { ModelBrandIcon } from "./modelBrand.jsx";
 
 /* Session Deck rail list: a prominent "New chat" compose row on top, then
    activity-ranked Pinned/Recent groups and quiet trailing groups for local or
    activity-less rows. Rows lead with the brand mark of the current model.
-   Right-click opens Pin/Unpin + Rename; renames set a title lock so daemon
-   reconciles never clobber them. The collapsed rail keeps the rows as a
+   Right-click opens Pin/Unpin plus receipt-backed lifecycle actions. The
+   collapsed rail keeps the rows as a
    brand-dot icon strip (compose stays as an icon square). New chat opens a
    zero-cost draft (no session is created until the harness acts). */
 
@@ -85,6 +86,13 @@ export default function SessionsRail({
   onPinWorkflow = null,
   onSwitchWorkflow = null,
   onAbandonWorkflow = null,
+  lifecyclePendingBySession = {},
+  lifecycleErrorBySession = {},
+  lifecycleUnavailableByAction = {},
+  onRenameSession = null,
+  onCompactSession = null,
+  onForkSession = null,
+  onRetrySession = null,
 }) {
   /* Relative times tick once a minute while the rail is mounted. */
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -126,8 +134,8 @@ export default function SessionsRail({
     event.stopPropagation();
     setMenu({
       session,
-      x: Math.min(event.clientX, window.innerWidth - 170),
-      y: Math.min(event.clientY, window.innerHeight - 96),
+      x: Math.max(8, Math.min(event.clientX, window.innerWidth - 300)),
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 300)),
     });
   }, []);
 
@@ -162,19 +170,18 @@ export default function SessionsRail({
     const id = renamingId;
     const title = renameDraft.trim();
     setRenamingId("");
-    if (!id || !title) {
+    if (!id) {
       return;
     }
     if (mediaSessions.some((row) => row.id === id)) {
-      onUpdateMedia?.(id, { title });
+      if (title) onUpdateMedia?.(id, { title });
       return;
     }
-    try {
-      await invoke("session_rename", { session_id: id, title });
-    } catch {
-      // Store predates renaming — leave the daemon title in place.
-    }
-  }, [mediaSessions, onUpdateMedia, renameDraft, renamingId]);
+    /* Empty is intentional: useSessionLifecycle turns it into an OMITTED
+       title key, the daemon's documented clear operation. The displayed
+       title remains receipt/refresh-owned throughout. */
+    await onRenameSession?.(id, title || undefined);
+  }, [mediaSessions, onRenameSession, onUpdateMedia, renameDraft, renamingId]);
 
   /* Space scoping has TWO states that must not be conflated:
        - spaceMode: a space is active. The rail must NEVER fall back to the
@@ -245,6 +252,25 @@ export default function SessionsRail({
         {formatSessionRelativeTime(session.latest_at_ms, nowMs)}
       </SessionRowMeta>
     );
+  };
+
+  const lifecycleSlot = (session) => {
+    const pending = lifecyclePendingBySession[session.id] || {};
+    const pendingAction = Object.keys(pending).find((action) => pending[action]);
+    if (pendingAction) {
+      const labels = {
+        rename: "Renaming…",
+        compact: "Compacting…",
+        fork: "Forking…",
+        retry: "Retrying…",
+      };
+      return <SessionLifecyclePending role="status">{labels[pendingAction]}</SessionLifecyclePending>;
+    }
+    const error = Object.values(lifecycleErrorBySession[session.id] || {}).find(Boolean);
+    if (error) {
+      return <SessionLifecycleError title={error}>Action failed</SessionLifecycleError>;
+    }
+    return statusSlot(session);
   };
 
   const renderRow = (session) => {
@@ -347,7 +373,7 @@ export default function SessionsRail({
           {session.title}
         </SessionRowTitle>
         <RailAvailabilityAffordance session={session} />
-        {statusSlot(session)}
+        {lifecycleSlot(session)}
         {/* Row actions replace the time on hover — same slot, so the row
             never reflows under the pointer. */}
         {/* Spans, not buttons: the row itself is a button and nesting one
@@ -550,6 +576,7 @@ export default function SessionsRail({
       {menu && createPortal(
         <SessionContextMenu
           ref={menuRef}
+          role="menu"
           style={{ left: menu.x, top: menu.y }}
         >
           <SessionContextItem
@@ -559,13 +586,28 @@ export default function SessionsRail({
             <PushPin aria-hidden="true" />
             <span>{menu.session.pinned ? "Unpin" : "Pin"}</span>
           </SessionContextItem>
-          <SessionContextItem
-            onClick={() => beginRename(menu.session)}
-            type="button"
-          >
-            <Edit aria-hidden="true" />
-            <span>Rename</span>
-          </SessionContextItem>
+          {menu.session.kind === "media" ? (
+            <SessionContextItem
+              onClick={() => beginRename(menu.session)}
+              type="button"
+            >
+              <Edit aria-hidden="true" />
+              <span>Rename</span>
+            </SessionContextItem>
+          ) : (
+            <SessionLifecycleMenuItems
+              errorBySession={lifecycleErrorBySession}
+              onBeginRename={beginRename}
+              onCompact={onCompactSession}
+              onDismiss={() => setMenu(null)}
+              onFork={onForkSession}
+              onForked={(receipt) => onSelectSession?.({ id: receipt.sessionId })}
+              onRetry={onRetrySession}
+              pendingBySession={lifecyclePendingBySession}
+              session={menu.session}
+              unavailableByAction={lifecycleUnavailableByAction}
+            />
+          )}
           {menu.session.kind === "media" && (
             <SessionContextItem
               data-danger="true"
@@ -939,13 +981,41 @@ const SessionRowMeta = styled.em`
   }
 `;
 
+const SessionLifecyclePending = styled.em`
+  margin-left: auto;
+  color: var(--forge-amber);
+  font-size: 9.5px;
+  font-style: normal;
+  transition: opacity 140ms ease;
+
+  ${SessionRowButton}:hover &,
+  ${SessionRowButton}:focus-within & { opacity: 0; }
+
+  [data-collapsed="true"] & { display: none; }
+`;
+
+const SessionLifecycleError = styled.em`
+  margin-left: auto;
+  color: var(--forge-red);
+  font-size: 9.5px;
+  font-style: normal;
+  transition: opacity 140ms ease;
+
+  ${SessionRowButton}:hover &,
+  ${SessionRowButton}:focus-within & { opacity: 0; }
+
+  [data-collapsed="true"] & { display: none; }
+`;
+
 const SessionContextMenu = styled.div`
   position: fixed;
   z-index: 950;
   display: grid;
-  min-width: 148px;
+  width: min(280px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
   gap: 1px;
   padding: 4px;
+  overflow-y: auto;
   border: 1px solid var(--forge-border-strong);
   border-radius: 9px;
   background: var(--forge-surface-raised, var(--forge-surface));

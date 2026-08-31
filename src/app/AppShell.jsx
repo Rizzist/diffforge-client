@@ -43,6 +43,7 @@ import { useFleet } from "../sessions/useFleet.js";
 import { useDescendantStream } from "../sessions/useDescendantStream.js";
 import { useMonitor } from "../sessions/useMonitor.js";
 import { useWorkflowGraph } from "../sessions/useWorkflowGraph.js";
+import { useSessionLifecycle } from "../sessions/useSessionLifecycle.js";
 import {
   rosterWithConfirmedSession,
 } from "../sessions/spacesController.js";
@@ -18880,6 +18881,10 @@ export default function App() {
      cli_present, raw install states); the select receipt is the only
      binding truth the surface shows. */
   const loomApi = useLoom({ enabled: authState === "authenticated" });
+  const lifecycleApi = useSessionLifecycle({
+    enabled: authState === "authenticated",
+    refreshAuthority: refreshSessions,
+  });
   /* Workflow / convergence graphs (P1′): catalog + instances in the rail,
      graph_status in the surface chip. All eight invokes live in
      useWorkflow.js; the chip shows ONLY graph_status reads (house law:
@@ -25365,6 +25370,13 @@ export default function App() {
                           onPinWorkflow={workflowApi.pin}
                           onSwitchWorkflow={workflowApi.switch}
                           onAbandonWorkflow={workflowApi.abandon}
+                          lifecyclePendingBySession={lifecycleApi.pendingBySession}
+                          lifecycleErrorBySession={lifecycleApi.errorBySession}
+                          lifecycleUnavailableByAction={lifecycleApi.unavailableByAction}
+                          onRenameSession={lifecycleApi.rename}
+                          onCompactSession={lifecycleApi.compact}
+                          onForkSession={lifecycleApi.fork}
+                          onRetrySession={lifecycleApi.retry}
                         />
                       )}
                     </WorkspaceList>
@@ -25891,6 +25903,13 @@ export default function App() {
                           workflowGraphError={workflowGraphApi.error}
                           workflowGraphUnavailable={workflowGraphApi.unavailable}
                           onWatchWorkflowGraph={workflowGraphApi.startWatch}
+                          lifecyclePendingBySession={lifecycleApi.pendingBySession}
+                          lifecycleErrorBySession={lifecycleApi.errorBySession}
+                          lifecycleUnavailableByAction={lifecycleApi.unavailableByAction}
+                          onRenameSession={lifecycleApi.rename}
+                          onCompactSession={lifecycleApi.compact}
+                          onForkSession={lifecycleApi.fork}
+                          onRetrySession={lifecycleApi.retry}
                         />
                       )
                   )}
