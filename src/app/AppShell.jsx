@@ -43,6 +43,7 @@ import { useFleet } from "../sessions/useFleet.js";
 import { useDescendantStream } from "../sessions/useDescendantStream.js";
 import { usePeers } from "../sessions/usePeers.js";
 import { useShells } from "../sessions/useShells.js";
+import { useSshProfiles } from "../sessions/useSshProfiles.js";
 import { useCapabilities } from "../sessions/useCapabilities.js";
 import { useMonitor } from "../sessions/useMonitor.js";
 import { useCheckpoints } from "../sessions/useCheckpoints.js";
@@ -18910,6 +18911,10 @@ export default function App() {
      owns the three shell commands and four pushed subscriptions; the panel
      receives only published rows, receipts, and transient output buffers. */
   const shellRegistryApi = useShells({ enabled: authState === "authenticated" });
+  /* Daemon-owned SSH profiles and explicit per-session routing scope. The
+     hook owns all six SSH profile commands and clears write-only form
+     secrets as soon as their dispatch begins. */
+  const sshProfileApi = useSshProfiles({ enabled: authState === "authenticated" });
   /* Workspace hook trust and canonical per-session tools (Wave6-UI). The
      hook owns all four commands and keeps hooks/tools independently gated. */
   const capabilityApi = useCapabilities({ enabled: authState === "authenticated" });
@@ -25940,6 +25945,24 @@ export default function App() {
                           onLoadShells={shellRegistryApi.list}
                           onCloseShell={shellRegistryApi.close}
                           onExecShell={shellRegistryApi.exec}
+                          sshProfilesBySession={sshProfileApi.bySession}
+                          sshProfileTestsBySession={sshProfileApi.testBySession}
+                          sshScopeReceiptBySession={sshProfileApi.scopeReceiptBySession}
+                          sshMutationReceiptBySession={sshProfileApi.mutationReceiptBySession}
+                          sshProfileLoading={sshProfileApi.loading}
+                          sshProfileAdding={sshProfileApi.adding}
+                          sshProfileUpdatingByName={sshProfileApi.updatingByName}
+                          sshProfileRemovingByName={sshProfileApi.removingByName}
+                          sshProfileTestingByName={sshProfileApi.testingByName}
+                          sshProfileSettingScopeBySession={sshProfileApi.settingScopeBySession}
+                          sshProfileError={sshProfileApi.error}
+                          sshProfileUnavailable={sshProfileApi.unavailable}
+                          onLoadSshProfiles={sshProfileApi.list}
+                          onAddSshProfile={sshProfileApi.add}
+                          onUpdateSshProfile={sshProfileApi.update}
+                          onRemoveSshProfile={sshProfileApi.remove}
+                          onTestSshProfile={sshProfileApi.test}
+                          onSetSessionSshScope={sshProfileApi.setSessionScope}
                           capabilityHooksByCwd={capabilityApi.hooksByCwd}
                           capabilityToolsBySession={capabilityApi.toolsBySession}
                           capabilityHookReceiptByDigest={capabilityApi.hookReceiptByDigest}

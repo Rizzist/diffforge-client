@@ -73,6 +73,7 @@ import FleetPanel from "./FleetPanel.jsx";
 import FleetChildTranscript from "./FleetChildTranscript.jsx";
 import PeersPanel from "./PeersPanel.jsx";
 import ShellsPanel from "./ShellsPanel.jsx";
+import SshProfilesPanel from "./SshProfilesPanel.jsx";
 import CapabilitiesPanel from "./CapabilitiesPanel.jsx";
 import MonitorPanel from "./MonitorPanel.jsx";
 import CheckpointPanel from "./CheckpointPanel.jsx";
@@ -218,6 +219,24 @@ export default function SessionSurface({
   onLoadShells = null,
   onCloseShell = null,
   onExecShell = null,
+  sshProfilesBySession = {},
+  sshProfileTestsBySession = {},
+  sshScopeReceiptBySession = {},
+  sshMutationReceiptBySession = {},
+  sshProfileLoading = false,
+  sshProfileAdding = false,
+  sshProfileUpdatingByName = {},
+  sshProfileRemovingByName = {},
+  sshProfileTestingByName = {},
+  sshProfileSettingScopeBySession = {},
+  sshProfileError = "",
+  sshProfileUnavailable = false,
+  onLoadSshProfiles = null,
+  onAddSshProfile = null,
+  onUpdateSshProfile = null,
+  onRemoveSshProfile = null,
+  onTestSshProfile = null,
+  onSetSessionSshScope = null,
   capabilityHooksByCwd = {},
   capabilityToolsBySession = {},
   capabilityHookReceiptByDigest = {},
@@ -1255,6 +1274,15 @@ export default function SessionSurface({
     onLoadShells?.(id);
   }, [activeSessionId, viewModes, onLoadShells]);
 
+  /* SSH profile registry: a session-scoped list publishes both the public
+     rows and each row's explicit in_scope fact. The returned set-scope
+     receipt remains the only authority for the aggregate session scope. */
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft" || (viewModes[id] || "ui") !== "sshProfiles") return;
+    onLoadSshProfiles?.(id);
+  }, [activeSessionId, viewModes, onLoadSshProfiles]);
+
   /* Hooks and tools have independent feature gates but share one coherent
      view entry. useCapabilities.js runs the two reads independently, so a
      missing hooks_v1 never suppresses tool_inventory_v1 (or vice versa). */
@@ -2024,6 +2052,19 @@ export default function SessionSurface({
               <span>Hooks &amp; Tools</span>
             </SessionViewButton>
           )}
+          {session.id !== "draft" && (
+            <SessionViewButton
+              aria-selected={activeTabIsChat && modeFor(session.id) === "sshProfiles"}
+              data-active={activeTabIsChat && modeFor(session.id) === "sshProfiles" ? "true" : undefined}
+              onClick={() => selectView("sshProfiles")}
+              role="tab"
+              title="SSH Profiles"
+              type="button"
+            >
+              <Language aria-hidden="true" size={13} />
+              <span>SSH Profiles</span>
+            </SessionViewButton>
+          )}
           {session && session.id !== "draft" && (
             <SessionViewButton
               aria-selected={activeTabIsChat && modeFor(session.id) === "monitors"}
@@ -2489,6 +2530,38 @@ export default function SessionSurface({
                         unavailable={shellRegistryUnavailable}
                       />
                     </ShellsHostLayer>
+                  )}
+                  {/* Daemon-owned SSH profile CRUD, published reachability,
+                      and explicit session routing scope. The panel is
+                      presentational; useSshProfiles.js owns all dispatches. */}
+                  {mode === "sshProfiles" && session && session.id !== "draft" && (
+                    <SshProfilesHostLayer>
+                      <SshProfilesPanel
+                        adding={sshProfileAdding}
+                        error={sshProfileError}
+                        loading={sshProfileLoading}
+                        mutationReceipt={sshMutationReceiptBySession[session.id]}
+                        onAdd={(profile, clearSecrets) => (
+                          onAddSshProfile?.(session.id, profile, clearSecrets)
+                        )}
+                        onRefresh={() => onLoadSshProfiles?.(session.id)}
+                        onRemove={(name) => onRemoveSshProfile?.(session.id, name)}
+                        onSetScope={(scope) => onSetSessionSshScope?.(session.id, scope)}
+                        onTest={(name) => onTestSshProfile?.(session.id, name)}
+                        onUpdate={(name, changes, clearSecrets) => (
+                          onUpdateSshProfile?.(session.id, name, changes, clearSecrets)
+                        )}
+                        profiles={sshProfilesBySession[session.id]}
+                        removingByName={sshProfileRemovingByName}
+                        scopeReceipt={sshScopeReceiptBySession[session.id]}
+                        sessionId={session.id}
+                        settingScope={sshProfileSettingScopeBySession[session.id] === true}
+                        testingByName={sshProfileTestingByName}
+                        testsByName={sshProfileTestsBySession[session.id]}
+                        unavailable={sshProfileUnavailable}
+                        updatingByName={sshProfileUpdatingByName}
+                      />
+                    </SshProfilesHostLayer>
                   )}
                   {/* Workspace hook trust + canonical session tools. The
                       panel is presentational; useCapabilities.js owns all
@@ -3040,6 +3113,14 @@ const PeersHostLayer = styled.div`
 
 /* Shell registry host: ShellsPanel owns its vertical scroll. */
 const ShellsHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+`;
+
+/* SSH profile manager host: SshProfilesPanel owns its vertical scroll. */
+const SshProfilesHostLayer = styled.div`
   display: flex;
   min-height: 0;
   flex: 1;
