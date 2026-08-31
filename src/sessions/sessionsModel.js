@@ -64,18 +64,53 @@ export async function listSessions() {
     .filter(Boolean);
 }
 
-export async function createSession({ title = "", pinnedDir = "" } = {}) {
-  const row = await invoke("session_create", {
+/* The local SQLite row is only a mirror for an already-accepted daemon
+   session. Its provider identity and durable coordinates must therefore be
+   supplied by SessionCreateReceipt; this door never generates or guesses
+   them in JavaScript, and it is never called before that receipt exists. */
+export async function createSession(
+  { receipt, title = "", pinnedDir = "" } = {},
+  invokeCommand = invoke,
+) {
+  const sessionId = String(receipt?.sessionId || "").trim();
+  if (!sessionId) {
+    throw new Error("A daemon session.create receipt is required before mirroring the session.");
+  }
+  const row = await invokeCommand("session_create", {
     args: {
-      title: title || null,
-      pinned_dir: pinnedDir || null,
+      /* One roster write receives every authoritative receipt coordinate.
+         There is no create-then-bind window and no client-minted identity. */
+      id: sessionId,
+      provider_session_id: sessionId,
+      created_seq: receipt.createdSeq,
+      worker_generation: receipt.workerGeneration,
+      metadata: receipt.metadata,
+      ...(title ? { title } : {}),
+      ...(pinnedDir ? { pinned_dir: pinnedDir } : {}),
     },
   });
-  return normalizeSessionRow(row);
+  const staged = normalizeSessionRow(row);
+  if (!staged?.id) {
+    throw new Error("The local session mirror did not return a row identity.");
+  }
+  if (staged.id !== sessionId) {
+    throw new Error(
+      `The local session mirror returned “${staged.id}” instead of the daemon receipt identity “${sessionId}”. The first prompt was not submitted and the draft is preserved.`,
+    );
+  }
+  return normalizeSessionRow({
+    ...staged,
+    id: sessionId,
+    session_id: sessionId,
+    provider_session_id: sessionId,
+    created_seq: receipt.createdSeq,
+    worker_generation: receipt.workerGeneration,
+    metadata: receipt.metadata,
+  });
 }
 
-export async function updateSession(id, patch = {}) {
-  return invoke("session_update", {
+export async function updateSession(id, patch = {}, invokeCommand = invoke) {
+  const row = await invokeCommand("session_update", {
     args: {
       id,
       title: patch.title ?? null,
@@ -85,6 +120,7 @@ export async function updateSession(id, patch = {}) {
       touch: patch.touch === true ? true : null,
     },
   });
+  return normalizeSessionRow(row);
 }
 
 export async function deleteSession(id, { deleteDir = false } = {}) {

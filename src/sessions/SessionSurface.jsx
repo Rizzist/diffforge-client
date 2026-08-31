@@ -163,6 +163,9 @@ export default function SessionSurface({
   activeSessionId,
   appThemeIsLight = false,
   draftOpen,
+  draftCreateCapabilities = {},
+  draftCreateStatus = null,
+  onCreateDraftSession = null,
   onDraftMaterialized,
   onHeaderDragStart = null,
   onOpenSession,
@@ -464,6 +467,11 @@ export default function SessionSurface({
   const [commandResults, setCommandResults] = useState({});
   const [commandMenuRequests, setCommandMenuRequests] = useState({});
   const [draftError, setDraftError] = useState("");
+  const [draftCreateOptions, setDraftCreateOptions] = useState({
+    interactionMode: "",
+    autoAllow: false,
+    maxTokens: "4096",
+  });
   const submitBusyRef = useRef(false);
 
   const refreshLibrary = useCallback(async () => {
@@ -1610,13 +1618,55 @@ export default function SessionSurface({
        if the user hasn't typed again while materialization ran. */
     const gen = editGenRef.current.draft || 0;
     try {
-      const config = runConfigFromPrefs(composerPrefs.draft || {});
-      const row = await invoke("session_start_with_prompt", {
+      const prefs = composerPrefs.draft || {};
+      const values = chipValuesFor(null);
+      const numericMaxTokens = Number(draftCreateOptions.maxTokens);
+      if (draftCreateCapabilities.native
+        && (!Number.isSafeInteger(numericMaxTokens) || numericMaxTokens <= 0)) {
+        setDraftError("Max output tokens must be a positive whole number.");
+        return false;
+      }
+      const admission = {};
+      if (draftCreateCapabilities.admission) {
+        if (!values.modelProvider) admission.resolve_provider = true;
+        if (!values.model) admission.resolve_model = true;
+        if (prefs.effort && prefs.effort !== "default") admission.effort = prefs.effort;
+        if (prefs.speed === "fast") admission.fast = true;
+        if (prefs.account && prefs.account !== "default") admission.account_alias = prefs.account;
+      } else if (draftCreateCapabilities.native
+        && (!values.modelProvider || !values.model)) {
+        setDraftError("Choose a published provider and model before creating this session.");
+        return false;
+      }
+      const legacyMaterialize = () => invoke("session_start_with_prompt", {
         prompt,
         pinned_dir: null,
         attachments: attachments?.length ? attachments : null,
-        config,
+        config: runConfigFromPrefs(prefs),
       });
+      const row = onCreateDraftSession
+        ? await onCreateDraftSession({
+          attachments,
+          draft: {
+            cwd: "",
+            provider: values.modelProvider,
+            model: values.model,
+            maxTokens: numericMaxTokens,
+          },
+          legacyMaterialize,
+          options: {
+            maxTokens: numericMaxTokens,
+            ...(draftCreateOptions.interactionMode
+              ? { interactionMode: draftCreateOptions.interactionMode }
+              : {}),
+            ...(draftCreateCapabilities.permissionOverrides && draftCreateOptions.autoAllow
+              ? { permissionOverrides: { auto_allow: true } }
+              : {}),
+            ...(Object.keys(admission).length ? { admission } : {}),
+          },
+          prompt,
+        })
+        : await legacyMaterialize();
       if (row?.id) {
         if ((editGenRef.current.draft || 0) === gen) {
           setComposerText("draft", "");
@@ -1629,7 +1679,9 @@ export default function SessionSurface({
         onDraftMaterialized(row);
         return true;
       }
-      setDraftError("The session did not start. Check that haider is installed.");
+      if (!onCreateDraftSession) {
+        setDraftError("The session did not start. Check that haider is installed.");
+      }
       return false;
     } catch (error) {
       setDraftError(String(error?.message || error || "Unable to start the session."));
@@ -1639,6 +1691,9 @@ export default function SessionSurface({
     }
   }, [
     composerPrefs,
+    draftCreateCapabilities,
+    draftCreateOptions,
+    onCreateDraftSession,
     onDraftMaterialized,
     setComposerPastesFor,
     setComposerText,
@@ -2253,8 +2308,9 @@ export default function SessionSurface({
   if (draftOpen) {
     // Draft = the harness itself. Default view is the Chat composer —
     // selected and immediately typeable — with the plain haider TUI mounted
-    // warm behind it (Shell toggle). Both defer creation to the harness
-    // (session_start_with_prompt only surfaces bound rows).
+    // warm behind it (Shell toggle). Feature-gated daemons use the native
+    // create -> attach -> first-submit path; older daemons retain the shipped
+    // session_start_with_prompt materialization unchanged.
     const draftSession = {
       id: "draft",
       title: "New chat",
@@ -2279,8 +2335,16 @@ export default function SessionSurface({
                     <TerminalGlyph size={22} />
                   </EmptyStateIcon>
                   <h2>No session yet.</h2>
-                  <p>Send a message below — the Haider harness creates the session and its folder on your first message. Nothing runs until then.</p>
+                  <p>Send a message below — the Haider harness creates the session on your first message. Nothing runs until then.</p>
                   {draftError && <DraftError>{draftError}</DraftError>}
+                  {draftCreateStatus?.message && (
+                    <DraftError
+                      data-state={draftCreateStatus.phase}
+                      role={draftCreateStatus.phase === "rejected" ? "alert" : "status"}
+                    >
+                      {draftCreateStatus.message}
+                    </DraftError>
+                  )}
                 </EmptyState>
               </DraftBody>
               <SessionComposer
@@ -2298,9 +2362,15 @@ export default function SessionSurface({
                 chipValues={chipValuesFor(null)}
                 commandMenuRequest={commandMenuRequests.draft || null}
                 commandNotice={commandResults.draft || null}
+                createCapabilities={draftCreateCapabilities}
+                createOptions={draftCreateCapabilities.native ? draftCreateOptions : null}
                 onAttachmentsChange={(next) => handleAttachmentsChange({ id: "draft" }, next)}
                 onChipChange={(key, option) => handleChipChange("draft", key, option)}
                 onChipMenuOpen={() => { void refreshLibrary(); }}
+                onCreateOptionChange={(key, value) => setDraftCreateOptions((current) => ({
+                  ...current,
+                  [key]: value,
+                }))}
                 onSubmit={submitDraft}
                 onPastedBlocksChange={(blocks) => setComposerPastesFor("draft", blocks)}
                 onValueChange={(text) => setComposerText("draft", text)}

@@ -50,6 +50,7 @@ import { useMonitor } from "../sessions/useMonitor.js";
 import { useCheckpoints } from "../sessions/useCheckpoints.js";
 import { useWorkflowGraph } from "../sessions/useWorkflowGraph.js";
 import { useSessionLifecycle } from "../sessions/useSessionLifecycle.js";
+import { useSessionCreate } from "../sessions/useSessionCreate.js";
 import {
   rosterWithConfirmedSession,
 } from "../sessions/spacesController.js";
@@ -18891,6 +18892,10 @@ export default function App() {
     enabled: authState === "authenticated",
     refreshAuthority: refreshSessions,
   });
+  /* Native session.create is additive. The hook feature-gates its receipt ->
+     attach -> roster mirror -> first-submit flow and retains the legacy draft
+     materializer whenever session_mutation_v1 is absent or unavailable. */
+  const sessionCreateApi = useSessionCreate({ enabled: authState === "authenticated" });
   /* Workflow / convergence graphs (P1′): catalog + instances in the rail,
      graph_status in the surface chip. All eight invokes live in
      useWorkflow.js; the chip shows ONLY graph_status reads (house law:
@@ -25890,6 +25895,9 @@ export default function App() {
                           activeSessionId={activeSessionId}
                           appThemeIsLight={activeAppTheme === APP_THEME_LIGHT}
                           draftOpen={sessionDraftOpen}
+                          draftCreateCapabilities={sessionCreateApi.capabilities}
+                          draftCreateStatus={sessionCreateApi.status}
+                          onCreateDraftSession={sessionCreateApi.materialize}
                           onDraftMaterialized={handleDraftMaterialized}
                           onHeaderDragStart={handleTitleBarMouseDown}
                           onOpenSession={openSessionFromRail}

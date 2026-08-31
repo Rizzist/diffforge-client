@@ -65,6 +65,11 @@ export default function SessionComposer({
      absence removes the chip as well as the mode-selection callback. */
   deliveryMode = "queue",
   onDeliveryModeChange = null,
+  /* Draft-only, create-time controls. Existing sessions never receive these
+     props, so interaction mode cannot masquerade as a live session toggle. */
+  createOptions = null,
+  createCapabilities = {},
+  onCreateOptionChange = null,
 }) {
   /* The draft text is SURFACE-owned (value/onValueChange): the composer
      unmounts on every view/session switch, so component-local text would be
@@ -415,12 +420,135 @@ export default function SessionComposer({
     );
   };
 
+  const interactionModeChip = () => {
+    if (!createOptions) return null;
+    const selected = ["interactive", "autonomous"].includes(createOptions.interactionMode)
+      ? createOptions.interactionMode
+      : "";
+    const modes = [
+      {
+        value: "",
+        label: "Daemon default",
+        detail: "No interaction mode is sent; the daemon chooses its default.",
+      },
+      {
+        value: "interactive",
+        label: "Interactive",
+        detail: "The session may pause for operator input.",
+      },
+      ...(createCapabilities.autonomous ? [{
+        value: "autonomous",
+        label: "Autonomous",
+        detail: "Acts without interaction pauses; permissions still apply.",
+      }] : []),
+    ];
+    const current = modes.find((mode) => mode.value === selected) || modes[0];
+    return (
+      <ChipWrap key="create-interaction">
+        <Chip
+          data-open={openMenu === "create-interaction" ? "true" : undefined}
+          onClick={() => setOpenMenu((open) => (
+            open === "create-interaction" ? "" : "create-interaction"
+          ))}
+          type="button"
+        >
+          <em>Interaction</em>
+          <span>{current.label}</span>
+          <ChipCaret aria-hidden="true">▾</ChipCaret>
+        </Chip>
+        {openMenu === "create-interaction" && (
+          <ChipMenu role="menu">
+            {modes.map((mode) => (
+              <DeliveryModeItem
+                data-active={mode.value === selected ? "true" : undefined}
+                key={mode.value || "daemon-default"}
+                onClick={() => {
+                  setOpenMenu("");
+                  onCreateOptionChange?.("interactionMode", mode.value);
+                }}
+                role="menuitem"
+                type="button"
+              >
+                <strong>{mode.label}</strong>
+                <span>{mode.detail}</span>
+              </DeliveryModeItem>
+            ))}
+          </ChipMenu>
+        )}
+      </ChipWrap>
+    );
+  };
+
+  const permissionOverrideChip = () => {
+    if (!createOptions || !createCapabilities.permissionOverrides) return null;
+    const autoAllow = createOptions.autoAllow === true;
+    return (
+      <ChipWrap key="create-permissions">
+        <Chip
+          data-open={openMenu === "create-permissions" ? "true" : undefined}
+          onClick={() => setOpenMenu((open) => (
+            open === "create-permissions" ? "" : "create-permissions"
+          ))}
+          type="button"
+        >
+          <em>Permissions</em>
+          <span>{autoAllow ? "Auto-allow" : "Daemon policy"}</span>
+          <ChipCaret aria-hidden="true">▾</ChipCaret>
+        </Chip>
+        {openMenu === "create-permissions" && (
+          <ChipMenu role="menu">
+            <DeliveryModeItem
+              data-active={!autoAllow ? "true" : undefined}
+              onClick={() => {
+                setOpenMenu("");
+                onCreateOptionChange?.("autoAllow", false);
+              }}
+              role="menuitem"
+              type="button"
+            >
+              <strong>Daemon policy</strong>
+              <span>No permission override is sent.</span>
+            </DeliveryModeItem>
+            <DeliveryModeItem
+              data-active={autoAllow ? "true" : undefined}
+              onClick={() => {
+                setOpenMenu("");
+                onCreateOptionChange?.("autoAllow", true);
+              }}
+              role="menuitem"
+              type="button"
+            >
+              <strong>Auto-allow</strong>
+              <span>Auto-allows permission requests; separate from autonomy.</span>
+            </DeliveryModeItem>
+          </ChipMenu>
+        )}
+      </ChipWrap>
+    );
+  };
+
   return (
     <ComposerRoot ref={rootRef}>
       <ChipsRow>
         {modelChip()}
         {chip("effort", "Effort")}
         {chipOptions.speedApplicable ? chip("speed", "Speed") : null}
+        {interactionModeChip()}
+        {permissionOverrideChip()}
+        {createOptions && (
+          <CreateTokenField title="Create-time maximum output tokens">
+            <em>Max output</em>
+            <input
+              aria-label="Maximum output tokens"
+              inputMode="numeric"
+              min="1"
+              onChange={(event) => onCreateOptionChange?.("maxTokens", event.target.value)}
+              step="1"
+              type="number"
+              value={createOptions.maxTokens}
+            />
+          </CreateTokenField>
+        )}
         {deliveryModeChip()}
       </ChipsRow>
 
@@ -631,6 +759,38 @@ const Chip = styled.button`
   &[data-open="true"] {
     color: var(--forge-text);
     border-color: var(--forge-border-strong);
+  }
+`;
+
+const CreateTokenField = styled.label`
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 11px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  color: var(--forge-text-soft);
+  background: var(--forge-surface-control);
+  font-size: 10.5px;
+
+  em {
+    color: var(--forge-text-muted);
+    font-size: 9px;
+    font-style: normal;
+    font-weight: 760;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  input {
+    width: 62px;
+    padding: 0;
+    border: 0;
+    outline: 0;
+    color: var(--forge-text);
+    background: transparent;
+    font: inherit;
+    font-weight: 700;
   }
 `;
 
