@@ -41,6 +41,7 @@ import { useLoom } from "../sessions/useLoom.js";
 import { useWorkflow } from "../sessions/useWorkflow.js";
 import { useFleet } from "../sessions/useFleet.js";
 import { useDescendantStream } from "../sessions/useDescendantStream.js";
+import { usePeers } from "../sessions/usePeers.js";
 import { useMonitor } from "../sessions/useMonitor.js";
 import { useCheckpoints } from "../sessions/useCheckpoints.js";
 import { useWorkflowGraph } from "../sessions/useWorkflowGraph.js";
@@ -18900,6 +18901,9 @@ export default function App() {
   /* Live descendant upgrade for Fleet. The snapshot hook above remains the
      explicitly labeled fallback and continues to own drilldown/dispatch. */
   const descendantApi = useDescendantStream({ enabled: authState === "authenticated" });
+  /* App-level peer_messaging_v1 state, presented by SessionSurface's Peers
+     tab. usePeers owns all three commands and both pushed subscriptions. */
+  const peerApi = usePeers({ enabled: authState === "authenticated" });
   /* Monitor manager (P4): the per-session registry and delivery watch for
      the surface's Monitors view. All four monitor invokes live in
      useMonitor.js and the feature-gated daemon settles unavailable once. */
@@ -25905,6 +25909,16 @@ export default function App() {
                           onReconnectDescendantStream={descendantApi.reconnect}
                           onStartDescendantStream={descendantApi.start}
                           onStopDescendantStream={descendantApi.stop}
+                          peerRoster={peerApi.peers}
+                          peerOwnName={peerApi.ownName}
+                          peerInbox={peerApi.inbox}
+                          peerSentById={peerApi.sentById}
+                          peerError={peerApi.error}
+                          peerLoading={peerApi.loading}
+                          peerSending={peerApi.sending}
+                          peerUnavailable={peerApi.unavailable}
+                          onLoadPeers={peerApi.load}
+                          onSendPeerMessage={peerApi.send}
                           monitorBySession={monitorApi.bySession}
                           monitorDeliveries={monitorApi.deliveries}
                           monitorCursor={monitorApi.cursor}

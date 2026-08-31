@@ -70,6 +70,7 @@ import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
 import FleetPanel from "./FleetPanel.jsx";
 import FleetChildTranscript from "./FleetChildTranscript.jsx";
+import PeersPanel from "./PeersPanel.jsx";
 import MonitorPanel from "./MonitorPanel.jsx";
 import CheckpointPanel from "./CheckpointPanel.jsx";
 import WorkflowGraphView from "./WorkflowGraphView.jsx";
@@ -191,6 +192,16 @@ export default function SessionSurface({
   onReconnectDescendantStream = null,
   onStartDescendantStream = null,
   onStopDescendantStream = null,
+  peerRoster = null,
+  peerOwnName = null,
+  peerInbox = [],
+  peerSentById = {},
+  peerError = "",
+  peerLoading = false,
+  peerSending = false,
+  peerUnavailable = false,
+  onLoadPeers = null,
+  onSendPeerMessage = null,
   monitorBySession = {},
   monitorDeliveries = [],
   monitorCursor = null,
@@ -1191,6 +1202,16 @@ export default function SessionSurface({
     onStopDescendantStream,
   ]);
 
+  /* Peer messaging is app-level authority (its SDK commands carry no
+     session id) presented as a per-session tab. Entering the view refreshes
+     the roster and this client's peer name; usePeers.js owns all invokes and
+     keeps its pushed inbox alive independently of the selected session. */
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft" || (viewModes[id] || "ui") !== "peers") return;
+    onLoadPeers?.();
+  }, [activeSessionId, viewModes, onLoadPeers]);
+
   /* Monitor manager (P4): entering the view reads the authoritative
      registry and starts its delivery watch. Leaving, switching sessions,
      or unmounting stops the watch; all four invokes remain centralized in
@@ -1912,6 +1933,19 @@ export default function SessionSurface({
               <span>Fleet</span>
             </SessionViewButton>
           )}
+          {session.id !== "draft" && (
+            <SessionViewButton
+              aria-selected={activeTabIsChat && modeFor(session.id) === "peers"}
+              data-active={activeTabIsChat && modeFor(session.id) === "peers" ? "true" : undefined}
+              onClick={() => selectView("peers")}
+              role="tab"
+              title="Peer messaging"
+              type="button"
+            >
+              <Forum aria-hidden="true" size={13} />
+              <span>Peers</span>
+            </SessionViewButton>
+          )}
           {session && session.id !== "draft" && (
             <SessionViewButton
               aria-selected={activeTabIsChat && modeFor(session.id) === "monitors"}
@@ -2320,6 +2354,29 @@ export default function SessionSurface({
                       </FleetHostLayer>
                     );
                   })()}
+                  {/* App-level peer roster, receipt-backed compose, and
+                      pushed inbox shown in this per-session tab. PeersPanel
+                      is presentational; usePeers.js owns the SDK boundary. */}
+                  {mode === "peers" && session && session.id !== "draft" && (
+                    <PeersHostLayer>
+                      <PeersPanel
+                        error={peerError}
+                        inbox={peerInbox}
+                        loading={peerLoading}
+                        onRefresh={() => onLoadPeers?.()}
+                        onSend={(to, message, summary) => (
+                          summary === undefined
+                            ? onSendPeerMessage?.(to, message)
+                            : onSendPeerMessage?.(to, message, summary)
+                        )}
+                        ownName={peerOwnName}
+                        peers={peerRoster}
+                        sending={peerSending}
+                        sentById={peerSentById}
+                        unavailable={peerUnavailable}
+                      />
+                    </PeersHostLayer>
+                  )}
                   {/* Monitor manager (P4): per-source availability, the
                       listed registry, register/remove controls, and the
                       live delivery stream. MonitorPanel is presentational;
@@ -2831,6 +2888,14 @@ const FleetHostLayer = styled.div`
     flex: none;
     max-height: 45%;
   }
+`;
+
+/* Per-session host for the app-level peer messaging surface. */
+const PeersHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
 `;
 
 /* Monitor manager host: MonitorPanel owns its vertical scroll. */
