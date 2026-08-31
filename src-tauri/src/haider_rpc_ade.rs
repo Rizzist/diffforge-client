@@ -99,6 +99,7 @@ const FEATURE_CONTEXT_COMPACTION_V1: &str = "context_compaction_v1";
 const FEATURE_SESSION_FORK_V1: &str = "session_fork_v1";
 const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
 const FEATURE_CHECKPOINT_V1: &str = "checkpoint_v1";
+const FEATURE_PEER_MESSAGING_V1: &str = "peer_messaging_v1";
 const HAIDER_ACCOUNTS_UNAVAILABLE: &str = "haider_accounts_unavailable";
 const HAIDER_NEEDS_INPUT_UNAVAILABLE: &str = "haider_needs_input_unavailable";
 const HAIDER_NEEDS_INPUT_NO_CONNECTION: &str = "haider_needs_input_no_connection";
@@ -130,6 +131,8 @@ const SESSION_DESCENDANT_STREAM_EVENT: &str = "session-descendant-stream";
 const SESSION_DESCENDANT_REPAIR_EVENT: &str = "session-descendant-repair";
 const LOOM_REGISTRY_DELTA_EVENT: &str = "loom-registry-delta";
 const LOOM_REGISTRY_CAUGHT_UP_EVENT: &str = "loom-registry-caught-up";
+const PEER_MESSAGE_RECEIVED_EVENT: &str = "peer-message-received";
+const PEER_DELIVERY_CHANGED_EVENT: &str = "peer-delivery-changed";
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
 const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const FEATURE_SNIFF_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2847,6 +2850,179 @@ raw_string_enum!(TypedAgentInstallTerminalStateV1 {
     Cancelled => "cancelled",
 });
 
+raw_string_enum!(PeerKindV1 {
+    HaiderSession => "haider_session",
+    External => "external",
+});
+
+raw_string_enum!(PeerStateV1 {
+    Idle => "idle",
+    Busy => "busy",
+});
+
+// Security provenance published by the daemon. Unknown values remain
+// explicitly unknown; they are never promoted to `VerifiedHaider`.
+raw_string_enum!(PeerTrustV1 {
+    VerifiedHaider => "verified_haider",
+    UntrustedExternal => "untrusted_external",
+});
+
+raw_string_enum!(PeerDeliveryV1 {
+    Queued => "queued",
+    Delivered => "delivered",
+    Expired => "expired",
+    Refused => "refused",
+});
+
+raw_string_enum!(PeerDeliveryReasonV1 {
+    DeadlineElapsed => "deadline_elapsed",
+    TargetNeverReturned => "target_never_returned",
+    TargetUnavailable => "target_unavailable",
+    TargetRefused => "target_refused",
+    InvalidMessage => "invalid_message",
+});
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerDescriptorV1 {
+    pub id: String,
+    pub name: String,
+    pub kind: PeerKindV1,
+    pub workspace: String,
+    pub model: String,
+    pub state: PeerStateV1,
+    /// Unix epoch milliseconds. This is a timestamp, not a replay cursor.
+    pub started_at: u64,
+    /// Unix epoch milliseconds. This is a timestamp, not a replay cursor.
+    pub last_seen: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerCandidateV1 {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerSenderV1 {
+    pub id: String,
+    pub name: String,
+    pub kind: PeerKindV1,
+    /// Required security provenance. A missing field fails decoding rather
+    /// than silently acquiring a verified default.
+    pub trust: PeerTrustV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerReceiptV1 {
+    pub msg_id: String,
+    pub delivery: PeerDeliveryV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PeerDeliveryReasonV1>,
+}
+
+/// Remote `message` and `summary` strings are untrusted data. The SDK stores
+/// and forwards them unchanged and never passes them through a renderer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerMessageV1 {
+    pub msg_id: String,
+    pub from: PeerSenderV1,
+    pub to: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Unix epoch milliseconds. This is a timestamp, not a replay cursor.
+    pub queued_at: u64,
+    /// Unix epoch milliseconds. This is a timestamp, not a replay cursor.
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerListResultV1 {
+    pub agents: Vec<PeerDescriptorV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerErrorDataV1 {
+    PeerAmbiguous { candidates: Vec<PeerCandidateV1> },
+    Unknown(Value),
+}
+
+impl Serialize for PeerErrorDataV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::PeerAmbiguous { candidates } => serde_json::json!({
+                "kind": "peer_ambiguous",
+                "candidates": candidates,
+            })
+            .serialize(serializer),
+            Self::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerErrorDataV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        if raw.get("kind").and_then(Value::as_str) == Some("peer_ambiguous") {
+            #[derive(Deserialize)]
+            struct Fields {
+                candidates: Vec<PeerCandidateV1>,
+            }
+
+            let fields: Fields = serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
+            Ok(Self::PeerAmbiguous {
+                candidates: fields.candidates,
+            })
+        } else {
+            Ok(Self::Unknown(raw))
+        }
+    }
+}
+
+/// Structured peer rejection returned through Tauri. Name ambiguity keeps
+/// every candidate so callers can require an explicit identity selection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PeerCommandErrorV1 {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<PeerErrorDataV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PeerMessageReceivedPayloadV1 {
+    /// Complete daemon-authored message object, including additive fields.
+    message: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PeerDeliveryChangedPayloadV1 {
+    /// Complete daemon-authored receipt object, including additive fields.
+    receipt: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PeerWebviewEventV1 {
+    MessageReceived(PeerMessageReceivedPayloadV1),
+    DeliveryChanged(PeerDeliveryChangedPayloadV1),
+}
+
+impl PeerWebviewEventV1 {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::MessageReceived(_) => PEER_MESSAGE_RECEIVED_EVENT,
+            Self::DeliveryChanged(_) => PEER_DELIVERY_CHANGED_EVENT,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoomAuthorLocation {
     /// Daemon coordinates are one-based and cross the SDK unchanged.
@@ -4192,6 +4368,17 @@ enum RequestBody {
         worker_generation: u64,
         run_id: String,
     },
+    #[serde(rename = "peer.list")]
+    PeerList {},
+    #[serde(rename = "peer.send")]
+    PeerSend {
+        to: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    #[serde(rename = "peer.name")]
+    PeerName { name: String },
     #[serde(rename = "session.fleet")]
     SessionFleet { session_id: String },
     #[serde(rename = "session.attach")]
@@ -4641,6 +4828,12 @@ enum ResponseBody {
     CheckpointRollbackTurn {
         receipt: CheckpointMutationReceiptWire,
     },
+    #[serde(rename = "peer.list")]
+    PeerList { agents: Vec<PeerDescriptorV1> },
+    #[serde(rename = "peer.send")]
+    PeerSend { receipt: PeerReceiptV1 },
+    #[serde(rename = "peer.name")]
+    PeerName { agent: PeerDescriptorV1 },
     #[serde(rename = "session.fleet")]
     SessionFleet { snapshot: SessionFleetSnapshot },
     #[serde(rename = "session.attach")]
@@ -4970,6 +5163,12 @@ enum WireFrame {
         watch_id: String,
         high_water_cursor: u64,
     },
+    PeerMessageReceived {
+        message: Value,
+    },
+    PeerDeliveryChanged {
+        receipt: Value,
+    },
     /// Raw event records preserve future event/change/state vocabulary.
     SessionDescendantStream {
         attachment_id: String,
@@ -5003,6 +5202,34 @@ enum WireFrame {
     ProtocolError(ProtocolError),
     #[serde(other)]
     Unknown,
+}
+
+/// Separate peer notifications from the general frame stream without
+/// interpreting their remote-authored fields. Non-peer frames are returned
+/// to the ordinary dispatcher unchanged.
+fn peer_event_from_frame(frame: WireFrame) -> Result<PeerWebviewEventV1, WireFrame> {
+    match frame {
+        WireFrame::PeerMessageReceived { message } => Ok(PeerWebviewEventV1::MessageReceived(
+            PeerMessageReceivedPayloadV1 { message },
+        )),
+        WireFrame::PeerDeliveryChanged { receipt } => Ok(PeerWebviewEventV1::DeliveryChanged(
+            PeerDeliveryChangedPayloadV1 { receipt },
+        )),
+        frame => Err(frame),
+    }
+}
+
+#[cfg(unix)]
+fn emit_peer_webview_event(app: &AppHandle, event: PeerWebviewEventV1) {
+    let event_name = event.name();
+    match event {
+        PeerWebviewEventV1::MessageReceived(payload) => {
+            let _ = app.emit_to("main", event_name, payload);
+        }
+        PeerWebviewEventV1::DeliveryChanged(payload) => {
+            let _ = app.emit_to("main", event_name, payload);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5671,6 +5898,14 @@ enum ActorCommand {
         capability: Capability,
         features: FeatureGate,
         error_style: RpcErrorStyle,
+        reply: RpcReply,
+    },
+    /// A peer request also installs its webview destination before the write,
+    /// so an immediately buffered push cannot overtake command resolution.
+    PeerRequest {
+        app: AppHandle,
+        body: RequestBody,
+        capability: Capability,
         reply: RpcReply,
     },
     DescendantAttach {
@@ -7609,6 +7844,148 @@ fn checkpoint_rollback_turn_response(
     }
 }
 
+fn peer_list_request() -> RequestBody {
+    RequestBody::PeerList {}
+}
+
+fn peer_send_request(to: String, message: String, summary: Option<String>) -> RequestBody {
+    RequestBody::PeerSend {
+        to,
+        message,
+        summary,
+    }
+}
+
+fn peer_name_request(name: String) -> RequestBody {
+    RequestBody::PeerName { name }
+}
+
+impl PeerCommandErrorV1 {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: "unavailable".to_string(),
+            message: message.into(),
+            retryable: true,
+            data: None,
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            code: "protocol_error".to_string(),
+            message: message.into(),
+            retryable: false,
+            data: None,
+        }
+    }
+
+    fn from_daemon(code: String, message: String, retryable: bool, data: Option<Value>) -> Self {
+        Self {
+            code,
+            message,
+            retryable,
+            data: data.map(|raw| {
+                serde_json::from_value(raw.clone()).unwrap_or(PeerErrorDataV1::Unknown(raw))
+            }),
+        }
+    }
+}
+
+fn peer_response_error(body: ResponseBody, mismatch: &'static str) -> PeerCommandErrorV1 {
+    match body {
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => PeerCommandErrorV1::from_daemon(code, message, retryable, data),
+        _ => PeerCommandErrorV1::protocol(mismatch),
+    }
+}
+
+fn peer_list_response(body: ResponseBody) -> Result<PeerListResultV1, PeerCommandErrorV1> {
+    match body {
+        ResponseBody::PeerList { agents } => Ok(PeerListResultV1 { agents }),
+        response => Err(peer_response_error(
+            response,
+            "peer.list response method mismatch",
+        )),
+    }
+}
+
+fn peer_send_response(body: ResponseBody) -> Result<PeerReceiptV1, PeerCommandErrorV1> {
+    match body {
+        ResponseBody::PeerSend { receipt } => Ok(receipt),
+        response => Err(peer_response_error(
+            response,
+            "peer.send response method mismatch",
+        )),
+    }
+}
+
+fn peer_name_response(body: ResponseBody) -> Result<PeerDescriptorV1, PeerCommandErrorV1> {
+    match body {
+        ResponseBody::PeerName { agent } => Ok(agent),
+        response => Err(peer_response_error(
+            response,
+            "peer.name response method mismatch",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn peer_transport_error(error: String) -> PeerCommandErrorV1 {
+    if error.starts_with("missing_feature:") {
+        PeerCommandErrorV1 {
+            code: "missing_feature".to_string(),
+            message: error,
+            retryable: false,
+            data: None,
+        }
+    } else if error == "capability_denied" {
+        PeerCommandErrorV1 {
+            code: error,
+            message: "The current Haider RPC connection lacks the required capability.".to_string(),
+            retryable: false,
+            data: None,
+        }
+    } else {
+        PeerCommandErrorV1::unavailable(error)
+    }
+}
+
+#[cfg(unix)]
+async fn peer_request(
+    app: AppHandle,
+    body: RequestBody,
+    capability: Capability,
+) -> Result<ResponseBody, PeerCommandErrorV1> {
+    let (reply, answer) = oneshot::channel();
+    actor_handle()
+        .commands
+        .send(ActorCommand::PeerRequest {
+            app,
+            body,
+            capability,
+            reply,
+        })
+        .map_err(|_| PeerCommandErrorV1::unavailable("The peer RPC actor is unavailable."))?;
+
+    match tokio::time::timeout(COMMAND_REPLY_TIMEOUT, answer).await {
+        Ok(Ok(Some(Ok(response)))) => Ok(response),
+        Ok(Ok(Some(Err(error)))) => Err(peer_transport_error(error)),
+        Ok(Ok(None)) => Err(PeerCommandErrorV1::unavailable(
+            "The peer RPC connection is unavailable.",
+        )),
+        Ok(Err(_)) => Err(PeerCommandErrorV1::unavailable(
+            "The peer RPC actor dropped its response.",
+        )),
+        Err(_) => Err(PeerCommandErrorV1::unavailable(
+            "The peer RPC request timed out.",
+        )),
+    }
+}
+
 fn checkpoint_list_request(
     session_id: String,
     branch_id: Option<String>,
@@ -9274,6 +9651,74 @@ pub async fn monitor_watch(
     {
         let _ = (session_id, after_cursor);
         Err("monitor.watch unavailable on this platform".to_string())
+    }
+}
+
+/// List every currently live peer after the daemon's liveness checks. Calling
+/// this method also opts the connection into peer notifications.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn peer_list(app: AppHandle) -> Result<PeerListResultV1, PeerCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return peer_list_response(peer_request(app, peer_list_request(), Capability::View).await?);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = app;
+        Err(PeerCommandErrorV1::unavailable(
+            "peer.list unavailable on this platform",
+        ))
+    }
+}
+
+/// Queue untrusted message text exactly as supplied. `None` omits the summary
+/// wire key; it is not rewritten as an empty summary.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn peer_send(
+    app: AppHandle,
+    to: String,
+    message: String,
+    summary: Option<String>,
+) -> Result<PeerReceiptV1, PeerCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return peer_send_response(
+            peer_request(
+                app,
+                peer_send_request(to, message, summary),
+                Capability::Control,
+            )
+            .await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, to, message, summary);
+        Err(PeerCommandErrorV1::unavailable(
+            "peer.send unavailable on this platform",
+        ))
+    }
+}
+
+/// Durably rename the exactly one control-attached session and return the
+/// daemon's refreshed descriptor. This does not rewrite a local roster row.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn peer_name(
+    app: AppHandle,
+    name: String,
+) -> Result<PeerDescriptorV1, PeerCommandErrorV1> {
+    #[cfg(unix)]
+    {
+        return peer_name_response(
+            peer_request(app, peer_name_request(name), Capability::Control).await?,
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, name);
+        Err(PeerCommandErrorV1::unavailable(
+            "peer.name unavailable on this platform",
+        ))
     }
 }
 
@@ -12925,6 +13370,9 @@ fn apply_disconnected_command(
         ActorCommand::RpcRequest { reply, .. } => {
             let _ = reply.send(None);
         }
+        ActorCommand::PeerRequest { reply, .. } => {
+            let _ = reply.send(None);
+        }
         ActorCommand::DescendantAttach { reply, .. } => {
             let _ = reply.send(Err(
                 "session.descendants.attach unavailable: no ADE connection".to_string(),
@@ -12990,6 +13438,7 @@ async fn run_connected(
     let mut descendant_forwarders = DescendantForwarders::new();
     let mut pending_loom_watches: HashMap<String, PendingLoomWatch> = HashMap::new();
     let mut loom_registry_forwarders = LoomRegistryForwarders::new();
+    let mut peer_event_app = None;
     let mut pending_account_roster_watch = None;
     let mut account_roster_watch_waiters = Vec::new();
     let mut decoder = StreamingFrameDecoder::default();
@@ -13074,6 +13523,7 @@ async fn run_connected(
                             subscriptions,
                             last_published_revision,
                             roster_app,
+                            &mut peer_event_app,
                             account_roster_window,
                             &mut pending_requests,
                             &mut pending_queue_attaches,
@@ -13122,6 +13572,17 @@ async fn run_connected(
                 continue;
             }
             Err(_) => return,
+        };
+        let frame = match peer_event_from_frame(frame) {
+            Ok(event) => {
+                if connection.features.contains(FEATURE_PEER_MESSAGING_V1) {
+                    if let Some(app) = peer_event_app.as_ref() {
+                        emit_peer_webview_event(app, event);
+                    }
+                }
+                continue;
+            }
+            Err(frame) => frame,
         };
         // A decoded buffered frame gets priority over fresh commands and
         // timers; it was already read from the socket and must be kept.
@@ -13410,6 +13871,7 @@ async fn apply_connected_command(
     subscriptions: &mut HashMap<String, Subscription>,
     last_published_revision: &mut HashMap<String, u64>,
     roster_app: &mut Option<AppHandle>,
+    peer_event_app: &mut Option<AppHandle>,
     account_roster_window: &mut Option<tauri::WebviewWindow>,
     pending_requests: &mut HashMap<String, PendingRpcRequest>,
     pending_queue_attaches: &mut HashMap<String, String>,
@@ -13583,6 +14045,41 @@ async fn apply_connected_command(
                 return false;
             }
             pending_requests.insert(request_id, (reply, error_style));
+            true
+        }
+        ActorCommand::PeerRequest {
+            app,
+            body,
+            capability,
+            reply,
+        } => {
+            if !connection.grants(capability) {
+                let _ = reply.send(Some(Err("capability_denied".to_string())));
+                return true;
+            }
+            if !connection.features.contains(FEATURE_PEER_MESSAGING_V1) {
+                let _ = reply.send(Some(Err(format!(
+                    "missing_feature: daemon does not advertise {FEATURE_PEER_MESSAGING_V1}"
+                ))));
+                return true;
+            }
+
+            // Install the destination before writing the opt-in request. The
+            // next buffered frame may already be a peer notification.
+            *peer_event_app = Some(app);
+            let request_id = request_id(next_request);
+            let request = WireFrame::Request {
+                request_id: request_id.clone(),
+                body,
+            };
+            if write_frame(stream, &request, connection.frame_limit, encoding)
+                .await
+                .is_err()
+            {
+                let _ = reply.send(None);
+                return false;
+            }
+            pending_requests.insert(request_id, (reply, RpcErrorStyle::Passthrough));
             true
         }
         ActorCommand::DescendantAttach {
@@ -14326,6 +14823,8 @@ fn wire_frame_kind(frame: &WireFrame) -> &'static str {
         WireFrame::MonitorDeliveryCaughtUp { .. } => "monitor_delivery_caught_up",
         WireFrame::LoomRegistryDelta { .. } => "loom_registry_delta",
         WireFrame::LoomRegistryCaughtUp { .. } => "loom_registry_caught_up",
+        WireFrame::PeerMessageReceived { .. } => "peer_message_received",
+        WireFrame::PeerDeliveryChanged { .. } => "peer_delivery_changed",
         WireFrame::SessionDescendantStream { .. } => "session_descendant_stream",
         WireFrame::SessionDescendantRepairRequired { .. } => "session_descendant_repair_required",
         WireFrame::MenuAnswer { .. } => "menu_answer",
@@ -14706,6 +15205,11 @@ mod lifecycle_tests;
 #[allow(clippy::expect_used)]
 #[path = "haider_rpc_ade_checkpoint_tests.rs"]
 mod checkpoint_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "haider_rpc_ade_peer_tests.rs"]
+mod peer_tests;
 
 #[cfg(test)]
 mod tests {
