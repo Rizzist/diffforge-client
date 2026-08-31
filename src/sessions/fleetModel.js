@@ -31,6 +31,11 @@ const KNOWN_DELIVERY_SET = new Set([
   "delivered_subturn",
 ]);
 
+const KNOWN_CANCEL_STATUS_SET = new Set(["accepted", "already_terminal"]);
+const CANCELLABLE_AGENT_STATE_SET = new Set(["queued", "live", "waiting"]);
+const TERMINAL_AGENT_STATE_SET = new Set(["done", "failed", "cancelled"]);
+const DECIMAL_STRING = /^\d+$/;
+
 function finiteOrNull(value) {
   return Number.isFinite(value) ? value : null;
 }
@@ -185,6 +190,77 @@ export function messageReceiptView(receipt) {
     },
     childRunId: String(receipt?.child_run_id ?? ""),
     childRunState: receipt?.child_run_state ?? null,
+  };
+}
+
+/* agent.cancel receipt. `accepted` means only that cancellation was
+   requested: this view deliberately has no node state and can never turn
+   that receipt into a locally invented `cancelled` publication.
+   `already_terminal` is a normal typed outcome. Future status strings stay
+   raw and visibly unknown. terminal_seq accepts only the SDK's decimal-
+   string form and is carried character-for-character (including leading
+   zeroes); absence or any non-string/non-decimal value remains null. */
+export function cancelReceiptView(receipt) {
+  const raw = typeof receipt?.status === "string"
+    ? receipt.status
+    : String(receipt?.status ?? "");
+  const terminalSeq = typeof receipt?.terminal_seq === "string"
+    && DECIMAL_STRING.test(receipt.terminal_seq)
+    ? receipt.terminal_seq
+    : null;
+  return {
+    agent: String(receipt?.agent ?? ""),
+    childSessionId: String(receipt?.child_session_id ?? ""),
+    childRunId: String(receipt?.child_run_id ?? ""),
+    status: {
+      kind: KNOWN_CANCEL_STATUS_SET.has(raw) ? raw : "unknown",
+      label: raw,
+      raw,
+    },
+    terminalSeq,
+  };
+}
+
+/* Cancel eligibility comes ONLY from the fleet node's published state view.
+   queued/live/waiting are the closed eligible set. Terminal, unknown, and
+   absent publications are disabled with distinct honest reasons; task text,
+   ids, metrics, and receipt state can never imply eligibility. Addressing is
+   checked separately by the panel because it is an independent wire fact. */
+export function cancelEligibility(node) {
+  const publication = node?.state;
+  const raw = publication && typeof publication === "object"
+    && typeof publication.raw === "string" && publication.raw.length > 0
+    ? publication.raw
+    : null;
+  if (raw == null) {
+    return {
+      kind: "unknown",
+      eligible: false,
+      publishedState: null,
+      reason: "Cancel unavailable: agent state was not published by the daemon.",
+    };
+  }
+  if (CANCELLABLE_AGENT_STATE_SET.has(raw)) {
+    return {
+      kind: "eligible",
+      eligible: true,
+      publishedState: raw,
+      reason: "",
+    };
+  }
+  if (TERMINAL_AGENT_STATE_SET.has(raw)) {
+    return {
+      kind: "terminal",
+      eligible: false,
+      publishedState: raw,
+      reason: `Cancel unavailable: published agent state is “${raw}” (already terminal).`,
+    };
+  }
+  return {
+    kind: "unknown",
+    eligible: false,
+    publishedState: raw,
+    reason: `Cancel unavailable: published agent state “${raw}” is unrecognized.`,
   };
 }
 

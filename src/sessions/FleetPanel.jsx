@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 import styled from "styled-components";
 
-import { findFleetNode, nodeLabel } from "./fleetModel.js";
+import { cancelEligibility, findFleetNode, nodeLabel } from "./fleetModel.js";
 
 /* Subagent fleet panel (P2). PRESENTATIONAL ONLY — every daemon read/write
    lives in useFleet.js; this component renders fleetModel views and
@@ -17,8 +17,11 @@ import { findFleetNode, nodeLabel } from "./fleetModel.js";
      daemon-assigned identity;
    - an UNREAD fleet ("Fleet not read.") and an available-but-empty fleet
      ("No subagents.") are distinct states;
-   - the composer messages only a REAL selected agent through its REAL
-     parent session id, and is disabled when the fleet is unavailable. */
+   - message and cancel dispatch only through a node's REAL parent session
+     id + agent id. A missing parent disables both controls with the same
+     honest note;
+   - an accepted cancel receipt stays "cancel requested" pending until the
+     fleet/descendant authority publishes a terminal node state. */
 
 const STATE_ORDER = ["queued", "live", "waiting", "done", "failed", "cancelled"];
 
@@ -40,7 +43,75 @@ function compactJson(value) {
   }
 }
 
-function FleetNodeRows({ node, level, selectedAgentId, onSelectNode }) {
+/* Shared by the message composer and per-row Cancel control: neither may
+   guess the current surface/session as a missing parent coordinate. */
+function nodeAddressing(node) {
+  if (node?.parentSessionId == null) {
+    return {
+      addressable: false,
+      reason: "parent session unknown; cannot address this agent",
+    };
+  }
+  if (!node.agentId) {
+    return {
+      addressable: false,
+      reason: "agent id unknown; cannot address this agent",
+    };
+  }
+  return { addressable: true, reason: "" };
+}
+
+function CancelFeedback({ cancelReason, cancelState, eligibility }) {
+  const receipt = cancelState?.receipt;
+  const terminalSeq = receipt?.terminalSeq;
+  if (receipt?.status.kind === "accepted") {
+    if (eligibility.kind === "terminal") {
+      return (
+        <NodeCancelNote>
+          finished in published state: {eligibility.publishedState}
+          {terminalSeq != null && <> · terminal seq {terminalSeq}</>}
+        </NodeCancelNote>
+      );
+    }
+    return (
+      <NodeCancelNote data-kind="pending">
+        cancel requested (pending)
+        {terminalSeq != null && <> · terminal seq {terminalSeq}</>}
+      </NodeCancelNote>
+    );
+  }
+  if (receipt?.status.kind === "already_terminal") {
+    return (
+      <NodeCancelNote>
+        already finished
+        {terminalSeq != null && <> · terminal seq {terminalSeq}</>}
+      </NodeCancelNote>
+    );
+  }
+  if (receipt?.status.kind === "unknown") {
+    return (
+      <NodeCancelNote data-kind="unknown">
+        unrecognized cancel status: {receipt.status.raw || "(unnamed)"}
+        {terminalSeq != null && <> · terminal seq {terminalSeq}</>}
+      </NodeCancelNote>
+    );
+  }
+  if (cancelState?.error) {
+    return <NodeCancelError role="alert">Cancel failed: {cancelState.error}</NodeCancelError>;
+  }
+  if (cancelReason) return <NodeCancelNote>{cancelReason}</NodeCancelNote>;
+  return null;
+}
+
+function FleetNodeRows({
+  cancelByAgent,
+  cancelUnavailable,
+  node,
+  level,
+  onCancelAgent,
+  selectedAgentId,
+  onSelectNode,
+}) {
   const label = nodeLabel(node);
   const stateKind = node.state?.kind ?? "unknown";
   const stateLabel = node.state == null
@@ -48,33 +119,76 @@ function FleetNodeRows({ node, level, selectedAgentId, onSelectNode }) {
     : node.state.kind === "unknown"
       ? `unrecognized state: ${node.state.label || "(unnamed)"}`
       : node.state.label;
+  const eligibility = cancelEligibility(node);
+  const addressing = nodeAddressing(node);
+  const cancelState = cancelByAgent[node.agentId] || null;
+  const commandUnavailableReason = typeof cancelUnavailable === "string"
+    ? cancelUnavailable
+    : cancelUnavailable
+      ? "Cancel unavailable on this daemon."
+      : "";
+  const callbackUnavailableReason = typeof onCancelAgent === "function"
+    ? ""
+    : "Cancel unavailable: cancel control is not mounted.";
+  const cancelReason = addressing.reason || eligibility.reason
+    || commandUnavailableReason || callbackUnavailableReason;
+  const requestPending = Boolean(cancelState?.pending) && eligibility.kind !== "terminal";
+  const cancelDisabled = Boolean(cancelReason) || requestPending
+    || cancelState?.receipt != null;
   return (
     <>
-      <NodeRow
-        data-bounded={node.bounded ? "true" : undefined}
-        data-selected={node.agentId === selectedAgentId ? "true" : undefined}
-        data-state={stateKind}
-        onClick={() => onSelectNode?.(node)}
-        style={{ "--fleet-indent": `${level * 16}px` }}
-        title="Open this subagent's nested transcript"
-        type="button"
-      >
-        <NodeStateDot aria-hidden="true" data-state={stateKind} />
-        {label.fallback ? (
-          <NodeFallbackId title="No daemon callsign — showing the agent id (client fallback)">
-            id:{label.text || "unknown"}
-          </NodeFallbackId>
-        ) : (
-          <NodeCallsign>{label.text}</NodeCallsign>
-        )}
-        <NodeTask>{node.task}</NodeTask>
-        <NodeState data-state={stateKind}>{stateLabel}</NodeState>
-      </NodeRow>
+      <NodeLine style={{ "--fleet-indent": `${level * 16}px` }}>
+        <NodeRow
+          data-bounded={node.bounded ? "true" : undefined}
+          data-selected={node.agentId === selectedAgentId ? "true" : undefined}
+          data-state={stateKind}
+          onClick={() => onSelectNode?.(node)}
+          title="Open this subagent's nested transcript"
+          type="button"
+        >
+          <NodeStateDot aria-hidden="true" data-state={stateKind} />
+          {label.fallback ? (
+            <NodeFallbackId title="No daemon callsign — showing the agent id (client fallback)">
+              id:{label.text || "unknown"}
+            </NodeFallbackId>
+          ) : (
+            <NodeCallsign>{label.text}</NodeCallsign>
+          )}
+          <NodeTask>{node.task}</NodeTask>
+          <NodeState data-state={stateKind}>{stateLabel}</NodeState>
+        </NodeRow>
+        <NodeCancelControl>
+          <NodeCancelButton
+            disabled={cancelDisabled}
+            onClick={() => {
+              if (cancelDisabled) return;
+              void onCancelAgent(node.parentSessionId, node.agentId);
+            }}
+            title={requestPending
+              ? "Cancel requested; waiting for a terminal fleet publication"
+              : cancelReason || "Request cancellation for this published non-terminal agent"}
+            type="button"
+          >
+            {requestPending && cancelState.receipt == null ? "Cancelling…" : "Cancel"}
+          </NodeCancelButton>
+          <CancelFeedback
+            cancelReason={cancelReason}
+            cancelState={cancelState}
+            eligibility={eligibility}
+          />
+          {cancelState?.receipt != null && addressing.reason && (
+            <NodeCancelNote>{addressing.reason}</NodeCancelNote>
+          )}
+        </NodeCancelControl>
+      </NodeLine>
       {node.children.map((child) => (
         <FleetNodeRows
+          cancelByAgent={cancelByAgent}
+          cancelUnavailable={cancelUnavailable}
           key={child.agentId || child.sessionId}
           level={level + 1}
           node={child}
+          onCancelAgent={onCancelAgent}
           onSelectNode={onSelectNode}
           selectedAgentId={selectedAgentId}
         />
@@ -89,6 +203,8 @@ function FleetNodeRows({ node, level, selectedAgentId, onSelectNode }) {
 }
 
 export default function FleetPanel({
+  cancelByAgent = {},
+  cancelUnavailable = "",
   entry = undefined,
   error = "",
   fallbackEntry = undefined,
@@ -99,6 +215,7 @@ export default function FleetPanel({
   onRefresh = null,
   onReconnect = null,
   onObserveAll = null,
+  onCancelAgent = null,
   onSendMessage = null,
   streamError = "",
   streamLoading = false,
@@ -111,9 +228,10 @@ export default function FleetPanel({
 
   const selectedNode = entry ? findFleetNode(entry.tree, selectedAgentId) : null;
   const selectedLabel = selectedNode ? nodeLabel(selectedNode) : null;
+  const selectedAddressing = nodeAddressing(selectedNode);
 
   const commitSend = useCallback(async () => {
-    if (!selectedNode || !messageText.trim() || sending) return;
+    if (!selectedNode || !selectedAddressing.addressable || !messageText.trim() || sending) return;
     setSending(true);
     try {
       const result = await onSendMessage?.(selectedNode, messageText);
@@ -124,7 +242,7 @@ export default function FleetPanel({
     } finally {
       setSending(false);
     }
-  }, [messageText, onSendMessage, selectedNode, sending]);
+  }, [messageText, onSendMessage, selectedAddressing.addressable, selectedNode, sending]);
 
   const isLive = streamMode === "live" && entry != null;
 
@@ -322,9 +440,12 @@ export default function FleetPanel({
             <FleetTree role="tree">
               {roots.map((node) => (
                 <FleetNodeRows
+                  cancelByAgent={cancelByAgent}
+                  cancelUnavailable={cancelUnavailable}
                   key={node.agentId || node.sessionId}
                   level={0}
                   node={node}
+                  onCancelAgent={onCancelAgent}
                   onSelectNode={onSelectNode}
                   selectedAgentId={selectedAgentId}
                 />
@@ -344,15 +465,15 @@ export default function FleetPanel({
                   ) : (
                     <strong>{selectedLabel.text}</strong>
                   )}
-                  {selectedNode.parentSessionId == null && (
+                  {!selectedAddressing.addressable && (
                     <ComposerWarn>
-                      {" "}— parent session unknown; cannot address this agent
+                      {" "}— {selectedAddressing.reason}
                     </ComposerWarn>
                   )}
                 </ComposerTarget>
                 <ComposerRow>
                   <ComposerInput
-                    disabled={selectedNode.parentSessionId == null}
+                    disabled={!selectedAddressing.addressable}
                     onChange={(event) => setMessageText(event.target.value)}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" && !event.shiftKey) {
@@ -366,7 +487,7 @@ export default function FleetPanel({
                   />
                   <ComposerSend
                     disabled={sending || !messageText.trim()
-                      || selectedNode.parentSessionId == null}
+                      || !selectedAddressing.addressable}
                     onClick={() => { void commitSend(); }}
                     type="button"
                   >
@@ -532,12 +653,20 @@ const FleetTree = styled.div`
   gap: 2px;
 `;
 
-const NodeRow = styled.button`
+const NodeLine = styled.div`
   display: flex;
-  align-items: baseline;
+  align-items: flex-start;
   gap: 7px;
   min-width: 0;
   margin-left: var(--fleet-indent, 0px);
+`;
+
+const NodeRow = styled.button`
+  display: flex;
+  flex: 1;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
   padding: 4px 8px;
   border: 1px solid transparent;
   border-radius: 6px;
@@ -553,6 +682,50 @@ const NodeRow = styled.button`
     border-color: var(--forge-border-strong);
     background: var(--forge-surface);
   }
+`;
+
+const NodeCancelControl = styled.span`
+  display: flex;
+  flex: 0 1 260px;
+  min-width: 84px;
+  align-items: flex-end;
+  flex-direction: column;
+  gap: 2px;
+`;
+
+const NodeCancelButton = styled.button`
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 6px;
+  color: var(--forge-danger, #d66);
+  background: var(--forge-surface);
+  font-size: 10.5px;
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    background: var(--forge-surface-hover);
+  }
+
+  &:disabled {
+    color: var(--forge-text-muted);
+    opacity: 0.65;
+    cursor: default;
+  }
+`;
+
+const NodeCancelNote = styled.small`
+  color: var(--forge-text-muted);
+  font-size: 10px;
+  line-height: 1.2;
+  text-align: right;
+
+  &[data-kind="pending"] { color: var(--forge-warning, #ca4); }
+  &[data-kind="unknown"] { font-style: italic; }
+`;
+
+const NodeCancelError = styled(NodeCancelNote)`
+  color: var(--forge-danger, #d66);
 `;
 
 const NodeStateDot = styled.i`

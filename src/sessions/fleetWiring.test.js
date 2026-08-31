@@ -1,18 +1,30 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 /* Source-introspection wiring pins for the subagent fleet UI (P2). These
-   guard consumer wiring the pure fleetModel tests cannot observe: the four
-   P0.5 fleet commands with their snake_case arg keys living ONLY in
+   guard consumer wiring the pure fleetModel tests cannot observe: the five
+   fleet commands with their snake_case arg keys living ONLY in
    useFleet.js (the single reconcile point), the SessionSurface Fleet view
    mount fed from AppShell's useFleet, the authoritative child transcript
    reuse, and the house-law honesty wording (folded/bounded, no-data,
    fallback labeling, unread ≠ empty). */
 
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
+const srcRoot = fileURLToPath(new URL("../", import.meta.url));
 
-test("[pin] useFleet invokes the four fleet commands with snake_case arg keys", () => {
+function productionJsSources(directory = srcRoot) {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) return productionJsSources(path);
+    if (!/\.(?:js|jsx|mjs)$/.test(entry.name) || /\.(?:test|spec)\./.test(entry.name)) return [];
+    return [{ path, source: readFileSync(path, "utf8") }];
+  });
+}
+
+test("[pin] useFleet invokes the five fleet commands with snake_case arg keys", () => {
   const source = read("./useFleet.js");
 
   assert.match(source, /invoke\("session_fleet", \{ session_id: sessionId \}\)/,
@@ -46,12 +58,21 @@ test("[pin] useFleet invokes the four fleet commands with snake_case arg keys", 
   for (const key of ["session_id: sessionId", "agent: agentId", "text: body"]) {
     assert.ok(messageBlock.includes(key), `agent_message must pass ${key}`);
   }
+
+  const cancelStart = source.indexOf('invoke("agent_cancel", {');
+  assert.notEqual(cancelStart, -1, "agent_cancel must be invoked");
+  const cancelBlock = source.slice(cancelStart, source.indexOf("})", cancelStart));
+  for (const key of ["session_id: sessionId", "agent: agentId"]) {
+    assert.ok(cancelBlock.includes(key), `agent_cancel must pass ${key}`);
+  }
+  assert.ok(!cancelBlock.includes("text:"),
+    "agent_cancel accepts only the real parent session + agent coordinates");
 });
 
 test("[pin] every fleet invoke lives in useFleet.js — components are presentational", () => {
   const hook = read("./useFleet.js");
   for (const command of [
-    "session_fleet", "session_observe", "session_observe_batch", "agent_message",
+    "session_fleet", "session_observe", "session_observe_batch", "agent_message", "agent_cancel",
   ]) {
     assert.ok(hook.includes(`invoke("${command}"`), `useFleet must own ${command}`);
     assert.equal((hook.match(new RegExp(`invoke\\("${command}"`, "g")) || []).length, 1,
@@ -62,6 +83,27 @@ test("[pin] every fleet invoke lives in useFleet.js — components are presentat
     assert.ok(!text.includes("invoke("),
       `${consumer} must not call invoke at all — every dispatch rides useFleet callbacks`);
   }
+});
+
+test("[pin] agent_cancel exists only in useFleet and its gate cannot disable other fleet commands", () => {
+  const hook = read("./useFleet.js");
+  assert.equal((hook.match(/invoke\("agent_cancel"/g) || []).length, 1,
+    "agent_cancel has exactly one centralized dispatch");
+  const owners = productionJsSources()
+    .filter(({ source }) => source.includes('invoke("agent_cancel"'))
+    .map(({ path }) => relative(srcRoot, path).replaceAll("\\", "/"));
+  assert.deepEqual(owners, ["sessions/useFleet.js"],
+    "no other production JS/JSX module may dispatch agent_cancel");
+  assert.match(hook, /const cancelUnavailableRef = useRef\(false\)/,
+    "cancel has an independent settle-once feature gate");
+  assert.match(hook, /cancelUnavailableRef\.current = true/,
+    "a feature-gated cancel settles unavailable once");
+  assert.match(hook, /!agentId \|\| cancelUnavailableRef\.current/,
+    "settled cancel unavailability must stop future cancel dispatches");
+  assert.doesNotMatch(hook, /cancelUnavailableRef\.current[\s\S]{0,160}markUnavailable\(/,
+    "cancel unavailability must not mark the other fleet commands unavailable");
+  assert.equal((hook.match(/unavailableRef\.current\) return null;/g) || []).length, 4,
+    "the original four commands retain their independent shared gate");
 });
 
 test("[pin] dispatches carry only REAL coordinates: batch bound 1..64, message trims to non-empty", () => {
@@ -183,6 +225,52 @@ test("[pin] the honest wording renders: folded/bounded, no-data, fallback labeli
   assert.ok(panel.includes("No subagents."), "an available-but-empty fleet has its own wording");
   assert.ok(panel.includes("Subagent fleet is unavailable on this daemon."),
     "an unavailable fleet has its own wording");
+});
+
+test("[pin] Cancel stays receipt-first, decimal-string-safe, and honestly addressed", () => {
+  const model = read("./fleetModel.js");
+  const hook = read("./useFleet.js");
+  const panel = read("./FleetPanel.jsx");
+
+  assert.match(hook, /const \[cancelByAgent, setCancelByAgent\] = useState\(\{\}\)/,
+    "cancel pending/receipt/error state must be per agent node");
+  assert.match(hook, /pending: view\.status\.kind === "accepted"/,
+    "accepted stays pending while authority still publishes a non-terminal node");
+  assert.match(panel, /const eligibility = cancelEligibility\(node\)/,
+    "the control must use the published-state-only model helper");
+  assert.match(panel, /onCancelAgent\(node\.parentSessionId, node\.agentId\)/,
+    "Cancel must dispatch with the node's real parent session + agent id");
+  assert.equal((panel.match(/parent session unknown; cannot address this agent/g) || []).length, 1,
+    "unknown-parent wording must live once in the shared addressing helper");
+  assert.match(panel, /const addressing = nodeAddressing\(node\)/,
+    "Cancel must use the shared node-addressing helper");
+  assert.match(panel, /const selectedAddressing = nodeAddressing\(selectedNode\)/,
+    "the message composer must use that same addressing helper");
+  assert.match(panel, /requestPending = Boolean\(cancelState\?\.pending\)[\s\S]{0,80}eligibility\.kind !== "terminal"/,
+    "a terminal fleet publication must end the accepted-receipt pending presentation");
+
+  for (const wording of [
+    "cancel requested (pending)",
+    "already finished",
+    "unrecognized cancel status:",
+  ]) {
+    assert.ok(panel.includes(wording), `FleetPanel must render “${wording}”`);
+  }
+  assert.match(panel, /terminalSeq != null &&/,
+    "terminal_seq absence must omit the sequence wording");
+
+  const cancelModelStart = model.indexOf("export function cancelReceiptView");
+  assert.notEqual(cancelModelStart, -1, "cancelReceiptView must exist");
+  const cancelModelBlock = model.slice(
+    cancelModelStart,
+    model.indexOf("export function cancelEligibility", cancelModelStart),
+  );
+  assert.match(cancelModelBlock, /typeof receipt\?\.terminal_seq === "string"/,
+    "terminal_seq must accept the pinned string shape only");
+  assert.doesNotMatch(cancelModelBlock, /Number\(|parseInt\(/,
+    "terminal_seq must never pass through lossy JS number parsing");
+  assert.doesNotMatch(`${hook}\n${panel}`, /Number\([^\n]*terminalSeq|parseInt\([^\n]*terminalSeq/,
+    "terminal_seq consumers must show the preserved string without numeric parsing");
 });
 
 test("[pin] the child transcript is authoritative: the child session's own feed, real lineage", () => {

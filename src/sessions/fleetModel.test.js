@@ -4,6 +4,8 @@ import test from "node:test";
 
 import {
   agentStateView,
+  cancelEligibility,
+  cancelReceiptView,
   findFleetNode,
   fleetNodeView,
   fleetSessionIds,
@@ -247,6 +249,92 @@ test("[pin] parent lineage is verbatim-or-null: an absent parent is UNKNOWN, nev
   assert.equal(findFleetNode(tree, "agent-not-here"), null,
     "an unknown agent id resolves to null, never a substitute node");
   assert.equal(findFleetNode(tree, ""), null);
+});
+
+/* ---- W7 cancel house laws ---------------------------------------------- */
+
+test("[pin] already_terminal is a normal cancel outcome, never a failure", () => {
+  const receipt = cancelReceiptView({
+    agent: "agent-abcdef123456",
+    child_session_id: "child-sess-1",
+    child_run_id: "run-9",
+    status: "already_terminal",
+    terminal_seq: "18446744073709551615",
+  });
+  assert.equal(receipt.status.kind, "already_terminal",
+    "a cancel-vs-terminal race must remain the normal already_terminal outcome");
+  assert.equal(receipt.status.raw, "already_terminal");
+  assert.equal(Object.hasOwn(receipt, "error"), false,
+    "already_terminal must never be remodeled as a failure");
+});
+
+test("[pin] accepted means cancel requested only and never invents a cancelled node state", () => {
+  const publishedNode = fleetNodeView(wireNode({ state: "live" }));
+  const receipt = cancelReceiptView({
+    agent: publishedNode.agentId,
+    child_session_id: publishedNode.sessionId,
+    child_run_id: "run-live",
+    status: "accepted",
+  });
+  assert.equal(receipt.status.kind, "accepted");
+  assert.notEqual(receipt.status.kind, "cancelled",
+    "an accepted request is not a cancelled publication");
+  assert.equal(Object.hasOwn(receipt, "state"), false,
+    "the receipt view must expose no synthetic node-state field");
+  assert.equal(publishedNode.state.kind, "live",
+    "the node stays in its published state until fleet/descendant authority updates it");
+});
+
+test("[pin] terminal_seq remains a decimal string shown as-is; absence is never fabricated", () => {
+  const exact = "00018446744073709551615";
+  const receipt = cancelReceiptView({ status: "already_terminal", terminal_seq: exact });
+  assert.equal(receipt.terminalSeq, exact,
+    "terminal_seq must survive character-for-character without numeric coercion");
+  assert.equal(typeof receipt.terminalSeq, "string");
+  assert.equal(cancelReceiptView({ status: "accepted" }).terminalSeq, null,
+    "an absent terminal_seq stays absent");
+  assert.equal(cancelReceiptView({ status: "accepted", terminal_seq: 42 }).terminalSeq, null,
+    "a number is not the pinned decimal-string wire shape");
+  assert.equal(cancelReceiptView({ status: "accepted", terminal_seq: "42x" }).terminalSeq, null,
+    "a non-decimal string is not a terminal sequence");
+});
+
+test("[pin] cancel eligibility uses only queued/live/waiting published states", () => {
+  for (const state of ["queued", "live", "waiting"]) {
+    const eligibility = cancelEligibility(fleetNodeView(wireNode({ state })));
+    assert.equal(eligibility.eligible, true, `${state} is published non-terminal`);
+    assert.equal(eligibility.publishedState, state);
+  }
+  for (const state of ["done", "failed", "cancelled"]) {
+    const eligibility = cancelEligibility(fleetNodeView(wireNode({ state })));
+    assert.equal(eligibility.eligible, false, `${state} is published terminal`);
+    assert.equal(eligibility.kind, "terminal");
+  }
+
+  const future = cancelEligibility(fleetNodeView(wireNode({ state: "hibernating" })));
+  assert.equal(future.eligible, false, "an unknown published state never implies liveness");
+  assert.equal(future.kind, "unknown");
+  assert.equal(future.publishedState, "hibernating",
+    "an unknown state remains raw so the disabled reason is honest");
+
+  const absent = wireNode({ task: "live and still working" });
+  delete absent.state;
+  const absentEligibility = cancelEligibility(fleetNodeView(absent));
+  assert.equal(absentEligibility.eligible, false,
+    "task prose and other node facts cannot substitute for a published state");
+  assert.equal(absentEligibility.publishedState, null);
+});
+
+test("cancelReceiptView preserves an unknown status raw and marked unrecognized", () => {
+  const receipt = cancelReceiptView({
+    agent: "agent-1",
+    child_session_id: "child-1",
+    child_run_id: "run-1",
+    status: "queued_for_cancellation",
+  });
+  assert.equal(receipt.status.kind, "unknown");
+  assert.equal(receipt.status.label, "queued_for_cancellation");
+  assert.equal(receipt.status.raw, "queued_for_cancellation");
 });
 
 /* ---- supporting shapes ------------------------------------------------- */
