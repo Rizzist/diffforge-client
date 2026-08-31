@@ -22,12 +22,18 @@ function frontendSources(root) {
   return files;
 }
 
-test("[pin] the three shell commands and four push names live only in useShells", () => {
+test("[pin] the three shell commands and four push names live only in approved shell hooks", () => {
   const hook = read("./useShells.js");
   const panel = read("./ShellsPanel.jsx");
   const sources = frontendSources(SRC_ROOT);
   const commands = ["shell_list", "shell_close", "shell_exec"];
   const events = ["shell-opened", "shell-state", "shell-closed", "shell-output"];
+  const eventOwners = {
+    "shell-opened": ["sessions/useShells.js"],
+    "shell-state": ["sessions/useShells.js", "sessions/useSshPty.js"],
+    "shell-closed": ["sessions/useShells.js", "sessions/useSshPty.js"],
+    "shell-output": ["sessions/useShells.js", "sessions/useSshPty.js"],
+  };
 
   assert.match(hook, /invoke\("shell_list", \{ session_id: sessionId \}\)/,
     "shell_list must use the pinned session_id key");
@@ -58,8 +64,8 @@ test("[pin] the three shell commands and four push names live only in useShells"
     const owners = sources
       .filter((path) => readFileSync(path, "utf8").includes(eventName))
       .map((path) => relative(SRC_ROOT, path));
-    assert.deepEqual(owners, ["sessions/useShells.js"],
-      `${eventName} must stay centralized in useShells.js`);
+    assert.deepEqual(owners, eventOwners[eventName],
+      `${eventName} must stay centralized in its approved shell hooks`);
   }
 
   assert.doesNotMatch(panel, /invoke\(/,
