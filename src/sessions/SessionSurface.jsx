@@ -11,6 +11,7 @@ import {
 import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
+import { Build } from "@styled-icons/material-rounded/Build";
 import { Forum } from "@styled-icons/material-rounded/Forum";
 import { History } from "@styled-icons/material-rounded/History";
 import { Language } from "@styled-icons/material-rounded/Language";
@@ -72,6 +73,7 @@ import FleetPanel from "./FleetPanel.jsx";
 import FleetChildTranscript from "./FleetChildTranscript.jsx";
 import PeersPanel from "./PeersPanel.jsx";
 import ShellsPanel from "./ShellsPanel.jsx";
+import CapabilitiesPanel from "./CapabilitiesPanel.jsx";
 import MonitorPanel from "./MonitorPanel.jsx";
 import CheckpointPanel from "./CheckpointPanel.jsx";
 import WorkflowGraphView from "./WorkflowGraphView.jsx";
@@ -79,6 +81,7 @@ import SessionLifecycleMenuItems from "./SessionLifecycleMenuItems.jsx";
 import { findFleetNode, fleetSessionIds } from "./fleetModel.js";
 import {
   formatSessionRelativeTime,
+  sessionWorkingDirectory,
   sessionModelProviderFallback,
 } from "./sessionsModel.js";
 import {
@@ -215,6 +218,21 @@ export default function SessionSurface({
   onLoadShells = null,
   onCloseShell = null,
   onExecShell = null,
+  capabilityHooksByCwd = {},
+  capabilityToolsBySession = {},
+  capabilityHookReceiptByDigest = {},
+  capabilityHookPendingByDigest = {},
+  capabilityHookError = "",
+  capabilityToolError = "",
+  capabilityHookLoading = false,
+  capabilityToolLoading = false,
+  capabilityHooksUnavailable = false,
+  capabilityToolsUnavailable = false,
+  onLoadCapabilities = null,
+  onLoadCapabilityHooks = null,
+  onLoadCapabilityTools = null,
+  onTrustHook = null,
+  onRevokeHook = null,
   monitorBySession = {},
   monitorDeliveries = [],
   monitorCursor = null,
@@ -1161,6 +1179,9 @@ export default function SessionSurface({
   const activeCheckpointBranchId = useMemo(() => publishedCheckpointBranchId(
     sessions.find((candidate) => candidate.id === activeSessionId),
   ), [activeSessionId, sessions]);
+  const activeCapabilityCwd = useMemo(() => sessionWorkingDirectory(
+    sessions.find((candidate) => candidate.id === activeSessionId),
+  ), [activeSessionId, sessions]);
   const setModeFor = useCallback((sessionId, mode) => {
     setViewModes((current) => ({ ...current, [sessionId]: mode }));
     if (mode === "terminal") {
@@ -1233,6 +1254,15 @@ export default function SessionSurface({
     if (!id || id === "draft" || (viewModes[id] || "ui") !== "shells") return;
     onLoadShells?.(id);
   }, [activeSessionId, viewModes, onLoadShells]);
+
+  /* Hooks and tools have independent feature gates but share one coherent
+     view entry. useCapabilities.js runs the two reads independently, so a
+     missing hooks_v1 never suppresses tool_inventory_v1 (or vice versa). */
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft" || (viewModes[id] || "ui") !== "capabilities") return;
+    onLoadCapabilities?.(activeCapabilityCwd, id);
+  }, [activeCapabilityCwd, activeSessionId, viewModes, onLoadCapabilities]);
 
   /* Monitor manager (P4): entering the view reads the authoritative
      registry and starts its delivery watch. Leaving, switching sessions,
@@ -1981,6 +2011,19 @@ export default function SessionSurface({
               <span>Shells</span>
             </SessionViewButton>
           )}
+          {session.id !== "draft" && (
+            <SessionViewButton
+              aria-selected={activeTabIsChat && modeFor(session.id) === "capabilities"}
+              data-active={activeTabIsChat && modeFor(session.id) === "capabilities" ? "true" : undefined}
+              onClick={() => selectView("capabilities")}
+              role="tab"
+              title="Workspace hooks and session tools"
+              type="button"
+            >
+              <Build aria-hidden="true" size={13} />
+              <span>Hooks &amp; Tools</span>
+            </SessionViewButton>
+          )}
           {session && session.id !== "draft" && (
             <SessionViewButton
               aria-selected={activeTabIsChat && modeFor(session.id) === "monitors"}
@@ -2447,6 +2490,33 @@ export default function SessionSurface({
                       />
                     </ShellsHostLayer>
                   )}
+                  {/* Workspace hook trust + canonical session tools. The
+                      panel is presentational; useCapabilities.js owns all
+                      four commands and re-lists hooks after each receipt. */}
+                  {mode === "capabilities" && session && session.id !== "draft" && (() => {
+                    const capabilityCwd = sessionWorkingDirectory(session);
+                    return (
+                      <CapabilitiesHostLayer>
+                        <CapabilitiesPanel
+                          cwd={capabilityCwd}
+                          hookError={capabilityHookError}
+                          hookLoading={capabilityHookLoading}
+                          hookPendingByDigest={capabilityHookPendingByDigest}
+                          hookReceiptByDigest={capabilityHookReceiptByDigest}
+                          hooks={capabilityHooksByCwd[capabilityCwd]}
+                          hooksUnavailable={capabilityHooksUnavailable}
+                          onRefreshHooks={() => onLoadCapabilityHooks?.(capabilityCwd)}
+                          onRefreshTools={() => onLoadCapabilityTools?.(session.id)}
+                          onRevoke={(digest) => onRevokeHook?.(capabilityCwd, digest)}
+                          onTrust={(digest) => onTrustHook?.(capabilityCwd, digest)}
+                          toolError={capabilityToolError}
+                          toolLoading={capabilityToolLoading}
+                          tools={capabilityToolsBySession[session.id]}
+                          toolsUnavailable={capabilityToolsUnavailable}
+                        />
+                      </CapabilitiesHostLayer>
+                    );
+                  })()}
                   {/* Monitor manager (P4): per-source availability, the
                       listed registry, register/remove controls, and the
                       live delivery stream. MonitorPanel is presentational;
@@ -2970,6 +3040,14 @@ const PeersHostLayer = styled.div`
 
 /* Shell registry host: ShellsPanel owns its vertical scroll. */
 const ShellsHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+`;
+
+/* Workspace capability manager host: CapabilitiesPanel owns its scroll. */
+const CapabilitiesHostLayer = styled.div`
   display: flex;
   min-height: 0;
   flex: 1;

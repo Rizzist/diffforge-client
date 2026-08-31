@@ -43,6 +43,7 @@ import { useFleet } from "../sessions/useFleet.js";
 import { useDescendantStream } from "../sessions/useDescendantStream.js";
 import { usePeers } from "../sessions/usePeers.js";
 import { useShells } from "../sessions/useShells.js";
+import { useCapabilities } from "../sessions/useCapabilities.js";
 import { useMonitor } from "../sessions/useMonitor.js";
 import { useCheckpoints } from "../sessions/useCheckpoints.js";
 import { useWorkflowGraph } from "../sessions/useWorkflowGraph.js";
@@ -18909,6 +18910,9 @@ export default function App() {
      owns the three shell commands and four pushed subscriptions; the panel
      receives only published rows, receipts, and transient output buffers. */
   const shellRegistryApi = useShells({ enabled: authState === "authenticated" });
+  /* Workspace hook trust and canonical per-session tools (Wave6-UI). The
+     hook owns all four commands and keeps hooks/tools independently gated. */
+  const capabilityApi = useCapabilities({ enabled: authState === "authenticated" });
   /* Monitor manager (P4): the per-session registry and delivery watch for
      the surface's Monitors view. All four monitor invokes live in
      useMonitor.js and the feature-gated daemon settles unavailable once. */
@@ -25936,6 +25940,21 @@ export default function App() {
                           onLoadShells={shellRegistryApi.list}
                           onCloseShell={shellRegistryApi.close}
                           onExecShell={shellRegistryApi.exec}
+                          capabilityHooksByCwd={capabilityApi.hooksByCwd}
+                          capabilityToolsBySession={capabilityApi.toolsBySession}
+                          capabilityHookReceiptByDigest={capabilityApi.hookReceiptByDigest}
+                          capabilityHookPendingByDigest={capabilityApi.hookPendingByDigest}
+                          capabilityHookError={capabilityApi.hookError}
+                          capabilityToolError={capabilityApi.toolError}
+                          capabilityHookLoading={capabilityApi.hookLoading}
+                          capabilityToolLoading={capabilityApi.toolLoading}
+                          capabilityHooksUnavailable={capabilityApi.hooksUnavailable}
+                          capabilityToolsUnavailable={capabilityApi.toolsUnavailable}
+                          onLoadCapabilities={capabilityApi.load}
+                          onLoadCapabilityHooks={capabilityApi.listHooks}
+                          onLoadCapabilityTools={capabilityApi.listTools}
+                          onTrustHook={capabilityApi.trust}
+                          onRevokeHook={capabilityApi.revoke}
                           monitorBySession={monitorApi.bySession}
                           monitorDeliveries={monitorApi.deliveries}
                           monitorCursor={monitorApi.cursor}
