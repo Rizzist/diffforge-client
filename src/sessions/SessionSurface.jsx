@@ -71,6 +71,7 @@ import SessionTranscript from "./SessionTranscript.jsx";
 import FleetPanel from "./FleetPanel.jsx";
 import FleetChildTranscript from "./FleetChildTranscript.jsx";
 import PeersPanel from "./PeersPanel.jsx";
+import ShellsPanel from "./ShellsPanel.jsx";
 import MonitorPanel from "./MonitorPanel.jsx";
 import CheckpointPanel from "./CheckpointPanel.jsx";
 import WorkflowGraphView from "./WorkflowGraphView.jsx";
@@ -202,6 +203,18 @@ export default function SessionSurface({
   peerUnavailable = false,
   onLoadPeers = null,
   onSendPeerMessage = null,
+  shellRegistryBySession = {},
+  shellOutputByShell = {},
+  shellCloseOutcomeByShell = {},
+  shellExecReceiptBySession = {},
+  shellClosingByShell = {},
+  shellExecutingBySession = {},
+  shellRegistryError = "",
+  shellRegistryLoading = false,
+  shellRegistryUnavailable = false,
+  onLoadShells = null,
+  onCloseShell = null,
+  onExecShell = null,
   monitorBySession = {},
   monitorDeliveries = [],
   monitorCursor = null,
@@ -1212,6 +1225,15 @@ export default function SessionSurface({
     onLoadPeers?.();
   }, [activeSessionId, viewModes, onLoadPeers]);
 
+  /* Shell registry (Wave5-UI-a): entering the view performs one authoritative
+     per-session list. Lifecycle/output pushes remain attached in useShells;
+     no registry state is inferred while this view is hidden. */
+  useEffect(() => {
+    const id = activeSessionId;
+    if (!id || id === "draft" || (viewModes[id] || "ui") !== "shells") return;
+    onLoadShells?.(id);
+  }, [activeSessionId, viewModes, onLoadShells]);
+
   /* Monitor manager (P4): entering the view reads the authoritative
      registry and starts its delivery watch. Leaving, switching sessions,
      or unmounting stops the watch; all four invokes remain centralized in
@@ -1946,6 +1968,19 @@ export default function SessionSurface({
               <span>Peers</span>
             </SessionViewButton>
           )}
+          {session.id !== "draft" && (
+            <SessionViewButton
+              aria-selected={activeTabIsChat && modeFor(session.id) === "shells"}
+              data-active={activeTabIsChat && modeFor(session.id) === "shells" ? "true" : undefined}
+              onClick={() => selectView("shells")}
+              role="tab"
+              title="Live shell registry"
+              type="button"
+            >
+              <TerminalGlyph aria-hidden="true" size={13} />
+              <span>Shells</span>
+            </SessionViewButton>
+          )}
           {session && session.id !== "draft" && (
             <SessionViewButton
               aria-selected={activeTabIsChat && modeFor(session.id) === "monitors"}
@@ -2376,6 +2411,41 @@ export default function SessionSurface({
                         unavailable={peerUnavailable}
                       />
                     </PeersHostLayer>
+                  )}
+                  {/* Unified local + SSH shell registry, receipt-backed close
+                      and direct command execution, and connection-transient
+                      pushed output. ShellsPanel is presentational; every SDK
+                      boundary lives in useShells.js. */}
+                  {mode === "shells" && session && session.id !== "draft" && (
+                    <ShellsHostLayer>
+                      <ShellsPanel
+                        closeOutcomeByShell={shellCloseOutcomeByShell}
+                        closingByShell={shellClosingByShell}
+                        error={shellRegistryError}
+                        execReceipt={shellExecReceiptBySession[session.id]}
+                        executing={shellExecutingBySession[session.id] === true}
+                        loading={shellRegistryLoading}
+                        onClose={(shellId) => onCloseShell?.(shellId)}
+                        onExec={(command, cwd) => (
+                          cwd === undefined
+                            ? onExecShell?.(
+                              session.id,
+                              publishedCheckpointBranchId(session),
+                              command,
+                            )
+                            : onExecShell?.(
+                              session.id,
+                              publishedCheckpointBranchId(session),
+                              command,
+                              cwd,
+                            )
+                        )}
+                        onRefresh={() => onLoadShells?.(session.id)}
+                        outputByShell={shellOutputByShell}
+                        shells={shellRegistryBySession[session.id]}
+                        unavailable={shellRegistryUnavailable}
+                      />
+                    </ShellsHostLayer>
                   )}
                   {/* Monitor manager (P4): per-source availability, the
                       listed registry, register/remove controls, and the
@@ -2892,6 +2962,14 @@ const FleetHostLayer = styled.div`
 
 /* Per-session host for the app-level peer messaging surface. */
 const PeersHostLayer = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+`;
+
+/* Shell registry host: ShellsPanel owns its vertical scroll. */
+const ShellsHostLayer = styled.div`
   display: flex;
   min-height: 0;
   flex: 1;

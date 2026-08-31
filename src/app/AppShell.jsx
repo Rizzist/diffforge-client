@@ -42,6 +42,7 @@ import { useWorkflow } from "../sessions/useWorkflow.js";
 import { useFleet } from "../sessions/useFleet.js";
 import { useDescendantStream } from "../sessions/useDescendantStream.js";
 import { usePeers } from "../sessions/usePeers.js";
+import { useShells } from "../sessions/useShells.js";
 import { useMonitor } from "../sessions/useMonitor.js";
 import { useCheckpoints } from "../sessions/useCheckpoints.js";
 import { useWorkflowGraph } from "../sessions/useWorkflowGraph.js";
@@ -18904,6 +18905,10 @@ export default function App() {
   /* App-level peer_messaging_v1 state, presented by SessionSurface's Peers
      tab. usePeers owns all three commands and both pushed subscriptions. */
   const peerApi = usePeers({ enabled: authState === "authenticated" });
+  /* Unified shell registry and direct user commands (Wave5-UI-a). The hook
+     owns the three shell commands and four pushed subscriptions; the panel
+     receives only published rows, receipts, and transient output buffers. */
+  const shellRegistryApi = useShells({ enabled: authState === "authenticated" });
   /* Monitor manager (P4): the per-session registry and delivery watch for
      the surface's Monitors view. All four monitor invokes live in
      useMonitor.js and the feature-gated daemon settles unavailable once. */
@@ -25919,6 +25924,18 @@ export default function App() {
                           peerUnavailable={peerApi.unavailable}
                           onLoadPeers={peerApi.load}
                           onSendPeerMessage={peerApi.send}
+                          shellRegistryBySession={shellRegistryApi.bySession}
+                          shellOutputByShell={shellRegistryApi.outputByShell}
+                          shellCloseOutcomeByShell={shellRegistryApi.closeOutcomeByShell}
+                          shellExecReceiptBySession={shellRegistryApi.execReceiptBySession}
+                          shellClosingByShell={shellRegistryApi.closingByShell}
+                          shellExecutingBySession={shellRegistryApi.executingBySession}
+                          shellRegistryError={shellRegistryApi.error}
+                          shellRegistryLoading={shellRegistryApi.loading}
+                          shellRegistryUnavailable={shellRegistryApi.unavailable}
+                          onLoadShells={shellRegistryApi.list}
+                          onCloseShell={shellRegistryApi.close}
+                          onExecShell={shellRegistryApi.exec}
                           monitorBySession={monitorApi.bySession}
                           monitorDeliveries={monitorApi.deliveries}
                           monitorCursor={monitorApi.cursor}
