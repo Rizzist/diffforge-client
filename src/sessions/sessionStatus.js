@@ -85,6 +85,67 @@ export function applySessionSurfaceStatusEvent(event, sessions, setSurfaceStatus
   return { local, payload };
 }
 
+/* The adoption barrier for the composer's own identity (A03/W8.3).
+   The SDK's SurfaceWatchState stamps its retained `caller_owner` on EVERY
+   payload it emits — watch adoptions and subsequent deltas alike — and its
+   adoption replaces that retained identity with the response's optional
+   value: present from a 970 watch, cleared for a legacy 969 response. No
+   delta is emitted before adoption. A payload without the field can
+   therefore only come from a watch whose adoption established NO identity,
+   so mirroring each accepted payload exactly IS the epoch fence: absence
+   means "identity unknown" — the previously `retained` value is
+   surrendered, never remembered — and never fabricates an identity. */
+export function adoptSurfaceCallerIdentity(payload, retained = "") {
+  if (typeof payload?.caller_owner === "string") return payload.caller_owner;
+  return "";
+}
+
+/* input_mirror_v1 revisions are publisher-local u64 DECIMAL STRINGS and may
+   exceed 2^53 — compare them as decimals, never through Number(). */
+function surfaceRevisionAdvances(candidate, floor) {
+  const next = String(candidate).replace(/^0+(?=.)/, "");
+  const applied = String(floor).replace(/^0+(?=.)/, "");
+  if (next.length !== applied.length) return next.length > applied.length;
+  return next > applied;
+}
+
+/* Owner discrimination for one input-mirror frame (A03/W8.3).
+   `session.surface_watch.caller_owner` (970) publishes the composer's OWN
+   identity: once adopted, "is this mine" is owner-identity EQUALITY — never
+   revision+text resemblance, which two publishers can legitimately share.
+   Without it (969 daemons) the documented fallback stands unchanged: an
+   exact revision+text echo of one of our publishes teaches us our owner id,
+   later frames from that learned owner drop as echoes, and every other lane
+   applies when its OWN revision advances — a fresh publisher's revision 1 is
+   newer than nothing of ours. A self frame never yields "apply", so a
+   delayed self-echo can never overwrite newer local typing or attachments. */
+export function surfaceInputMirrorPlan(input, {
+  callerOwner = "",
+  learnedOwner = "",
+  history = null,
+  floors = null,
+} = {}) {
+  if (input?.text == null) return { kind: "none" };
+  const { text } = input;
+  const owner = typeof input.owner === "string" ? input.owner : "";
+  const revision = String(input.revision ?? 0);
+  if (callerOwner) {
+    /* Daemon-published identity: the ONLY self test. learnOwner stays empty
+       because there is nothing left to guess. */
+    if (owner === callerOwner) return { kind: "self-echo", learnOwner: "" };
+  } else {
+    if (history && history.get(revision) === text) {
+      return { kind: "self-echo", learnOwner: owner };
+    }
+    if (owner && owner === learnedOwner) return { kind: "drop" };
+  }
+  const floor = floors ? floors[owner] : undefined;
+  if (floor !== undefined && !surfaceRevisionAdvances(revision, floor)) {
+    return { kind: "drop" };
+  }
+  return { kind: "apply", owner, revision, text };
+}
+
 /* A daemon state/detail is authoritative. Everything else is display text
    with explicit presentation-only provenance; the line is never parsed. */
 export function surfaceStatusPresentation(surface, session) {

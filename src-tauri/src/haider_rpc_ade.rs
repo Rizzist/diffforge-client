@@ -5141,6 +5141,7 @@ pub struct SurfaceInput {
     /// retain local file names, so `name` is the stable artifact ref.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<SurfaceAttachment>,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
     pub revision: u64,
     /// Daemon-stamped publisher connection id. Revision lanes are
     /// PER-CONNECTION, so the UI must discriminate self/foreign by owner —
@@ -5163,12 +5164,16 @@ pub struct SurfaceStatus {
     pub state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
     pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct SessionSurfacePayload {
     session_id: String,
+    /// Caller identity from the adopted watch, never the input publisher.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller_owner: Option<String>,
     input: Option<SurfaceInput>,
     status: Option<SurfaceStatus>,
 }
@@ -6683,6 +6688,8 @@ enum ResponseBody {
     SessionSurfaceWatching {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_owner: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         input: Option<SurfaceInputWire>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<SurfaceStatusWire>,
@@ -7739,10 +7746,103 @@ impl FeatureGate {
     }
 }
 
+/// A watch acknowledgement is the adoption barrier for both the complete
+/// snapshot and the caller's connection identity. Subscriptions survive actor
+/// reconnects; their authority does not.
+#[cfg(unix)]
+#[derive(Debug, Clone, Default)]
+struct SurfaceWatchState {
+    session_id: String,
+    connection: Option<RosterConnectionIdentity>,
+    pending_request: Option<String>,
+    adopted: bool,
+    caller_owner: Option<String>,
+    revision_gate: RevisionGate,
+}
+
+#[cfg(unix)]
+impl SurfaceWatchState {
+    fn begin(
+        &mut self,
+        session_id: String,
+        connection: RosterConnectionIdentity,
+        request_id: String,
+    ) {
+        if self.session_id != session_id || self.connection.as_ref() != Some(&connection) {
+            *self = Self::default();
+        }
+        self.session_id = session_id;
+        self.connection = Some(connection);
+        self.pending_request = Some(request_id);
+    }
+
+    fn matches(&self, connection: &ConnectionSnapshot, session_id: &str) -> bool {
+        connection.can_watch_surfaces()
+            && self.session_id == session_id
+            && self.connection.is_some()
+            && self.connection == connection.roster_identity
+    }
+
+    fn adopt(
+        &mut self,
+        connection: &ConnectionSnapshot,
+        request_id: &str,
+        body: &ResponseBody,
+    ) -> Option<SessionSurfacePayload> {
+        let ResponseBody::SessionSurfaceWatching {
+            session_id,
+            caller_owner,
+            input,
+            status,
+        } = body
+        else {
+            return None;
+        };
+        if !self.matches(connection, session_id)
+            || self.pending_request.as_deref() != Some(request_id)
+        {
+            return None;
+        }
+        self.pending_request = None;
+        self.adopted = true;
+        self.caller_owner = caller_owner.clone();
+        let (input, status) =
+            gated_surface_snapshot(&connection.features, input.clone(), status.clone());
+        let _ = self.revision_gate.accept(input, status);
+        // Emit every valid adoption, even an empty/unchanged snapshot: caller
+        // identity may be the only new fact, or an older daemon may omit it.
+        Some(self.payload())
+    }
+
+    fn delta(
+        &mut self,
+        connection: &ConnectionSnapshot,
+        session_id: String,
+        input: Option<SurfaceInputWire>,
+        status: Option<SurfaceStatusWire>,
+    ) -> Option<SessionSurfacePayload> {
+        if !self.adopted || !self.matches(connection, &session_id) {
+            return None;
+        }
+        let (input, status) = gated_surface_snapshot(&connection.features, input, status);
+        self.revision_gate.accept(input, status)?;
+        Some(self.payload())
+    }
+
+    fn payload(&self) -> SessionSurfacePayload {
+        SessionSurfacePayload {
+            session_id: self.session_id.clone(),
+            caller_owner: self.caller_owner.clone(),
+            input: self.revision_gate.input.clone(),
+            status: self.revision_gate.status.clone(),
+        }
+    }
+}
+
 #[cfg(unix)]
 struct Subscription {
     app: AppHandle,
-    revision_gate: RevisionGate,
+    surface_watch: SurfaceWatchState,
     queue_cursor: u64,
     queue_attachment_id: Option<String>,
     queue_attach_pending: bool,
@@ -7758,7 +7858,7 @@ impl Subscription {
     fn new(app: AppHandle, session_id: &str) -> Self {
         Self {
             app,
-            revision_gate: RevisionGate::default(),
+            surface_watch: SurfaceWatchState::default(),
             queue_cursor: super::haider_bridge_head_seq(session_id)
                 .and_then(|head| u64::try_from(head).ok())
                 .unwrap_or(0),
@@ -17665,9 +17765,10 @@ async fn run_actor(
             for session_id in session_ids {
                 if send_surface_watch(
                     &mut stream,
-                    snapshot.frame_limit,
+                    &snapshot,
                     encoding,
                     &mut next_request,
+                    &mut subscriptions,
                     session_id,
                 )
                 .await
@@ -18150,19 +18251,16 @@ async fn run_connected(
                     let _ = pending.reply.send(result);
                     continue;
                 }
-                if let ResponseBody::SessionSurfaceWatching {
-                    session_id,
-                    input,
-                    status,
-                } = &body
-                {
-                    emit_surface(
-                        subscriptions,
-                        &connection,
-                        session_id.clone(),
-                        input.clone(),
-                        status.clone(),
-                    );
+                if let ResponseBody::SessionSurfaceWatching { session_id, .. } = &body {
+                    if let Some(subscription) = subscriptions.get_mut(session_id) {
+                        if let Some(payload) =
+                            subscription
+                                .surface_watch
+                                .adopt(&connection, &request_id, &body)
+                        {
+                            let _ = subscription.app.emit(SURFACE_EVENT, payload);
+                        }
+                    }
                 }
                 if let Some((reply, error_style)) = pending_requests.remove(&request_id) {
                     let _ = reply.send(Some(response_result(body, error_style)));
@@ -18825,9 +18923,10 @@ async fn apply_connected_command(
             let written = !active
                 || send_surface_watch(
                     stream,
-                    connection.frame_limit,
+                    connection,
                     encoding,
                     next_request,
+                    subscriptions,
                     session_id.clone(),
                 )
                 .await
@@ -18925,18 +19024,12 @@ fn emit_surface(
     let Some(subscription) = subscriptions.get_mut(&session_id) else {
         return;
     };
-    let (input, status) = gated_surface_snapshot(&connection.features, input, status);
-    let Some((input, status)) = subscription.revision_gate.accept(input, status) else {
-        return;
-    };
-    let _ = subscription.app.emit(
-        SURFACE_EVENT,
-        SessionSurfacePayload {
-            session_id,
-            input,
-            status,
-        },
-    );
+    if let Some(payload) = subscription
+        .surface_watch
+        .delta(connection, session_id, input, status)
+    {
+        let _ = subscription.app.emit(SURFACE_EVENT, payload);
+    }
 }
 
 fn gated_surface_snapshot(
@@ -19371,16 +19464,37 @@ async fn send_queue_watch(
 #[cfg(unix)]
 async fn send_surface_watch(
     stream: &mut UnixStream,
-    frame_limit: usize,
+    connection: &ConnectionSnapshot,
     encoding: WireEncoding,
     next_request: &mut u64,
+    subscriptions: &mut HashMap<String, Subscription>,
     session_id: String,
 ) -> std::io::Result<()> {
-    let request = WireFrame::Request {
-        request_id: request_id(next_request),
-        body: RequestBody::SessionSurfaceWatch { session_id },
+    let Some(subscription) = subscriptions.get_mut(&session_id) else {
+        return Ok(());
     };
-    write_frame(stream, &request, frame_limit, encoding).await
+    let identity = connection
+        .roster_identity
+        .as_ref()
+        .ok_or_else(|| invalid_data("surface watch requires a connection identity"))?;
+    // General request counters restart on reconnect. Include the existing
+    // actor epoch so a delayed response cannot match a replacement watch.
+    let request_id = format!(
+        "{}-surface-{}",
+        request_id(next_request),
+        identity.connection_serial
+    );
+    let request = WireFrame::Request {
+        request_id: request_id.clone(),
+        body: RequestBody::SessionSurfaceWatch {
+            session_id: session_id.clone(),
+        },
+    };
+    write_frame(stream, &request, connection.frame_limit, encoding).await?;
+    subscription
+        .surface_watch
+        .begin(session_id, identity.clone(), request_id);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -20017,6 +20131,10 @@ mod capability_tests;
 #[allow(clippy::expect_used)]
 #[path = "haider_rpc_ade_bits_tests.rs"]
 mod bits_tests;
+
+#[cfg(all(test, unix))]
+#[path = "haider_rpc_ade_surface_tests.rs"]
+mod surface_tests;
 
 #[cfg(test)]
 mod tests {
@@ -22015,8 +22133,7 @@ mod tests {
                     owner: "tui".to_owned(),
                 }),
             )
-            .is_none()
-        );
+            .is_none());
 
         let (input, status) = gate
             .accept(

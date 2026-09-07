@@ -45,7 +45,9 @@ import {
   modelOptionCatalog,
 } from "./haiderClientContract.js";
 import {
+  adoptSurfaceCallerIdentity,
   applySessionSurfaceStatusEvent,
+  surfaceInputMirrorPlan,
   surfaceRunStatusView,
   surfaceStatusPillView,
 } from "./sessionStatus.js";
@@ -348,10 +350,12 @@ export default function SessionSurface({
      the text must outlive it. Daemon revision lanes are PER-CONNECTION
      (rev934 P1-1), so frames are discriminated by OWNER, never by comparing
      revisions across lanes: mirrorRevisionsRef stamps only OUR publishes;
-     mirrorHistoryRef remembers our recent publishes so any pending echo
-     (revision AND text match) teaches us our owner id; foreign lanes keep
-     per-owner applied floors in mirrorForeignRef. A fresh TUI's revision 1
-     applies. */
+     mirrorCallerOwnerRef holds the daemon-published caller identity (970
+     `session.surface_watch.caller_owner`), the authoritative self test when
+     present; on 969 daemons that omit it, mirrorHistoryRef remembers our
+     recent publishes so any pending echo (revision AND text match) teaches
+     us our owner id; foreign lanes keep per-owner applied floors in
+     mirrorForeignRef. A fresh TUI's revision 1 applies. */
   const [composerTexts, setComposerTexts] = useState({});
   const composerTextsRef = useRef(composerTexts);
   composerTextsRef.current = composerTexts;
@@ -369,12 +373,20 @@ export default function SessionSurface({
   }, []);
   const mirrorRevisionsRef = useRef({});
   /* Bounded history of OUR recent publishes (revision → text) per session:
-     self-echo matching must survive multiple in-flight publishes — a
+     legacy self-echo matching must survive multiple in-flight publishes — a
      single-slot "latest" let an older echo resurrect a just-cleared prompt
-     by masquerading as foreign. Cleared once the owner id is learned. */
-  const mirrorHistoryRef = useRef({}); // sessionId -> Map(revision -> text)
-  const mirrorSelfOwnerRef = useRef(""); // learned daemon connection id
-  const mirrorForeignRef = useRef({}); // sessionId -> {owner -> floor}
+     by masquerading as foreign. Cleared once the owner id is learned. Keys
+     are DECIMAL STRINGS: the SDK delivers echo revisions as decimal u64
+     strings (possibly above 2^53), never as JS numbers. */
+  const mirrorHistoryRef = useRef({}); // sessionId -> Map(revisionString -> text)
+  /* Daemon-published caller identity (970): mirrored verbatim from
+     `caller_owner` on every accepted session-surface payload; "" until a
+     new daemon publishes it, and cleared again when a legacy re-adoption
+     emits payloads without the field — identity is watch-scoped, never
+     remembered across a watch that did not establish it. */
+  const mirrorCallerOwnerRef = useRef("");
+  const mirrorSelfOwnerRef = useRef(""); // legacy echo-learned connection id
+  const mirrorForeignRef = useRef({}); // sessionId -> {owner -> floorString}
   const setComposerText = useCallback((sessionId, text) => {
     editGenRef.current[sessionId] = (editGenRef.current[sessionId] || 0) + 1;
     setComposerTexts((current) => ({ ...current, [sessionId]: text }));
@@ -388,7 +400,9 @@ export default function SessionSurface({
     const revision = (mirrorRevisionsRef.current[session.id] || 0) + 1;
     mirrorRevisionsRef.current[session.id] = revision;
     const history = (mirrorHistoryRef.current[session.id] ||= new Map());
-    history.set(revision, text);
+    /* String key: the echo comes back with a decimal-string revision. The
+       wire publish itself keeps the numeric u64. */
+    history.set(String(revision), text);
     while (history.size > 32) {
       history.delete(history.keys().next().value);
     }
@@ -993,65 +1007,83 @@ export default function SessionSurface({
       );
       if (!surfaceEvent) return;
       const { local, payload } = surfaceEvent;
+      /* `caller_owner` (970, A03): the daemon publishes OUR OWN identity at
+         the watch-adoption barrier — adopted verbatim, no matching, no
+         guessing. The SDK fences it by session/connection epoch and stamps
+         the adopted watch's retained identity on EVERY payload it emits, so
+         each accepted payload is mirrored exactly: a payload without the
+         field can only come from a watch whose adoption established no
+         identity (legacy 969 response) — the retained identity is cleared,
+         the echo-matching fallback below returns to force, and absence
+         never fabricates an identity. */
+      mirrorCallerOwnerRef.current = adoptSurfaceCallerIdentity(
+        payload,
+        mirrorCallerOwnerRef.current,
+      );
       if (payload.input?.text != null) {
-        /* input_mirror_v1, owner-aware (rev934 P1-1): our own accepted
+        /* input_mirror_v1, owner-aware (rev934 P1-1, A03): suppression keys
+           on owner-identity EQUALITY against the published caller_owner when
+           adopted — never revision+text resemblance, which two publishers
+           can share. Legacy fallback (no caller_owner): our own accepted
            publish echoed back (revision AND text match) names our lane and
            drops; other frames from that learned owner drop as echoes; every
            foreign lane applies when its OWN revision advances — a fresh
            publisher's revision 1 is newer than nothing of ours. */
-        const { text, owner = "" } = payload.input;
-        const revision = payload.input.revision || 0;
-        const history = mirrorHistoryRef.current[local.id];
-        if (history && history.get(revision) === text) {
-          /* One of OUR publishes echoed back (any pending one, not just the
-             latest) — learn the owner and drop. Our own refs already render
-             as LOCAL chips: an echo must not leave them up as stale
-             read-only "TUI" chips. */
-          if (owner) {
-            mirrorSelfOwnerRef.current = owner;
-            history.clear();
+        const plan = surfaceInputMirrorPlan(payload.input, {
+          callerOwner: mirrorCallerOwnerRef.current,
+          learnedOwner: mirrorSelfOwnerRef.current,
+          history: mirrorHistoryRef.current[local.id],
+          floors: mirrorForeignRef.current[local.id],
+        });
+        if (plan.kind === "self-echo") {
+          /* One of OUR publishes echoed back — drop; a self-echo never
+             carries apply text, so it cannot clobber newer local typing or
+             staged attachments. Our own refs already render as LOCAL chips:
+             an echo must not leave them up as stale read-only "TUI" chips.
+             Legacy fallback only: learn the owner from the exact echo. */
+          if (plan.learnOwner) {
+            mirrorSelfOwnerRef.current = plan.learnOwner;
+            mirrorHistoryRef.current[local.id]?.clear();
           }
           setMirrorAttachments((current) => (
             (current[local.id] || []).length
               ? { ...current, [local.id]: [] }
               : current
           ));
-        } else if (!owner || owner !== mirrorSelfOwnerRef.current) {
+        } else if (plan.kind === "apply") {
           const floors = (mirrorForeignRef.current[local.id] ||= {});
-          if (!(owner in floors) || revision > floors[owner]) {
-            floors[owner] = revision;
-            /* A remote apply IS an edit for generation purposes: a pending
-               submit's success-clear must not wipe TUI-typed text that
-               arrived while the submit was in flight. */
-            editGenRef.current[local.id] = (editGenRef.current[local.id] || 0) + 1;
-            setComposerTexts((current) => (
-              (current[local.id] || "") === text
-                ? current
-                : { ...current, [local.id]: text }
-            ));
-            /* A remote frame is the FULL composer truth: local paste blocks
-               AND local staged attachments would mix stale content into the
-               newer draft — clear both. */
-            setComposerPastes((current) => (
-              (current[local.id] || []).length
-                ? { ...current, [local.id]: [] }
-                : current
-            ));
-            if ((composerAttachmentsRef.current[local.id] || []).length) {
-              composerAttachmentsRef.current[local.id] = [];
-              setComposerAttachments((current) => ({ ...current, [local.id]: [] }));
-            }
-            /* input_mirror_attachments_v1: refs from the owning surface
-               render as read-only chips (metadata only — no bytes). */
-            const refs = Array.isArray(payload.input.attachments)
-              ? payload.input.attachments
-              : [];
-            setMirrorAttachments((current) => (
-              (current[local.id] || []).length || refs.length
-                ? { ...current, [local.id]: refs }
-                : current
-            ));
+          floors[plan.owner] = plan.revision;
+          /* A remote apply IS an edit for generation purposes: a pending
+             submit's success-clear must not wipe TUI-typed text that
+             arrived while the submit was in flight. */
+          editGenRef.current[local.id] = (editGenRef.current[local.id] || 0) + 1;
+          setComposerTexts((current) => (
+            (current[local.id] || "") === plan.text
+              ? current
+              : { ...current, [local.id]: plan.text }
+          ));
+          /* A remote frame is the FULL composer truth: local paste blocks
+             AND local staged attachments would mix stale content into the
+             newer draft — clear both. */
+          setComposerPastes((current) => (
+            (current[local.id] || []).length
+              ? { ...current, [local.id]: [] }
+              : current
+          ));
+          if ((composerAttachmentsRef.current[local.id] || []).length) {
+            composerAttachmentsRef.current[local.id] = [];
+            setComposerAttachments((current) => ({ ...current, [local.id]: [] }));
           }
+          /* input_mirror_attachments_v1: refs from the owning surface
+             render as read-only chips (metadata only — no bytes). */
+          const refs = Array.isArray(payload.input.attachments)
+            ? payload.input.attachments
+            : [];
+          setMirrorAttachments((current) => (
+            (current[local.id] || []).length || refs.length
+              ? { ...current, [local.id]: refs }
+              : current
+          ));
         }
       }
     }).then((fn) => {
