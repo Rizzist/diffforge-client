@@ -294,6 +294,272 @@ fn headless_status_round_trips_large_sequences_as_decimal_strings() {
 }
 
 #[test]
+fn headless_legacy_start_wire_bytes_remain_identical() {
+    let spec =
+        serde_json::json!({"provider": "provider", "model": "model", "max_output_tokens": 4096});
+    let (features, trust_hooks) = headless_spec_features(&spec).expect("legacy spec");
+    assert_eq!(features, BTreeSet::from(["headless_run_v1".to_string()]));
+    let frame = WireFrame::Request {
+        request_id: "request-1".to_string(),
+        body: RequestBody::HeadlessRunStart {
+            command_id: "command-1".to_string(),
+            session_id: "session-1".to_string(),
+            worker_generation: 41,
+            text: "hello".to_string(),
+            attachments: None,
+            spec,
+            trust_hooks,
+        },
+    };
+    let wire = encode_framed(&frame, DEFAULT_FRAME_LIMIT).expect("legacy wire");
+    let expected = r#"{"v":1,"kind":"request","request_id":"request-1","body":{"method":"headless.run.start","command_id":"command-1","session_id":"session-1","worker_generation":41,"text":"hello","spec":{"max_output_tokens":4096,"model":"model","provider":"provider"},"trust_hooks":false}}"#;
+    assert_eq!(&wire[4..], expected.as_bytes());
+    assert_eq!(&wire[..4], &(expected.len() as u32).to_be_bytes());
+}
+
+#[test]
+fn headless_receipts_echo_start_stop_coordinates_and_terminal_absence() {
+    let start = serde_json::from_value(serde_json::json!({
+        "method": "headless.run.start", "session_id": "daemon-session", "run_id": "daemon-run",
+        "accepted_seq": 9007199254740993_u64, "worker_generation": u64::MAX, "disposition": "started",
+    })).expect("start fixture");
+    let receipt = serde_json::to_value(headless_run_start_response(start).expect("start receipt"))
+        .expect("JS receipt");
+    assert_eq!(
+        receipt,
+        serde_json::json!({
+            "session_id": "daemon-session", "run_id": "daemon-run", "accepted_seq": "9007199254740993",
+            "worker_generation": u64::MAX.to_string(), "disposition": "started",
+        })
+    );
+    for terminal_seq in [None, Some(u64::MAX)] {
+        let response = serde_json::from_value(serde_json::json!({
+            "method": "headless.run.stop", "session_id": "daemon-session", "run_id": "daemon-run",
+            "status": "already_terminal", "terminal_seq": terminal_seq,
+        }))
+        .expect("stop fixture");
+        let receipt =
+            serde_json::to_value(headless_run_stop_response(response).expect("stop receipt"))
+                .expect("JS stop");
+        assert_eq!(receipt["session_id"], "daemon-session");
+        assert_eq!(receipt["run_id"], "daemon-run");
+        assert_eq!(receipt["status"], "already_terminal");
+        assert_eq!(
+            receipt.get("terminal_seq"),
+            terminal_seq
+                .map(|v| serde_json::json!(v.to_string()))
+                .as_ref()
+        );
+    }
+}
+
+fn headless_fact_json(payload: &Value) -> Value {
+    let features = BTreeSet::from([
+        "headless_run_v1".to_string(),
+        "request_budget_v1".to_string(),
+    ]);
+    serde_json::to_value(
+        parse_ade_durable_fact(&features, payload)
+            .expect("valid headless fact")
+            .expect("recognized headless fact"),
+    )
+    .expect("JS fact")
+}
+
+#[test]
+fn headless_deadline_fact_requires_a_typed_absolute_deadline() {
+    let payload =
+        serde_json::json!({"type": "run_deadline_exceeded", "deadline_unix_ms": 1900000000123_u64});
+    assert_eq!(
+        parse_ade_durable_fact(&BTreeSet::new(), &payload).expect("no bit"),
+        None
+    );
+    assert_eq!(headless_fact_json(&payload), payload);
+    let features = BTreeSet::from(["headless_run_v1".to_string()]);
+    for malformed in [
+        serde_json::json!({"type": "run_deadline_exceeded", "message": "deadline 1900000000123 exceeded"}),
+        serde_json::json!({"type": "run_deadline_exceeded", "deadline_unix_ms": null}),
+        serde_json::json!({"type": "run_deadline_exceeded", "deadline_unix_ms": "1900000000123"}),
+    ] {
+        assert!(parse_ade_durable_fact(&features, &malformed).is_err());
+    }
+    let fact = parse_ade_durable_fact(&features, &payload)
+        .expect("valid")
+        .expect("deadline");
+    assert!(matches!(
+        fact,
+        AdeDurableFactV1::RunDeadlineExceeded(RunDeadlineExceededV1 {
+            deadline_unix_ms: 1900000000123
+        })
+    ));
+    let envelope = serde_json::to_value(AdeDurableFactEnvelopeV1 {
+        session_id: "daemon-session".to_string(),
+        seq: u64::MAX,
+        fact,
+    })
+    .expect("envelope");
+    assert_eq!(envelope["seq"], u64::MAX.to_string());
+    assert_eq!(envelope["session_id"], "daemon-session");
+}
+
+#[test]
+fn headless_terminal_details_preserve_absence_and_never_classify_prose() {
+    for state in ["done", "cancelled", "errored"] {
+        let legacy = serde_json::json!({"type": "run_state", "state": state});
+        assert_eq!(headless_fact_json(&legacy), legacy);
+        assert_eq!(
+            parse_ade_durable_fact(&BTreeSet::new(), &legacy).expect("unnegotiated"),
+            None
+        );
+        let absent = serde_json::json!({"type": "run_state", "state": state,
+            "terminal_kind": null, "error_code": null, "terminal": null,
+            "message": "provider timeout, budget_exhausted, request_budget_exceeded"});
+        assert_eq!(headless_fact_json(&absent), legacy);
+    }
+    for (kind, code) in [
+        ("timeout", "timeout"),
+        ("budget", "budget_exhausted"),
+        ("failure", "request_budget_exceeded"),
+        ("future_kind", "future_code"),
+    ] {
+        let payload = serde_json::json!({"type": "run_state", "state": "errored", "terminal_kind": kind, "error_code": code});
+        assert_eq!(headless_fact_json(&payload), payload);
+    }
+    let features = BTreeSet::from([
+        "headless_run_v1".to_string(),
+        "request_budget_v1".to_string(),
+    ]);
+    assert_eq!(
+        parse_ade_durable_fact(
+            &features,
+            &serde_json::json!({"type": "run_state", "state": "streaming"})
+        )
+        .expect("active state"),
+        None
+    );
+    assert!(parse_ade_durable_fact(
+        &features,
+        &serde_json::json!({"type": "run_state", "state": "errored", "terminal_kind": 3})
+    )
+    .is_err());
+    for code in ["provider_error", "provider_timeout", "future_code"] {
+        assert_eq!(
+            parse_ade_durable_fact(
+                &features,
+                &serde_json::json!({"type": "run_failed", "code": code,
+            "message": "request_budget_exceeded timeout", "retryable": false})
+            )
+            .expect("other failure"),
+            None
+        );
+    }
+}
+
+#[test]
+fn headless_request_budget_failure_is_an_independently_negotiated_run_fact() {
+    let payload = serde_json::json!({"type": "run_failed", "code": "request_budget_exceeded",
+        "message": "logical request ceiling", "retryable": false});
+    for features in [
+        BTreeSet::new(),
+        BTreeSet::from(["run_budget_v1".to_string(), "headless_run_v1".to_string()]),
+    ] {
+        assert_eq!(
+            parse_ade_durable_fact(&features, &payload).expect("absent request feature"),
+            None
+        );
+    }
+    let features = BTreeSet::from(["request_budget_v1".to_string()]);
+    let decoded = parse_ade_durable_fact(&features, &payload)
+        .expect("failure")
+        .expect("typed failure");
+    assert!(
+        matches!(&decoded, AdeDurableFactV1::RunFailed(fact) if fact.code == "request_budget_exceeded" && fact.presentation.is_none())
+    );
+    assert_eq!(serde_json::to_value(decoded).expect("JS failure"), payload);
+}
+
+fn headless_ceiling_fixture() -> Value {
+    serde_json::json!({"type": "run_state", "state": "errored", "terminal_kind": "failure",
+    "error_code": "request_budget_exceeded", "terminal": {
+        "end_reason": "harness_internal_ceiling", "internal_cap_detected": true, "exit_code": 78,
+        "ceilings": {"soft": 32, "hard": 64, "used": 64},
+        "continuation": {"session_id": "exact-session", "run_id": "exact-run", "branch_id": "exact-branch", "agent_id": "exact-agent"},
+        "workspace_state": "mutated", "workspace_before": "receipt-before", "workspace_after": "receipt-after",
+        "partial_progress": {"files_written": ["changed.rs"], "files_deleted": [], "tool_calls": 17, "last_request_ordinal": 9007199254740993_u64}
+    }})
+}
+
+#[test]
+fn headless_ceiling_detail_decodes_exactly_with_receipt_absence_preserved() {
+    let payload = headless_ceiling_fixture();
+    let untouched = payload.clone();
+    let mut expected = payload.clone();
+    expected["terminal"]["partial_progress"]["last_request_ordinal"] =
+        serde_json::json!("9007199254740993");
+    assert_eq!(headless_fact_json(&payload), expected);
+    assert_eq!(
+        payload, untouched,
+        "typed projection must not change raw passthrough"
+    );
+
+    let mut unavailable = payload;
+    let terminal = unavailable["terminal"].as_object_mut().expect("terminal");
+    for field in ["workspace_state", "workspace_before", "workspace_after"] {
+        terminal.remove(field);
+    }
+    terminal.insert(
+        "workspace_receipt_error".to_string(),
+        serde_json::json!({"phase": "before", "detail": "workspace_unavailable"}),
+    );
+    let continuation = terminal
+        .get_mut("continuation")
+        .expect("continuation")
+        .as_object_mut()
+        .expect("object");
+    continuation.remove("branch_id");
+    continuation.remove("agent_id");
+    let progress = terminal
+        .get_mut("partial_progress")
+        .expect("progress")
+        .as_object_mut()
+        .expect("object");
+    progress.remove("files_written");
+    progress.remove("files_deleted");
+    let decoded = headless_fact_json(&unavailable);
+    expected = unavailable.clone();
+    expected["terminal"]["partial_progress"]["last_request_ordinal"] =
+        serde_json::json!("9007199254740993");
+    assert_eq!(decoded, expected);
+    let features = BTreeSet::from(["headless_run_v1".to_string()]);
+    unavailable["terminal"]
+        .as_object_mut()
+        .expect("terminal")
+        .remove("ceilings");
+    assert!(
+        parse_ade_durable_fact(&features, &unavailable).is_err(),
+        "required ceiling data cannot be fabricated"
+    );
+}
+
+#[test]
+fn headless_budget_decision_projection_null_and_omission_remain_distinct() {
+    let features = BTreeSet::from(["run_budget_v1".to_string()]);
+    for projection in [None, Some(Value::Null), Some(serde_json::json!(19))] {
+        let mut payload = serde_json::json!({"type": "run_budget_exhausted", "dimension": "tokens", "limit": 100,
+            "usage": {"logical_input_tokens": 81, "billed_output_tokens": 0, "additional_reasoning_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0, "total_tokens": 81, "elapsed_ms": 700},
+            "decision": {"spent": 81, "cap": 100, "reason": {"type": "usage_unavailable", "provider": "provider", "model": "model"}}});
+        if let Some(value) = projection {
+            payload["decision"]["projected"] = value;
+        }
+        let fact = parse_ade_durable_fact(&features, &payload)
+            .expect("decision")
+            .expect("budget fact");
+        assert_eq!(serde_json::to_value(fact).expect("JS decision"), payload);
+    }
+}
+
+#[test]
 fn sealed_replay_none_is_byte_identical_and_some_is_explicit() {
     let legacy = WireFrame::Request {
         request_id: "request-1".to_string(),

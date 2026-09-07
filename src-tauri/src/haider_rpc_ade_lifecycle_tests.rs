@@ -166,8 +166,19 @@ async fn create_through_actor(
         ssh_scope,
     )
     .expect("build create request");
+    lifecycle_request_through_actor(body, features, advertised)
+        .await
+        .map_err(SessionCreateCommandErrorV1::from)
+}
+
+#[cfg(unix)]
+async fn lifecycle_request_through_actor(
+    body: RequestBody,
+    features: BTreeSet<String>,
+    advertised: BTreeSet<String>,
+) -> Result<Value, LifecycleCommandError> {
     let expected_body = request_json(body.clone());
-    let (mut client, mut server) = UnixStream::pair().expect("create socket pair");
+    let (mut client, mut server) = UnixStream::pair().expect("lifecycle socket pair");
     let connection = ConnectionSnapshot {
         connected: true,
         features: advertised,
@@ -217,33 +228,31 @@ async fn create_through_actor(
             .expect_err("local refusal");
         assert!(
             pending.is_empty(),
-            "refused create must not await a receipt"
+            "refused request must not await a receipt"
         );
         assert_eq!(next_request, 0, "refusal must not allocate a wire request");
         let error_kind = server
             .try_read(&mut [0; 1])
-            .expect_err("refused create wrote bytes")
+            .expect_err("refused request wrote bytes")
             .kind();
         assert_eq!(error_kind, std::io::ErrorKind::WouldBlock);
-        return Err(SessionCreateCommandErrorV1::from(
-            lifecycle_transport_error(error),
-        ));
+        return Err(lifecycle_transport_error(error));
     }
 
     assert_eq!(
         pending.len(),
         1,
-        "sent create must await the daemon receipt"
+        "sent request must await the daemon receipt"
     );
     let frame = tokio::time::timeout(
         Duration::from_secs(1),
         read_frame(&mut server, DEFAULT_FRAME_LIMIT),
     )
     .await
-    .expect("create frame timeout")
-    .expect("read actual create frame");
+    .expect("lifecycle frame timeout")
+    .expect("read actual lifecycle frame");
     let WireFrame::Request { request_id, body } = frame else {
-        panic!("expected a create request on the wire");
+        panic!("expected a lifecycle request on the wire");
     };
     assert!(
         pending.contains_key(&request_id),
@@ -267,6 +276,265 @@ fn create_policy_peer(read_only: bool) -> BTreeSet<String> {
         features.insert("session_read_only_v1".to_string());
     }
     features
+}
+
+#[cfg(unix)]
+fn headless_policy_cases() -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        (
+            "read_only_true",
+            "session_read_only_v1",
+            serde_json::json!({
+                "permission_overrides": {"read_only": true, "allow_exec": true}
+            }),
+        ),
+        (
+            "read_only_false",
+            "session_read_only_v1",
+            serde_json::json!({
+                "permission_overrides": {"read_only": false}
+            }),
+        ),
+        (
+            "read_only_null",
+            "session_read_only_v1",
+            serde_json::json!({
+                "permission_overrides": {"read_only": null}
+            }),
+        ),
+        (
+            "agent_spawn",
+            "agent_cli_v1",
+            serde_json::json!({
+                "agent_spawn": {"task": "inspect", "prompt": "opaque operator prompt",
+                    "workflow": "future-workflow", "future": {"keep": 7}}
+            }),
+        ),
+        (
+            "request_budget",
+            "request_budget_v1",
+            serde_json::json!({
+                "budget": {"request_budget": {"tranche": 3, "hard_cap": 7}}
+            }),
+        ),
+        (
+            "continuation_of",
+            "request_budget_v1",
+            serde_json::json!({
+                "continuation_of": "run-authoritative-checkpoint"
+            }),
+        ),
+    ]
+}
+
+#[cfg(unix)]
+async fn headless_through_actor(
+    spec: Value,
+    advertised: BTreeSet<String>,
+) -> Result<Value, LifecycleCommandError> {
+    let (features, trust_hooks) = headless_spec_features(&spec)?;
+    lifecycle_request_through_actor(
+        headless_run_start_request(
+            &attachment(),
+            "ordinary text".to_string(),
+            None,
+            spec,
+            trust_hooks,
+        ),
+        features,
+        advertised,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn assert_headless_pin_gate(pin_prefix: &str) {
+    for (pin, feature, spec) in headless_policy_cases()
+        .into_iter()
+        .filter(|(pin, _, _)| pin.starts_with(pin_prefix))
+    {
+        // Other new bits cannot stand in for this pin's published bit.
+        let mut peer = BTreeSet::from([
+            "headless_run_v1".to_string(),
+            "run_budget_v1".to_string(),
+            "session_read_only_v1".to_string(),
+            "agent_cli_v1".to_string(),
+            "request_budget_v1".to_string(),
+        ]);
+        peer.remove(feature);
+        let error = headless_through_actor(spec.clone(), peer)
+            .await
+            .expect_err("unnegotiated pin must not write a request");
+        assert_eq!(
+            serde_json::to_value(&error).expect("typed rejection"),
+            serde_json::json!({
+                "code": "missing_feature",
+                "message": format!("missing_feature: daemon does not advertise {feature}"),
+                "retryable": false,
+            }),
+            "{pin}"
+        );
+
+        // Only the relevant new bit is present on the accepting peer.
+        let peer = BTreeSet::from([
+            "headless_run_v1".to_string(),
+            "run_budget_v1".to_string(),
+            feature.to_string(),
+        ]);
+        let wire = headless_through_actor(spec.clone(), peer)
+            .await
+            .expect("negotiated pin");
+        assert_eq!(wire["spec"], spec, "{pin} was rewritten");
+        assert_eq!(wire["session_id"], "provider-session-authority");
+        assert_eq!(wire["worker_generation"], 41);
+        assert_eq!(wire["text"], "ordinary text");
+        assert!(wire.get("attachments").is_none());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_headless_read_only_gate_rejects_and_forwards_exactly() {
+    assert_headless_pin_gate("read_only").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_headless_agent_spawn_gate_rejects_and_forwards_exactly() {
+    assert_headless_pin_gate("agent_spawn").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_headless_request_budget_gate_rejects_and_forwards_exactly() {
+    assert_headless_pin_gate("request_budget").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_headless_continuation_of_gate_rejects_and_forwards_exactly() {
+    assert_headless_pin_gate("continuation_of").await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_headless_combined_pins_still_require_each_independent_feature() {
+    let spec = serde_json::json!({
+        "permission_overrides": {"read_only": false},
+        "agent_spawn": {"task": "inspect", "prompt": "inspect"},
+        "budget": {"request_budget": {"tranche": 2, "hard_cap": 4}, "max_tokens": 40},
+        "continuation_of": "run-checkpoint"
+    });
+    let all = BTreeSet::from([
+        "headless_run_v1".to_string(),
+        "run_budget_v1".to_string(),
+        "session_read_only_v1".to_string(),
+        "agent_cli_v1".to_string(),
+        "request_budget_v1".to_string(),
+    ]);
+    for bit in &all {
+        let mut peer = all.clone();
+        peer.remove(bit);
+        let error = headless_through_actor(spec.clone(), peer)
+            .await
+            .expect_err("missing bit");
+        assert_eq!(error.code, "missing_feature");
+        assert_eq!(
+            error.message,
+            format!("missing_feature: daemon does not advertise {bit}")
+        );
+    }
+    assert_eq!(
+        headless_through_actor(spec.clone(), all)
+            .await
+            .expect("all negotiated")["spec"],
+        spec
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_headless_legacy_specs_have_no_new_gates_or_defaults() {
+    for spec in [
+        serde_json::json!({"provider": "provider", "model": "model", "max_output_tokens": 4096}),
+        serde_json::json!({"permission_overrides": {"allow_writes": false}, "budget": {}}),
+        serde_json::json!({"budget": {"max_tokens": 123, "max_cost_microusd": 456, "max_time_ms": 789},
+            "request_deadline_unix_ms": 1900000000000_u64, "replay_of": "old-run", "future": [1, null]}),
+    ] {
+        let mut legacy = lifecycle_features("headless_run_v1");
+        if spec.get("budget").is_some() {
+            legacy.insert("run_budget_v1".to_string());
+        }
+        assert_eq!(headless_spec_features(&spec).expect("old spec").0, legacy);
+        let wire = headless_through_actor(spec.clone(), legacy)
+            .await
+            .expect("ordinary start needs no task/prompt pin");
+        assert_eq!(wire["spec"], spec);
+    }
+    fn accepts_optional_attachments<Fut>(_: fn(String, String, Option<Vec<Value>>, Value) -> Fut) {}
+    accepts_optional_attachments(headless_run_start);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_headless_agent_task_and_prompt_are_required_only_inside_the_pin() {
+    for spawn in [
+        serde_json::json!({}),
+        serde_json::json!({"task": "task"}),
+        serde_json::json!({"prompt": "prompt"}),
+        serde_json::json!({"task": 3, "prompt": "prompt"}),
+    ] {
+        let error =
+            headless_through_actor(serde_json::json!({"agent_spawn": spawn}), BTreeSet::new())
+                .await
+                .expect_err("invalid operator pin");
+        assert_eq!(error.code, "invalid_argument");
+    }
+    assert!(headless_spec_features(&serde_json::json!({})).is_ok());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires the already-running 969 fixture; only View status requests, never starts headless work"]
+async fn lifecycle_headless_live_969_pins_reject_at_the_production_gate() {
+    let mut connection = actor_handle().connection.subscribe();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !connection.borrow().connected {
+            connection.changed().await.expect("live actor connection");
+        }
+    })
+    .await
+    .expect("live daemon connection timeout");
+    let snapshot = connection.borrow().clone();
+    assert_eq!(snapshot.daemon_version.as_deref(), Some("0.0.969"));
+    assert!(snapshot.features.contains("headless_run_v1"));
+    assert!(snapshot.features.contains("run_budget_v1"));
+    for (pin, feature, spec) in headless_policy_cases() {
+        assert!(
+            !snapshot.features.contains(feature),
+            "negative fixture changed: {feature}"
+        );
+        let (features, _) = headless_spec_features(&spec).expect("valid pin");
+        // No published dry-run start exists. Exercise the same negotiated
+        // transport gate with a View body, making a test regression harmless.
+        let error = headless_request(
+            headless_run_status_request("w8-2-negative-gate-no-run".to_string()),
+            Capability::View,
+            &features,
+        )
+        .await
+        .expect_err("live 969 must reject the missing bit locally");
+        assert_eq!(error.code, "missing_feature");
+        assert!(!error.retryable);
+        assert_eq!(
+            error.message,
+            format!("missing_feature: daemon does not advertise {feature}")
+        );
+        println!(
+            "LIVE daemon=0.0.969 pin={pin} feature={feature} rejection={}",
+            serde_json::to_string(&error).expect("typed error")
+        );
+    }
 }
 
 #[cfg(unix)]

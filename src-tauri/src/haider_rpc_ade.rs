@@ -110,6 +110,8 @@ const FEATURE_SESSION_PROMPT_FORK_V1: &str = "session_prompt_fork_v1";
 const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
 const FEATURE_RUN_BUDGET_V1: &str = "run_budget_v1";
 const FEATURE_HEADLESS_RUN_V1: &str = "headless_run_v1";
+const FEATURE_AGENT_CLI_V1: &str = "agent_cli_v1";
+const FEATURE_REQUEST_BUDGET_V1: &str = "request_budget_v1";
 const FEATURE_SESSION_ATTACH_SEALED_V1: &str = "session_attach_sealed_v1";
 const FEATURE_COMPUTER_PERMISSION_ACTIONS_V1: &str = "computer_permission_actions_v1";
 const FEATURE_TRANSCRIPTION_V1: &str = "transcription_v1";
@@ -3058,6 +3060,76 @@ pub struct RunBudgetExhaustedV1 {
     pub usage: HeadlessRunUsageV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDeadlineExceededV1 {
+    pub deadline_unix_ms: u64,
+}
+
+/// Retained terminal evidence, decoded without classifying human messages or
+/// filling in missing causes. Strings preserve future daemon classifications.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadlessRunTerminalV1 {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<InternalCeilingTerminalV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InternalCeilingTerminalV1 {
+    pub end_reason: String,
+    pub internal_cap_detected: bool,
+    pub exit_code: u8,
+    pub ceilings: TurnCeilingV1,
+    pub continuation: RequestBudgetContinuationV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_receipt_error: Option<WorkspaceReceiptErrorV1>,
+    pub partial_progress: PartialProgressV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCeilingV1 {
+    pub soft: u64,
+    pub hard: u64,
+    pub used: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestBudgetContinuationV1 {
+    pub session_id: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceReceiptErrorV1 {
+    pub phase: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialProgressV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_written: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_deleted: Option<Vec<String>>,
+    pub tool_calls: u64,
+    #[serde(serialize_with = "serialize_lifecycle_u64")]
+    pub last_request_ordinal: u64,
 }
 
 /// JavaScript supplies prompt-fork sequences as decimal strings so values
@@ -7230,7 +7302,7 @@ pub struct PermissionGrantNeededV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RunFailedBudgetExhaustedV1 {
+pub struct RunFailedHeadlessV1 {
     pub code: String,
     pub message: String,
     pub retryable: bool,
@@ -7245,7 +7317,9 @@ pub struct RunFailedBudgetExhaustedV1 {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdeDurableFactV1 {
     RunBudgetExhausted(RunBudgetExhaustedV1),
-    RunFailed(RunFailedBudgetExhaustedV1),
+    RunDeadlineExceeded(RunDeadlineExceededV1),
+    RunState(HeadlessRunTerminalV1),
+    RunFailed(RunFailedHeadlessV1),
     PermissionGrantNeeded(PermissionGrantNeededV1),
 }
 
@@ -12093,11 +12167,35 @@ fn headless_spec_features(spec: &Value) -> Result<(BTreeSet<String>, bool), Life
         })?,
     };
     let mut features = lifecycle_features(FEATURE_HEADLESS_RUN_V1);
+    // Presence is deliberate, including explicit false/null read_only, just
+    // like session.create. The caller's raw policy is never rewritten.
+    if object
+        .get("permission_overrides")
+        .is_some_and(|policy| policy.get("read_only").is_some())
+    {
+        features.insert(FEATURE_SESSION_READ_ONLY_V1.to_string());
+    }
+    if let Some(spawn) = object.get("agent_spawn") {
+        features.insert(FEATURE_AGENT_CLI_V1.to_string());
+        for field in ["task", "prompt"] {
+            if spawn.get(field).and_then(Value::as_str).is_none() {
+                return Err(LifecycleCommandError::invalid_argument(format!(
+                    "headless run agent_spawn {field} must be a string"
+                )));
+            }
+        }
+    }
+    if object.contains_key("continuation_of") {
+        features.insert(FEATURE_REQUEST_BUDGET_V1.to_string());
+    }
     if let Some(budget) = object.get("budget") {
         let budget = budget.as_object().ok_or_else(|| {
             LifecycleCommandError::invalid_argument("headless run budget must be an object")
         })?;
         features.insert(FEATURE_RUN_BUDGET_V1.to_string());
+        if budget.contains_key("request_budget") {
+            features.insert(FEATURE_REQUEST_BUDGET_V1.to_string());
+        }
         for field in ["max_tokens", "max_cost_microusd", "max_time_ms"] {
             let Some(limit) = budget.get(field) else {
                 continue;
@@ -18975,14 +19073,35 @@ fn parse_ade_durable_fact(
                 .map(Some)
                 .map_err(|error| format!("invalid RunBudgetExhausted payload: {error}"))
         }
+        Some("run_deadline_exceeded") if features.contains(FEATURE_HEADLESS_RUN_V1) => {
+            serde_json::from_value(payload.clone())
+                .map(AdeDurableFactV1::RunDeadlineExceeded)
+                .map(Some)
+                .map_err(|error| format!("invalid RunDeadlineExceeded payload: {error}"))
+        }
+        Some("run_state")
+            if features.contains(FEATURE_HEADLESS_RUN_V1)
+                && matches!(
+                    payload.get("state").and_then(Value::as_str),
+                    Some("done" | "cancelled" | "errored")
+                ) =>
+        {
+            serde_json::from_value(payload.clone())
+                .map(AdeDurableFactV1::RunState)
+                .map(Some)
+                .map_err(|error| format!("invalid headless terminal RunState payload: {error}"))
+        }
         Some("run_failed")
-            if features.contains(FEATURE_RUN_BUDGET_V1)
-                && payload.get("code").and_then(Value::as_str) == Some("budget_exhausted") =>
+            if match payload.get("code").and_then(Value::as_str) {
+                Some("budget_exhausted") => features.contains(FEATURE_RUN_BUDGET_V1),
+                Some("request_budget_exceeded") => features.contains(FEATURE_REQUEST_BUDGET_V1),
+                _ => false,
+            } =>
         {
             serde_json::from_value(payload.clone())
                 .map(AdeDurableFactV1::RunFailed)
                 .map(Some)
-                .map_err(|error| format!("invalid budget-exhausted RunFailed payload: {error}"))
+                .map_err(|error| format!("invalid headless budget RunFailed payload: {error}"))
         }
         Some("permission_grant_needed")
             if features.contains(FEATURE_COMPUTER_PERMISSION_ACTIONS_V1) =>
