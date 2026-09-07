@@ -892,8 +892,9 @@ const BILLING_STATUS_REFRESH_MS = 5 * 60 * 1000;
 // the ws), so a 10s floor meant a fat /v1/billing/status fetch + merge +
 // persist every ~15s — the recurring idle energy spike.
 const BILLING_STATUS_EVENT_REFRESH_MIN_MS = 90 * 1000;
-const TODO_DISPATCH_HEARTBEAT_ACTIVE_MS = 5000;
-const TODO_DISPATCH_HEARTBEAT_IDLE_MS = 10000;
+// Native command availability is fixed for this webview session, across effect remounts.
+let todoDispatchAckUnavailable = false;
+let todoDispatcherReadyUnavailable = false;
 const LOW_CREDIT_WARNING_STORAGE_KEY = "diffforge.lowCreditWarning.dismissed.v1";
 const LOW_CREDIT_WARNING_THRESHOLD = 1000;
 // Startup-only "credit reserve low" overlay: shown once per sign-in when the
@@ -8223,7 +8224,10 @@ function LoopspaceRuntimeView({
         };
       });
     } catch (dispatchError) {
-      setRuntimeError(String(dispatchError || "Unable to dispatch todos."));
+      const message = String(dispatchError || "Unable to dispatch todos.");
+      setRuntimeError(message.includes("Command todo_store_dispatch_loopspace_batch not found")
+        ? "Loopspace todo dispatch is unavailable in this build."
+        : message);
     } finally {
       setDispatchTodosPendingNodeId((current) => (current === nodeId ? "" : current));
     }
@@ -17472,44 +17476,6 @@ export default function App() {
 
 
 
-  useEffect(() => {
-    // Mounted-webview presence for remote app-control levers. A minimized or
-    // backgrounded Tauri webview is still able to consume navigation events;
-    // visibility must not make Rust misclassify it as absent.
-    let cancelled = false;
-    let timerId = 0;
-    const beat = () => {
-      if (!cancelled) {
-        void invoke("todo_dispatch_dispatcher_heartbeat").catch(() => {});
-      }
-    };
-    const schedule = () => {
-      window.clearTimeout(timerId);
-      const delay = document.visibilityState !== "hidden" && readMainWindowFocusedFallback()
-        ? TODO_DISPATCH_HEARTBEAT_ACTIVE_MS
-        : TODO_DISPATCH_HEARTBEAT_IDLE_MS;
-      timerId = window.setTimeout(() => {
-        beat();
-        schedule();
-      }, delay);
-    };
-    const handlePresenceChange = () => {
-      beat();
-      schedule();
-    };
-    beat();
-    schedule();
-    window.addEventListener("focus", handlePresenceChange);
-    window.addEventListener("blur", handlePresenceChange);
-    document.addEventListener("visibilitychange", handlePresenceChange);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timerId);
-      window.removeEventListener("focus", handlePresenceChange);
-      window.removeEventListener("blur", handlePresenceChange);
-      document.removeEventListener("visibilitychange", handlePresenceChange);
-    };
-  }, []);
 
 
 
@@ -22181,8 +22147,14 @@ export default function App() {
       } catch (error) {
         await recordStatus(event, "failed", getErrorMessage(error, "Remote command failed."), details);
       } finally {
-        if (commandId) {
-          await invoke("todo_dispatch_ack_deferred_remote_command", { command_id: commandId }).catch(() => {});
+        if (commandId && !todoDispatchAckUnavailable) {
+          await invoke("todo_dispatch_ack_deferred_remote_command", { command_id: commandId }).catch((error) => {
+            if (!todoDispatchAckUnavailable
+              && getErrorMessage(error, "") === "Command todo_dispatch_ack_deferred_remote_command not found") {
+              todoDispatchAckUnavailable = true;
+              console.warn("todo_dispatch_ack_deferred_remote_command is unavailable in this build.");
+            }
+          });
         }
       }
     };
@@ -22193,7 +22165,16 @@ export default function App() {
     unlistenRemoteCommand = listenShared(CLOUD_MCP_REMOTE_COMMAND_EVENT, handleRemoteCommand);
     void waitSharedListenerReady(CLOUD_MCP_REMOTE_COMMAND_EVENT)
       .then(() => invoke("cloud_mcp_start_remote_command_listener"))
-      .then(() => invoke("todo_dispatch_dispatcher_ready"))
+      .then(() => {
+        if (todoDispatcherReadyUnavailable) return;
+        return invoke("todo_dispatch_dispatcher_ready").catch((error) => {
+          if (!todoDispatcherReadyUnavailable
+            && getErrorMessage(error, "") === "Command todo_dispatch_dispatcher_ready not found") {
+            todoDispatcherReadyUnavailable = true;
+            console.warn("todo_dispatch_dispatcher_ready is unavailable in this build.");
+          }
+        });
+      })
       .catch(() => {});
 
     return () => {

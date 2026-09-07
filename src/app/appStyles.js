@@ -11952,7 +11952,7 @@ export const LoopspaceRuntimeError = styled.div`
   left: 12px;
   right: 12px;
   bottom: 266px;
-  z-index: 8;
+  z-index: 10;
   min-width: 0;
   padding: 8px 10px;
   border: 1px solid rgba(255, 110, 110, 0.32);
