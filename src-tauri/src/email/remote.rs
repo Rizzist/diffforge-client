@@ -383,7 +383,7 @@ async fn send_email_command_ack(
 /// event was a RECOGNIZED email command — valid or not — so the generic
 /// pipeline never acknowledges a malformed email command as if it were an
 /// ordinary one.
-pub async fn email_try_handle_remote_command(
+pub(crate) async fn email_try_handle_remote_command(
     state: &crate::CloudMcpState,
     event: &Value,
     source: &'static str,
@@ -595,7 +595,7 @@ pub(crate) fn claim_send_worker(send_job_id: &str, generation: u32) -> Option<Se
 /// Spawn the send worker for one (send_job_id, generation) on a blocking
 /// thread, panic-caught per the self-restarting worker shape — a panic is
 /// logged and the pair is left to the resume path (never silently lost).
-pub fn spawn_send_worker(
+pub(crate) fn spawn_send_worker(
     state: crate::CloudMcpState,
     send_job_id: String,
     generation: u32,
@@ -949,7 +949,7 @@ pub fn email_startup_journal_recovery() {
 /// `email_send_resume` — applying reoffers through the SAME
 /// journal-before-ack intake path (§9.4) and marking stale generations
 /// superseded.
-pub async fn email_account_sync_resume_hook(state: &crate::CloudMcpState) {
+pub(crate) async fn email_account_sync_resume_hook(state: &crate::CloudMcpState) {
     use super::cloud_transport::EmailCloudTransport;
 
     // (a) Pending events → outbox. The whole walk runs on a blocking thread:

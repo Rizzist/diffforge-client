@@ -40,25 +40,6 @@ pub(crate) fn native_notifications_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// True when the user is actively watching this workspace's terminals: app
-/// focused, that workspace selected, terminals view visible. Attention-grade
-/// notifications for a watched workspace are redundant (the in-app cue and
-/// pane chip are on screen).
-pub(crate) fn native_attention_watching_workspace(workspace_id: &str) -> bool {
-    let workspace_id = workspace_id.trim();
-    if workspace_id.is_empty() {
-        return false;
-    }
-    native_attention_state()
-        .lock()
-        .map(|state| {
-            state.focused
-                && state.terminals_view_visible
-                && state.selected_workspace_id == workspace_id
-        })
-        .unwrap_or(false)
-}
-
 fn diffforge_native_notify_with_outcome(
     app: &AppHandle,
     title: &str,

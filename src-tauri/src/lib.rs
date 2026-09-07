@@ -31,7 +31,6 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot, Mutex, OwnedMutexGuard, RwLock},
     time::{sleep, timeout},
@@ -41,7 +40,6 @@ use tokio_tungstenite::{
     tungstenite::{
         client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig, Message,
     },
-    MaybeTlsStream, WebSocketStream,
 };
 
 mod codex_config;
@@ -89,21 +87,7 @@ const DEVICE_AUTH_START_TIMEOUT_SECS: u64 = 10;
 const DEVICE_AUTH_POLL_TIMEOUT_SECS: u64 = 10;
 const DESKTOP_AUTH_PROVISION_REDEEM_TIMEOUT_SECS: u64 = 10;
 const AGENT_STATUS_TIMEOUT_SECS: u64 = 6;
-const AGENT_UPDATE_CHECK_TIMEOUT_SECS: u64 = 3;
-// Coding-agent npm packages ship multi-hundred-MB native binaries (Claude
-// Code's darwin-arm64 binary alone is ~220MB). run_command_capture KILLS the
-// child on timeout, and killing npm mid-extraction leaves a truncated binary
-// with a missing package.json — the agent then launches as a broken stub
-// ("native binary not installed"). Keep this generous; a slow network is not
-// an error.
-const AGENT_INSTALL_TIMEOUT_SECS: u64 = 900;
-const AGENT_RUN_TIMEOUT_SECS: u64 = 120;
-const AGENT_THREAD_TURN_TIMEOUT_SECS: u64 = 30 * 60;
-const AGENT_LOGOUT_TIMEOUT_SECS: u64 = 30;
 const MAX_FORGE_PROMPT_LENGTH: usize = 12_000;
-// Long enough for OpenCode `providerID/modelID` ids, whose model segment can
-// itself be a slash path (e.g. `fireworks-ai/accounts/fireworks/routers/...`).
-const MAX_FORGE_MODEL_LENGTH: usize = 128;
 const MAX_FORGE_IMAGES: usize = 5;
 const MAX_FORGE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_FORGE_IMAGE_TOTAL_BYTES: usize = 20 * 1024 * 1024;
@@ -117,7 +101,6 @@ const TERMINAL_MAX_COLS: u16 = 400;
 const TERMINAL_MAX_ROWS: u16 = 160;
 const MAX_TERMINAL_WRITE_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_INPUT_TRANSPORT_MESSAGE_BYTES: usize = 256 * 1024;
-const MAX_TERMINAL_ACTIVITY_TRANSPORT_MESSAGE_BYTES: usize = 256 * 1024;
 const TERMINAL_INPUT_QUEUE_CAPACITY: usize = 1024;
 const TERMINAL_INPUT_QUEUE_IDLE_SECS: u64 = 30;
 const TERMINAL_PTY_POOL_TARGET: usize = 0;
@@ -135,12 +118,6 @@ const TERMINAL_OUTPUT_COALESCE_MAX_BYTES: usize = 64 * 1024;
 const TERMINAL_OUTPUT_COALESCE_QUEUE_CAPACITY: usize = 64;
 const TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES: usize = 512 * 1024;
 const TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE: &str = "\r";
-const TERMINAL_ACTIVITY_HOOK_POLL_MS: u64 = 50;
-const TERMINAL_ACTIVITY_HOOK_BACKOFF_POLL_MS: u64 = 250;
-const TERMINAL_ACTIVITY_HOOK_IDLE_POLL_MS: u64 = 1_000;
-const TERMINAL_ACTIVITY_HOOK_FALLBACK_POLL_MS: u64 = 2_000;
-const TERMINAL_ACTIVITY_HOOK_BACKOFF_UNCHANGED_POLLS: u32 = 4;
-const TERMINAL_STRUCTURED_INTERACTION_WAIT_SECONDS: u64 = 570;
 // Once an answer has been written or handed to a provider API, only the
 // provider's resolution event remains. Bound that confirmation gap so a lost
 // follow-up cannot leave the terminal prompting forever.
@@ -472,7 +449,6 @@ const AUDIO_INPUT_WAVEFORM_SAMPLE_COUNT: usize = 256;
 
 static AGENT_COMMAND_CANDIDATE_CACHE: OnceLock<StdMutex<HashMap<&'static str, Vec<String>>>> =
     OnceLock::new();
-static LOGIN_TERMINAL_CHILDREN: OnceLock<StdMutex<Vec<std::process::Child>>> = OnceLock::new();
 static WHISPER_LOCAL_AUDIO_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -2114,14 +2090,6 @@ struct AgentStatus {
     active_model_supports_images: bool,
 }
 
-struct AgentRuntimeStatus {
-    installed: bool,
-    authenticated: bool,
-    version: String,
-    auth_message: String,
-    recommend_native_install: bool,
-}
-
 #[derive(Clone, Debug, Serialize)]
 struct AgentInstallResult {
     provider: &'static str,
@@ -3018,11 +2986,6 @@ struct AudioWidgetVisibility {
 struct ActivityOverlayVisibility {
     visible: bool,
     shortcut: String,
-}
-
-struct PreparedPromptImages {
-    directory: PathBuf,
-    paths: Vec<String>,
 }
 
 include!("validation.rs");
@@ -6490,7 +6453,7 @@ fn run_app(daemon: bool) {
         context.config_mut().app.windows.clear();
     }
 
-    let mut app = builder
+    let app = builder
         .setup(move |app| {
             if daemon {
                 #[cfg(target_os = "macos")]

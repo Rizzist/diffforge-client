@@ -242,7 +242,7 @@ pub fn send_event_idempotency_key(
 /// Methods are synchronous by design: the send worker runs on a blocking
 /// thread and parks on the async runtime only for the round-trip itself.
 pub struct WsCloudTransport {
-    pub state: crate::CloudMcpState,
+    pub(crate) state: crate::CloudMcpState,
 }
 
 const EMAIL_WS_TIMEOUT: Duration = Duration::from_secs(20);

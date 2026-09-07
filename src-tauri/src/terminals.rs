@@ -108,11 +108,6 @@ impl TerminalAdoptableOutputSlot {
         self.ring.clear();
     }
 }
-// A resume binding is captured before a busy restart is queued. Keep it past
-// the longest admission deadline so the ready event can still reopen against
-// the pane's frozen account instead of falling back to the mutable active one.
-const TERMINAL_FROZEN_RESUME_BINDING_TTL_MS: u64 =
-    TERMINAL_RESTART_INTENT_MAX_DEADLINE_MS + 2 * 60_000;
 static TERMINAL_DAEMON_RESPAWN_HISTORY: OnceLock<StdMutex<HashMap<String, VecDeque<u64>>>> =
     OnceLock::new();
 
@@ -441,88 +436,6 @@ enum TerminalProviderLaunchAccountBinding {
     },
 }
 
-#[derive(Clone)]
-struct TerminalFrozenResumeBinding {
-    account_binding: TerminalProviderLaunchAccountBinding,
-    captured_at_ms: u64,
-    instance_id: u64,
-    provider_id: String,
-    provider_session_id: String,
-}
-
-static TERMINAL_FROZEN_RESUME_BINDINGS: OnceLock<
-    StdMutex<HashMap<String, TerminalFrozenResumeBinding>>,
-> = OnceLock::new();
-
-fn terminal_frozen_resume_bindings(
-) -> &'static StdMutex<HashMap<String, TerminalFrozenResumeBinding>> {
-    TERMINAL_FROZEN_RESUME_BINDINGS.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-fn terminal_store_frozen_resume_binding(
-    pane_id: &str,
-    instance_id: u64,
-    provider: AgentProvider,
-    provider_session_id: &str,
-    account_binding: &TerminalProviderLaunchAccountBinding,
-) {
-    let provider_id = agent_definition(provider).id;
-    if let Ok(mut bindings) = terminal_frozen_resume_bindings().lock() {
-        let now_ms = terminal_now_ms();
-        bindings.retain(|_, binding| {
-            now_ms.saturating_sub(binding.captured_at_ms)
-                <= TERMINAL_FROZEN_RESUME_BINDING_TTL_MS
-        });
-        bindings.insert(
-            pane_id.to_string(),
-            TerminalFrozenResumeBinding {
-                account_binding: account_binding.clone(),
-                captured_at_ms: now_ms,
-                instance_id,
-                provider_id: provider_id.to_string(),
-                provider_session_id: provider_session_id.to_string(),
-            },
-        );
-    }
-}
-
-fn terminal_frozen_resume_binding(
-    pane_id: &str,
-    instance_id: Option<u64>,
-    provider: AgentProvider,
-    provider_session_id: &str,
-    take: bool,
-) -> Option<TerminalProviderLaunchAccountBinding> {
-    let provider_id = agent_definition(provider).id;
-    let mut bindings = terminal_frozen_resume_bindings().lock().ok()?;
-    let now_ms = terminal_now_ms();
-    bindings.retain(|_, binding| {
-        now_ms.saturating_sub(binding.captured_at_ms)
-            <= TERMINAL_FROZEN_RESUME_BINDING_TTL_MS
-    });
-    let matches = bindings.get(pane_id).is_some_and(|binding| {
-        binding.provider_id == provider_id
-            && binding.provider_session_id == provider_session_id
-            && instance_id.is_none_or(|instance_id| binding.instance_id == instance_id)
-    });
-    if !matches {
-        return None;
-    }
-    if take {
-        bindings.remove(pane_id).map(|binding| binding.account_binding)
-    } else {
-        bindings
-            .get(pane_id)
-            .map(|binding| binding.account_binding.clone())
-    }
-}
-
-fn terminal_clear_frozen_resume_binding(pane_id: &str) {
-    if let Ok(mut bindings) = terminal_frozen_resume_bindings().lock() {
-        bindings.remove(pane_id);
-    }
-}
-
 impl Default for TerminalProviderLaunchAccountBinding {
     fn default() -> Self {
         Self::Unmanaged { account: None }
@@ -735,13 +648,6 @@ impl TerminalProviderLaunchAccountBinding {
             }
         }
     }
-}
-
-fn terminal_launch_account_binding_for_instance(
-    _instance: &TerminalInstance,
-    provider: AgentProvider,
-) -> TerminalProviderLaunchAccountBinding {
-    TerminalProviderLaunchAccountBinding::capture(provider)
 }
 
 fn terminal_resolve_provider_resume_session_for_binding(
@@ -2565,15 +2471,6 @@ fn terminal_record_coordination_provider_session_id(
 ) {
 }
 
-fn terminal_provider_session_binding_root(instance: &TerminalInstance) -> String {
-    instance
-        .coordination
-        .as_ref()
-        .map(|coordination| coordination.repo_path.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| instance.working_directory.to_string_lossy().to_string())
-}
-
 fn terminal_workspace_agent_session_status_requires_input(
     event_type: &str,
     activity_status: &str,
@@ -2626,29 +2523,6 @@ fn terminal_record_workspace_agent_session_history(
     _source: impl Into<String>,
     _slot_key_override: Option<&str>,
 ) {
-}
-
-const TERMINAL_CODEX_SESSION_DISCOVERY_DELAYS_MS: [u64; 6] = [100, 250, 500, 1_000, 2_000, 4_000];
-
-fn terminal_runtime_has_provider_session(instance: &TerminalInstance) -> bool {
-    terminal_runtime_snapshot(instance)
-        .provider_session_id
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-}
-
-fn terminal_current_recordable_provider_session_id(instance: &TerminalInstance) -> Option<String> {
-    let runtime = terminal_runtime_snapshot(instance);
-    runtime
-        .provider_session_id
-        .or(runtime.native_session_id)
-        .and_then(|session_id| {
-            terminal_recordable_provider_session_id_for_metadata(
-                &instance.metadata,
-                Some(&session_id),
-            )
-        })
 }
 
 type TerminalLaunchResult = (
@@ -2911,7 +2785,7 @@ fn webview_window_is_focused(app: &AppHandle, label: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn app_process_is_active() -> bool {
     // NSRunningApplication is documented thread-safe, unlike NSApplication.
-    unsafe { objc2_app_kit::NSRunningApplication::currentApplication().isActive() }
+    objc2_app_kit::NSRunningApplication::currentApplication().isActive()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -8689,24 +8563,6 @@ fn emit_terminal_input_error(
     );
 }
 
-fn emit_terminal_fork_requested(
-    app: &AppHandle,
-    instance: &TerminalInstance,
-    provider_session_id: String,
-) {
-    let payload = TerminalForkRequestedPayload {
-        pane_id: instance.metadata.pane_id.clone(),
-        instance_id: instance.id,
-        workspace_id: instance.metadata.workspace_id.clone(),
-        terminal_index: instance.metadata.terminal_index,
-        thread_id: instance.metadata.thread_id.clone(),
-        agent_id: instance.metadata.agent_id.clone(),
-        agent_kind: instance.metadata.agent_kind.clone(),
-        provider_session_id,
-    };
-    let _ = app.emit(TERMINAL_FORK_REQUESTED_EVENT, payload);
-}
-
 /// Detects a local CLI slash command shaped like `^/[A-Za-z0-9_:-]+(\s|$)`
 /// (`/model`, `/clear`, `/model gpt-5.1`, `/status`, …). Claude Code, Codex,
 /// and OpenCode handle these entirely in-process: they print a result, never
@@ -12096,35 +11952,6 @@ async fn terminal_activity_hook_current_instance(
         .cloned()
 }
 
-async fn read_terminal_activity_hook_chunk(
-    path: &Path,
-    offset: u64,
-) -> Result<(u64, String), String> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|error| format!("Unable to read activity hook metadata: {error}"))?;
-    let length = metadata.len();
-    if length <= offset {
-        return Ok((length, String::new()));
-    }
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .open(path)
-        .await
-        .map_err(|error| format!("Unable to open activity hook events: {error}"))?;
-    file.seek(SeekFrom::Start(offset))
-        .await
-        .map_err(|error| format!("Unable to seek activity hook events: {error}"))?;
-    let mut chunk = String::new();
-    file.read_to_string(&mut chunk)
-        .await
-        .map_err(|error| format!("Unable to read activity hook events: {error}"))?;
-    let next_offset = offset.saturating_add(chunk.as_bytes().len() as u64);
-
-    Ok((next_offset, chunk))
-}
-
 #[derive(Clone, Eq, PartialEq)]
 struct TerminalActivityHookFileFingerprint {
     len: u64,
@@ -12138,38 +11965,10 @@ fn terminal_activity_hook_file_changed_since_last_drain(
     latest.is_some() && latest != last_drained
 }
 
-async fn terminal_activity_hook_file_fingerprint(
-    path: &Path,
-) -> Option<TerminalActivityHookFileFingerprint> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    Some(TerminalActivityHookFileFingerprint {
-        len: metadata.len(),
-        modified: metadata.modified().ok(),
-    })
-}
-
-fn terminal_activity_hook_next_poll_ms(current_poll_ms: u64) -> u64 {
-    if current_poll_ms < TERMINAL_ACTIVITY_HOOK_BACKOFF_POLL_MS {
-        TERMINAL_ACTIVITY_HOOK_BACKOFF_POLL_MS
-    } else if current_poll_ms < TERMINAL_ACTIVITY_HOOK_IDLE_POLL_MS {
-        TERMINAL_ACTIVITY_HOOK_IDLE_POLL_MS
-    } else {
-        TERMINAL_ACTIVITY_HOOK_FALLBACK_POLL_MS
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalActivityWatchdogAction {
     WaitingRelease,
     PromptSubmitThinkingDecayIdle,
-}
-
-fn terminal_activity_watchdog_launch_mode(runtime: &TerminalRuntimeSnapshot) -> &'static str {
-    if runtime.source.contains("start-agent") {
-        "terminal_start_agent"
-    } else {
-        "terminal_open"
-    }
 }
 
 fn terminal_activity_watchdog_waiting_release_action(
@@ -12253,34 +12052,6 @@ fn terminal_activity_watchdog_event(
         }
     }
     event
-}
-
-async fn handle_terminal_activity_hook_event(
-    app: &AppHandle,
-    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
-    cloud_mcp_state: &CloudMcpState,
-    pane_id: &str,
-    instance_id: u64,
-    event: Value,
-    source: &str,
-) -> Result<(), String> {
-    let Some(instance) =
-        terminal_activity_hook_current_instance(terminals, pane_id, instance_id).await
-    else {
-        return Err("Terminal activity event target is not active.".to_string());
-    };
-    process_terminal_activity_hook_event(
-        app,
-        terminals,
-        cloud_mcp_state,
-        pane_id,
-        instance_id,
-        &instance,
-        &event,
-        source,
-    )
-    .await;
-    Ok(())
 }
 
 fn terminal_activity_hook_startup_idle_candidate(event: &Value) -> bool {
@@ -14177,23 +13948,6 @@ fn terminal_activity_events_path(
         ))
 }
 
-fn terminal_activity_debug_path(
-    pane_id: &str,
-    instance_id: u64,
-    workspace_id: Option<&str>,
-) -> PathBuf {
-    let mut path = terminal_activity_events_path(pane_id, instance_id, workspace_id);
-    path.set_extension("debug.jsonl");
-    path
-}
-
-fn terminal_activity_hook_event_was_transport_delivered(event: &Value) -> bool {
-    event
-        .get("_diffforge_transport_delivered")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
 fn terminal_prompt_submitted_source_is_authoritative(
     prompt_source: &str,
     prompt_match: bool,
@@ -15592,14 +15346,6 @@ fn terminal_structured_interaction_claim_answer_confirmation(
     true
 }
 
-fn terminal_structured_interaction_claim_matches_option(
-    interaction: &TerminalStructuredInteraction,
-    option_id: &str,
-) -> bool {
-    interaction.awaiting_provider_confirmation
-        && interaction.claimed_option_id.as_deref() == Some(option_id)
-}
-
 fn terminal_structured_interaction_arm_answer_confirmation_timeout(
     app: &AppHandle,
     interaction: TerminalStructuredInteraction,
@@ -15720,53 +15466,6 @@ fn terminal_structured_interaction_arm_answer_confirmation_timeout(
         terminal_structured_interaction_remove_answered_generation(&state, &interaction);
     });
     true
-}
-
-async fn terminal_structured_interaction_publish_answered(
-    app: &AppHandle,
-    state: &TerminalState,
-    cloud_mcp_state: &CloudMcpState,
-    instance: &TerminalInstance,
-    interaction: &TerminalStructuredInteraction,
-    option_id: &str,
-    source: &str,
-) {
-    let denied = matches!(
-        terminal_activity_hook_name_key(option_id).as_str(),
-        "deny" | "denied" | "reject" | "rejected" | "decline" | "cancel"
-    );
-    let permission_request = matches!(
-        terminal_activity_hook_name_key(&interaction.hook_event_name).as_str(),
-        "permissionrequest" | "permissiondenied"
-    );
-    let event = json!({
-        "hook_event_name": if permission_request {
-            "PermissionResult"
-        } else {
-            "ElicitationResult"
-        },
-        "provider": interaction.provider,
-        "source_hook_event_name": interaction.hook_event_name,
-        "permission_request_id": interaction.provider_request_id,
-        "prompt_id": interaction.prompt_id,
-        "resolved_interaction_id": interaction.interaction_id,
-        "resolved_interaction_revision": interaction.revision,
-        "selected_option_id": option_id,
-        "decision": if denied { "denied" } else { "accepted" },
-        "timestamp_ms": terminal_now_ms(),
-        "resolution_reason": "structured_interaction_answered",
-    });
-    process_terminal_activity_hook_event(
-        app,
-        &state.terminals,
-        cloud_mcp_state,
-        &interaction.pane_id,
-        interaction.instance_id,
-        instance,
-        &event,
-        source,
-    )
-    .await;
 }
 
 async fn terminal_answer_agent_prompt_remote_command(

@@ -757,11 +757,6 @@ fn terminal_agent_start_input(command_path: &str, args: &[String]) -> String {
 }
 
 
-const TERMINAL_PERMISSION_MODE_PLAN: &str = "plan";
-const TERMINAL_PERMISSION_MODE_ASK: &str = "ask";
-const TERMINAL_PERMISSION_MODE_ACCEPT_EDITS: &str = "accept_edits";
-const TERMINAL_PERMISSION_MODE_AUTO: &str = "auto";
-const TERMINAL_PERMISSION_MODE_FULL_ACCESS: &str = "full_access";
 const TERMINAL_PERMISSION_MODE_BYPASS: &str = "bypass";
 
 
@@ -1387,11 +1382,6 @@ where
 }
 
 
-
-fn verify_agent_binary_runs(definition: AgentDefinition) -> Result<(), String> {
-    let _ = definition;
-    Err("DiffForge does not probe legacy harness executables.".to_string())
-}
 
 
 
@@ -2494,112 +2484,6 @@ fn save_todo_text_attachment_for(
     })
 }
 
-
-fn json_string(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn extract_session_id_from_json(value: &Value) -> Option<String> {
-    match value {
-        Value::Object(object) => {
-            for (key, child) in object {
-                let normalized_key = key
-                    .chars()
-                    .filter(|character| character.is_ascii_alphanumeric())
-                    .collect::<String>()
-                    .to_ascii_lowercase();
-                if matches!(normalized_key.as_str(), "sessionid" | "sessionuuid") {
-                    if let Some(session_id) = json_string(Some(child)) {
-                        return Some(clean_codex_id(session_id));
-                    }
-                }
-                if normalized_key == "session" {
-                    if let Some(session_object) = child.as_object() {
-                        if let Some(session_id) = json_string(session_object.get("id")) {
-                            return Some(clean_codex_id(session_id));
-                        }
-                    }
-                }
-            }
-
-            object.values().find_map(extract_session_id_from_json)
-        }
-        Value::Array(items) => items.iter().find_map(extract_session_id_from_json),
-        _ => None,
-    }
-}
-
-fn json_content_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.trim().to_string(),
-        Value::Array(items) => items
-            .iter()
-            .map(json_content_text)
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Object(object) => {
-            if let Some(text) = json_string(object.get("text")) {
-                return text;
-            }
-            if let Some(text) = json_string(object.get("content")) {
-                return text;
-            }
-            if let Some(content) = object.get("content") {
-                return json_content_text(content);
-            }
-            String::new()
-        }
-        _ => String::new(),
-    }
-}
-
-fn collect_agent_turn_texts(value: &Value, texts: &mut Vec<String>) {
-    match value {
-        Value::Object(object) => {
-            let event_type = json_string(object.get("type"))
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let role = json_string(object.get("role"))
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-
-            if event_type == "result" {
-                if let Some(result) = json_string(object.get("result")) {
-                    texts.push(result);
-                }
-            }
-
-            if role == "assistant"
-                || event_type.contains("assistant")
-                || event_type.contains("message")
-            {
-                for key in ["message", "content", "text", "delta", "output"] {
-                    if let Some(child) = object.get(key) {
-                        let text = json_content_text(child);
-                        if !text.is_empty() {
-                            texts.push(text);
-                        }
-                    }
-                }
-            }
-
-            object
-                .values()
-                .for_each(|child| collect_agent_turn_texts(child, texts));
-        }
-        Value::Array(items) => {
-            items
-                .iter()
-                .for_each(|child| collect_agent_turn_texts(child, texts));
-        }
-        _ => {}
-    }
-}
 
 
 

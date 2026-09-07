@@ -15762,7 +15762,6 @@ fn read_staged_paste_attachment(path: &str) -> Result<(Vec<u8>, String), String>
         fs::File,
         io::Read,
         os::unix::{
-            ffi::OsStrExt as _,
             fs::MetadataExt as _,
             io::{AsRawFd as _, FromRawFd as _},
         },

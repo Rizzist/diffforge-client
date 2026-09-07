@@ -227,7 +227,7 @@ extern "C" {
 
 #[cfg(target_os = "macos")]
 fn backend_thread_cpu_time_ns() -> Option<u128> {
-    let thread = unsafe { libc::mach_thread_self() };
+    let thread = unsafe { mach2::mach_init::mach_thread_self() };
     if thread == 0 {
         return None;
     }
@@ -242,7 +242,7 @@ fn backend_thread_cpu_time_ns() -> Option<u128> {
             &mut count,
         )
     };
-    let _ = unsafe { mach_port_deallocate(libc::mach_task_self(), thread) };
+    let _ = unsafe { mach_port_deallocate(mach2::traps::mach_task_self(), thread) };
     if result != libc::KERN_SUCCESS {
         return None;
     }

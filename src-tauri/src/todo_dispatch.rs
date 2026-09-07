@@ -203,13 +203,6 @@ pub(crate) fn todo_store_account_resume_reconciliation_commits(
     Vec::new()
 }
 
-pub(crate) fn todo_dispatch_pane_has_running_or_in_flight_todo(
-    _workspace_id: &str,
-    _pane_id: &str,
-) -> bool {
-    false
-}
-
 pub(crate) fn todo_dispatch_mark_active_for_pane_interrupted(
     _app: Option<&AppHandle>,
     _workspace_id: &str,
@@ -228,10 +221,6 @@ pub(crate) fn todo_dispatch_mark_active_for_swarm_completed(
     _dispatch_attempt_seq: Option<u64>,
 ) -> usize {
     0
-}
-
-pub(crate) fn todo_dispatch_workspace_has_busy_terminals(_workspace_id: &str) -> bool {
-    false
 }
 
 pub(crate) fn todo_dispatch_capture_direct_prompt_todo(

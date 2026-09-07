@@ -25,7 +25,6 @@ const TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS: u64 = 5 * 60;
 const TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS: u64 = 7 * 24 * 60 * 60;
 const TOKENOMICS_SUMMARY_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_LIVE_LIMITS_CACHE_TTL_MS: u64 = 60_000;
-const TOKENOMICS_PERIODIC_SAMPLE_INTERVAL_MS: u64 = 15 * 60 * 1000;
 const TOKENOMICS_SUMMARY_SNAPSHOT_CACHE_KEY_PREFIX: &str = "summary_snapshot_cache:";
 const TOKENOMICS_UPDATED_EVENT: &str = "diffforge://tokenomics-updated";
 const TOKENOMICS_LOCAL_DEVICE_ALIASES_KEY: &str = "local_device_aliases";
@@ -44,7 +43,6 @@ const TOKENOMICS_LIMITS_CHANGED_SYNC_REASON: &str = "tokenomics_limits_changed";
 /// last republished `aus` packet, so the web Billing tab needs a fresh copy.
 const TOKENOMICS_WINDOW_REPUBLISH_SYNC_REASON: &str = "tokenomics_window_republish";
 const TOKENOMICS_DEVICE_IDENTITIES_KEY: &str = "device_identities";
-const TOKENOMICS_CLOUD_ACCOUNT_SYNC_CURSOR_KEY_PREFIX: &str = "cloud_account_sync_cursor:";
 const TOKENOMICS_CODEX_USAGE_CACHE_ALIAS_KEY_PREFIX: &str = "codex_usage_api_cache_alias:";
 const TOKENOMICS_DAEMON_USAGE_AUTHORITY_KEY: &str = "daemon_usage_authority_v1";
 const TOKENOMICS_DAEMON_METER_STATES_KEY: &str = "daemon_meter_states_v1";
@@ -5015,20 +5013,6 @@ fn tokenomics_prune_unknown_provider_account_rows(
     Ok(())
 }
 
-fn tokenomics_purge_retired_limit_samples(
-    conn: &rusqlite::Connection,
-    retired_keys: &[String],
-) -> Result<(), String> {
-    for key in retired_keys {
-        conn.execute(
-            "DELETE FROM tokenomics_provider_limit_samples WHERE provider_account_key=?1",
-            rusqlite::params![key],
-        )
-        .map_err(|error| format!("Unable to purge retired limit samples: {error}"))?;
-    }
-    Ok(())
-}
-
 #[derive(Clone)]
 struct TokenomicsProviderAccount {
     key: String,
@@ -5157,97 +5141,9 @@ fn tokenomics_provider_account_from_auth_scoped(
     }
 }
 
-fn tokenomics_tag_limit_agent_profile(
-    limits: &mut [Value],
-    profile_id: &str,
-    active_profile_id: &str,
-) {
-    let active = profile_id == active_profile_id;
-    for limit in limits {
-        let Some(object) = limit.as_object_mut() else {
-            continue;
-        };
-        object.insert("agent_profile_id".to_string(), json!(profile_id));
-        object.insert("active_agent_profile".to_string(), json!(active));
-        object.insert("active_provider_account".to_string(), json!(active));
-    }
-}
-
-fn tokenomics_tag_dormant_cached_provider_limits(limits: &mut [Value]) {
-    for limit in limits {
-        let Some(object) = limit.as_object_mut() else {
-            continue;
-        };
-        object.insert(
-            "provider_limit_refresh_mode".to_string(),
-            json!("cached_dormant"),
-        );
-    }
-}
-
 fn tokenomics_provider_limit_is_dormant_cached(limit: &Value) -> bool {
     tokenomics_value_string(limit, &["provider_limit_refresh_mode"])
         .is_some_and(|value| value == "cached_dormant")
-}
-
-fn tokenomics_strip_provider_limit_refresh_mode(limits: &mut [Value]) {
-    for limit in limits {
-        let Some(object) = limit.as_object_mut() else {
-            continue;
-        };
-        object.remove("provider_limit_refresh_mode");
-    }
-}
-
-fn tokenomics_active_provider_account_key_map(limits: &[Value]) -> HashMap<String, String> {
-    let mut keys = HashMap::new();
-    for limit in limits {
-        let active = limit
-            .get("active_provider_account")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !active {
-            continue;
-        }
-        let provider =
-            tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-        let agent_kind =
-            tokenomics_value_string(limit, &["agent_kind"]).unwrap_or_else(|| provider.clone());
-        let account_key =
-            tokenomics_value_string(limit, &["provider_account_key", "subscription_key"])
-                .unwrap_or_default();
-        if provider == "unknown" || account_key.is_empty() {
-            continue;
-        }
-        keys.insert(format!("{provider}\u{1f}{agent_kind}"), account_key);
-    }
-    keys
-}
-
-fn tokenomics_retag_active_provider_accounts(
-    limits: &mut [Value],
-    active_account_keys: &HashMap<String, String>,
-) {
-    if active_account_keys.is_empty() {
-        return;
-    }
-    for limit in limits {
-        let provider =
-            tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
-        let agent_kind =
-            tokenomics_value_string(limit, &["agent_kind"]).unwrap_or_else(|| provider.clone());
-        let account_key =
-            tokenomics_value_string(limit, &["provider_account_key", "subscription_key"])
-                .unwrap_or_default();
-        let active = active_account_keys
-            .get(&format!("{provider}\u{1f}{agent_kind}"))
-            .map(|active_key| active_key == &account_key)
-            .unwrap_or(false);
-        let Some(object) = limit.as_object_mut() else {
-            continue;
-        };
-        object.insert("active_provider_account".to_string(), json!(active));
-    }
 }
 
 fn tokenomics_provider_account_base_label(provider: &str, agent_kind: &str) -> String {
@@ -5450,14 +5346,6 @@ fn tokenomics_provider_account_key_identifiers(
     }
 }
 
-fn tokenomics_opencode_account_key_identifiers(auth_value: &Value) -> Vec<String> {
-    // Preserve the historical API-key fingerprint. OAuth uses provider plus
-    // stable accountId/JWT claims; if the provider exposes neither, capture
-    // persists a first-seen identity in the active profile and tokenomics uses
-    // that immutable registry identity instead of rotating secrets.
-    tokenomics_opencode_account_key_identifiers_with_stable(auth_value, None)
-}
-
 fn tokenomics_opencode_account_key_identifiers_with_stable(
     auth_value: &Value,
     stable_identity: Option<&str>,
@@ -5606,28 +5494,6 @@ fn tokenomics_claude_profile_auth_value(profile_dir: &Path) -> Option<Value> {
         "credentials": credentials,
         "claude_config": claude_config,
     }))
-}
-
-/// Resolve the Claude identity visible to the hook process at SessionStart.
-/// Hooks inherit the CLI's effective CLAUDE_CONFIG_DIR, including an inline
-/// binding used to relaunch Claude inside an existing PTY. Only the opaque
-/// Tokenomics key is attached to the local activity record.
-fn tokenomics_process_provider_account_identity(provider_id: &str) -> Option<Value> {
-    if agent_accounts_supported_kind(provider_id) != Some("claude") {
-        return None;
-    }
-    let auth_value = match env::var_os("CLAUDE_CONFIG_DIR") {
-        Some(config_dir) => tokenomics_claude_profile_auth_value(&PathBuf::from(config_dir)),
-        None => tokenomics_claude_auth_value(),
-    }?;
-    let account = tokenomics_provider_account_from_auth("anthropic", "claude", Some(&auth_value));
-    (!tokenomics_provider_account_key_is_unknown(&account.key)).then(|| {
-        json!({
-            "provider": "anthropic",
-            "agent_kind": "claude",
-            "provider_account_key": account.key,
-        })
-    })
 }
 
 /// Identity-first account for a captured Claude profile, mirroring the Codex
@@ -6086,63 +5952,6 @@ fn tokenomics_cached_device_identities(conn: &rusqlite::Connection) -> Result<Ve
     };
     let parsed = serde_json::from_str::<Value>(&stored).unwrap_or_else(|_| json!([]));
     Ok(parsed.as_array().cloned().unwrap_or_default())
-}
-
-fn tokenomics_store_cloud_device_identities(
-    conn: &rusqlite::Connection,
-    summary: &Value,
-) -> Result<usize, String> {
-    let incoming = summary
-        .get("device_identities")
-        .or_else(|| summary.get("devices"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if incoming.is_empty() {
-        return Ok(0);
-    }
-
-    let mut by_id = std::collections::BTreeMap::<String, Value>::new();
-    for identity in tokenomics_cached_device_identities(conn)?
-        .into_iter()
-        .chain(incoming.into_iter())
-    {
-        let ids = tokenomics_device_identity_ids(&identity);
-        if ids.is_empty() {
-            continue;
-        }
-        let primary_id = ids[0].clone();
-        let label = tokenomics_device_identity_label(&identity);
-        let updated_at = tokenomics_text_field(&identity, &["updated_at", "last_seen_at"])
-            .unwrap_or_else(tokenomics_now_iso_like);
-        let mut object = identity.as_object().cloned().unwrap_or_default();
-        object.insert("device_id".to_string(), json!(primary_id.as_str()));
-        object.insert("machine_id".to_string(), json!(primary_id.as_str()));
-        object.insert("updated_at".to_string(), json!(updated_at.as_str()));
-        object.insert("last_seen_at".to_string(), json!(updated_at.as_str()));
-        if let Some(label) = label {
-            object.insert("display_name".to_string(), json!(label.as_str()));
-            object.insert("device_name".to_string(), json!(label.as_str()));
-        }
-        let value = Value::Object(object);
-        for id in ids {
-            let replace = by_id
-                .get(&id)
-                .and_then(|existing| tokenomics_text_field(existing, &["updated_at"]))
-                .map(|existing_updated_at| updated_at.as_str() >= existing_updated_at.as_str())
-                .unwrap_or(true);
-            if replace {
-                by_id.insert(id, value.clone());
-            }
-        }
-    }
-    let rows = by_id.into_values().collect::<Vec<_>>();
-    conn.execute(
-        "INSERT OR REPLACE INTO tokenomics_meta(key, value) VALUES(?1, ?2)",
-        rusqlite::params![TOKENOMICS_DEVICE_IDENTITIES_KEY, json!(rows).to_string()],
-    )
-    .map_err(|error| format!("Unable to store Tokenomics device identities: {error}"))?;
-    Ok(rows.len())
 }
 
 fn tokenomics_summary_device_identities(
@@ -7505,293 +7314,6 @@ fn tokenomics_clean_non_profile_provider_account_label(label: &str) -> Option<St
         .filter(|clean| !tokenomics_provider_account_label_is_profile(clean))
 }
 
-fn tokenomics_normalized_provider_account_identity_label(
-    provider: &str,
-    agent_kind: &str,
-    label: &str,
-) -> Option<String> {
-    let clean = tokenomics_clean_non_profile_provider_account_label(label)?;
-    if clean.chars().count() <= 1 {
-        return None;
-    }
-    let normalized = clean.split_whitespace().collect::<Vec<_>>().join(" ");
-    let normalized_lower = normalized.to_lowercase();
-    let base_lower = tokenomics_provider_account_base_label(provider, agent_kind).to_lowercase();
-    if normalized_lower == base_lower || normalized_lower.starts_with(&format!("{base_lower} ")) {
-        return None;
-    }
-    Some(normalized_lower)
-}
-
-#[derive(Clone, Debug)]
-struct TokenomicsProviderAccountIdentityCandidate {
-    provider: String,
-    agent_kind: String,
-    provider_account_key: String,
-    provider_account_label: String,
-    normalized_label: String,
-    usage_total: i64,
-    rollup_total: i64,
-    cloud_total: i64,
-    limit_rows: i64,
-    latest_rows: i64,
-    account_rows: i64,
-    updated_at_unix: i64,
-}
-
-impl TokenomicsProviderAccountIdentityCandidate {
-    fn authoritative_rows(&self) -> i64 {
-        self.limit_rows + self.latest_rows
-    }
-
-    fn authoritative_tokens(&self) -> i64 {
-        self.usage_total + self.rollup_total + self.cloud_total
-    }
-
-    fn has_authoritative_data(&self) -> bool {
-        self.authoritative_tokens() > 0 || self.authoritative_rows() > 0
-    }
-}
-
-fn tokenomics_provider_account_identity_candidates(
-    conn: &rusqlite::Connection,
-) -> Result<Vec<TokenomicsProviderAccountIdentityCandidate>, String> {
-    let mut statement = conn
-        .prepare(
-            "SELECT
-               provider,
-               agent_kind,
-               provider_account_key,
-               provider_account_label,
-               SUM(usage_total) AS usage_total,
-               SUM(rollup_total) AS rollup_total,
-               SUM(cloud_total) AS cloud_total,
-               SUM(limit_rows) AS limit_rows,
-               SUM(latest_rows) AS latest_rows,
-               SUM(account_rows) AS account_rows,
-               MAX(updated_at_unix) AS updated_at_unix
-             FROM (
-               SELECT
-                 provider,
-                 agent_kind,
-                 COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) AS provider_account_key,
-                 provider_account_label,
-                 COALESCE(SUM(total_tokens), 0) AS usage_total,
-                 0 AS rollup_total,
-                 0 AS cloud_total,
-                 0 AS limit_rows,
-                 0 AS latest_rows,
-                 0 AS account_rows,
-                 0 AS updated_at_unix
-	               FROM tokenomics_usage_events
-	               WHERE COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, ''), '') != ''
-	                 AND COALESCE(provider_account_label, '') != ''
-	               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
-	               UNION ALL
-	               SELECT
-	                 provider,
-	                 agent_kind,
-	                 COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) AS provider_account_key,
-	                 provider_account_label,
-	                 COALESCE(SUM(total_tokens), 0) AS usage_total,
-	                 0 AS rollup_total,
-	                 0 AS cloud_total,
-	                 0 AS limit_rows,
-	                 0 AS latest_rows,
-	                 0 AS account_rows,
-	                 0 AS updated_at_unix
-	               FROM tokenomics_pruned_usage_rollups
-	               WHERE bucket_width='hour'
-	                 AND COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, ''), '') != ''
-	                 AND COALESCE(provider_account_label, '') != ''
-	               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
-	               UNION ALL
-	               SELECT
-	                 provider,
-	                 agent_kind,
-                 COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) AS provider_account_key,
-                 provider_account_label,
-                 0 AS usage_total,
-                 COALESCE(SUM(total_tokens), 0) AS rollup_total,
-                 0 AS cloud_total,
-                 0 AS limit_rows,
-                 0 AS latest_rows,
-                 0 AS account_rows,
-                 0 AS updated_at_unix
-               FROM tokenomics_rollups
-               WHERE bucket_width='hour'
-                 AND COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, ''), '') != ''
-                 AND COALESCE(provider_account_label, '') != ''
-               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
-               UNION ALL
-               SELECT
-                 provider,
-                 agent_kind,
-                 COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) AS provider_account_key,
-                 provider_account_label,
-                 0 AS usage_total,
-                 0 AS rollup_total,
-                 COALESCE(SUM(total_tokens), 0) AS cloud_total,
-                 0 AS limit_rows,
-                 0 AS latest_rows,
-                 0 AS account_rows,
-                 0 AS updated_at_unix
-               FROM tokenomics_cloud_rollups
-               WHERE bucket_width='hour'
-                 AND COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, ''), '') != ''
-                 AND COALESCE(provider_account_label, '') != ''
-               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
-               UNION ALL
-               SELECT
-                 provider,
-                 agent_kind,
-                 provider_account_key,
-                 provider_account_label,
-                 0 AS usage_total,
-                 0 AS rollup_total,
-                 0 AS cloud_total,
-                 COUNT(*) AS limit_rows,
-                 0 AS latest_rows,
-                 0 AS account_rows,
-                 MAX(updated_at_unix) AS updated_at_unix
-               FROM tokenomics_provider_limit_samples
-               WHERE COALESCE(provider_account_key, '') != ''
-                 AND COALESCE(provider_account_label, '') != ''
-               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
-               UNION ALL
-               SELECT
-                 provider,
-                 agent_kind,
-                 provider_account_key,
-                 provider_account_label,
-                 0 AS usage_total,
-                 0 AS rollup_total,
-                 0 AS cloud_total,
-                 0 AS limit_rows,
-                 COUNT(*) AS latest_rows,
-                 0 AS account_rows,
-                 MAX(updated_at_unix) AS updated_at_unix
-               FROM tokenomics_latest_windows
-               WHERE COALESCE(provider_account_key, '') != ''
-                 AND COALESCE(provider_account_label, '') != ''
-               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
-               UNION ALL
-               SELECT
-                 provider,
-                 agent_kind,
-                 provider_account_key,
-                 provider_account_label,
-                 0 AS usage_total,
-                 0 AS rollup_total,
-                 0 AS cloud_total,
-                 0 AS limit_rows,
-                 0 AS latest_rows,
-                 COUNT(*) AS account_rows,
-                 MAX(updated_at_unix) AS updated_at_unix
-               FROM tokenomics_provider_accounts
-               WHERE COALESCE(provider_account_key, '') != ''
-                 AND COALESCE(provider_account_label, '') != ''
-               GROUP BY provider, agent_kind, provider_account_key, provider_account_label
-             )
-             GROUP BY provider, agent_kind, provider_account_key, provider_account_label",
-        )
-        .map_err(|error| {
-            format!("Unable to prepare Tokenomics provider account identity query: {error}")
-        })?;
-    let mapped = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, i64>(10)?,
-            ))
-        })
-        .map_err(|error| {
-            format!("Unable to query Tokenomics provider account identities: {error}")
-        })?;
-    let mut candidates_by_key = HashMap::<
-        (String, String, String, String),
-        TokenomicsProviderAccountIdentityCandidate,
-    >::new();
-    for row in mapped {
-        let (
-            provider,
-            agent_kind,
-            provider_account_key,
-            provider_account_label,
-            usage_total,
-            rollup_total,
-            cloud_total,
-            limit_rows,
-            latest_rows,
-            account_rows,
-            updated_at_unix,
-        ) = row.map_err(|error| {
-            format!("Unable to read Tokenomics provider account identity row: {error}")
-        })?;
-        let provider = provider.trim().to_ascii_lowercase();
-        let agent_kind = agent_kind.trim().to_ascii_lowercase();
-        let provider_account_key = provider_account_key.trim().to_string();
-        if provider.is_empty()
-            || agent_kind.is_empty()
-            || provider_account_key.is_empty()
-            || provider_account_key.ends_with(":unknown")
-        {
-            continue;
-        }
-        let Some(provider_account_label) =
-            tokenomics_clean_non_profile_provider_account_label(&provider_account_label)
-        else {
-            continue;
-        };
-        let Some(normalized_label) = tokenomics_normalized_provider_account_identity_label(
-            &provider,
-            &agent_kind,
-            &provider_account_label,
-        ) else {
-            continue;
-        };
-        let key = (
-            provider.clone(),
-            agent_kind.clone(),
-            normalized_label.clone(),
-            provider_account_key.clone(),
-        );
-        let entry = candidates_by_key.entry(key).or_insert_with(|| {
-            TokenomicsProviderAccountIdentityCandidate {
-                provider,
-                agent_kind,
-                provider_account_key,
-                provider_account_label,
-                normalized_label,
-                usage_total: 0,
-                rollup_total: 0,
-                cloud_total: 0,
-                limit_rows: 0,
-                latest_rows: 0,
-                account_rows: 0,
-                updated_at_unix: 0,
-            }
-        });
-        entry.usage_total += usage_total;
-        entry.rollup_total += rollup_total;
-        entry.cloud_total += cloud_total;
-        entry.limit_rows += limit_rows;
-        entry.latest_rows += latest_rows;
-        entry.account_rows += account_rows;
-        entry.updated_at_unix = entry.updated_at_unix.max(updated_at_unix);
-    }
-    Ok(candidates_by_key.into_values().collect())
-}
-
 fn tokenomics_compact_provider_account_rows(conn: &rusqlite::Connection) -> Result<(), String> {
     conn.execute(
         "DELETE FROM tokenomics_provider_accounts
@@ -7859,58 +7381,6 @@ fn tokenomics_compact_provider_account_rows(conn: &rusqlite::Connection) -> Resu
         [],
     )
     .map_err(|error| format!("Unable to compact Tokenomics account badges: {error}"))?;
-    Ok(())
-}
-
-fn tokenomics_compact_provider_account_fact_rows(
-    conn: &rusqlite::Connection,
-) -> Result<(), String> {
-    conn.execute(
-        "DELETE FROM tokenomics_latest_windows
-         WHERE EXISTS (
-           SELECT 1 FROM tokenomics_latest_windows newer
-           WHERE newer.device_id=tokenomics_latest_windows.device_id
-             AND newer.provider=tokenomics_latest_windows.provider
-             AND newer.agent_kind=tokenomics_latest_windows.agent_kind
-             AND newer.provider_account_key=tokenomics_latest_windows.provider_account_key
-             AND COALESCE(newer.billing_scope_type, 'unknown')=COALESCE(tokenomics_latest_windows.billing_scope_type, 'unknown')
-             AND COALESCE(newer.billing_team_id, '')=COALESCE(tokenomics_latest_windows.billing_team_id, '')
-             AND newer.window_kind=tokenomics_latest_windows.window_kind
-             AND (
-               COALESCE(newer.sample_at_unix, 0) > COALESCE(tokenomics_latest_windows.sample_at_unix, 0)
-               OR (
-                 COALESCE(newer.sample_at_unix, 0)=COALESCE(tokenomics_latest_windows.sample_at_unix, 0)
-                 AND newer.rowid > tokenomics_latest_windows.rowid
-               )
-             )
-         )",
-        [],
-    )
-    .map_err(|error| format!("Unable to compact Tokenomics account windows: {error}"))?;
-    conn.execute(
-        "DELETE FROM tokenomics_provider_limit_samples
-         WHERE EXISTS (
-           SELECT 1 FROM tokenomics_provider_limit_samples newer
-           WHERE newer.device_id=tokenomics_provider_limit_samples.device_id
-             AND newer.provider=tokenomics_provider_limit_samples.provider
-             AND newer.agent_kind=tokenomics_provider_limit_samples.agent_kind
-             AND newer.provider_account_key=tokenomics_provider_limit_samples.provider_account_key
-             AND COALESCE(newer.billing_scope_type, 'unknown')=COALESCE(tokenomics_provider_limit_samples.billing_scope_type, 'unknown')
-             AND COALESCE(newer.billing_team_id, '')=COALESCE(tokenomics_provider_limit_samples.billing_team_id, '')
-             AND newer.window_kind=tokenomics_provider_limit_samples.window_kind
-             AND newer.sample_bucket_unix=tokenomics_provider_limit_samples.sample_bucket_unix
-             AND (
-               COALESCE(newer.sample_at_unix, 0) > COALESCE(tokenomics_provider_limit_samples.sample_at_unix, 0)
-               OR (
-                 COALESCE(newer.sample_at_unix, 0)=COALESCE(tokenomics_provider_limit_samples.sample_at_unix, 0)
-                 AND newer.rowid > tokenomics_provider_limit_samples.rowid
-               )
-             )
-         )",
-        [],
-    )
-    .map_err(|error| format!("Unable to compact Tokenomics account limit samples: {error}"))?;
-    tokenomics_compact_provider_account_rows(conn)?;
     Ok(())
 }
 
@@ -8077,19 +7547,6 @@ fn tokenomics_codex_canonical_provider_account_from_usage(
         key: canonical_key,
         label,
     }
-}
-
-fn tokenomics_codex_light_provider_account_from_usage(
-    usage: &Value,
-    fallback_account: &TokenomicsProviderAccount,
-) -> TokenomicsProviderAccount {
-    let Some(account_id) = tokenomics_codex_usage_account_id(usage) else {
-        return fallback_account.clone();
-    };
-    let key = tokenomics_codex_provider_account_key_from_usage_account_id(&account_id);
-    let label = tokenomics_clean_non_profile_provider_account_label(&fallback_account.label)
-        .unwrap_or_else(|| fallback_account.label.clone());
-    TokenomicsProviderAccount { key, label }
 }
 
 fn tokenomics_rewrite_cloud_provider_limits_for_account_key(
@@ -9089,18 +8546,6 @@ fn tokenomics_legacy_short_provider_account_key(
         return None;
     }
     Some(format!("{prefix}{}", suffix.get(0..8).unwrap_or(suffix)))
-}
-
-fn tokenomics_event_identity_account_key(
-    provider: &str,
-    agent_kind: &str,
-    provider_account_key: Option<&str>,
-) -> String {
-    let Some(provider_account_key) = provider_account_key else {
-        return String::new();
-    };
-    tokenomics_legacy_short_provider_account_key(provider, agent_kind, provider_account_key)
-        .unwrap_or_else(|| provider_account_key.to_string())
 }
 
 fn tokenomics_frozen_source_identity(source_path: &str) -> &str {
@@ -13010,50 +12455,6 @@ fn tokenomics_cloud_relay_window_row(
     Some(row)
 }
 
-fn tokenomics_cloud_account_sync_cursor_key(scope_key: &str) -> String {
-    let scope_key = scope_key.trim();
-    let scope_key = if scope_key.is_empty() {
-        "personal"
-    } else {
-        scope_key
-    };
-    format!("{TOKENOMICS_CLOUD_ACCOUNT_SYNC_CURSOR_KEY_PREFIX}{scope_key}")
-}
-
-fn tokenomics_cloud_account_scope_key(
-    event: &Value,
-    summary: &Value,
-    fallback: &TokenomicsBillingScope,
-) -> String {
-    tokenomics_value_string(summary, &["scope_key", "billing_scope_key"])
-        .or_else(|| tokenomics_value_string(event, &["scope_key", "billing_scope_key"]))
-        .unwrap_or_else(|| {
-            tokenomics_billing_scope_key(&fallback.scope_type, fallback.team_id.as_deref())
-        })
-}
-
-fn tokenomics_cloud_summary_sync_cursor(event: &Value, summary: &Value) -> Option<String> {
-    tokenomics_value_string(summary, &["server_cursor", "sync_cursor", "cursor"])
-        .or_else(|| tokenomics_value_string(event, &["server_cursor", "sync_cursor", "cursor"]))
-}
-
-fn tokenomics_store_cloud_account_sync_cursor(
-    conn: &rusqlite::Connection,
-    scope_key: &str,
-    cursor: &str,
-) -> Result<(), String> {
-    let cursor = cursor.trim();
-    if cursor.is_empty() {
-        return Ok(());
-    }
-    conn.execute(
-        "INSERT OR REPLACE INTO tokenomics_meta(key, value) VALUES(?1, ?2)",
-        rusqlite::params![tokenomics_cloud_account_sync_cursor_key(scope_key), cursor],
-    )
-    .map_err(|error| format!("Unable to store cloud Tokenomics sync cursor: {error}"))?;
-    Ok(())
-}
-
 fn tokenomics_account_device_live_state_payload(event: &Value) -> Option<&Value> {
     let event_kind = tokenomics_text_field(event, &["event_kind", "kind"]).unwrap_or_default();
     let payload = event.get("payload");
@@ -13165,25 +12566,6 @@ fn tokenomics_flatten_account_devices_usage(account_state: &Value) -> Option<Val
         }
     }
     Some(result)
-}
-
-fn tokenomics_tombstoned_cloud_account_device_ids(
-    event: &Value,
-    local_device_ids: &HashSet<String>,
-) -> HashSet<String> {
-    let mut tombstoned = HashSet::new();
-    let Some(account_state) = tokenomics_account_device_live_state_payload(event) else {
-        return tombstoned;
-    };
-    for (device_id, tokenomics) in tokenomics_account_device_usage_entries(account_state) {
-        if !tokenomics_is_remote_cloud_device_id(&device_id, local_device_ids) {
-            continue;
-        }
-        if tokenomics_account_device_is_removed(account_state, &device_id, &tokenomics) {
-            tombstoned.insert(device_id);
-        }
-    }
-    tombstoned
 }
 
 fn tokenomics_account_device_is_removed(
@@ -13787,25 +13169,6 @@ fn tokenomics_hydrate_device_row(row: &Value, device_id: &str) -> Option<Value> 
     Some(Value::Object(object))
 }
 
-fn tokenomics_cloud_rollup_id(
-    device_id: &str,
-    provider: &str,
-    agent_kind: &str,
-    model: Option<&str>,
-    provider_account_key: &str,
-    billing_scope_type: &str,
-    billing_team_id: Option<&str>,
-    bucket_width: &str,
-    bucket_start: &str,
-) -> String {
-    let raw = format!(
-        "{device_id}\u{1f}{provider}\u{1f}{agent_kind}\u{1f}{}\u{1f}{provider_account_key}\u{1f}{billing_scope_type}\u{1f}{}\u{1f}{bucket_width}\u{1f}{bucket_start}",
-        model.unwrap_or("agent"),
-        billing_team_id.unwrap_or_default()
-    );
-    format!("cloud-tokenomics-{}", tokenomics_hash(&raw))
-}
-
 fn tokenomics_refresh_cloud_daily_rollups(conn: &rusqlite::Connection) -> Result<(), String> {
     conn.execute(
         "DELETE FROM tokenomics_cloud_rollups WHERE bucket_width='day'",
@@ -13813,56 +13176,6 @@ fn tokenomics_refresh_cloud_daily_rollups(conn: &rusqlite::Connection) -> Result
     )
     .map_err(|error| format!("Unable to clear cached cloud Tokenomics day rows: {error}"))?;
     Ok(())
-}
-
-fn tokenomics_remove_cloud_provider_limits_for_devices(
-    conn: &rusqlite::Connection,
-    device_ids: &HashSet<String>,
-) -> Result<(), String> {
-    if device_ids.is_empty() {
-        return Ok(());
-    }
-    let previous = tokenomics_cloud_provider_limits_raw(conn)?;
-    if previous.is_empty() {
-        return Ok(());
-    }
-    let filtered = previous
-        .into_iter()
-        .filter(|row| {
-            tokenomics_value_string(row, &["device_id", "machine_id"])
-                .map(|device_id| !device_ids.contains(device_id.trim()))
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    tokenomics_store_cloud_provider_limits_raw(conn, &filtered)
-}
-
-fn tokenomics_delete_cloud_device_facts(
-    conn: &rusqlite::Connection,
-    device_id: &str,
-) -> Result<(), String> {
-    let device_id = device_id.trim();
-    if device_id.is_empty() {
-        return Ok(());
-    }
-    conn.execute(
-        "DELETE FROM tokenomics_cloud_rollups WHERE device_id=?1",
-        rusqlite::params![device_id],
-    )
-    .map_err(|error| format!("Unable to clear cached cloud Tokenomics rows: {error}"))?;
-    conn.execute(
-        "DELETE FROM tokenomics_provider_limit_samples WHERE source='cloud' AND device_id=?1",
-        rusqlite::params![device_id],
-    )
-    .map_err(|error| format!("Unable to clear cached cloud Tokenomics limit samples: {error}"))?;
-    conn.execute(
-        "DELETE FROM tokenomics_latest_windows WHERE source='cloud' AND device_id=?1",
-        rusqlite::params![device_id],
-    )
-    .map_err(|error| format!("Unable to clear cached cloud Tokenomics windows: {error}"))?;
-    let mut ids = HashSet::new();
-    ids.insert(device_id.to_string());
-    tokenomics_remove_cloud_provider_limits_for_devices(conn, &ids)
 }
 
 fn tokenomics_prune_local_cloud_relay_rows(conn: &rusqlite::Connection) -> Result<(), String> {
@@ -14100,42 +13413,6 @@ fn tokenomics_store_codex_usage_cache_alias(
     )
     .map_err(|error| format!("Unable to store Codex usage cache alias: {error}"))?;
     Ok(())
-}
-
-fn tokenomics_codex_usage_cache_keys(
-    conn: &rusqlite::Connection,
-    provider_account: &TokenomicsProviderAccount,
-) -> Vec<String> {
-    let mut keys = vec![tokenomics_codex_usage_cache_key(provider_account)];
-    if let Some(canonical_account_key) =
-        tokenomics_read_codex_usage_cache_alias(conn, &provider_account.key)
-    {
-        let canonical_cache_key =
-            tokenomics_codex_usage_cache_key_from_account_key(&canonical_account_key);
-        if !keys.iter().any(|key| key == &canonical_cache_key) {
-            keys.push(canonical_cache_key);
-        }
-    }
-    keys
-}
-
-fn tokenomics_provider_account_refresh_keys(
-    conn: &rusqlite::Connection,
-    provider: &str,
-    agent_kind: &str,
-    provider_account: &TokenomicsProviderAccount,
-) -> Vec<String> {
-    let mut keys = vec![provider_account.key.clone()];
-    if provider == "openai" && agent_kind == "codex" {
-        if let Some(canonical_account_key) =
-            tokenomics_read_codex_usage_cache_alias(conn, &provider_account.key)
-        {
-            if !keys.iter().any(|key| key == &canonical_account_key) {
-                keys.push(canonical_account_key);
-            }
-        }
-    }
-    keys
 }
 
 fn tokenomics_strip_account_usage_fields(value: &mut Value) {

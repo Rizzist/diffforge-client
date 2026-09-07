@@ -1645,21 +1645,6 @@ fn architecture_graph_save_blocking(
     architecture_graph_save_blocking_with_reason(repo_path, graph, "save")
 }
 
-fn architecture_graph_write_cloud_arch_blocking(
-    repo_path: String,
-    graph: Value,
-) -> Result<ArchitectureGraphSaveResult, String> {
-    let source = graph
-        .get("source")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| "Hydrated architecture graph source is required.".to_string())?;
-    if source.as_bytes().len() as u64 > ARCHITECTURE_GRAPH_MAX_BYTES {
-        return Err("Hydrated architecture DSL source is too large.".to_string());
-    }
-    architecture_graph_save_blocking_with_reason(repo_path, graph, "cloud-hydrate")
-}
-
 fn architecture_graph_revisions_list_blocking(
     repo_path: String,
     graph_id: Option<String>,
@@ -1974,118 +1959,6 @@ async fn architecture_graph_delete(
     Ok(result)
 }
 
-const ARCHITECTURE_STORE_CHANGED_EVENT: &str = "architecture-store-changed";
-
-/// One recursive watcher over the centralized architecture store keeps the
-/// Architecture tab live-refreshed: any graph source change — in-app saves,
-/// agent edits from terminals, direct file edits — emits a debounced
-/// `architecture-store-changed` event the webview reacts to. Only paths under
-/// a `graphs/` directory count, so generated files (index.json, AGENTS.md,
-/// icon-aliases.json, revisions) written during listing cannot self-trigger.
-fn architecture_store_changed_scope(root: &Path, path: &Path) -> Option<(String, String)> {
-    let relative = path.strip_prefix(root).ok()?;
-    let components = relative
-        .components()
-        .filter_map(|component| component.as_os_str().to_str())
-        .collect::<Vec<_>>();
-    let Some(graphs_index) = components
-        .iter()
-        .position(|component| *component == "graphs")
-    else {
-        return None;
-    };
-    let graph_id = components
-        .get(graphs_index + 1)
-        .and_then(|name| {
-            let path = Path::new(name);
-            let extension = path
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default();
-            if extension != "arch" && extension != "json" {
-                return None;
-            }
-            path.file_stem()
-        })
-        .and_then(|value| value.to_str())
-        .map(architecture_slug)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_default();
-    let slug = match components.first().copied() {
-        Some("repos") => components.get(1).map(|slug| slug.to_string()),
-        Some("global") => Some(ARCHITECTURE_GLOBAL_REPO_ID.to_string()),
-        _ => None,
-    }?;
-    Some((slug, graph_id))
-}
-
-pub(crate) fn architecture_store_watcher_start(app: AppHandle) {
-    std::thread::spawn(move || {
-        use notify::Watcher as _;
-        let Some(root) = architecture_central_data_root() else {
-            return;
-        };
-        if fs::create_dir_all(&root).is_err() {
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
-        let Ok(mut watcher) = notify::recommended_watcher(tx) else {
-            return;
-        };
-        if watcher
-            .watch(&root, notify::RecursiveMode::Recursive)
-            .is_err()
-        {
-            return;
-        }
-        let collect = |event: notify::Result<notify::Event>,
-                       slugs: &mut HashSet<String>,
-                       graph_ids: &mut HashSet<String>| {
-            let Ok(event) = event else {
-                return;
-            };
-            for path in &event.paths {
-                if let Some((slug, graph_id)) = architecture_store_changed_scope(&root, path) {
-                    slugs.insert(slug);
-                    if !graph_id.is_empty() {
-                        graph_ids.insert(graph_id);
-                    }
-                }
-            }
-        };
-        loop {
-            let mut pending_slugs = HashSet::new();
-            let mut pending_graph_ids = HashSet::new();
-            let Ok(first) = rx.recv() else {
-                return;
-            };
-            collect(first, &mut pending_slugs, &mut pending_graph_ids);
-            // Quiet-window debounce: keep absorbing the burst until 600ms of
-            // silence, then emit one change event for the whole batch.
-            loop {
-                match rx.recv_timeout(Duration::from_millis(600)) {
-                    Ok(event) => collect(event, &mut pending_slugs, &mut pending_graph_ids),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                }
-            }
-            if pending_slugs.is_empty() {
-                continue;
-            }
-            let slugs = pending_slugs.into_iter().collect::<Vec<_>>();
-            let graph_ids = pending_graph_ids.into_iter().collect::<Vec<_>>();
-            let _ = app.emit(
-                ARCHITECTURE_STORE_CHANGED_EVENT,
-                json!({
-                    "slugs": slugs,
-                    "graph_ids": graph_ids,
-                    "changed_at_ms": architecture_now_millis(),
-                }),
-            );
-        }
-    });
-}
-
 pub(crate) fn architecture_global_root_dir() -> Result<PathBuf, String> {
     let root = cloud_mcp_local_data_file_path("architectures")
         .ok_or_else(|| "Global architectures root is unavailable.".to_string())?
@@ -2093,49 +1966,6 @@ pub(crate) fn architecture_global_root_dir() -> Result<PathBuf, String> {
     fs::create_dir_all(&root)
         .map_err(|error| format!("Unable to create global architectures root: {error}"))?;
     Ok(root)
-}
-
-pub(crate) fn architecture_global_agent_paths(
-) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf), String> {
-    let root = architecture_global_root_dir()?;
-    ensure_architecture_agent_guide(&root)?;
-    let architecture_root = architecture_agents_root(&root);
-    let graphs_root = architecture_root.join("graphs");
-    fs::create_dir_all(&graphs_root).map_err(|error| {
-        format!("Unable to create global architecture graph directory: {error}")
-    })?;
-    let guide_path = architecture_agent_guide_path(&root);
-    let icon_reference_path = architecture_icon_reference_path(&root);
-    Ok((
-        root,
-        architecture_root,
-        graphs_root,
-        guide_path,
-        icon_reference_path,
-    ))
-}
-
-pub(crate) fn architecture_global_agent_paths_or_fallback(
-) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
-    architecture_global_agent_paths().unwrap_or_else(|_| {
-        let root = std::env::temp_dir()
-            .join("diffforge")
-            .join("architectures")
-            .join("global");
-        let _ = ensure_architecture_agent_guide(&root);
-        let architecture_root = architecture_agents_root(&root);
-        let graphs_root = architecture_root.join("graphs");
-        let _ = fs::create_dir_all(&graphs_root);
-        let guide_path = architecture_agent_guide_path(&root);
-        let icon_reference_path = architecture_icon_reference_path(&root);
-        (
-            root,
-            architecture_root,
-            graphs_root,
-            guide_path,
-            icon_reference_path,
-        )
-    })
 }
 
 fn architecture_central_data_root() -> Option<PathBuf> {
@@ -2371,22 +2201,6 @@ fn architecture_resolved_and_storage(repo_path: &str) -> Result<(PathBuf, PathBu
 
 fn architecture_storage_repo_base(repo_path: &str) -> Result<PathBuf, String> {
     architecture_resolved_and_storage(repo_path).map(|(_, storage)| storage)
-}
-
-/// Architecture env/context paths for coding agents launched against a repo.
-/// Architecture graph storage is account-global; the repo path is intentionally
-/// ignored so agents do not recreate workspace-scoped architecture stores.
-pub(crate) fn architecture_env_paths_for_repo(
-    _repo_path: &str,
-) -> (String, String, String, String) {
-    let (_, root, graphs_root, guide_path, icon_reference_path) =
-        architecture_global_agent_paths_or_fallback();
-    (
-        workspace_path_display(&root),
-        workspace_path_display(&graphs_root),
-        workspace_path_display(&guide_path),
-        workspace_path_display(&icon_reference_path),
-    )
 }
 
 /// Return the account-global architecture root and carry a requested folder

@@ -9,28 +9,6 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
     user_home_dir_from(env::var_os("USERPROFILE"), env::var_os("HOME"))
 }
 
-fn claude_credentials_detected() -> bool {
-    let env_has_credentials = [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-    ]
-    .iter()
-    .any(|key| env::var_os(key).is_some_and(|value| !value.is_empty()));
-
-    if env_has_credentials {
-        return true;
-    }
-
-    let config_dir = env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| user_home_dir().map(|home| home.join(".claude")));
-
-    config_dir
-        .map(|dir| dir.join(".credentials.json").exists())
-        .unwrap_or(false)
-}
-
 fn push_existing_command_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
     if !candidate.is_dir() || paths.iter().any(|path| path == &candidate) {
         return;
@@ -129,30 +107,6 @@ fn run_command_capture(
         &[],
         || false,
         "Command canceled.",
-    )
-}
-
-fn run_command_capture_with_started<S>(
-    binary: &str,
-    args: &[&str],
-    stdin_text: Option<&str>,
-    timeout: Duration,
-    working_directory: Option<&Path>,
-    on_started: S,
-) -> Result<CommandCapture, String>
-where
-    S: FnOnce(),
-{
-    run_command_capture_with_cancel_env_and_started(
-        binary,
-        args,
-        stdin_text,
-        timeout,
-        working_directory,
-        &[],
-        || false,
-        "Command canceled.",
-        on_started,
     )
 }
 
