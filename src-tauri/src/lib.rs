@@ -3005,6 +3005,7 @@ include!("workspace_view.rs");
 include!("haider_bridge.rs");
 include!("haider_projection.rs");
 mod haider_rpc_ade;
+mod haider_runtime;
 include!("haider_run.rs");
 include!("architectures.rs");
 include!("pcb.rs");
@@ -6695,6 +6696,9 @@ fn run_app(daemon: bool) {
             app_close_listener_ready,
             session_config_set,
             haider_rpc_ade::rpc_features,
+            haider_runtime::haider_runtime_status,
+            haider_runtime::haider_install_latest,
+            haider_runtime::haider_daemon_start,
             haider_rpc_ade::lifecycle_session_create_command,
             haider_rpc_ade::lifecycle_session_rename_command,
             haider_rpc_ade::session_compact,

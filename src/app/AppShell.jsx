@@ -102,6 +102,12 @@ import {
   useWorkspaceViewRestoreEffects,
   workspaceOpenSessionPresentation,
 } from "./workspaceViewRestore.js";
+import HaiderRuntimeSetupScreen, { HaiderRuntimeSetupNotice } from "./HaiderRuntimeSetup.jsx";
+import {
+  setupGateActive as haiderSetupGateActive,
+  setupNoticeVisible as haiderSetupNoticeVisible,
+} from "./haiderRuntimeSetupModel.js";
+import { useHaiderRuntimeSetup } from "./useHaiderRuntimeSetup.js";
 import {
   cleanAgentLaunchModelId,
   getAgentLaunchDefault,
@@ -18880,6 +18886,12 @@ export default function App() {
   /* App-level peer_messaging_v1 state, presented by SessionSurface's Peers
      tab. usePeers owns all three commands and both pushed subscriptions. */
   const peerApi = usePeers({ enabled: authState === "authenticated" });
+  /* Pre-login Haider runtime setup gate (F1-UI). The hook owns the offline
+     status probe, the install/daemon-start commands, and the
+     install-progress subscription; the gate below holds the auth ceremony
+     only while the user is signed out AND the status honestly said the
+     runtime is missing. */
+  const haiderSetup = useHaiderRuntimeSetup();
   /* Unified shell registry and direct user commands (Wave5-UI-a). The hook
      owns the three shell commands and four pushed subscriptions; the panel
      receives only published rows, receipts, and transient output buffers. */
@@ -24704,10 +24716,18 @@ export default function App() {
   const isWorkspaceStartupOverlayVisible = shouldShowStartupPhases;
   // The particle AuthFlow overlay (src/auth) owns splash + login + launch.
   const authFlowActive = authCeremony !== "done";
+  /* Haider runtime setup seam: after boot, BEFORE the entry card. While the
+     gate is active the ceremony holds its particle "boot" backdrop (the
+     engine guards onBootDone re-fires) and the setup screen renders above
+     it. A failed status check is "unknown", which never gates — login
+     proceeds and a dismissible notice offers setup instead. */
+  const haiderSetupBlocking = authBootDone
+    && authState === "signedOut"
+    && haiderSetupGateActive(haiderSetup.state);
   const authFlowPhase = !authBootDone
     ? "boot"
     : authState === "signedOut"
-      ? "entry"
+      ? (haiderSetupBlocking ? "boot" : "entry")
       : authState === "waiting" || authState === "exchanging"
         ? "waiting"
         : authState === "authenticated"
@@ -27603,6 +27623,25 @@ export default function App() {
               phase={authFlowPhase}
               rounded={windowControlPlatform === "macos" && !isWindowFrameExpanded}
               statusMessage={authState === "exchanging" ? authMessage : ""}
+            />
+          )}
+
+          {authFlowActive && haiderSetupBlocking && (
+            <HaiderRuntimeSetupScreen
+              onContinueWithout={haiderSetup.continueWithout}
+              onInstall={haiderSetup.install}
+              onRetry={haiderSetup.retry}
+              onTitleBarMouseDown={handleTitleBarMouseDown}
+              state={haiderSetup.state}
+            />
+          )}
+
+          {authFlowActive && authFlowPhase === "entry"
+            && haiderSetupNoticeVisible(haiderSetup.state) && (
+            <HaiderRuntimeSetupNotice
+              onDismiss={haiderSetup.dismissNotice}
+              onInstall={haiderSetup.install}
+              state={haiderSetup.state}
             />
           )}
 	        </AppContent>

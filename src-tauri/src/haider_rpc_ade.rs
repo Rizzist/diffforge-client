@@ -19364,78 +19364,224 @@ pub(crate) fn resolve_socket_path() -> Option<PathBuf> {
     #[cfg(unix)]
     {
         let uid = unsafe { libc::geteuid() };
-        let runtime_dir = runtime_dir(uid);
+        let env = SocketPathEnv::capture();
         deterministic_endpoint(
             std::env::var_os("HAIDER_PROFILE_DIR")
                 .as_deref()
                 .map(Path::new),
-            std::env::var_os("HOME").as_deref().map(Path::new),
-            &runtime_dir,
+            &env,
+            uid,
         )
     }
     #[cfg(not(unix))]
     None
 }
 
+/// Installer-only Windows discovery; the ADE's existing RPC surfaces are unchanged.
+#[cfg(windows)]
+pub(crate) fn runtime_pipe_path() -> Option<PathBuf> {
+    // Match Haider's Windows profile_home: USERPROFILE precedes HOME.
+    let home = std::env::var_os("USERPROFILE")
+        .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var_os("HOME"));
+    let profile_dir = std::env::var_os("HAIDER_PROFILE_DIR");
+    runtime_pipe_path_for(
+        profile_dir.as_deref().map(Path::new),
+        home.as_deref().map(Path::new),
+    )
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn runtime_pipe_path_for(
+    profile_dir: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let profile_id = profile_id_for(profile_dir, home)?;
+    let digest = hex(&blake3_hash(profile_id.as_bytes()));
+    Some(PathBuf::from(format!(r"\\.\pipe\haider-{}", &digest[..32])))
+}
+
 #[cfg(unix)]
-fn runtime_dir(uid: u32) -> PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-            if is_owner_private_directory(&xdg, uid) {
-                return xdg.join("haider");
+#[derive(Default)]
+struct SocketPathEnv {
+    home: Option<PathBuf>,
+    runtime_dir: Option<PathBuf>,
+    xdg_runtime_dir: Option<PathBuf>,
+    tmpdir: Option<PathBuf>,
+    prefix: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+impl SocketPathEnv {
+    fn capture() -> Self {
+        Self {
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            runtime_dir: std::env::var_os("HAIDER_RUNTIME_DIR").map(PathBuf::from),
+            xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+            tmpdir: std::env::var_os("TMPDIR").map(PathBuf::from),
+            prefix: std::env::var_os("PREFIX").map(PathBuf::from),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_owner_private_directory(path: &Path, uid: u32) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            Ok(metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn deterministic_endpoint(
+    profile_dir: Option<&Path>,
+    env: &SocketPathEnv,
+    uid: u32,
+) -> Option<PathBuf> {
+    let profile_id = profile_id_for(profile_dir, env.home.as_deref())?;
+    socket_endpoint_for_profile(&profile_id, env, uid)
+}
+
+/// Mirrors client-contract-v1 §2 / haider-client::profile::runtime_endpoint.
+/// A runtime override is a root, not a socket address. Never scan for another
+/// profile or escape an explicit root when the Unix bind address is too long.
+#[cfg(unix)]
+fn socket_endpoint_for_profile(profile_id: &str, env: &SocketPathEnv, uid: u32) -> Option<PathBuf> {
+    let explicit_root = env
+        .runtime_dir
+        .as_deref()
+        .filter(|p| !p.as_os_str().is_empty());
+    // XDG inspection errors are fatal; only absent/non-private bases fall
+    // through. An explicit override takes precedence without inspecting XDG.
+    let private_xdg = if explicit_root.is_some() {
+        None
+    } else if let Some(xdg) = env.xdg_runtime_dir.as_deref() {
+        is_owner_private_directory(xdg, uid).ok()?.then_some(xdg)
+    } else {
+        None
+    };
+    let root = if let Some(root) = explicit_root {
+        root.to_owned()
+    } else if let Some(xdg) = private_xdg {
+        xdg.join("haider")
+    } else {
+        if let Some(home) = env.home.as_deref().filter(|p| !p.as_os_str().is_empty()) {
+            home.join(".haider/runtime")
+        } else if let Some(tmp) = env
+            .tmpdir
+            .as_deref()
+            .filter(|p| is_owner_private_directory(p, uid).unwrap_or(false))
+        {
+            tmp.join("haider")
+        } else if let Some(tmp) = env
+            .prefix
+            .as_deref()
+            .map(|p| p.join("tmp"))
+            .filter(|p| is_owner_private_directory(p, uid).unwrap_or(false))
+        {
+            tmp.join("haider")
+        } else {
+            PathBuf::from("/tmp").join(format!("haider-{uid}"))
+        }
+    };
+
+    let scope = profile_id.get(..20)?;
+    let runtime = canonicalize_endpoint_ancestor(owner_scoped_runtime(root.join(scope), uid))?;
+    if socket_runtime_fits(&runtime) {
+        return Some(runtime.join("h.sock"));
+    }
+    if explicit_root.is_some() {
+        return None;
+    }
+    let fallback = canonicalize_endpoint_ancestor(
+        PathBuf::from("/tmp")
+            .join(format!("haider-{uid}"))
+            .join(scope),
+    )?;
+    socket_runtime_fits(&fallback).then(|| fallback.join("h.sock"))
+}
+
+#[cfg(unix)]
+fn owner_scoped_runtime(path: PathBuf, uid: u32) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(parent) = path.parent() else {
+        return path;
+    };
+    let owner_name = format!("haider-{uid}");
+    if parent.file_name() == Some(std::ffi::OsStr::new(&owner_name)) {
+        return path;
+    }
+    // Follow the outer /tmp alias on macOS, as haider-platform::user does.
+    if let Ok(metadata) = std::fs::metadata(parent) {
+        if metadata.is_dir() && metadata.uid() != uid && metadata.mode() & 0o1002 == 0o1002 {
+            if let Some(name) = path.file_name() {
+                return parent.join(owner_name).join(name);
             }
         }
     }
-    PathBuf::from("/tmp").join(format!("haider-{uid}"))
+    path
 }
 
-#[cfg(target_os = "linux")]
-fn is_owner_private_directory(path: &Path, uid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+fn socket_runtime_fits(runtime: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
 
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-        metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o777 == 0o700
-    })
+    // haider-platform::ipc::unix reserves a 20-byte ".hd-" + 16-char
+    // staging basename, plus the slash and terminating NUL in sun_path.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const LIMIT: usize = 107;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const LIMIT: usize = 103;
+    runtime.as_os_str().as_bytes().len() + 1 + 20 <= LIMIT
 }
 
-fn deterministic_endpoint(
-    profile_dir: Option<&Path>,
-    home: Option<&Path>,
-    runtime_dir: &Path,
-) -> Option<PathBuf> {
-    let store_dir = match profile_dir {
-        Some(path) => path.to_owned(),
-        None => home
-            .filter(|path| !path.as_os_str().is_empty())?
-            .join(".haider")
-            .join("dev-profile"),
-    };
-    let absolute = if store_dir.is_absolute() {
-        store_dir
+/// Canonicalize the deepest existing ancestor without creating runtime state.
+#[cfg(unix)]
+fn canonicalize_endpoint_ancestor(path: PathBuf) -> Option<PathBuf> {
+    let mut ancestor = if path.is_absolute() {
+        path
     } else {
-        std::env::current_dir().ok()?.join(store_dir)
+        std::env::current_dir().ok()?.join(path)
     };
-    std::fs::create_dir_all(&absolute).ok()?;
-    let canonical = absolute.canonicalize().ok()?;
-    let canonical_text = canonical.to_str()?;
-
-    let mut profile_material = Vec::with_capacity(PROFILE_ID_TAG.len() + canonical_text.len());
-    profile_material.extend_from_slice(PROFILE_ID_TAG);
-    profile_material.extend_from_slice(canonical_text.as_bytes());
-    let profile_id = hex(&blake3_hash(&profile_material));
-    let endpoint_digest = hex(&blake3_hash(profile_id.as_bytes()));
-    Some(runtime_dir.join(format!("haider-{}.sock", &endpoint_digest[..32])))
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                for component in missing.into_iter().rev() {
+                    canonical.push(component);
+                }
+                return Some(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name()?.to_owned());
+                if !ancestor.pop() {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 pub(crate) fn expected_profile_id() -> Option<String> {
     let profile_dir = std::env::var_os("HAIDER_PROFILE_DIR");
     let home = std::env::var_os("HOME");
-    let store_dir = match profile_dir.as_deref().map(Path::new) {
+    profile_id_for(
+        profile_dir.as_deref().map(Path::new),
+        home.as_deref().map(Path::new),
+    )
+}
+
+fn profile_id_for(profile_dir: Option<&Path>, home: Option<&Path>) -> Option<String> {
+    let store_dir = match profile_dir {
         Some(path) => path.to_owned(),
         None => home
-            .as_deref()
-            .map(Path::new)
             .filter(|path| !path.as_os_str().is_empty())?
             .join(".haider")
             .join("dev-profile"),
@@ -22118,23 +22264,207 @@ mod tests {
             hex(&blake3_hash(b"abc")),
             "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
         );
+    }
 
-        let root = std::env::temp_dir().join(format!("rpc-ade-path-{}", uuid::Uuid::new_v4()));
+    #[cfg(unix)]
+    #[test]
+    fn socket_endpoint_published_discovery_fixture_and_precedence() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        // Contract §2: runtime root / first 20 profile-id hex chars / h.sock.
+        // Fixed fixture expectations deliberately do not call the resolver's
+        // hashing/path helpers (the former double-hashed basename must fail).
+        let fixtures = [
+            (
+                "404a207b855a923e9533000000000000000000000000000000000000000000000000",
+                "404a207b855a923e9533/h.sock",
+            ),
+            (
+                "0123456789abcdefabcdffffffffffffffffffffffffffffffffffffffffffff",
+                "0123456789abcdefabcd/h.sock",
+            ),
+        ];
+        let root = tempfile::Builder::new()
+            .prefix("ade-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let home = root.join("home");
+        let xdg = root.join("xdg");
+        let explicit = root.join("override");
+        let tmp = root.join("temp");
+        let prefix = root.join("prefix");
+        for directory in [&xdg, &tmp, &prefix.join("tmp")] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for (profile_id, suffix) in fixtures {
+            let mut env = SocketPathEnv {
+                home: Some(home.clone()),
+                runtime_dir: Some(explicit.clone()),
+                xdg_runtime_dir: Some(xdg.clone()),
+                tmpdir: Some(tmp.clone()),
+                prefix: Some(prefix.clone()),
+            };
+            assert_eq!(
+                socket_endpoint_for_profile(profile_id, &env, uid),
+                Some(explicit.join(suffix))
+            );
+            assert!(
+                !explicit.exists(),
+                "discovery must not create daemon runtime state"
+            );
+            env.runtime_dir = None;
+            assert_eq!(
+                socket_endpoint_for_profile(profile_id, &env, uid),
+                Some(xdg.join("haider").join(suffix))
+            );
+            // XDG precedence applies on all Unix hosts, including macOS.
+            std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                socket_endpoint_for_profile(profile_id, &env, uid),
+                Some(home.join(".haider/runtime").join(suffix))
+            );
+            std::fs::set_permissions(&xdg, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let alias = root.join("alias");
+            symlink(&xdg, &alias).unwrap();
+            env.xdg_runtime_dir = Some(alias.clone());
+            assert_eq!(
+                socket_endpoint_for_profile(profile_id, &env, uid),
+                Some(home.join(".haider/runtime").join(suffix)),
+                "symlink XDG is not owner-private"
+            );
+            env.runtime_dir = Some(alias.clone());
+            assert_eq!(
+                socket_endpoint_for_profile(profile_id, &env, uid),
+                Some(xdg.join(suffix)),
+                "explicit aliases canonicalize"
+            );
+            std::fs::remove_file(alias).unwrap();
+            env.runtime_dir = None;
+            env.xdg_runtime_dir = None;
+            env.home = None;
+            assert_eq!(
+                socket_endpoint_for_profile(profile_id, &env, uid),
+                Some(tmp.join("haider").join(suffix))
+            );
+            env.tmpdir = None;
+            assert_eq!(
+                socket_endpoint_for_profile(profile_id, &env, uid),
+                Some(prefix.join("tmp/haider").join(suffix))
+            );
+            env.prefix = None;
+            let short = Path::new("/tmp")
+                .canonicalize()
+                .unwrap()
+                .join(format!("haider-{uid}"))
+                .join(suffix);
+            assert_eq!(
+                socket_endpoint_for_profile(profile_id, &env, uid),
+                Some(short.clone())
+            );
+            env.home = Some(root.join("long".repeat(40)));
+            assert_eq!(
+                socket_endpoint_for_profile(profile_id, &env, uid),
+                Some(short.clone()),
+                "derived overlong home falls back"
+            );
+            env.xdg_runtime_dir = Some(root.join("missing"));
+            env.runtime_dir = Some(root.join("long".repeat(40)));
+            assert_eq!(
+                socket_endpoint_for_profile(profile_id, &env, uid),
+                None,
+                "explicit isolation must never escape to a fallback"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_endpoint_canonical_profile_and_bind_budget() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new()
+            .prefix("ade-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = root.path().canonicalize().unwrap();
         let profile = root.join("profile");
-        let runtime = root.join("runtime");
-        std::fs::create_dir_all(&profile).expect("profile directory");
-        std::fs::create_dir_all(&runtime).expect("runtime directory");
+        std::fs::create_dir(&profile).unwrap();
+        let alias = root.join("alias");
+        symlink(&profile, &alias).unwrap();
+        let env = SocketPathEnv {
+            runtime_dir: Some(root.join("runtime")),
+            ..Default::default()
+        };
+        let uid = unsafe { libc::geteuid() };
+        let endpoint = deterministic_endpoint(Some(&profile), &env, uid).unwrap();
+        let profile_id = profile_id_for(Some(&profile), None).unwrap();
+        assert_eq!(
+            endpoint,
+            root.join("runtime").join(&profile_id[..20]).join("h.sock")
+        );
+        assert_eq!(
+            deterministic_endpoint(Some(&alias), &env, uid),
+            Some(endpoint.clone())
+        );
+        assert_eq!(
+            deterministic_endpoint(None, &env, uid),
+            None,
+            "no home/profile is unavailable"
+        );
+        assert!(!endpoint.exists());
+        assert!(!root.join("runtime").exists());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let limit = 107;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let limit = 103;
+        assert!(socket_runtime_fits(Path::new(&format!(
+            "/{}",
+            "a".repeat(limit - 22)
+        ))));
+        assert!(!socket_runtime_fits(Path::new(&format!(
+            "/{}",
+            "a".repeat(limit - 21)
+        ))));
+    }
 
-        let endpoint =
-            deterministic_endpoint(Some(&profile), None, &runtime).expect("deterministic endpoint");
-        let name = endpoint
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("endpoint basename");
-        assert!(name.starts_with("haider-") && name.ends_with(".sock"));
-        assert_eq!(name.len(), "haider-".len() + 32 + ".sock".len());
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_endpoint_absent_daemon_returns_unavailable_promptly() {
+        let root = tempfile::Builder::new()
+            .prefix("ade-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let env = SocketPathEnv {
+            home: Some(root.path().to_owned()),
+            ..Default::default()
+        };
+        let path = deterministic_endpoint(None, &env, unsafe { libc::geteuid() }).unwrap();
+        let error = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_and_handshake(&path))
+            .await
+            .expect("missing endpoint must settle without a retry spin")
+            .expect_err("an absent daemon must not connect");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
 
-        std::fs::remove_dir_all(root).expect("remove test directory");
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires an already-running Haider daemon; never starts or stops one"]
+    async fn live_resolved_endpoint_handshake() {
+        let path = resolve_socket_path().expect("resolved endpoint required for live gate");
+        let (_, welcome) = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_and_handshake(&path))
+            .await
+            .expect("live endpoint handshake timed out")
+            .expect("resolved endpoint must handshake with the running daemon");
+        println!(
+            "LIVE_HANDSHAKE endpoint={} daemon_version={} profile_id={} features={}",
+            path.display(),
+            welcome.daemon_version,
+            welcome.profile_id,
+            welcome.features.len()
+        );
     }
 
     #[cfg(unix)]
