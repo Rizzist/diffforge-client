@@ -7839,16 +7839,105 @@ impl SurfaceWatchState {
     }
 }
 
+/// The omission exception belongs to one requested initial store replay.
+/// Live delivery and unsealed replay always use our own applied cursor.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum QueueReplayPhase {
+    #[default]
+    Strict,
+    AwaitingAttach {
+        sealed_replay: bool,
+    },
+    SealedInitial {
+        replay_through_seq: u64,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct QueueReplayCursor {
+    last_applied: u64,
+    phase: QueueReplayPhase,
+}
+
+#[cfg(unix)]
+impl QueueReplayCursor {
+    fn new(last_applied: u64) -> Self {
+        Self {
+            last_applied,
+            phase: QueueReplayPhase::Strict,
+        }
+    }
+
+    fn begin_attach(&mut self, sealed_replay: Option<bool>) {
+        self.phase = QueueReplayPhase::AwaitingAttach {
+            sealed_replay: sealed_replay == Some(true),
+        };
+    }
+
+    fn adopt(&mut self, state: &AttachStateWire) -> bool {
+        // The echoed request must not replace the client's own applied cursor.
+        if state.requested_after_seq != self.last_applied
+            || state.replay_through_seq < state.requested_after_seq
+        {
+            return false;
+        }
+        self.phase = match self.phase {
+            QueueReplayPhase::AwaitingAttach {
+                sealed_replay: true,
+            } => QueueReplayPhase::SealedInitial {
+                replay_through_seq: state.replay_through_seq,
+            },
+            _ => QueueReplayPhase::Strict,
+        };
+        true
+    }
+
+    fn should_apply(&self, seq: u64) -> Result<bool, String> {
+        if seq <= self.last_applied {
+            return Ok(false);
+        }
+        let sealed_omission = matches!(self.phase,
+            QueueReplayPhase::SealedInitial { replay_through_seq } if seq <= replay_through_seq);
+        if seq != self.last_applied.saturating_add(1) && !sealed_omission {
+            return Err(format!(
+                "queue watch sequence gap after {} before {}",
+                self.last_applied, seq
+            ));
+        }
+        Ok(true)
+    }
+
+    fn caught_up(&mut self, high_water_seq: u64) -> Result<(), String> {
+        if let QueueReplayPhase::SealedInitial { replay_through_seq } = self.phase {
+            if high_water_seq < replay_through_seq {
+                return Err("queue caught-up watermark precedes sealed replay boundary".into());
+            }
+            // Only the initial sealed range can contain undelivered deltas.
+            if high_water_seq > replay_through_seq.max(self.last_applied) {
+                return Err("queue caught-up watermark skips live events".into());
+            }
+            self.last_applied = self.last_applied.max(high_water_seq);
+            self.phase = QueueReplayPhase::Strict;
+        } else if high_water_seq > self.last_applied {
+            return Err("queue caught-up watermark exceeds applied events".into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 struct Subscription {
     app: AppHandle,
     surface_watch: SurfaceWatchState,
-    queue_cursor: u64,
+    queue_cursor: QueueReplayCursor,
     queue_attachment_id: Option<String>,
     queue_attach_pending: bool,
     /// `true` may omit superseded item deltas only during the initial store
     /// replay. It is not a lossless transcript mode; buffered/live delivery
-    /// after AttachCaughtUp remains unfiltered.
+    /// after AttachCaughtUp remains unfiltered. QueueChanged and the typed
+    /// durable facts forwarded here do not consume transcript item deltas.
     sealed_replay: Option<bool>,
     queue_watch_waiters: Vec<QueueWatchReply>,
 }
@@ -7859,9 +7948,11 @@ impl Subscription {
         Self {
             app,
             surface_watch: SurfaceWatchState::default(),
-            queue_cursor: super::haider_bridge_head_seq(session_id)
-                .and_then(|head| u64::try_from(head).ok())
-                .unwrap_or(0),
+            queue_cursor: QueueReplayCursor::new(
+                super::haider_bridge_head_seq(session_id)
+                    .and_then(|head| u64::try_from(head).ok())
+                    .unwrap_or(0),
+            ),
             queue_attachment_id: None,
             queue_attach_pending: false,
             sealed_replay: None,
@@ -18051,6 +18142,7 @@ async fn run_connected(
     for subscription in subscriptions.values_mut() {
         subscription.queue_attachment_id = None;
         subscription.queue_attach_pending = false;
+        subscription.queue_cursor.phase = QueueReplayPhase::Strict;
     }
     if connection.can_watch_queue() {
         for session_id in subscriptions.keys().cloned().collect::<Vec<_>>() {
@@ -18310,6 +18402,14 @@ async fn run_connected(
                     session_id,
                     envelope,
                 ) {
+                    return;
+                }
+            }
+            WireFrame::AttachCaughtUp {
+                attachment_id,
+                high_water_seq,
+            } => {
+                if !handle_queue_caught_up(subscriptions, &attachment_id, high_water_seq) {
                     return;
                 }
             }
@@ -18905,7 +19005,8 @@ async fn apply_connected_command(
             }
             let sealed_replay_changed =
                 subscriptions.get(&session_id).is_some_and(|subscription| {
-                    subscription.queue_attachment_id.is_some()
+                    (subscription.queue_attachment_id.is_some()
+                        || subscription.queue_attach_pending)
                         && subscription.sealed_replay != sealed_replay
                 });
             subscriptions
@@ -19262,10 +19363,9 @@ fn finish_queue_watch(
         ResponseBody::SessionAttach {
             attachment_id,
             attach_state,
-        } if attach_state.session_id == expected_session_id => {
-            subscription.queue_cursor = subscription
-                .queue_cursor
-                .max(attach_state.requested_after_seq);
+        } if attach_state.session_id == expected_session_id
+            && subscription.queue_cursor.adopt(&attach_state) =>
+        {
             subscription.queue_attachment_id = Some(attachment_id);
             finish_queue_watch_waiters(Some(subscription), Ok(()));
         }
@@ -19324,17 +19424,14 @@ fn handle_queue_event(
         emit_queue_watch_failure_for_session(subscription, &expected_session_id, reason, false);
         return true;
     }
-    if envelope.seq <= subscription.queue_cursor {
-        return true;
-    }
-    if envelope.seq != subscription.queue_cursor.saturating_add(1) {
-        let reason = format!(
-            "queue watch sequence gap after {} before {}",
-            subscription.queue_cursor, envelope.seq
-        );
-        eprintln!("[ade-rpc] {reason}");
-        emit_queue_watch_failure_for_session(subscription, &expected_session_id, &reason, true);
-        return false;
+    match subscription.queue_cursor.should_apply(envelope.seq) {
+        Ok(false) => return true,
+        Ok(true) => {}
+        Err(reason) => {
+            eprintln!("[ade-rpc] {reason}");
+            emit_queue_watch_failure_for_session(subscription, &expected_session_id, &reason, true);
+            return false;
+        }
     }
 
     match parse_ade_durable_fact(features, &envelope.payload) {
@@ -19353,7 +19450,7 @@ fn handle_queue_event(
     }
 
     let parsed = parse_queue_changed_payload_owned(envelope.seq, envelope.payload);
-    subscription.queue_cursor = envelope.seq;
+    subscription.queue_cursor.last_applied = envelope.seq;
     match parsed {
         Ok(Some(payload)) => {
             let _ = subscription.app.emit(
@@ -19371,6 +19468,25 @@ fn handle_queue_event(
         Err(error) => {
             eprintln!("[ade-rpc] dropping malformed QueueChanged: {error}");
         }
+    }
+    true
+}
+
+#[cfg(unix)]
+fn handle_queue_caught_up(
+    subscriptions: &mut HashMap<String, Subscription>,
+    attachment_id: &str,
+    high_water_seq: u64,
+) -> bool {
+    let Some((session_id, subscription)) = subscriptions.iter_mut().find(|(_, subscription)| {
+        subscription.queue_attachment_id.as_deref() == Some(attachment_id)
+    }) else {
+        return true;
+    };
+    if let Err(reason) = subscription.queue_cursor.caught_up(high_water_seq) {
+        eprintln!("[ade-rpc] {reason}");
+        emit_queue_watch_failure_for_session(subscription, session_id, &reason, true);
+        return false;
     }
     true
 }
@@ -19436,7 +19552,7 @@ async fn send_queue_watch(
 ) -> std::io::Result<()> {
     let Some(after_seq) = subscriptions
         .get(&session_id)
-        .map(|subscription| subscription.queue_cursor)
+        .map(|subscription| subscription.queue_cursor.last_applied)
     else {
         return Ok(());
     };
@@ -19456,6 +19572,7 @@ async fn send_queue_watch(
     write_frame(stream, &request, frame_limit, encoding).await?;
     if let Some(subscription) = subscriptions.get_mut(&session_id) {
         subscription.queue_attach_pending = true;
+        subscription.queue_cursor.begin_attach(sealed_replay);
     }
     pending_queue_attaches.insert(request_id, session_id);
     Ok(())
@@ -20135,6 +20252,10 @@ mod bits_tests;
 #[cfg(all(test, unix))]
 #[path = "haider_rpc_ade_surface_tests.rs"]
 mod surface_tests;
+
+#[cfg(all(test, unix))]
+#[path = "haider_rpc_ade_replay_tests.rs"]
+mod replay_tests;
 
 #[cfg(test)]
 mod tests {
