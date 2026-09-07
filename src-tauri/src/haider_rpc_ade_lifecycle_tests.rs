@@ -108,7 +108,12 @@ fn lifecycle_every_optional_argument_omits_its_wire_key() {
     )
     .expect("create request with omitted optionals");
     let create = request_json(create);
-    for key in ["permission_overrides", "cache_policy", "interaction_mode"] {
+    for key in [
+        "permission_overrides",
+        "cache_policy",
+        "interaction_mode",
+        "ssh_scope",
+    ] {
         assert!(
             create.get(key).is_none(),
             "omitted optional {key} must carry no wire key, not null: {create}"
@@ -139,6 +144,287 @@ fn lifecycle_every_optional_argument_omits_its_wire_key() {
     accepts_create_optionals(session_create);
     accepts_compact_optional(session_compact);
     accepts_fork_optionals(session_fork);
+}
+
+/// Exercise the production actor's last gate before write_frame, using a real
+/// socket pair so a missing gate cannot pass by only returning expected bits.
+#[cfg(unix)]
+async fn create_through_actor(
+    policy: Option<Value>,
+    ssh_scope: Option<SshScopeV1>,
+    advertised: BTreeSet<String>,
+) -> Result<Value, SessionCreateCommandErrorV1> {
+    let (body, features) = session_create_request_with_admission(
+        "/work".to_string(),
+        "openai".to_string(),
+        "gpt-5".to_string(),
+        4096,
+        policy,
+        None,
+        None,
+        None,
+        ssh_scope,
+    )
+    .expect("build create request");
+    let expected_body = request_json(body.clone());
+    let (mut client, mut server) = UnixStream::pair().expect("create socket pair");
+    let connection = ConnectionSnapshot {
+        connected: true,
+        features: advertised,
+        capabilities_granted: BTreeSet::from([Capability::Control]),
+        frame_limit: DEFAULT_FRAME_LIMIT,
+        ..Default::default()
+    };
+    let (reply, mut answer) = oneshot::channel();
+    let mut pending = HashMap::new();
+    let mut next_request = 0;
+    let (watch_tx, _) = watch::channel(AccountRosterWatchState::default());
+    assert!(
+        apply_connected_command(
+            ActorCommand::RpcRequest {
+                body,
+                capability: Capability::Control,
+                features: FeatureGate::all(features),
+                error_style: RpcErrorStyle::Passthrough,
+                reply,
+            },
+            &mut client,
+            &connection,
+            WireEncoding::Json,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut pending,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut DescendantForwarders::new(),
+            &mut HashMap::new(),
+            &mut None,
+            &mut Vec::new(),
+            &mut next_request,
+            &watch_tx,
+        )
+        .await
+    );
+
+    if let Ok(result) = answer.try_recv() {
+        let error = result
+            .expect("actor stays connected")
+            .expect_err("local refusal");
+        assert!(
+            pending.is_empty(),
+            "refused create must not await a receipt"
+        );
+        assert_eq!(next_request, 0, "refusal must not allocate a wire request");
+        let error_kind = server
+            .try_read(&mut [0; 1])
+            .expect_err("refused create wrote bytes")
+            .kind();
+        assert_eq!(error_kind, std::io::ErrorKind::WouldBlock);
+        return Err(SessionCreateCommandErrorV1::from(
+            lifecycle_transport_error(error),
+        ));
+    }
+
+    assert_eq!(
+        pending.len(),
+        1,
+        "sent create must await the daemon receipt"
+    );
+    let frame = tokio::time::timeout(
+        Duration::from_secs(1),
+        read_frame(&mut server, DEFAULT_FRAME_LIMIT),
+    )
+    .await
+    .expect("create frame timeout")
+    .expect("read actual create frame");
+    let WireFrame::Request { request_id, body } = frame else {
+        panic!("expected a create request on the wire");
+    };
+    assert!(
+        pending.contains_key(&request_id),
+        "correlation identity must match the wire"
+    );
+    let body = request_json(body);
+    assert_eq!(
+        body, expected_body,
+        "actor must preserve all request fields exactly"
+    );
+    Ok(body)
+}
+
+#[cfg(unix)]
+fn create_policy_peer(read_only: bool) -> BTreeSet<String> {
+    let mut features = BTreeSet::from([
+        "session_mutation_v1".to_string(),
+        "session_permission_overrides_v1".to_string(),
+    ]);
+    if read_only {
+        features.insert("session_read_only_v1".to_string());
+    }
+    features
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_create_explicit_read_only_requires_its_own_bit_before_wire() {
+    for value in [
+        serde_json::json!(true),
+        serde_json::json!(false),
+        Value::Null,
+    ] {
+        let error = create_through_actor(
+            Some(serde_json::json!({"read_only": value, "allow_exec": true})),
+            None,
+            create_policy_peer(false),
+        )
+        .await
+        .expect_err("explicit read_only must never reach a legacy peer");
+        assert_eq!(
+            serde_json::to_value(&error).expect("typed create error"),
+            serde_json::json!({
+                "code": "unavailable",
+                "message": "missing_feature: daemon does not advertise session_read_only_v1",
+                "retryable": false
+            })
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_create_read_only_values_cross_exactly_when_advertised() {
+    for value in [true, false] {
+        let policy =
+            serde_json::json!({"read_only": value, "allow_exec": true, "future": {"keep": 7}});
+        let wire = create_through_actor(Some(policy.clone()), None, create_policy_peer(true))
+            .await
+            .expect("negotiated read_only create");
+        assert_eq!(wire["permission_overrides"], policy);
+        assert!(wire.get("ssh_scope").is_none());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_create_omitted_read_only_stays_absent_regardless_of_bit() {
+    for bit in [false, true] {
+        for policy in [
+            None,
+            Some(serde_json::json!({"allow_writes": false})),
+            Some(serde_json::json!({})),
+        ] {
+            let wire = create_through_actor(policy.clone(), None, create_policy_peer(bit))
+                .await
+                .expect("omitted read_only create");
+            assert_eq!(wire.get("permission_overrides"), policy.as_ref());
+            assert!(wire
+                .get("permission_overrides")
+                .and_then(|p| p.get("read_only"))
+                .is_none());
+            assert!(wire.get("ssh_scope").is_none());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_create_ssh_scope_is_optional_exact_and_feature_gated() {
+    for scope in [
+        None,
+        Some(SshScopeV1::All),
+        Some(SshScopeV1::None),
+        Some(SshScopeV1::Allow {
+            names: vec!["  opaque-profile  ".to_string(), "other".to_string()],
+        }),
+    ] {
+        let expected = scope
+            .as_ref()
+            .map(|s| serde_json::to_value(s).expect("scope JSON"));
+        for advertised in [false, true] {
+            let mut features = lifecycle_features("session_mutation_v1");
+            if advertised {
+                features.insert("ssh_profiles_v1".to_string());
+            }
+            let result = create_through_actor(None, scope.clone(), features).await;
+            if scope.is_some() && !advertised {
+                let error = result.expect_err("explicit scope requires the published SSH bit");
+                assert_eq!(error.code, "unavailable");
+                assert_eq!(
+                    error.message,
+                    "missing_feature: daemon does not advertise ssh_profiles_v1"
+                );
+            } else {
+                let wire = result.expect("omitted or negotiated create scope");
+                assert_eq!(wire.get("ssh_scope"), expected.as_ref());
+            }
+        }
+    }
+
+    fn accepts_command_optionals<Fut>(
+        _: fn(
+            String,
+            String,
+            String,
+            u64,
+            Option<Value>,
+            Option<Value>,
+            Option<String>,
+            Option<SessionCreateAdmissionV1>,
+            Option<SshScopeV1>,
+        ) -> Fut,
+    ) {
+    }
+    accepts_command_optionals(lifecycle_session_create_command);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires the already-running 969 negative fixture; never starts/stops a daemon or creates a session"]
+async fn lifecycle_create_live_969_read_only_rejects_with_typed_absence() {
+    let mut connection = actor_handle().connection.subscribe();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !connection.borrow().connected {
+            connection.changed().await.expect("live actor connection");
+        }
+    })
+    .await
+    .expect("live daemon connection timeout");
+    let snapshot = connection.borrow().clone();
+    assert_eq!(snapshot.daemon_version.as_deref(), Some("0.0.969"));
+    assert!(snapshot
+        .features
+        .contains("session_permission_overrides_v1"));
+    assert!(!snapshot.features.contains("session_read_only_v1"));
+    println!("LIVE daemon_version=0.0.969 session_permission_overrides_v1=true session_read_only_v1=false");
+    for value in [true, false] {
+        let error = lifecycle_session_create_command(
+            std::env::current_dir().expect("cwd").display().to_string(),
+            "openai".to_string(),
+            "gpt-5".to_string(),
+            4096,
+            Some(serde_json::json!({"read_only": value})),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("live legacy daemon must never receive this create");
+        println!(
+            "LIVE read_only={value} rejection={}",
+            serde_json::to_string(&error).expect("typed JSON")
+        );
+        assert_eq!(error.code, "unavailable");
+        assert_eq!(
+            error.message,
+            "missing_feature: daemon does not advertise session_read_only_v1"
+        );
+    }
 }
 
 #[test]

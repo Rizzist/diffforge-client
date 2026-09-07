@@ -127,6 +127,7 @@ fn admission_rejection_is_typed_and_success_keeps_the_legacy_receipt_shape() {
             effort: Some("xhigh".to_string()),
             fast: Some(false),
         }),
+        None,
     )
     .expect("build admitted session.create request");
     assert!(features.contains(FEATURE_SESSION_CREATE_ADMISSION_V1));
@@ -156,6 +157,7 @@ fn admission_rejection_is_typed_and_success_keeps_the_legacy_receipt_shape() {
         None,
         None,
         Some(SessionCreateAdmissionV1::default()),
+        None,
     )
     .expect("build admission request with absent fast");
     let request = serde_json::to_value(request).expect("serialize absent fast admission request");

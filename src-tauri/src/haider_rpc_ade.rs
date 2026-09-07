@@ -100,6 +100,7 @@ const FEATURE_MONITOR_CONTROL_V1: &str = "monitor_control_v1";
 const FEATURE_MONITOR_DELIVERY_V1: &str = "monitor_delivery_v1";
 const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
 const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
+const FEATURE_SESSION_READ_ONLY_V1: &str = "session_read_only_v1";
 const FEATURE_AUTONOMOUS_INTERACTION_V1: &str = "autonomous_interaction_v1";
 const FEATURE_SESSION_RENAME_V1: &str = "session_rename_v1";
 const FEATURE_CONTEXT_COMPACTION_V1: &str = "context_compaction_v1";
@@ -5486,6 +5487,8 @@ enum RequestBody {
         cache_policy: Option<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interaction_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_scope: Option<SshScopeV1>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_alias: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
@@ -11565,7 +11568,11 @@ impl SessionCreateCommandErrorV1 {
 impl From<LifecycleCommandError> for SessionCreateCommandErrorV1 {
     fn from(error: LifecycleCommandError) -> Self {
         Self {
-            code: error.code,
+            code: if error.code == "missing_feature" {
+                "unavailable".to_string()
+            } else {
+                error.code
+            },
             message: error.message,
             retryable: error.retryable,
             data: Self::data(error.data),
@@ -11875,6 +11882,7 @@ fn session_create_request(
         cache_policy,
         interaction_mode,
         None,
+        None,
     )
 }
 
@@ -11889,10 +11897,22 @@ fn session_create_request_with_admission(
     cache_policy: Option<Value>,
     interaction_mode: Option<String>,
     admission: Option<SessionCreateAdmissionV1>,
+    ssh_scope: Option<SshScopeV1>,
 ) -> Result<(RequestBody, BTreeSet<String>), LifecycleCommandError> {
     let mut features = lifecycle_features(FEATURE_SESSION_MUTATION_V1);
     if permission_overrides.is_some() {
         features.insert(FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_string());
+    }
+    // The additive deny needs its own negotiation, even for explicit false.
+    // Inspect presence only: omitted policy stays omitted and values cross verbatim.
+    if permission_overrides
+        .as_ref()
+        .is_some_and(|policy| policy.get("read_only").is_some())
+    {
+        features.insert(FEATURE_SESSION_READ_ONLY_V1.to_string());
+    }
+    if ssh_scope.is_some() {
+        features.insert(FEATURE_SSH_PROFILES_V1.to_string());
     }
     let interaction_mode = match interaction_mode.as_deref() {
         None | Some("interactive") => None,
@@ -11924,6 +11944,7 @@ fn session_create_request_with_admission(
             permission_overrides,
             cache_policy,
             interaction_mode,
+            ssh_scope,
             account_alias: admission.account_alias,
             resolve_provider: admission.resolve_provider.unwrap_or(false),
             resolve_model: admission.resolve_model.unwrap_or(false),
@@ -12266,6 +12287,7 @@ pub async fn session_create(
         cache_policy,
         interaction_mode,
         None,
+        None,
     )
     .await
 }
@@ -12280,6 +12302,7 @@ async fn session_create_with_admission(
     cache_policy: Option<Value>,
     interaction_mode: Option<String>,
     admission: Option<SessionCreateAdmissionV1>,
+    ssh_scope: Option<SshScopeV1>,
 ) -> Result<SessionCreateReceipt, SessionCreateCommandErrorV1> {
     #[cfg(unix)]
     {
@@ -12292,6 +12315,7 @@ async fn session_create_with_admission(
             cache_policy,
             interaction_mode,
             admission,
+            ssh_scope,
         )
         .map_err(SessionCreateCommandErrorV1::from)?;
         return session_create_response(
@@ -12311,6 +12335,7 @@ async fn session_create_with_admission(
             cache_policy,
             interaction_mode,
             admission,
+            ssh_scope,
         );
         Err(SessionCreateCommandErrorV1::from(
             LifecycleCommandError::unavailable("session.create unavailable on this platform"),
@@ -12332,6 +12357,7 @@ pub async fn lifecycle_session_create_command(
     cache_policy: Option<Value>,
     interaction_mode: Option<String>,
     admission: Option<SessionCreateAdmissionV1>,
+    ssh_scope: Option<SshScopeV1>,
 ) -> Result<SessionCreateReceipt, SessionCreateCommandErrorV1> {
     session_create_with_admission(
         cwd,
@@ -12342,6 +12368,7 @@ pub async fn lifecycle_session_create_command(
         cache_policy,
         interaction_mode,
         admission,
+        ssh_scope,
     )
     .await
 }

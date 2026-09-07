@@ -6,6 +6,7 @@ fn body_json(body: RequestBody) -> Value {
 
 #[test]
 fn bits_publish_the_exact_feature_names() {
+    assert_eq!(FEATURE_SESSION_READ_ONLY_V1, "session_read_only_v1");
     assert_eq!(FEATURE_BRANCH_CREATE_V1, "branch_create_v1");
     assert_eq!(FEATURE_RUN_BUDGET_V1, "run_budget_v1");
     assert_eq!(FEATURE_SESSION_PROMPT_FORK_V1, "session_prompt_fork_v1");
@@ -210,6 +211,7 @@ fn no_create_budget_is_fabricated_and_headless_budget_is_explicit() {
         permission_overrides: None,
         cache_policy: None,
         interaction_mode: None,
+        ssh_scope: None,
         account_alias: None,
         resolve_provider: false,
         resolve_model: false,
@@ -219,6 +221,7 @@ fn no_create_budget_is_fabricated_and_headless_budget_is_explicit() {
     assert!(create.get("budget").is_none());
     assert!(create.get("permission_overrides").is_none());
     assert!(create.get("cache_policy").is_none());
+    assert!(create.get("ssh_scope").is_none());
 
     let absent = headless_spec_features(&serde_json::json!({
         "cwd": "/workspace",
