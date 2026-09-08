@@ -125,37 +125,37 @@ const FILES_VSCODE_THEME_VARS = `
 
 export const GlobalStyle = createGlobalStyle`
   :root {
-    --forge-bg: #07090d;
+    --forge-bg: #030508;
     --forge-bg-deep: #020304;
-    --forge-surface: #0d1117;
-    --forge-surface-raised: #11161d;
-    --forge-surface-control: #151b23;
-    --forge-surface-hover: rgba(230, 236, 245, 0.055);
+    --forge-surface: #0d141f;
+    --forge-surface-raised: #111a26;
+    --forge-surface-control: #141c28;
+    --forge-surface-hover: rgba(255, 255, 255, 0.055);
     --forge-surface-selected: rgba(125, 160, 205, 0.12);
-    --forge-border: rgba(230, 236, 245, 0.1);
-    --forge-border-strong: rgba(230, 236, 245, 0.16);
-    --forge-text: #f4f7fa;
+    --forge-border: rgba(255, 255, 255, 0.1);
+    --forge-border-strong: rgba(255, 255, 255, 0.18);
+    --forge-text: #e8eef8;
     /* Chat body sits a step below --forge-text: near-white 13px prose on the
        near-black bg peaks ~19:1 contrast and reads harsh over long sessions;
        this keeps emphasis (strong/headings) on --forge-text so it still pops. */
     --forge-chat-text: #d6dee8;
-    --forge-text-soft: #b6c0cc;
-    --forge-text-muted: #7a8493;
+    --forge-text-soft: #a7b2c2;
+    --forge-text-muted: #687386;
     --forge-text-disabled: #505966;
-    --forge-blue: #3b82f6;
-    --forge-blue-soft: #7db0ff;
-    --forge-accent: #3b82f6;
-    --forge-accent-soft: #7db0ff;
+    --forge-blue: #2f80ff;
+    --forge-blue-soft: #62a0ff;
+    --forge-accent: #2f80ff;
+    --forge-accent-soft: #62a0ff;
     --forge-accent-blue: var(--forge-accent);
-    --forge-accent-rgb: 59, 130, 246;
-    --forge-accent-soft-rgb: 125, 176, 255;
+    --forge-accent-rgb: 47, 128, 255;
+    --forge-accent-soft-rgb: 98, 160, 255;
     --forge-tint: var(--forge-accent);
     --forge-tint-soft: var(--forge-accent-soft);
     --forge-tint-rgb: var(--forge-accent-rgb);
     --forge-tint-soft-rgb: var(--forge-accent-soft-rgb);
-    --forge-accent-selected-bg: rgba(59, 130, 246, 0.08);
-    --forge-accent-selected-border: rgba(125, 176, 255, 0.5);
-    --forge-accent-selected-ring: rgba(79, 163, 255, 0.24);
+    --forge-accent-selected-bg: rgba(47, 128, 255, 0.08);
+    --forge-accent-selected-border: rgba(98, 160, 255, 0.5);
+    --forge-accent-selected-ring: rgba(98, 160, 255, 0.24);
     --forge-titlebar-bg: #000000;
     --forge-shell-rail-bg: rgba(6, 9, 16, 0.94);
     --forge-shell-right-bg: rgba(5, 8, 13, 0.96);
@@ -163,8 +163,12 @@ export const GlobalStyle = createGlobalStyle`
     --forge-amber: #dfa55a;
     --forge-ember: #d97935;
     --forge-green: #3ccb7f;
+    --forge-green-rgb: 60, 203, 127;
+    --forge-good-text: #7ddf9a;
+    --forge-amber-rgb: 223, 165, 90;
+    --forge-red-rgb: 255, 107, 107;
     --forge-trajectory-model: #8b7cf6;
-    --forge-red: #ef6b6b;
+    --forge-red: #ff6b6b;
     --forge-color-scheme: dark;
     /* Architecture diagram (default/dark fallback) */
     --arch-canvas-bg: #070a0f;
@@ -203,37 +207,37 @@ export const GlobalStyle = createGlobalStyle`
   }
 
   html[data-forge-theme="dark"] {
-    --forge-bg: #07090d;
+    --forge-bg: #030508;
     --forge-bg-deep: #020304;
-    --forge-surface: #0d1117;
-    --forge-surface-raised: #11161d;
-    --forge-surface-control: #151b23;
-    --forge-surface-hover: rgba(230, 236, 245, 0.055);
+    --forge-surface: #0d141f;
+    --forge-surface-raised: #111a26;
+    --forge-surface-control: #141c28;
+    --forge-surface-hover: rgba(255, 255, 255, 0.055);
     --forge-surface-selected: rgba(125, 160, 205, 0.12);
-    --forge-border: rgba(230, 236, 245, 0.1);
-    --forge-border-strong: rgba(230, 236, 245, 0.16);
-    --forge-text: #f4f7fa;
+    --forge-border: rgba(255, 255, 255, 0.1);
+    --forge-border-strong: rgba(255, 255, 255, 0.18);
+    --forge-text: #e8eef8;
     /* Chat body sits a step below --forge-text: near-white 13px prose on the
        near-black bg peaks ~19:1 contrast and reads harsh over long sessions;
        this keeps emphasis (strong/headings) on --forge-text so it still pops. */
     --forge-chat-text: #d6dee8;
-    --forge-text-soft: #b6c0cc;
-    --forge-text-muted: #7a8493;
+    --forge-text-soft: #a7b2c2;
+    --forge-text-muted: #687386;
     --forge-text-disabled: #505966;
-    --forge-blue: #3b82f6;
-    --forge-blue-soft: #7db0ff;
-    --forge-accent: #3b82f6;
-    --forge-accent-soft: #7db0ff;
+    --forge-blue: #2f80ff;
+    --forge-blue-soft: #62a0ff;
+    --forge-accent: #2f80ff;
+    --forge-accent-soft: #62a0ff;
     --forge-accent-blue: var(--forge-accent);
-    --forge-accent-rgb: 59, 130, 246;
-    --forge-accent-soft-rgb: 125, 176, 255;
+    --forge-accent-rgb: 47, 128, 255;
+    --forge-accent-soft-rgb: 98, 160, 255;
     --forge-tint: var(--forge-accent);
     --forge-tint-soft: var(--forge-accent-soft);
     --forge-tint-rgb: var(--forge-accent-rgb);
     --forge-tint-soft-rgb: var(--forge-accent-soft-rgb);
-    --forge-accent-selected-bg: rgba(59, 130, 246, 0.08);
-    --forge-accent-selected-border: rgba(125, 176, 255, 0.5);
-    --forge-accent-selected-ring: rgba(79, 163, 255, 0.24);
+    --forge-accent-selected-bg: rgba(47, 128, 255, 0.08);
+    --forge-accent-selected-border: rgba(98, 160, 255, 0.5);
+    --forge-accent-selected-ring: rgba(98, 160, 255, 0.24);
     --forge-titlebar-bg: #000000;
     --forge-shell-rail-bg: rgba(6, 9, 16, 0.94);
     --forge-shell-right-bg: rgba(5, 8, 13, 0.96);
@@ -241,8 +245,12 @@ export const GlobalStyle = createGlobalStyle`
     --forge-amber: #dfa55a;
     --forge-ember: #d97935;
     --forge-green: #3ccb7f;
+    --forge-green-rgb: 60, 203, 127;
+    --forge-good-text: #7ddf9a;
+    --forge-amber-rgb: 223, 165, 90;
+    --forge-red-rgb: 255, 107, 107;
     --forge-trajectory-model: #8b7cf6;
-    --forge-red: #ef6b6b;
+    --forge-red: #ff6b6b;
     --forge-color-scheme: dark;
     /* Architecture diagram (dark) */
     --arch-canvas-bg: #070a0f;
@@ -267,7 +275,7 @@ export const GlobalStyle = createGlobalStyle`
   }
 
   html[data-forge-theme="light"] {
-    --forge-bg: #f5f5f7;
+    --forge-bg: #f4f6fb;
     --forge-bg-deep: #ffffff;
     --forge-surface: #ffffff;
     --forge-surface-raised: #ffffff;
@@ -276,25 +284,25 @@ export const GlobalStyle = createGlobalStyle`
     --forge-surface-selected: rgba(0, 102, 204, 0.1);
     --forge-border: rgba(0, 0, 0, 0.08);
     --forge-border-strong: rgba(0, 0, 0, 0.14);
-    --forge-text: #1d1d1f;
+    --forge-text: #16202e;
     --forge-chat-text: #2b2b2f;
-    --forge-text-soft: #333333;
-    --forge-text-muted: #7a7a7a;
+    --forge-text-soft: #46556b;
+    --forge-text-muted: #5f6b80;
     --forge-text-disabled: #a1a1a6;
-    --forge-blue: #0066cc;
-    --forge-blue-soft: #0071e3;
-    --forge-accent: #0066cc;
-    --forge-accent-soft: #0071e3;
+    --forge-blue: #1c66e0;
+    --forge-blue-soft: #1b5fd0;
+    --forge-accent: #1c66e0;
+    --forge-accent-soft: #1b5fd0;
     --forge-accent-blue: var(--forge-accent);
-    --forge-accent-rgb: 0, 102, 204;
-    --forge-accent-soft-rgb: 0, 113, 227;
+    --forge-accent-rgb: 28, 102, 224;
+    --forge-accent-soft-rgb: 27, 95, 208;
     --forge-tint: var(--forge-accent);
     --forge-tint-soft: var(--forge-accent-soft);
     --forge-tint-rgb: var(--forge-accent-rgb);
     --forge-tint-soft-rgb: var(--forge-accent-soft-rgb);
-    --forge-accent-selected-bg: rgba(0, 102, 204, 0.1);
-    --forge-accent-selected-border: rgba(0, 102, 204, 0.46);
-    --forge-accent-selected-ring: rgba(0, 102, 204, 0.18);
+    --forge-accent-selected-bg: rgba(28, 102, 224, 0.1);
+    --forge-accent-selected-border: rgba(28, 102, 224, 0.46);
+    --forge-accent-selected-ring: rgba(28, 102, 224, 0.18);
     --forge-titlebar-bg: #f5f5f7;
     --forge-shell-rail-bg: rgba(245, 245, 247, 0.88);
     --forge-shell-right-bg: #ffffff;
@@ -302,6 +310,10 @@ export const GlobalStyle = createGlobalStyle`
     --forge-amber: #8b5a00;
     --forge-ember: #0066cc;
     --forge-green: #0a7f45;
+    --forge-green-rgb: 10, 127, 69;
+    --forge-good-text: #15803d;
+    --forge-amber-rgb: 139, 90, 0;
+    --forge-red-rgb: 180, 35, 24;
     --forge-trajectory-model: #5b3fd4;
     --forge-red: #b42318;
     --forge-color-scheme: light;

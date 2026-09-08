@@ -93,6 +93,9 @@ test("available sessions render no unavailable affordance", () => {
 test("rail and session surface render the shared categorical presentation", () => {
   const rail = readFileSync(new URL("./SessionsRail.jsx", import.meta.url), "utf8");
   const surface = readFileSync(new URL("./SessionSurface.jsx", import.meta.url), "utf8");
+  // The active-session status pill now lives in SurfaceStatusPill.jsx; the
+  // typed availability category still flows surface → pill.
+  const pill = readFileSync(new URL("./SurfaceStatusPill.jsx", import.meta.url), "utf8");
 
   assert.match(
     rail,
@@ -101,10 +104,15 @@ test("rail and session surface render the shared categorical presentation", () =
   );
   assert.match(
     surface,
-    /const availability =[\s\S]*?sessionAvailabilityPresentation\(session\)[\s\S]*?data-session-availability=\{availability\?\.reason\}/,
+    /const availability =[\s\S]*?sessionAvailabilityPresentation\(session\)[\s\S]*?<SurfaceStatusPill[\s\S]*?availability=\{availability\}/,
+    "SessionSurface computes the typed availability category and feeds it to the pill",
+  );
+  assert.match(
+    pill,
+    /data-session-availability=\{availability\?\.reason\}/,
     "active-session status pill must render the typed availability category",
   );
-  assert.match(surface, /<span>\{availability\?\.label \|\| statusLine\}<\/span>/);
+  assert.match(pill, /<span>\{availability\?\.label \|\| statusLine\}<\/span>/);
   assert.match(
     surface,
     /<HomeAvailabilityAffordance\s+session=\{session\}\s*\/>/,

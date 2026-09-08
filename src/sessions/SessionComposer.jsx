@@ -8,6 +8,7 @@ import { KeyboardVoice } from "@styled-icons/material-rounded/KeyboardVoice";
 import { Send } from "@styled-icons/material-rounded/Send";
 
 import { modelGroupSelectionState } from "./haiderClientContract.js";
+import { ModelBrandIcon } from "./modelBrand.jsx";
 import {
   DELIVERY_MODES,
   deliveryModePresentation,
@@ -328,6 +329,7 @@ export default function SessionComposer({
           }}
           type="button"
         >
+          <ModelBrandIcon model={current} provider={provider} />
           <em>Model</em>
           {provider && <ChipDim>{provider}/</ChipDim>}
           <span>{current === "default" ? "Default" : current === "unknown" ? "Unknown" : current}</span>

@@ -13,6 +13,11 @@ import {
 } from "./sessionStatus.js";
 
 const surfaceSource = readFileSync(new URL("./SessionSurface.jsx", import.meta.url), "utf8");
+// The work-header status pill was extracted into its own presentational
+// component (SurfaceStatusPill.jsx); its render seam (data-* provenance +
+// label fallback) is pinned there, while SessionSurface still owns the
+// statusPillView computation it feeds in.
+const pillSource = readFileSync(new URL("./SurfaceStatusPill.jsx", import.meta.url), "utf8");
 
 test("[pin] listener adapter preserves optional fields and clears an absent whole status", () => {
   const sessions = [{ id: "local-1", provider_session_id: "provider-1" }];
@@ -148,23 +153,35 @@ test("[pin] pill marks line and local fallbacks as presentation-only", () => {
   assert.equal(unavailablePill.source, "session-availability");
 
   assert.match(
-    surfaceSource,
-    /data-status-authority=\{statusPillView\.authority\}/,
+    pillSource,
+    /data-status-authority=\{view\.authority\}/,
     "the rendered pill authority must come from the same render seam as its label",
   );
   assert.match(
-    surfaceSource,
-    /data-status-source=\{statusPillView\.source\}/,
+    pillSource,
+    /data-status-source=\{view\.source\}/,
     "the rendered pill source must come from the same render seam as its label",
   );
   assert.match(
-    surfaceSource,
-    /data-structured-status=\{statusPillView\.structuredStatus\}/,
+    pillSource,
+    /data-structured-status=\{view\.structuredStatus\}/,
     "the pill must expose structured absence independently of fallback text",
+  );
+  // SessionSurface computes the fallback line from the same render seam and
+  // hands it, plus the availability presentation, to the extracted pill.
+  assert.match(
+    surfaceSource,
+    /const statusLine = statusPillView\?\.label \|\| "";/,
+    "SessionSurface derives the pill's fallback line from the render seam",
   );
   assert.match(
     surfaceSource,
-    /const statusLine = statusPillView\?\.label \|\| "";[\s\S]*?<span>\{availability\?\.label \|\| statusLine\}<\/span>/,
+    /<SurfaceStatusPill[\s\S]*?availability=\{availability\}[\s\S]*?statusLine=\{statusLine\}[\s\S]*?statusPillView=\{statusPillView\}/,
+    "SessionSurface feeds the pill the availability, fallback line, and render seam",
+  );
+  assert.match(
+    pillSource,
+    /<span>\{availability\?\.label \|\| statusLine\}<\/span>/,
     "the rendered pill label must come from the provenance-bearing render seam",
   );
 });

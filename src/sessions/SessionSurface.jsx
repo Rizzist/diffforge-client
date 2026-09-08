@@ -34,6 +34,7 @@ import {
 } from "../app/appStyles.js";
 import { PlanFlame } from "../app/PlanFlame.jsx";
 import SessionComposer from "./SessionComposer.jsx";
+import { SurfaceStatusPill } from "./SurfaceStatusPill.jsx";
 import {
   COMMAND_DOOR_FEATURE,
   catalogToSlashCommands,
@@ -2449,17 +2450,12 @@ export default function SessionSurface({
         </SessionViewToggle>
         )}
         {session && session.id !== "draft" && (
-          <StatusPill
-            data-session-availability={availability?.reason}
-            data-status={statusPillView.status}
-            data-status-authority={statusPillView.authority}
-            data-status-source={statusPillView.source}
-            data-structured-status={statusPillView.structuredStatus}
-            title={statusPillView.title}
-          >
-            <i aria-hidden="true" />
-            <span>{availability?.label || statusLine}</span>
-          </StatusPill>
+          <SurfaceStatusPill
+            availability={availability}
+            session={session}
+            statusLine={statusLine}
+            statusPillView={statusPillView}
+          />
         )}
         {/* F2.1: the persona binding control and the display-only workflow
             chip left this row for the Settings menu — the header is ONE
@@ -3266,60 +3262,6 @@ const SegAddButton = styled.button`
   }
 `;
 
-const StatusPill = styled.span`
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 10px;
-  border: 1px solid var(--forge-border);
-  border-radius: 999px;
-  color: var(--forge-text-soft);
-  background: var(--forge-surface-control);
-  font-size: 10px;
-  font-weight: 700;
-
-  /* The harness line stays byte-exact; a floating pill just can't grow
-     without bound, so extreme lines clip visually (full text on hover). */
-  > span {
-    max-width: 300px;
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
-
-  i {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--forge-text-disabled);
-  }
-
-  &[data-status="running"] i {
-    background: var(--forge-green);
-  }
-
-  &[data-status="waiting"] i {
-    background: var(--forge-amber);
-  }
-
-  &[data-status="error"] i {
-    background: var(--forge-red);
-  }
-
-  &[data-session-availability="daemon-unavailable"] i {
-    background: var(--forge-red);
-  }
-
-  &[data-session-availability="not-published"] i {
-    background: var(--forge-amber);
-  }
-
-  &[data-session-availability="legacy-provenance"] i {
-    background: var(--forge-text-muted);
-  }
-`;
-
 const HeaderIconButton = styled.button`
   display: grid;
   width: 26px;
@@ -3753,31 +3695,36 @@ const PanelPickerCard = styled.button`
 `;
 
 const EmptyState = styled.div`
-  max-width: 460px;
+  display: flex;
+  max-width: 480px;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 16px;
   text-align: center;
 
   h2 {
-    margin: 12px 0 6px;
+    margin: 20px 0 10px;
     color: var(--forge-text);
-    font-size: 19px;
+    font-size: 20px;
     font-weight: 700;
   }
 
   p {
+    max-width: 42ch;
     margin: 0;
     color: var(--forge-text-muted);
     font-size: 12.5px;
-    line-height: 1.55;
+    line-height: 1.65;
   }
 `;
 
 const EmptyStateIcon = styled.span`
   display: inline-grid;
-  width: 44px;
-  height: 44px;
+  width: 52px;
+  height: 52px;
   place-items: center;
   border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.4);
-  border-radius: 12px;
+  border-radius: 14px;
   color: var(--forge-accent-soft);
   background: rgba(var(--forge-tint-rgb), 0.12);
 `;
