@@ -171,10 +171,21 @@ test("[pin] finding 7: no-attachment space submits reach invoke without throwing
     "SpaceSurface must use the behaviorally pinned submit adapter");
   assert.match(surface, /submitCommandFor\(session\)\(prompt, attachments \|\| \[\]\)/,
     "SpaceSurface must always pass an attachment array");
-  assert.match(surface, /onPastedBlocksChange=\{/, "paste blocks must be captured");
-  assert.match(surface, /pastedBlocks=\{/, "paste blocks must be controlled");
-  assert.match(surface, /onAttachmentsChange=\{/, "attachments must be captured");
-  assert.match(surface, /attachments=\{attachmentsBySession/, "attachments must be controlled");
+  /* F9 Phase 2: the composer now lives inside the shared SessionView, so a live
+     leaf's controlled composer state rides through the shared controller's ctx
+     (buildSpaceLeafSessionViewProps) instead of a direct <SessionComposer>. The
+     control guarantee is unchanged: typed text, paste blocks, and staged
+     attachments are all captured AND controlled from this surface's maps. */
+  assert.match(surface, /buildSpaceLeafSessionViewProps\(session, leaf, \{/,
+    "a live leaf must feed SessionView through the shared controller");
+  assert.match(surface, /onPastedBlocksChange: \(next\) => setPastesBySession/,
+    "paste blocks must be captured");
+  assert.match(surface, /composerPastedBlocks: pastesBySession\[session\.id\]/,
+    "paste blocks must be controlled");
+  assert.match(surface, /onAttachmentsChange: \(next\) => setAttachmentsFor\(session\.id, next\)/,
+    "attachments must be captured");
+  assert.match(surface, /composerAttachments: attachmentsBySession\[session\.id\]/,
+    "attachments must be controlled");
   assert.match(surface, /typeof next === "function" \? next\(previous\) : next/,
     "image-paste updater callbacks must be applied to the prior attachments");
   const submitCatch = surface.slice(

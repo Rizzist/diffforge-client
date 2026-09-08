@@ -9,13 +9,12 @@ import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Timeline } from "@styled-icons/material-rounded/Timeline";
 import { Workspaces } from "@styled-icons/material-rounded/Workspaces";
 
-import SessionComposer from "./SessionComposer.jsx";
-import SessionTranscript from "./SessionTranscript.jsx";
-import SessionTrajectory from "./SessionTrajectory.jsx";
+import SessionView from "./SessionView.jsx";
 import SessionSettingsMenu, {
   SessionViewButton,
   SessionViewToggle,
 } from "./SessionSettingsMenu.jsx";
+import { buildSpaceLeafSessionViewProps } from "./sessionViewController.js";
 import { spaceLeafById } from "./spacesModel.js";
 import {
   createSpaceSessionSubmitFor,
@@ -195,42 +194,31 @@ export default function SpaceSurface({
       );
     }
     const session = presentation.session;
-    if (leaf.viewKind === "trajectory") {
-      return (
-        <LeafViewHost>
-          <SessionTrajectory session={session} />
-        </LeafViewHost>
-      );
-    }
-    if (leaf.viewKind === "shell") {
-      /* The model carries shell leaves; this surface does not render them
-         yet. An honest placeholder beats a silently blank PTY. */
-      return (
-        <LeafStateCard data-tone="unknown">
-          <LeafStateTag>shell</LeafStateTag>
-          <strong>Shell view not rendered in spaces yet</strong>
-          <span>Open “{session.title || leaf.sessionRef}” from All sessions for its shell.</span>
-        </LeafStateCard>
-      );
-    }
+    /* F9 Phase 2: a live leaf mounts the REAL shared SessionView (body only —
+       the space header owns identity/toggle/gear), so chat, shell, and traj all
+       render exactly as standalone does. Shell mounts the real SessionTerminal
+       (PTY) bound to this session's own pane, replacing the old
+       unrendered-shell placeholder card. The composer stays controlled by this
+       surface's per-session draft/paste/attachment maps. */
     return (
       <LeafViewHost>
-        <SessionTranscript session={session} />
-        <SessionComposer
-          attachments={attachmentsBySession[session.id] || []}
-          onAttachmentsChange={(next) => setAttachmentsFor(session.id, next)}
-          onPastedBlocksChange={(next) => setPastesBySession((current) => ({
-            ...current,
-            [session.id]: next,
-          }))}
-          onSubmit={submitFor(session)}
-          onValueChange={(text) => setDrafts((current) => ({
-            ...current,
-            [session.id]: text,
-          }))}
-          pastedBlocks={pastesBySession[session.id] || []}
-          placeholder={`Message ${session.title || "session"}…`}
-          value={drafts[session.id] || ""}
+        <SessionView
+          {...buildSpaceLeafSessionViewProps(session, leaf, {
+            onSetLeafView,
+            composerValue: drafts[session.id] || "",
+            onValueChange: (text) => setDrafts((current) => ({
+              ...current,
+              [session.id]: text,
+            })),
+            composerPastedBlocks: pastesBySession[session.id] || [],
+            onPastedBlocksChange: (next) => setPastesBySession((current) => ({
+              ...current,
+              [session.id]: next,
+            })),
+            composerAttachments: attachmentsBySession[session.id] || [],
+            onAttachmentsChange: (next) => setAttachmentsFor(session.id, next),
+            onSubmit: submitFor(session),
+          })}
         />
       </LeafViewHost>
     );
@@ -897,6 +885,7 @@ const StackContent = styled.div`
 `;
 
 const LeafViewHost = styled.div`
+  position: relative;
   display: flex;
   min-width: 0;
   min-height: 0;

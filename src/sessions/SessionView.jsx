@@ -61,6 +61,13 @@ export default function SessionView({
   paneBody = null,
   // header identity + drag region
   session,
+  /* The one-line WorkHeader (title + toggle + status pill + theme). Standalone,
+     draft, and home never set this, so it defaults on and their panes are
+     byte-identical to Phase 1. A space leaf sets it false: the space's own
+     header owns the session's identity/toggle/gear (F2), so the leaf mounts the
+     shared SessionView for its real BODY alone — chat/shell/traj + composer —
+     without a second, redundant header row. */
+  showHeader = true,
   showToggle = true,
   onHeaderDragStart = null,
   // title block
@@ -555,7 +562,7 @@ export default function SessionView({
 
   return (
     <SessionPane data-active={active ? "true" : "false"}>
-      {workHeader}
+      {showHeader && workHeader}
       <PaneContent>{paneContent}</PaneContent>
     </SessionPane>
   );
