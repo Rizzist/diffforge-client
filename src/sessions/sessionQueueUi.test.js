@@ -34,16 +34,18 @@ test("queue_control_v1 exclusively supplies the delivery-mode chip callback", ()
     { onDeliveryModeChange: onChange },
   );
 
-  const surface = read("SessionSurface.jsx");
+  // F9: the session composer moved from SessionSurface into the shared
+  // SessionView; the feature-gated delivery-mode seam rides with it.
+  const view = read("SessionView.jsx");
   assert.match(
-    surface,
+    view,
     /\{\.\.\.sessionComposerDeliveryModeProps\(\s*rpcFeatures,/,
     "the rendered composer must use the feature-gated prop seam",
   );
   assert.doesNotMatch(
-    surface,
+    view,
     /onDeliveryModeChange\s*=/,
-    "SessionSurface must not install an unconditional delivery-mode callback",
+    "SessionView must not install an unconditional delivery-mode callback",
   );
 });
 

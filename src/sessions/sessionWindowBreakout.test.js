@@ -65,13 +65,15 @@ async function sessionSurfaceModule() {
     ssr: { noExternal: ["styled-components", /^@xterm\//] },
   });
   try {
-    /* Load the surface AND the shared Settings menu from ONE module graph so
-       component identities can be compared against the rendered tree. */
-    const [surface, settingsMenu] = await Promise.all([
+    /* Load the surface, the shared SessionView (which now owns the one-line
+       header + pop-out affordance), AND the shared Settings menu from ONE
+       module graph so component identities can be compared against the tree. */
+    const [surface, view, settingsMenu] = await Promise.all([
       server.ssrLoadModule("/src/sessions/SessionSurface.jsx"),
+      server.ssrLoadModule("/src/sessions/SessionView.jsx"),
       server.ssrLoadModule("/src/sessions/SessionSettingsMenu.jsx"),
     ]);
-    return { settingsMenu, surface };
+    return { settingsMenu, surface, view };
   } finally {
     await server.close();
   }
@@ -588,7 +590,17 @@ test("native liveness and incarnation guard preserve a newer reopened window", a
 });
 
 test("session header pop-out affordance calls its production command prop", async () => {
-  const [{ default: React }, { surface: { default: SessionSurface } }] = await Promise.all([
+  /* F9: the one-line header (with its pop-out affordance) moved into the shared
+     SessionView, but SessionSurface (the OWNER) is what wires onPopOutSession
+     into the delegated pane. Render the owner, expand the exact SessionView it
+     delegates to with the owner's forwarded props, click the real header
+     button, and prove the click reaches the owner-supplied callback — so
+     dropping the owner's onPopOutSession forwarding loses the pop-out button
+     and fails this pin. */
+  const [
+    { default: React },
+    { surface: { default: SessionSurface }, view: { default: SessionView } },
+  ] = await Promise.all([
     import("react"),
     sessionSurfaceModule(),
   ]);
@@ -600,20 +612,27 @@ test("session header pop-out affordance calls its production command prop", asyn
     title: "Clicked session",
   };
   const calls = [];
-  const tree = renderFunctionComponent(React, () => SessionSurface({
+  const surfaceTree = renderFunctionComponent(React, () => SessionSurface({
     activeSessionId: session.id,
     draftOpen: false,
     onPopOutSession: (selected) => calls.push(selected),
     openSessions: [session],
     sessions: [session],
   }));
+  const pane = findElement(surfaceTree, (element) => element.type === SessionView);
+  assert.ok(pane, "SessionSurface must delegate the active pane to SessionView");
+  /* Render the delegated pane with the owner's forwarded props — this is where
+     the pop-out button is composed AND where the owner's wiring is proved. */
+  const paneTree = renderFunctionComponent(React, () => SessionView(pane.props));
   const affordance = findElement(
-    tree,
+    paneTree,
     (element) => element.props?.["aria-label"] === "Pop out session",
   );
-  assert.ok(affordance, "the active session header must expose its pop-out affordance");
+  assert.ok(affordance,
+    "the delegated session header must expose its pop-out affordance");
   affordance.props.onClick();
-  assert.deepEqual(calls, [session]);
+  assert.deepEqual(calls, [session],
+    "the pop-out must dispatch through the owner's onPopOutSession wiring");
 });
 
 test("the Settings menu host stays mounted while CLOSED, so dismissal keeps its editors' state (F2 verify P2)", async () => {

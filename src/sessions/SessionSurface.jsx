@@ -8,7 +8,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
 import { Build } from "@styled-icons/material-rounded/Build";
@@ -16,25 +15,14 @@ import { Forum } from "@styled-icons/material-rounded/Forum";
 import { History } from "@styled-icons/material-rounded/History";
 import { Language } from "@styled-icons/material-rounded/Language";
 import { Mediation } from "@styled-icons/material-rounded/Mediation";
-import { Memory } from "@styled-icons/material-rounded/Memory";
-import { MoreHoriz } from "@styled-icons/material-rounded/MoreHoriz";
-import { Movie } from "@styled-icons/material-rounded/Movie";
 import { NotificationsActive } from "@styled-icons/material-rounded/NotificationsActive";
-import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
-import { PushPin } from "@styled-icons/material-rounded/PushPin";
-import { Settings } from "@styled-icons/material-rounded/Settings";
 import { Terminal as TerminalGlyph } from "@styled-icons/material-rounded/Terminal";
-import { Timeline } from "@styled-icons/material-rounded/Timeline";
 
 import {
-  ButtonDarkModeIcon,
-  ButtonLightModeIcon,
-  ButtonCloseIcon,
   ButtonAddIcon,
 } from "../app/appStyles.js";
 import { PlanFlame } from "../app/PlanFlame.jsx";
 import SessionComposer from "./SessionComposer.jsx";
-import { SurfaceStatusPill } from "./SurfaceStatusPill.jsx";
 import {
   COMMAND_DOOR_FEATURE,
   catalogToSlashCommands,
@@ -51,11 +39,9 @@ import {
   applySessionSurfaceStatusEvent,
   surfaceInputMirrorPlan,
   surfaceRunStatusView,
-  surfaceStatusPillView,
 } from "./sessionStatus.js";
 import {
   SessionAvailabilityAffordance,
-  sessionAvailabilityPresentation,
 } from "./sessionAvailability.js";
 import {
   rehomeSessionPane,
@@ -69,8 +55,12 @@ import {
   sessionBindingAnnouncement,
 } from "./sessionTerminalBinding.js";
 import SessionTerminal from "./SessionTerminal.jsx";
-import SessionTrajectory from "./SessionTrajectory.jsx";
-import SessionTranscript from "./SessionTranscript.jsx";
+import SessionView, {
+  ChatHostLayer,
+  TerminalHostLayer,
+  EmptyState,
+  EmptyStateIcon,
+} from "./SessionView.jsx";
 import FleetPanel from "./FleetPanel.jsx";
 import FleetChildTranscript from "./FleetChildTranscript.jsx";
 import PeersPanel from "./PeersPanel.jsx";
@@ -83,11 +73,8 @@ import MonitorPanel from "./MonitorPanel.jsx";
 import CheckpointPanel from "./CheckpointPanel.jsx";
 import WorkflowGraphView from "./WorkflowGraphView.jsx";
 import SessionSettingsMenu, {
-  SessionViewButton,
-  SessionViewToggle,
   SettingsMenuItem,
 } from "./SessionSettingsMenu.jsx";
-import SessionLifecycleMenuItems from "./SessionLifecycleMenuItems.jsx";
 import { findFleetNode, fleetSessionIds } from "./fleetModel.js";
 import {
   formatSessionRelativeTime,
@@ -106,7 +93,6 @@ import {
 } from "./sessionSync.js";
 import { viewportMenuPosition } from "./viewportMenuPosition.js";
 import { providerRowView } from "./providerAdminModel.js";
-import SessionQueuePanel from "./SessionQueuePanel.jsx";
 import {
   applyQueueDelta,
   createQueueInvokeBoundary,
@@ -118,7 +104,6 @@ import {
   queueListStarted,
   queueListSucceeded,
   queueStateForFeatures,
-  sessionComposerDeliveryModeProps,
 } from "./queueViewModel.js";
 import {
   normalizeDeliveryMode,
@@ -154,29 +139,9 @@ const SUBMIT_CONFIRMATION_MS = 5000;
 
 const queueInvokeBoundary = createQueueInvokeBoundary(invoke);
 
-
-const PANEL_KINDS = {
-  web: { label: "Web", Icon: Language },
-  pcb: { label: "PCB Design", Icon: Memory },
-  video: { label: "AI Video Editor", Icon: Movie },
-};
-
-/* View modes hosted by the Settings (gear) menu instead of the tab bar
-   (F2-UI): every SDK-backed agent-settings surface. The gear shows the
-   active state whenever one of these is the session's current view;
-   "sshPty" rides the SSH Profiles entry exactly as it rode its tab. */
-const SETTINGS_MENU_MODES = [
-  "fleet",
-  "peers",
-  "shells",
-  "capabilities",
-  "sshProfiles",
-  "sshPty",
-  "providers",
-  "monitors",
-  "checkpoints",
-  "graph",
-];
+/* PANEL_KINDS and SETTINGS_MENU_MODES (the gear's relocated-mode list that
+   lights it when a settings surface is current) moved to SessionView.jsx with
+   the toggle and gear anchor. */
 
 function publishedCheckpointBranchId(session) {
   return typeof session?.branch_id === "string" && session.branch_id.length > 0
@@ -2035,131 +2000,10 @@ export default function SessionSurface({
     await onRenameSession?.(id, title || undefined);
   }, [onRenameSession, titleDraft, titleRenamingId]);
 
-  const lifecycleNoticeFor = (sessionId) => {
-    const pending = lifecyclePendingBySession[sessionId] || {};
-    const pendingAction = Object.keys(pending).find((action) => pending[action]);
-    if (pendingAction) {
-      return {
-        kind: "pending",
-        text: {
-          rename: "Renaming…",
-          compact: "Compacting…",
-          fork: "Forking…",
-          retry: "Retrying…",
-        }[pendingAction],
-      };
-    }
-    const error = Object.values(lifecycleErrorBySession[sessionId] || {}).find(Boolean);
-    return error ? { kind: "error", text: "Lifecycle action failed", title: error } : null;
-  };
-
-  /* ONE header row for every tab: small title + its menu on the left, the
-     view cluster (segmented, status pill, theme) on the right; wraps to a
-     second line only when the pane is too narrow. */
-  const workHeader = (session, options = {}) => (
-    /* The header doubles as a window-drag region (AppShell's titlebar
-       handler: interactive elements opt out, double-click zooms). */
-    <WorkHeader onMouseDown={onHeaderDragStart || undefined}>
-      {session ? renderTitleBlock(session) : <span />}
-      <WorkHeaderSpacer aria-hidden="true" />
-      {floatingControls(session, options)}
-    </WorkHeader>
-  );
-
-  const renderTitleBlock = (session) => {
-    const lifecycleNotice = lifecycleNoticeFor(session.id);
-    return (
-      <TitleRow>
-        {titleRenamingId === session.id ? (
-          <TitleRenameInput
-            aria-label="Rename session"
-            autoFocus
-            onBlur={() => void commitTitleRename()}
-            onChange={(event) => setTitleDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                void commitTitleRename();
-              } else if (event.key === "Escape") {
-                event.preventDefault();
-                setTitleRenamingId("");
-              }
-            }}
-            value={titleDraft}
-          />
-        ) : (
-          <h1 title={session.title}>{session.title}</h1>
-        )}
-        {lifecycleNotice && (
-          <LifecycleTitleNotice
-            data-kind={lifecycleNotice.kind}
-            role={lifecycleNotice.kind === "pending" ? "status" : "alert"}
-            title={lifecycleNotice.title}
-          >
-            {lifecycleNotice.text}
-          </LifecycleTitleNotice>
-        )}
-        <TitleMenuWrap ref={titleMenuFor === session.id ? titleMenuRef : undefined}>
-          <HeaderIconButton
-            ref={titleMenuFor === session.id ? titleMenuButtonRef : undefined}
-            aria-expanded={titleMenuFor === session.id}
-            aria-haspopup="menu"
-            aria-label="Session menu"
-            onClick={() => setTitleMenuFor(
-              (current) => (current === session.id ? "" : session.id),
-            )}
-            title="Session options"
-            type="button"
-          >
-            <MoreHoriz aria-hidden="true" size={15} />
-          </HeaderIconButton>
-          {titleMenuFor === session.id && createPortal(
-            <TitleMenu
-              $left={titleMenuPosition?.left}
-              $positioned={Boolean(titleMenuPosition)}
-              $top={titleMenuPosition?.top}
-              ref={titleMenuPanelRef}
-              role="menu"
-            >
-              <TitleMenuItem
-                onClick={() => void toggleSessionPin(session)}
-                role="menuitem"
-                type="button"
-              >
-                <PushPin aria-hidden="true" />
-                <span>{session.pinned ? "Unpin" : "Pin"}</span>
-              </TitleMenuItem>
-              {session.id !== "draft" && (
-                <SessionLifecycleMenuItems
-                  errorBySession={lifecycleErrorBySession}
-                  onBeginRename={beginTitleRename}
-                  onCompact={onCompactSession}
-                  onDismiss={() => setTitleMenuFor("")}
-                  onFork={onForkSession}
-                  onForked={(receipt) => onOpenSession?.({ id: receipt.sessionId })}
-                  onRetry={onRetrySession}
-                  pendingBySession={lifecyclePendingBySession}
-                  session={session}
-                  unavailableByAction={lifecycleUnavailableByAction}
-                />
-              )}
-            </TitleMenu>,
-            document.body,
-          )}
-        </TitleMenuWrap>
-        {session.id !== "draft" && onPopOutSession && (
-          <HeaderIconButton
-            aria-label="Pop out session"
-            onClick={() => onPopOutSession(session)}
-            title="Open this session in its own window"
-            type="button"
-          >
-            <OpenInNew aria-hidden="true" />
-          </HeaderIconButton>
-        )}
-      </TitleRow>
-    );
-  };
+  /* The one-line header (title + Chat/Shell/Traj toggle + gear anchor + status
+     pill + theme) moved to SessionView.jsx, which SessionSurface mounts per
+     pane. The state/handlers those controls drive stay here and pass in as an
+     explicit props contract; see the <SessionView …/> mounts below. */
 
   /* ONE view-dispatch authority for the toggle tabs AND the Settings menu
      entries: leave any panel tab for the chat tab, then set the session's
@@ -2325,154 +2169,345 @@ export default function SessionSurface({
     );
   };
 
-  /* Floating cluster, top-right of the workspace — ONLY view-scoped chrome:
-     the segmented view control (with the session's panel tabs riding it),
-     the exact harness status pill, and the theme toggle. */
-  const floatingControls = (session, { showToggle = true } = {}) => {
-    const tabsState = session && session.id !== "draft" ? tabsStateFor(session.id) : null;
-    const panelTabs = tabsState ? tabsState.tabs.filter((tab) => tab.kind !== "chat") : [];
-    const activeTabIsChat = !tabsState
-      || !tabsState.tabs.some((tab) => tab.id === tabsState.activeTabId)
-      || tabsState.activeTabId === "chat";
-    const selectView = (viewMode) => selectViewOn(session.id, viewMode);
-    /* With only Chat/Shell/Traj left as tabs, the gear carries the active
-       state whenever the current view is one of the relocated
-       agent-settings surfaces, so the user can still see where they are. */
-    const settingsViewActive = Boolean(session)
-      && activeTabIsChat
-      && SETTINGS_MENU_MODES.includes(modeFor(session.id));
-    const settingsMenuOpen = Boolean(session) && settingsMenuSession?.id === session.id;
-    /* status_segment_structured_v1: only state/detail can carry structured
-       authority. The raw line/local bucket remain useful presentation, with
-       provenance beside the rendered label instead of masquerading as it. */
-    const availability = session && session.id !== "draft"
-      ? sessionAvailabilityPresentation(session)
-      : null;
-    const statusPillView = session && session.id !== "draft"
-      ? surfaceStatusPillView(surfaceStatus[session.id] || null, session, availability)
-      : null;
-    const statusLine = statusPillView?.label || "";
-    return (
-      <FloatingControls>
-        {showToggle && session && (
-        <SessionViewToggle aria-label="Session view" role="tablist">
-          <SessionViewButton
-            aria-selected={activeTabIsChat && modeFor(session.id) === "ui"}
-            data-active={activeTabIsChat && modeFor(session.id) === "ui" ? "true" : undefined}
-            onClick={() => selectView("ui")}
-            role="tab"
-            type="button"
-          >
-            <Forum aria-hidden="true" size={13} />
-            <span>Chat</span>
-          </SessionViewButton>
-          <SessionViewButton
-            aria-selected={activeTabIsChat && modeFor(session.id) === "terminal"}
-            data-active={activeTabIsChat && modeFor(session.id) === "terminal" ? "true" : undefined}
-            onClick={() => selectView("terminal")}
-            role="tab"
-            type="button"
-          >
-            <TerminalGlyph aria-hidden="true" size={13} />
-            <span>Shell</span>
-          </SessionViewButton>
-          {session.id !== "draft" && (
-            <SessionViewButton
-              aria-selected={activeTabIsChat && modeFor(session.id) === "trajectory"}
-              data-active={activeTabIsChat && modeFor(session.id) === "trajectory" ? "true" : undefined}
-              onClick={() => selectView("trajectory")}
-              role="tab"
-              title="Trajectory"
-              type="button"
-            >
-              <Timeline aria-hidden="true" size={13} />
-              <span>Traj</span>
-            </SessionViewButton>
-          )}
-          {panelTabs.map((tab) => {
-            const panel = PANEL_KINDS[tab.kind];
-            const PanelIcon = panel?.Icon || ButtonAddIcon;
-            const label = panel?.label || "New panel";
-            return (
-              <SessionViewButton
-                aria-selected={tabsState.activeTabId === tab.id}
-                data-active={tabsState.activeTabId === tab.id ? "true" : undefined}
-                key={tab.id}
-                onClick={() => selectTab(session.id, tab.id)}
-                role="tab"
-                title={label}
-                type="button"
-              >
-                <PanelIcon aria-hidden="true" size={13} />
-                <span>{label}</span>
-                <PanelSegClose
-                  aria-label="Close panel"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    closeTab(session.id, tab.id);
-                  }}
-                  role="button"
-                  tabIndex={-1}
-                >
-                  <ButtonCloseIcon aria-hidden="true" />
-                </PanelSegClose>
-              </SessionViewButton>
-            );
-          })}
-          {session.id !== "draft" && (
-            <SegAddButton
-              aria-label="New panel"
-              onClick={() => addTab(session.id)}
-              title="New panel"
-              type="button"
-            >
-              <ButtonAddIcon aria-hidden="true" />
-            </SegAddButton>
-          )}
-          {/* Settings (gear): anchors the shared agent-settings menu (mounted
-              once at the surface root). Every relocated surface entry
-              dispatches the exact same selectView mode its tab did, behind
-              the same draft guard it had. */}
-          <SessionViewButton
-            ref={settingsMenuOpen ? settingsMenuButtonRef : undefined}
-            aria-expanded={settingsMenuOpen}
-            aria-haspopup="menu"
-            aria-label="Agent settings"
-            data-active={settingsViewActive ? "true" : undefined}
-            onClick={() => setSettingsMenuSession(
-              (current) => (current?.id === session.id ? null : session),
+  /* The floating cluster (Chat/Shell/Traj toggle, panel tabs, gear anchor,
+     status pill, theme) moved to SessionView.jsx. Its dispatches ride in as
+     bound props from the per-pane <SessionView …/> mounts below. */
+
+  /* The nine agent-settings surfaces the gear opens (fleet/peers/shells/ssh/
+     capabilities/providers/monitors/checkpoints/graph): each a hook-backed
+     presentational panel this surface owns. They mount inside the unified
+     SessionView through this slot, keyed by the session's current mode exactly
+     as their tabs were — so the view chrome is shared while every SDK boundary
+     stays here. */
+  const renderAgentSurface = (session, mode) => (
+    <>
+      {/* Fleet view (P2): descendant tree + rollup chips from
+          session.fleet, drilldown into a child's OWN transcript,
+          agent.message composer. Presentational components only —
+          every invoke lives in useFleet.js (AppShell-owned). */}
+      {mode === "fleet" && session.id !== "draft" && (() => {
+        const snapshotEntry = fleetBySession[session.id];
+        const liveForSession = descendantMode === "live"
+          && descendantSessionId === session.id
+          && descendantEntry;
+        const fleetEntry = liveForSession ? descendantEntry : snapshotEntry;
+        const fleetSelectedAgentId = fleetSelected[session.id] || "";
+        const fleetSelectedNode = fleetEntry
+          ? findFleetNode(fleetEntry.tree, fleetSelectedAgentId)
+          : null;
+        return (
+          <FleetHostLayer>
+            <FleetPanel
+              entry={fleetEntry}
+              error={fleetError}
+              fallbackEntry={snapshotEntry}
+              loading={fleetLoading}
+              onObserveAll={() => {
+                if (!fleetEntry) return;
+                /* SDK bound: at most 64 ids per observe batch. */
+                onObserveFleetBatch?.(
+                  fleetSessionIds(fleetEntry.tree).slice(0, 64),
+                );
+              }}
+              onRefresh={() => onLoadFleet?.(session.id)}
+              onReconnect={() => onReconnectDescendantStream?.(session.id)}
+              onSelectNode={(node) => {
+                setFleetSelected((current) => ({
+                  ...current,
+                  [session.id]: node.agentId,
+                }));
+                if (node.sessionId) onObserveFleetChild?.(node.sessionId);
+              }}
+              onSendMessage={(node, text) => (
+                /* agent.message addresses a DIRECT child of its
+                   session_id — so the dispatch uses the node's
+                   REAL parent_session_id from the fleet, never an
+                   assumed parent. */
+                onSendAgentMessage?.(node.parentSessionId, node.agentId, text)
+              )}
+              selectedAgentId={fleetSelectedAgentId}
+              streamError={descendantError}
+              streamLoading={descendantLoading}
+              streamMode={descendantSessionId === session.id
+                ? descendantMode
+                : "unavailable"}
+              streamRepair={descendantSessionId === session.id
+                ? descendantRepair
+                : null}
+              unavailable={fleetUnavailable}
+            />
+            {fleetSelectedNode && (
+              <FleetChildTranscript
+                digest={fleetChildDigests[fleetSelectedNode.sessionId]}
+                node={fleetSelectedNode}
+                onObserve={() => onObserveFleetChild?.(fleetSelectedNode.sessionId)}
+              />
             )}
-            title="Agent settings"
-            type="button"
-          >
-            <Settings aria-hidden="true" size={13} />
-          </SessionViewButton>
-        </SessionViewToggle>
-        )}
-        {session && session.id !== "draft" && (
-          <SurfaceStatusPill
-            availability={availability}
-            session={session}
-            statusLine={statusLine}
-            statusPillView={statusPillView}
+          </FleetHostLayer>
+        );
+      })()}
+      {/* App-level peer roster, receipt-backed compose, and
+          pushed inbox shown in this per-session tab. PeersPanel
+          is presentational; usePeers.js owns the SDK boundary. */}
+      {mode === "peers" && session && session.id !== "draft" && (
+        <PeersHostLayer>
+          <PeersPanel
+            error={peerError}
+            inbox={peerInbox}
+            loading={peerLoading}
+            onRefresh={() => onLoadPeers?.()}
+            onSend={(to, message, summary) => (
+              summary === undefined
+                ? onSendPeerMessage?.(to, message)
+                : onSendPeerMessage?.(to, message, summary)
+            )}
+            ownName={peerOwnName}
+            peers={peerRoster}
+            sending={peerSending}
+            sentById={peerSentById}
+            unavailable={peerUnavailable}
           />
-        )}
-        {/* F2.1: the persona binding control and the display-only workflow
-            chip left this row for the Settings menu — the header is ONE
-            line: name … view toggle … status pill. */}
-        <HeaderIconButton
-          aria-label={appThemeIsLight ? "Switch to dark theme" : "Switch to light theme"}
-          onClick={onToggleTheme}
-          title={appThemeIsLight ? "Dark theme" : "Light theme"}
-          type="button"
-        >
-          {appThemeIsLight
-            ? <ButtonDarkModeIcon aria-hidden="true" />
-            : <ButtonLightModeIcon aria-hidden="true" />}
-        </HeaderIconButton>
-      </FloatingControls>
-    );
-  };
+        </PeersHostLayer>
+      )}
+      {/* Unified local + SSH shell registry, receipt-backed close
+          and direct command execution, and connection-transient
+          pushed output. ShellsPanel is presentational; every SDK
+          boundary lives in useShells.js. */}
+      {mode === "shells" && session && session.id !== "draft" && (
+        <ShellsHostLayer>
+          <ShellsPanel
+            closeOutcomeByShell={shellCloseOutcomeByShell}
+            closingByShell={shellClosingByShell}
+            error={shellRegistryError}
+            execReceipt={shellExecReceiptBySession[session.id]}
+            executing={shellExecutingBySession[session.id] === true}
+            loading={shellRegistryLoading}
+            onClose={(shellId) => onCloseShell?.(shellId)}
+            onExec={(command, cwd) => (
+              cwd === undefined
+                ? onExecShell?.(
+                  session.id,
+                  publishedCheckpointBranchId(session),
+                  command,
+                )
+                : onExecShell?.(
+                  session.id,
+                  publishedCheckpointBranchId(session),
+                  command,
+                  cwd,
+                )
+            )}
+            onRefresh={() => onLoadShells?.(session.id)}
+            outputByShell={shellOutputByShell}
+            shells={shellRegistryBySession[session.id]}
+            unavailable={shellRegistryUnavailable}
+          />
+        </ShellsHostLayer>
+      )}
+      {/* Daemon-owned SSH profile CRUD, published reachability,
+          and explicit session routing scope. The panel is
+          presentational; useSshProfiles.js owns all dispatches. */}
+      {mode === "sshProfiles" && session && session.id !== "draft" && (
+        <SshProfilesHostLayer>
+          <SshProfilesPanel
+            adding={sshProfileAdding}
+            error={sshProfileError}
+            loading={sshProfileLoading}
+            mutationReceipt={sshMutationReceiptBySession[session.id]}
+            onAdd={(profile, clearSecrets) => (
+              onAddSshProfile?.(session.id, profile, clearSecrets)
+            )}
+            onRefresh={() => onLoadSshProfiles?.(session.id)}
+            onOpenShell={(name) => openSshPtyView(session.id, name)}
+            onRemove={(name) => onRemoveSshProfile?.(session.id, name)}
+            onSetScope={(scope) => onSetSessionSshScope?.(session.id, scope)}
+            onTest={(name) => onTestSshProfile?.(session.id, name)}
+            onUpdate={(name, changes, clearSecrets) => (
+              onUpdateSshProfile?.(session.id, name, changes, clearSecrets)
+            )}
+            profiles={sshProfilesBySession[session.id]}
+            removingByName={sshProfileRemovingByName}
+            scopeReceipt={sshScopeReceiptBySession[session.id]}
+            sessionId={session.id}
+            settingScope={sshProfileSettingScopeBySession[session.id] === true}
+            sshPtyOpening={sshPtyOpening}
+            sshPtyUnavailable={sshPtyUnavailable}
+            testingByName={sshProfileTestingByName}
+            testsByName={sshProfileTestsBySession[session.id]}
+            unavailable={sshProfileUnavailable}
+            updatingByName={sshProfileUpdatingByName}
+          />
+        </SshProfilesHostLayer>
+      )}
+      {/* Interactive saved-profile PTY. The sibling terminal
+          mirrors SessionTerminal's lifecycle and shared helpers;
+          useSshPty owns every daemon boundary and pushed fact. */}
+      {mode === "sshPty" && session && session.id !== "draft"
+        && sshPtyProfileBySession[session.id] && (
+        <SshPtyHostLayer>
+          <SshPtyTerminal
+            closedByShell={sshPtyClosedByShell}
+            eofByShell={sshPtyEofByShell}
+            error={sshPtyError}
+            onBack={() => setModeFor(session.id, "sshProfiles")}
+            onEof={onEofSshPty}
+            onInput={onInputSshPty}
+            onOpen={onOpenSshPty}
+            onResize={onResizeSshPty}
+            opening={sshPtyOpening}
+            outputByShell={sshPtyOutputByShell}
+            profileName={sshPtyProfileBySession[session.id]}
+            stateByShell={sshPtyStateByShell}
+            subscriptionId={sshPtySubscriptionId}
+            unavailable={sshPtyUnavailable}
+          />
+        </SshPtyHostLayer>
+      )}
+      {/* Workspace hook trust + canonical session tools. The
+          panel is presentational; useCapabilities.js owns all
+          four commands and re-lists hooks after each receipt. */}
+      {mode === "capabilities" && session && session.id !== "draft" && (() => {
+        const capabilityCwd = sessionWorkingDirectory(session);
+        return (
+          <CapabilitiesHostLayer>
+            <CapabilitiesPanel
+              cwd={capabilityCwd}
+              hookError={capabilityHookError}
+              hookLoading={capabilityHookLoading}
+              hookPendingByDigest={capabilityHookPendingByDigest}
+              hookReceiptByDigest={capabilityHookReceiptByDigest}
+              hooks={capabilityHooksByCwd[capabilityCwd]}
+              hooksUnavailable={capabilityHooksUnavailable}
+              onRefreshHooks={() => onLoadCapabilityHooks?.(capabilityCwd)}
+              onRefreshTools={() => onLoadCapabilityTools?.(session.id)}
+              onRevoke={(digest) => onRevokeHook?.(capabilityCwd, digest)}
+              onTrust={(digest) => onTrustHook?.(capabilityCwd, digest)}
+              toolError={capabilityToolError}
+              toolLoading={capabilityToolLoading}
+              tools={capabilityToolsBySession[session.id]}
+              toolsUnavailable={capabilityToolsUnavailable}
+            />
+          </CapabilitiesHostLayer>
+        );
+      })()}
+      {/* Provider management is distinct from provider/model
+          selection. It reuses the existing library snapshot;
+          useProviderAdmin.js owns the five management invokes. */}
+      {mode === "providers" && session && session.id !== "draft" && (
+        <ProviderAdminHostLayer>
+          <ProviderAdminPanel
+            configureError={providerAdminConfigureError}
+            configurePending={providerAdminConfigurePending}
+            configureUnavailable={providerAdminConfigureUnavailable}
+            conflict={providerAdminConflict}
+            globalLockdown={providerAdminGlobalLockdown}
+            lastReceipt={providerAdminLastReceipt}
+            lockdownByProvider={providerAdminLockdownByProvider}
+            lockdownError={providerAdminLockdownError}
+            lockdownLoading={providerAdminLockdownLoading}
+            lockdownUnavailable={providerAdminLockdownUnavailable}
+            onConfigure={(modeName, fields) => (
+              onConfigureProvider?.(modeName, fields, refreshLibrary)
+            )}
+            onRefresh={() => onReadProviderAdmin?.(refreshLibrary)}
+            onRemove={(row) => onRemoveProvider?.(row, refreshLibrary)}
+            onSetQuota={(bytes) => onSetLockdownQuota?.(bytes, refreshLibrary)}
+            onSetTrust={(row, trust) => (
+              onSetProviderTrust?.(row, trust, refreshLibrary)
+            )}
+            providerAvailability={library?.provider_availability}
+            providerRevision={providerAdminRevision}
+            providers={providerAdminRows}
+            quotaPending={providerAdminQuotaPending}
+            removeError={providerAdminRemoveError}
+            removePendingByProvider={providerAdminRemovePendingByProvider}
+            removeUnavailable={providerAdminRemoveUnavailable}
+            trustPendingByProvider={providerAdminTrustPendingByProvider}
+          />
+        </ProviderAdminHostLayer>
+      )}
+      {/* Monitor manager (P4): per-source availability, the
+          listed registry, register/remove controls, and the
+          live delivery stream. MonitorPanel is presentational;
+          useMonitor.js owns every daemon dispatch. */}
+      {mode === "monitors" && session && session.id !== "draft" && (
+        <MonitorHostLayer>
+          <MonitorPanel
+            cursor={monitorCursor}
+            deliveries={monitorDeliveries}
+            entry={monitorBySession[session.id]}
+            error={monitorError}
+            loading={monitorLoading}
+            onRefresh={() => onLoadMonitors?.(session.id)}
+            onRegister={(spec) => onRegisterMonitor?.(session.id, spec)}
+            onRemove={(monitorId) => onRemoveMonitor?.(session.id, monitorId)}
+            unavailable={monitorUnavailable}
+            watchOutcome={monitorWatchOutcome}
+          />
+        </MonitorHostLayer>
+      )}
+      {/* Durable workspace checkpoint timeline (Wave2): newest-
+          first authority list plus receipt-backed undo, redo,
+          and turn rollback. CheckpointPanel is presentational;
+          all four invokes live in useCheckpoints.js. */}
+      {mode === "checkpoints" && session && session.id !== "draft" && (
+        <CheckpointHostLayer>
+          <CheckpointPanel
+            branchId={publishedCheckpointBranchId(session)}
+            conflict={checkpointConflictBySession[session.id]}
+            entry={checkpointBySession[session.id]}
+            error={checkpointErrorBySession[session.id] || ""}
+            loading={checkpointLoadingBySession[session.id] === true}
+            onLoadMore={() => onLoadMoreCheckpoints?.(
+              session.id,
+              publishedCheckpointBranchId(session),
+            )}
+            onRedo={(target) => onRedoCheckpoint?.(
+              session.id,
+              publishedCheckpointBranchId(session),
+              target,
+            )}
+            onRefresh={() => onLoadCheckpoints?.(
+              session.id,
+              publishedCheckpointBranchId(session),
+            )}
+            onRollbackTurn={(runId) => onRollbackCheckpointTurn?.(
+              session.id,
+              publishedCheckpointBranchId(session),
+              runId,
+            )}
+            onUndo={(target) => onUndoCheckpoint?.(
+              session.id,
+              publishedCheckpointBranchId(session),
+              target,
+            )}
+            pending={checkpointPendingBySession[session.id]}
+            receipt={checkpointReceiptBySession[session.id]}
+            unavailable={checkpointUnavailable}
+          />
+        </CheckpointHostLayer>
+      )}
+      {/* Live workflow graph (P6): the workflow_graph_v1
+          projection — topology + per-node runtime state from
+          workflow.graph.state, kept live by the hook's
+          workflow.graph.watch change-signal loop. The view is
+          presentational only — both invokes live in
+          useWorkflowGraph.js (AppShell-owned) — and an UNSEEN
+          state read stays undefined here: it is never
+          collapsed into a "no live graph" claim. */}
+      {mode === "graph" && session.id !== "draft" && (
+        <GraphHostLayer>
+          <WorkflowGraphView
+            cursor={workflowGraphCursor}
+            entry={workflowGraphBySession[session.id]}
+            error={workflowGraphError}
+            events={workflowGraphEvents}
+            unavailable={workflowGraphUnavailable}
+          />
+        </GraphHostLayer>
+      )}
+    </>
+  );
 
   /* The three surface bodies (draft / home / open sessions) share ONE
      return below so the Settings menu host keeps its mount — and the
@@ -2496,9 +2531,50 @@ export default function SessionSurface({
     };
     const draftMode = modeFor("draft");
     surfaceBody = (
-        <SessionPane data-active="true">
-          {workHeader(draftSession)}
-          <PaneContent>
+      <SessionView
+        active
+        session={draftSession}
+        onHeaderDragStart={onHeaderDragStart}
+        titleMenuFor={titleMenuFor}
+        titleMenuRef={titleMenuRef}
+        titleMenuButtonRef={titleMenuButtonRef}
+        titleMenuPanelRef={titleMenuPanelRef}
+        titleMenuPosition={titleMenuPosition}
+        onToggleTitleMenu={() => setTitleMenuFor(
+          (current) => (current === "draft" ? "" : "draft"),
+        )}
+        onCloseTitleMenu={() => setTitleMenuFor("")}
+        titleRenamingId={titleRenamingId}
+        titleDraft={titleDraft}
+        onTitleDraftChange={setTitleDraft}
+        onCommitTitleRename={commitTitleRename}
+        onCancelTitleRename={() => setTitleRenamingId("")}
+        onTogglePin={toggleSessionPin}
+        onBeginRename={beginTitleRename}
+        onCompactSession={onCompactSession}
+        onForkSession={onForkSession}
+        onOpenSession={onOpenSession}
+        onRetrySession={onRetrySession}
+        lifecyclePendingBySession={lifecyclePendingBySession}
+        lifecycleErrorBySession={lifecycleErrorBySession}
+        lifecycleUnavailableByAction={lifecycleUnavailableByAction}
+        onPopOutSession={onPopOutSession}
+        mode={draftMode}
+        tabsState={null}
+        onSelectView={(viewMode) => selectViewOn("draft", viewMode)}
+        onSelectTab={(tabId) => selectTab("draft", tabId)}
+        onCloseTab={(tabId) => closeTab("draft", tabId)}
+        onAddTab={() => addTab("draft")}
+        settingsMenuOpen={settingsMenuSession?.id === "draft"}
+        settingsMenuButtonRef={settingsMenuButtonRef}
+        onToggleSettingsMenu={() => setSettingsMenuSession(
+          (current) => (current?.id === "draft" ? null : draftSession),
+        )}
+        surfaceStatusForSession={null}
+        appThemeIsLight={appThemeIsLight}
+        onToggleTheme={onToggleTheme}
+        paneBody={(
+          <>
             {/* Both draft views stay mounted (hidden one display:none) so
                 Chat↔Shell flips are instant and the TUI stays warm. */}
             <ChatHostLayer data-visible={draftMode === "ui" ? "true" : "false"}>
@@ -2564,8 +2640,9 @@ export default function SessionSurface({
                 />
               </TerminalHostLayer>
             )}
-          </PaneContent>
-        </SessionPane>
+          </>
+        )}
+      />
     );
   } else if (!activeSessionId) {
     // Home: the flame hero with the plan tiers, plus recent sessions to
@@ -2574,41 +2651,46 @@ export default function SessionSurface({
     // Max 3 recents, like the CLI's own launcher list.
     const recentSessions = sessions.slice(0, 3);
     surfaceBody = (
-        <SessionPane data-active="true">
-          {workHeader(null, { showToggle: false })}
-          <PaneContent>
-            <HomeBody>
-              <HomeLogo alt="" src="/logo.webp" />
-              <HomeContinue>
-                <HomeContinueTitle>
-                  {recentSessions.length ? "Continue" : "Start your first session"}
-                </HomeContinueTitle>
-                {recentSessions.map((session) => (
-                  <HomeContinueRow
-                    key={session.id}
-                    onClick={() => onOpenSession?.(session)}
-                    type="button"
-                  >
-                    <HomeContinueDot
-                      aria-hidden="true"
-                      data-status={sessionActivityVisualState(session)}
-                    />
-                    <HomeContinueSessionTitle>{session.title}</HomeContinueSessionTitle>
-                    <HomeAvailabilityAffordance session={session} />
-                    <em>{formatSessionRelativeTime(session.latest_at_ms)}</em>
-                  </HomeContinueRow>
-                ))}
-                <HomeNewChat onClick={onResetToDraft} type="button">
-                  <ButtonAddIcon aria-hidden="true" />
-                  <span>New chat</span>
-                </HomeNewChat>
-              </HomeContinue>
-              <HomeFlame>
-                <PlanFlame active plan={planKey} showControls />
-              </HomeFlame>
-            </HomeBody>
-          </PaneContent>
-        </SessionPane>
+      <SessionView
+        active
+        session={null}
+        showToggle={false}
+        onHeaderDragStart={onHeaderDragStart}
+        appThemeIsLight={appThemeIsLight}
+        onToggleTheme={onToggleTheme}
+        paneBody={(
+          <HomeBody>
+            <HomeLogo alt="" src="/logo.webp" />
+            <HomeContinue>
+              <HomeContinueTitle>
+                {recentSessions.length ? "Continue" : "Start your first session"}
+              </HomeContinueTitle>
+              {recentSessions.map((session) => (
+                <HomeContinueRow
+                  key={session.id}
+                  onClick={() => onOpenSession?.(session)}
+                  type="button"
+                >
+                  <HomeContinueDot
+                    aria-hidden="true"
+                    data-status={sessionActivityVisualState(session)}
+                  />
+                  <HomeContinueSessionTitle>{session.title}</HomeContinueSessionTitle>
+                  <HomeAvailabilityAffordance session={session} />
+                  <em>{formatSessionRelativeTime(session.latest_at_ms)}</em>
+                </HomeContinueRow>
+              ))}
+              <HomeNewChat onClick={onResetToDraft} type="button">
+                <ButtonAddIcon aria-hidden="true" />
+                <span>New chat</span>
+              </HomeNewChat>
+            </HomeContinue>
+            <HomeFlame>
+              <PlanFlame active plan={planKey} showControls />
+            </HomeFlame>
+          </HomeBody>
+        )}
+      />
     );
   } else {
     const sessionPanes = openSessions.map((session) => {
@@ -2624,467 +2706,98 @@ export default function SessionSurface({
           sessionRunIsActive(session),
         );
         return (
-          <SessionPane data-active={active ? "true" : "false"} key={session.id}>
-            {workHeader(session)}
-
-            <PaneContent>
-              {/* Chat tab: Chat and Shell BOTH stay mounted for the ACTIVE
-                  session — the unselected view is display:none — so flips
-                  are instant, xterm state survives, and the shell is live
-                  before the first toggle. Background sessions mount neither;
-                  their PTYs persist daemon-side and are re-adopted here. */}
-              {chatTabActive && active && (
-                <>
-                  <ChatHostLayer
-                    data-run-status-authority={runStatusView.authority}
-                    data-run-status-source={runStatusView.source}
-                    data-run-structured-status={runStatusView.structuredStatus}
-                    data-visible={mode === "ui" ? "true" : "false"}
-                  >
-                    <SessionTranscript
-                      onAnswered={onSessionsRefresh}
-                      onSyncingChange={(syncing) => handleTranscriptSyncing(session.id, syncing)}
-                      runStatus={runStatusView.label}
-                      session={session}
-                    />
-                    <SessionQueuePanel
-                      actionBusy={queueActionBusy}
-                      actionError={queueActionError}
-                      confirmation={submissionConfirmations[session.id] || null}
-                      onPromoteSteer={(id) => { void mutateQueuedRow("promoteSteer", id); }}
-                      onRefresh={() => setQueueRefreshGeneration((value) => value + 1)}
-                      onRemove={(id) => { void mutateQueuedRow("remove", id); }}
-                      state={queueState}
-                    />
-                    <SessionComposer
-                      chipCapabilities={library?.capabilities || {}}
-                      chipOptions={chipOptionsFor(session)}
-                      chipValues={chipValuesFor(session)}
-                      commandMenuRequest={commandMenuRequests[session.id] || null}
-                      commandNotice={commandResults[session.id] || null}
-                      deliveryMode={composerDeliveryModes[session.id] || "queue"}
-                      onChipChange={(key, option) => handleChipChange(session.id, key, option)}
-                      onChipMenuOpen={() => {
-                        void refreshLibrary();
-                        refreshConfig(session.id);
-                      }}
-                      attachments={composerAttachments[session.id] || []}
-                      holdNotice={submitHold[session.id] || ""}
-                      onCancelTurn={cancelTurnFor(session)}
-                      mirrorAttachments={mirrorAttachments[session.id] || []}
-                      onAttachmentsChange={(next) => handleAttachmentsChange(session, next)}
-                      onMirrorType={(text) => publishMirror(session, text)}
-                      {...sessionComposerDeliveryModeProps(
-                        rpcFeatures,
-                        (deliveryMode) => setComposerDeliveryModes((current) => ({
-                          ...current,
-                          [session.id]: normalizeDeliveryMode(deliveryMode),
-                        })),
-                      )}
-                      onSubmit={(prompt, attachments, deliveryMode) => (
-                        submitIntoSession(session, prompt, attachments, deliveryMode)
-                      )}
-                      onPastedBlocksChange={(blocks) => setComposerPastesFor(session.id, blocks)}
-                      onValueChange={(text) => setComposerText(session.id, text)}
-                      pastedBlocks={composerPastes[session.id] || []}
-                      slashCommands={commandDoorAvailable ? slashCommands : []}
-                      value={composerTexts[session.id] || ""}
-                    />
-                  </ChatHostLayer>
-                  {mode === "trajectory" && (
-                    <TrajectoryHostLayer>
-                      <SessionTrajectory session={session} />
-                    </TrajectoryHostLayer>
-                  )}
-                  {/* Fleet view (P2): descendant tree + rollup chips from
-                      session.fleet, drilldown into a child's OWN transcript,
-                      agent.message composer. Presentational components only —
-                      every invoke lives in useFleet.js (AppShell-owned). */}
-                  {mode === "fleet" && session.id !== "draft" && (() => {
-                    const snapshotEntry = fleetBySession[session.id];
-                    const liveForSession = descendantMode === "live"
-                      && descendantSessionId === session.id
-                      && descendantEntry;
-                    const fleetEntry = liveForSession ? descendantEntry : snapshotEntry;
-                    const fleetSelectedAgentId = fleetSelected[session.id] || "";
-                    const fleetSelectedNode = fleetEntry
-                      ? findFleetNode(fleetEntry.tree, fleetSelectedAgentId)
-                      : null;
-                    return (
-                      <FleetHostLayer>
-                        <FleetPanel
-                          entry={fleetEntry}
-                          error={fleetError}
-                          fallbackEntry={snapshotEntry}
-                          loading={fleetLoading}
-                          onObserveAll={() => {
-                            if (!fleetEntry) return;
-                            /* SDK bound: at most 64 ids per observe batch. */
-                            onObserveFleetBatch?.(
-                              fleetSessionIds(fleetEntry.tree).slice(0, 64),
-                            );
-                          }}
-                          onRefresh={() => onLoadFleet?.(session.id)}
-                          onReconnect={() => onReconnectDescendantStream?.(session.id)}
-                          onSelectNode={(node) => {
-                            setFleetSelected((current) => ({
-                              ...current,
-                              [session.id]: node.agentId,
-                            }));
-                            if (node.sessionId) onObserveFleetChild?.(node.sessionId);
-                          }}
-                          onSendMessage={(node, text) => (
-                            /* agent.message addresses a DIRECT child of its
-                               session_id — so the dispatch uses the node's
-                               REAL parent_session_id from the fleet, never an
-                               assumed parent. */
-                            onSendAgentMessage?.(node.parentSessionId, node.agentId, text)
-                          )}
-                          selectedAgentId={fleetSelectedAgentId}
-                          streamError={descendantError}
-                          streamLoading={descendantLoading}
-                          streamMode={descendantSessionId === session.id
-                            ? descendantMode
-                            : "unavailable"}
-                          streamRepair={descendantSessionId === session.id
-                            ? descendantRepair
-                            : null}
-                          unavailable={fleetUnavailable}
-                        />
-                        {fleetSelectedNode && (
-                          <FleetChildTranscript
-                            digest={fleetChildDigests[fleetSelectedNode.sessionId]}
-                            node={fleetSelectedNode}
-                            onObserve={() => onObserveFleetChild?.(fleetSelectedNode.sessionId)}
-                          />
-                        )}
-                      </FleetHostLayer>
-                    );
-                  })()}
-                  {/* App-level peer roster, receipt-backed compose, and
-                      pushed inbox shown in this per-session tab. PeersPanel
-                      is presentational; usePeers.js owns the SDK boundary. */}
-                  {mode === "peers" && session && session.id !== "draft" && (
-                    <PeersHostLayer>
-                      <PeersPanel
-                        error={peerError}
-                        inbox={peerInbox}
-                        loading={peerLoading}
-                        onRefresh={() => onLoadPeers?.()}
-                        onSend={(to, message, summary) => (
-                          summary === undefined
-                            ? onSendPeerMessage?.(to, message)
-                            : onSendPeerMessage?.(to, message, summary)
-                        )}
-                        ownName={peerOwnName}
-                        peers={peerRoster}
-                        sending={peerSending}
-                        sentById={peerSentById}
-                        unavailable={peerUnavailable}
-                      />
-                    </PeersHostLayer>
-                  )}
-                  {/* Unified local + SSH shell registry, receipt-backed close
-                      and direct command execution, and connection-transient
-                      pushed output. ShellsPanel is presentational; every SDK
-                      boundary lives in useShells.js. */}
-                  {mode === "shells" && session && session.id !== "draft" && (
-                    <ShellsHostLayer>
-                      <ShellsPanel
-                        closeOutcomeByShell={shellCloseOutcomeByShell}
-                        closingByShell={shellClosingByShell}
-                        error={shellRegistryError}
-                        execReceipt={shellExecReceiptBySession[session.id]}
-                        executing={shellExecutingBySession[session.id] === true}
-                        loading={shellRegistryLoading}
-                        onClose={(shellId) => onCloseShell?.(shellId)}
-                        onExec={(command, cwd) => (
-                          cwd === undefined
-                            ? onExecShell?.(
-                              session.id,
-                              publishedCheckpointBranchId(session),
-                              command,
-                            )
-                            : onExecShell?.(
-                              session.id,
-                              publishedCheckpointBranchId(session),
-                              command,
-                              cwd,
-                            )
-                        )}
-                        onRefresh={() => onLoadShells?.(session.id)}
-                        outputByShell={shellOutputByShell}
-                        shells={shellRegistryBySession[session.id]}
-                        unavailable={shellRegistryUnavailable}
-                      />
-                    </ShellsHostLayer>
-                  )}
-                  {/* Daemon-owned SSH profile CRUD, published reachability,
-                      and explicit session routing scope. The panel is
-                      presentational; useSshProfiles.js owns all dispatches. */}
-                  {mode === "sshProfiles" && session && session.id !== "draft" && (
-                    <SshProfilesHostLayer>
-                      <SshProfilesPanel
-                        adding={sshProfileAdding}
-                        error={sshProfileError}
-                        loading={sshProfileLoading}
-                        mutationReceipt={sshMutationReceiptBySession[session.id]}
-                        onAdd={(profile, clearSecrets) => (
-                          onAddSshProfile?.(session.id, profile, clearSecrets)
-                        )}
-                        onRefresh={() => onLoadSshProfiles?.(session.id)}
-                        onOpenShell={(name) => openSshPtyView(session.id, name)}
-                        onRemove={(name) => onRemoveSshProfile?.(session.id, name)}
-                        onSetScope={(scope) => onSetSessionSshScope?.(session.id, scope)}
-                        onTest={(name) => onTestSshProfile?.(session.id, name)}
-                        onUpdate={(name, changes, clearSecrets) => (
-                          onUpdateSshProfile?.(session.id, name, changes, clearSecrets)
-                        )}
-                        profiles={sshProfilesBySession[session.id]}
-                        removingByName={sshProfileRemovingByName}
-                        scopeReceipt={sshScopeReceiptBySession[session.id]}
-                        sessionId={session.id}
-                        settingScope={sshProfileSettingScopeBySession[session.id] === true}
-                        sshPtyOpening={sshPtyOpening}
-                        sshPtyUnavailable={sshPtyUnavailable}
-                        testingByName={sshProfileTestingByName}
-                        testsByName={sshProfileTestsBySession[session.id]}
-                        unavailable={sshProfileUnavailable}
-                        updatingByName={sshProfileUpdatingByName}
-                      />
-                    </SshProfilesHostLayer>
-                  )}
-                  {/* Interactive saved-profile PTY. The sibling terminal
-                      mirrors SessionTerminal's lifecycle and shared helpers;
-                      useSshPty owns every daemon boundary and pushed fact. */}
-                  {mode === "sshPty" && session && session.id !== "draft"
-                    && sshPtyProfileBySession[session.id] && (
-                    <SshPtyHostLayer>
-                      <SshPtyTerminal
-                        closedByShell={sshPtyClosedByShell}
-                        eofByShell={sshPtyEofByShell}
-                        error={sshPtyError}
-                        onBack={() => setModeFor(session.id, "sshProfiles")}
-                        onEof={onEofSshPty}
-                        onInput={onInputSshPty}
-                        onOpen={onOpenSshPty}
-                        onResize={onResizeSshPty}
-                        opening={sshPtyOpening}
-                        outputByShell={sshPtyOutputByShell}
-                        profileName={sshPtyProfileBySession[session.id]}
-                        stateByShell={sshPtyStateByShell}
-                        subscriptionId={sshPtySubscriptionId}
-                        unavailable={sshPtyUnavailable}
-                      />
-                    </SshPtyHostLayer>
-                  )}
-                  {/* Workspace hook trust + canonical session tools. The
-                      panel is presentational; useCapabilities.js owns all
-                      four commands and re-lists hooks after each receipt. */}
-                  {mode === "capabilities" && session && session.id !== "draft" && (() => {
-                    const capabilityCwd = sessionWorkingDirectory(session);
-                    return (
-                      <CapabilitiesHostLayer>
-                        <CapabilitiesPanel
-                          cwd={capabilityCwd}
-                          hookError={capabilityHookError}
-                          hookLoading={capabilityHookLoading}
-                          hookPendingByDigest={capabilityHookPendingByDigest}
-                          hookReceiptByDigest={capabilityHookReceiptByDigest}
-                          hooks={capabilityHooksByCwd[capabilityCwd]}
-                          hooksUnavailable={capabilityHooksUnavailable}
-                          onRefreshHooks={() => onLoadCapabilityHooks?.(capabilityCwd)}
-                          onRefreshTools={() => onLoadCapabilityTools?.(session.id)}
-                          onRevoke={(digest) => onRevokeHook?.(capabilityCwd, digest)}
-                          onTrust={(digest) => onTrustHook?.(capabilityCwd, digest)}
-                          toolError={capabilityToolError}
-                          toolLoading={capabilityToolLoading}
-                          tools={capabilityToolsBySession[session.id]}
-                          toolsUnavailable={capabilityToolsUnavailable}
-                        />
-                      </CapabilitiesHostLayer>
-                    );
-                  })()}
-                  {/* Provider management is distinct from provider/model
-                      selection. It reuses the existing library snapshot;
-                      useProviderAdmin.js owns the five management invokes. */}
-                  {mode === "providers" && session && session.id !== "draft" && (
-                    <ProviderAdminHostLayer>
-                      <ProviderAdminPanel
-                        configureError={providerAdminConfigureError}
-                        configurePending={providerAdminConfigurePending}
-                        configureUnavailable={providerAdminConfigureUnavailable}
-                        conflict={providerAdminConflict}
-                        globalLockdown={providerAdminGlobalLockdown}
-                        lastReceipt={providerAdminLastReceipt}
-                        lockdownByProvider={providerAdminLockdownByProvider}
-                        lockdownError={providerAdminLockdownError}
-                        lockdownLoading={providerAdminLockdownLoading}
-                        lockdownUnavailable={providerAdminLockdownUnavailable}
-                        onConfigure={(modeName, fields) => (
-                          onConfigureProvider?.(modeName, fields, refreshLibrary)
-                        )}
-                        onRefresh={() => onReadProviderAdmin?.(refreshLibrary)}
-                        onRemove={(row) => onRemoveProvider?.(row, refreshLibrary)}
-                        onSetQuota={(bytes) => onSetLockdownQuota?.(bytes, refreshLibrary)}
-                        onSetTrust={(row, trust) => (
-                          onSetProviderTrust?.(row, trust, refreshLibrary)
-                        )}
-                        providerAvailability={library?.provider_availability}
-                        providerRevision={providerAdminRevision}
-                        providers={providerAdminRows}
-                        quotaPending={providerAdminQuotaPending}
-                        removeError={providerAdminRemoveError}
-                        removePendingByProvider={providerAdminRemovePendingByProvider}
-                        removeUnavailable={providerAdminRemoveUnavailable}
-                        trustPendingByProvider={providerAdminTrustPendingByProvider}
-                      />
-                    </ProviderAdminHostLayer>
-                  )}
-                  {/* Monitor manager (P4): per-source availability, the
-                      listed registry, register/remove controls, and the
-                      live delivery stream. MonitorPanel is presentational;
-                      useMonitor.js owns every daemon dispatch. */}
-                  {mode === "monitors" && session && session.id !== "draft" && (
-                    <MonitorHostLayer>
-                      <MonitorPanel
-                        cursor={monitorCursor}
-                        deliveries={monitorDeliveries}
-                        entry={monitorBySession[session.id]}
-                        error={monitorError}
-                        loading={monitorLoading}
-                        onRefresh={() => onLoadMonitors?.(session.id)}
-                        onRegister={(spec) => onRegisterMonitor?.(session.id, spec)}
-                        onRemove={(monitorId) => onRemoveMonitor?.(session.id, monitorId)}
-                        unavailable={monitorUnavailable}
-                        watchOutcome={monitorWatchOutcome}
-                      />
-                    </MonitorHostLayer>
-                  )}
-                  {/* Durable workspace checkpoint timeline (Wave2): newest-
-                      first authority list plus receipt-backed undo, redo,
-                      and turn rollback. CheckpointPanel is presentational;
-                      all four invokes live in useCheckpoints.js. */}
-                  {mode === "checkpoints" && session && session.id !== "draft" && (
-                    <CheckpointHostLayer>
-                      <CheckpointPanel
-                        branchId={publishedCheckpointBranchId(session)}
-                        conflict={checkpointConflictBySession[session.id]}
-                        entry={checkpointBySession[session.id]}
-                        error={checkpointErrorBySession[session.id] || ""}
-                        loading={checkpointLoadingBySession[session.id] === true}
-                        onLoadMore={() => onLoadMoreCheckpoints?.(
-                          session.id,
-                          publishedCheckpointBranchId(session),
-                        )}
-                        onRedo={(target) => onRedoCheckpoint?.(
-                          session.id,
-                          publishedCheckpointBranchId(session),
-                          target,
-                        )}
-                        onRefresh={() => onLoadCheckpoints?.(
-                          session.id,
-                          publishedCheckpointBranchId(session),
-                        )}
-                        onRollbackTurn={(runId) => onRollbackCheckpointTurn?.(
-                          session.id,
-                          publishedCheckpointBranchId(session),
-                          runId,
-                        )}
-                        onUndo={(target) => onUndoCheckpoint?.(
-                          session.id,
-                          publishedCheckpointBranchId(session),
-                          target,
-                        )}
-                        pending={checkpointPendingBySession[session.id]}
-                        receipt={checkpointReceiptBySession[session.id]}
-                        unavailable={checkpointUnavailable}
-                      />
-                    </CheckpointHostLayer>
-                  )}
-                  {/* Live workflow graph (P6): the workflow_graph_v1
-                      projection — topology + per-node runtime state from
-                      workflow.graph.state, kept live by the hook's
-                      workflow.graph.watch change-signal loop. The view is
-                      presentational only — both invokes live in
-                      useWorkflowGraph.js (AppShell-owned) — and an UNSEEN
-                      state read stays undefined here: it is never
-                      collapsed into a "no live graph" claim. */}
-                  {mode === "graph" && session.id !== "draft" && (
-                    <GraphHostLayer>
-                      <WorkflowGraphView
-                        cursor={workflowGraphCursor}
-                        entry={workflowGraphBySession[session.id]}
-                        error={workflowGraphError}
-                        events={workflowGraphEvents}
-                        unavailable={workflowGraphUnavailable}
-                      />
-                    </GraphHostLayer>
-                  )}
-                </>
-              )}
-              {/* Three honest reasons to mount: you are looking at it; it is
-                  kept warm (stays mounted while you work elsewhere, so
-                  switching back skips xterm re-instantiation + replay); or
-                  it is pre-warming for an open session. Turning it OFF from
-                  the rail suppresses the last two, so off means off. */}
-              {(() => {
-                const pref = shellPrefs[session.id];
-                const viewing = chatTabActive && active && mode === "terminal";
-                const preWarm = chatTabActive && active
-                  && shellTouched[session.id] && pref !== false;
-                return viewing || preWarm || pref === true;
-              })() && (
-                <TerminalHostLayer
-                  data-visible={chatTabActive && active && mode === "terminal" ? "true" : "false"}
-                >
-                  <SessionTerminal
-                    active={chatTabActive && active && mode === "terminal"}
-                    bindingAuthority={sessionBinding.authority}
-                    onTuiAttached={handleLegacyTuiAttached}
-                    paneIdOverride={paneOverrides[session.id]}
-                    session={session}
-                  />
-                </TerminalHostLayer>
-              )}
-
-              {/* Panel tabs: picker, then staged panel stubs. */}
-              {!chatTabActive && activeTab.kind === "picker" && (
-                <PanelPickerBody>
-                  <EmptyState>
-                    <h2>Choose a panel</h2>
-                    <p>Panels attach to this session and work inside its folder.</p>
-                  </EmptyState>
-                  <PanelPickerGrid>
-                    {Object.entries(PANEL_KINDS).map(([kind, panel]) => (
-                      <PanelPickerCard
-                        key={kind}
-                        onClick={() => setTabPanel(session.id, activeTab.id, kind)}
-                        type="button"
-                      >
-                        <panel.Icon aria-hidden="true" size={22} />
-                        <strong>{panel.label}</strong>
-                      </PanelPickerCard>
-                    ))}
-                  </PanelPickerGrid>
-                </PanelPickerBody>
-              )}
-              {!chatTabActive && PANEL_KINDS[activeTab.kind] && (
-                <PanelPickerBody>
-                  <EmptyState>
-                    <EmptyStateIcon aria-hidden="true">
-                      {(() => {
-                        const PanelIcon = PANEL_KINDS[activeTab.kind].Icon;
-                        return <PanelIcon size={22} />;
-                      })()}
-                    </EmptyStateIcon>
-                    <h2>{PANEL_KINDS[activeTab.kind].label}</h2>
-                    <p>This panel is being rebuilt session-native. It will open inside this session's folder.</p>
-                  </EmptyState>
-                </PanelPickerBody>
-              )}
-            </PaneContent>
-          </SessionPane>
+          <SessionView
+            active={active}
+            key={session.id}
+            session={session}
+            onHeaderDragStart={onHeaderDragStart}
+            titleMenuFor={titleMenuFor}
+            titleMenuRef={titleMenuRef}
+            titleMenuButtonRef={titleMenuButtonRef}
+            titleMenuPanelRef={titleMenuPanelRef}
+            titleMenuPosition={titleMenuPosition}
+            onToggleTitleMenu={() => setTitleMenuFor(
+              (current) => (current === session.id ? "" : session.id),
+            )}
+            onCloseTitleMenu={() => setTitleMenuFor("")}
+            titleRenamingId={titleRenamingId}
+            titleDraft={titleDraft}
+            onTitleDraftChange={setTitleDraft}
+            onCommitTitleRename={commitTitleRename}
+            onCancelTitleRename={() => setTitleRenamingId("")}
+            onTogglePin={toggleSessionPin}
+            onBeginRename={beginTitleRename}
+            onCompactSession={onCompactSession}
+            onForkSession={onForkSession}
+            onOpenSession={onOpenSession}
+            onRetrySession={onRetrySession}
+            lifecyclePendingBySession={lifecyclePendingBySession}
+            lifecycleErrorBySession={lifecycleErrorBySession}
+            lifecycleUnavailableByAction={lifecycleUnavailableByAction}
+            onPopOutSession={onPopOutSession}
+            mode={mode}
+            tabsState={tabsStateFor(session.id)}
+            onSelectView={(viewMode) => selectViewOn(session.id, viewMode)}
+            onSelectTab={(tabId) => selectTab(session.id, tabId)}
+            onCloseTab={(tabId) => closeTab(session.id, tabId)}
+            onAddTab={() => addTab(session.id)}
+            settingsMenuOpen={settingsMenuSession?.id === session.id}
+            settingsMenuButtonRef={settingsMenuButtonRef}
+            onToggleSettingsMenu={() => setSettingsMenuSession(
+              (current) => (current?.id === session.id ? null : session),
+            )}
+            surfaceStatusForSession={surfaceStatus[session.id] || null}
+            appThemeIsLight={appThemeIsLight}
+            onToggleTheme={onToggleTheme}
+            chatTabActive={chatTabActive}
+            runStatusView={runStatusView}
+            onSessionsRefresh={onSessionsRefresh}
+            onTranscriptSyncing={(syncing) => handleTranscriptSyncing(session.id, syncing)}
+            queueState={queueState}
+            queueActionBusy={queueActionBusy}
+            queueActionError={queueActionError}
+            submissionConfirmation={submissionConfirmations[session.id] || null}
+            onPromoteSteer={(id) => { void mutateQueuedRow("promoteSteer", id); }}
+            onQueueRefresh={() => setQueueRefreshGeneration((value) => value + 1)}
+            onQueueRemove={(id) => { void mutateQueuedRow("remove", id); }}
+            composerChipCapabilities={library?.capabilities || {}}
+            composerChipOptions={chipOptionsFor(session)}
+            composerChipValues={chipValuesFor(session)}
+            composerCommandMenuRequest={commandMenuRequests[session.id] || null}
+            composerCommandNotice={commandResults[session.id] || null}
+            composerDeliveryMode={composerDeliveryModes[session.id] || "queue"}
+            onChipChange={(key, option) => handleChipChange(session.id, key, option)}
+            onChipMenuOpen={() => {
+              void refreshLibrary();
+              refreshConfig(session.id);
+            }}
+            composerAttachments={composerAttachments[session.id] || []}
+            composerHoldNotice={submitHold[session.id] || ""}
+            onCancelTurn={cancelTurnFor(session)}
+            composerMirrorAttachments={mirrorAttachments[session.id] || []}
+            onAttachmentsChange={(next) => handleAttachmentsChange(session, next)}
+            onMirrorType={(text) => publishMirror(session, text)}
+            rpcFeatures={rpcFeatures}
+            onSetDeliveryMode={(deliveryMode) => setComposerDeliveryModes((current) => ({
+              ...current,
+              [session.id]: normalizeDeliveryMode(deliveryMode),
+            }))}
+            onSubmit={(prompt, attachments, deliveryMode) => (
+              submitIntoSession(session, prompt, attachments, deliveryMode)
+            )}
+            onPastedBlocksChange={(blocks) => setComposerPastesFor(session.id, blocks)}
+            onValueChange={(text) => setComposerText(session.id, text)}
+            composerPastedBlocks={composerPastes[session.id] || []}
+            composerSlashCommands={commandDoorAvailable ? slashCommands : []}
+            composerValue={composerTexts[session.id] || ""}
+            shellPref={shellPrefs[session.id]}
+            shellTouched={shellTouched[session.id]}
+            bindingAuthority={sessionBinding.authority}
+            onTuiAttached={handleLegacyTuiAttached}
+            paneIdOverride={paneOverrides[session.id]}
+            onSetTabPanel={(tabId, kind) => setTabPanel(session.id, tabId, kind)}
+            renderAgentSurface={renderAgentSurface}
+          />
         );
       });
     surfaceBody = <>{sessionPanes}</>;
@@ -3156,248 +2869,6 @@ const SessionSurfaceRoot = styled.div`
   min-width: 0;
   min-height: 0;
   background: var(--forge-bg);
-`;
-
-const SessionPane = styled.div`
-  position: absolute;
-  inset: 0;
-  display: flex;
-  min-height: 0;
-  flex-direction: column;
-
-  &[data-active="false"] {
-    visibility: hidden;
-    pointer-events: none;
-  }
-`;
-
-const PaneContent = styled.div`
-  position: relative;
-  display: flex;
-  min-height: 0;
-  flex: 1;
-  flex-direction: column;
-`;
-
-/* The old top bar's controls live HERE — floating in the workspace's
-   top-right corner, scoped visually to the session under them. */
-/* The view cluster rides the header row (right side), wrapping under the
-   title only when the pane is too narrow. */
-const FloatingControls = styled.div`
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  flex-wrap: nowrap;
-  gap: 8px;
-`;
-
-/* ONE row of workspace chrome, on every tab: title + menu left, cluster
-   right. Normal flow — content starts below it, no overlay clearances.
-   F2.1: a SINGLE line — nothing wraps; a long session name ellipsizes in
-   the title block instead. */
-const WorkHeader = styled.div`
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  flex-wrap: nowrap;
-  gap: 6px 10px;
-  padding: 10px 16px 8px;
-  border-bottom: 1px solid var(--forge-border);
-  /* Drag region (see workHeader). */
-  user-select: none;
-  -webkit-user-select: none;
-`;
-
-const WorkHeaderSpacer = styled.span`
-  flex: 1;
-`;
-
-/* The segmented toggle and its buttons live in SessionSettingsMenu.jsx now,
-   shared with SpaceSurface so an active space renders the SAME view chrome. */
-
-/* Close affordance on a panel segment (design note 5: panels are workspace
-   tabs riding behind the segmented control). */
-const PanelSegClose = styled.span`
-  display: grid;
-  width: 13px;
-  height: 13px;
-  margin-left: 1px;
-  place-items: center;
-  border-radius: 4px;
-  color: var(--forge-text-muted);
-
-  svg {
-    width: 9px;
-    height: 9px;
-  }
-
-  &:hover {
-    color: var(--forge-text);
-    background: rgba(255, 255, 255, 0.12);
-  }
-`;
-
-const SegAddButton = styled.button`
-  display: grid;
-  width: 20px;
-  height: 20px;
-  flex: 0 0 auto;
-  place-items: center;
-  align-self: center;
-  padding: 0;
-  border: 0;
-  border-radius: 999px;
-  color: var(--forge-text-muted);
-  background: transparent;
-  cursor: pointer;
-
-  svg {
-    width: 11px;
-    height: 11px;
-  }
-
-  &:hover {
-    color: var(--forge-text);
-    background: var(--forge-surface-hover);
-  }
-`;
-
-const HeaderIconButton = styled.button`
-  display: grid;
-  width: 26px;
-  height: 26px;
-  place-items: center;
-  border: 1px solid var(--forge-border);
-  border-radius: 999px;
-  color: var(--forge-text-soft);
-  background: var(--forge-surface-control);
-  cursor: pointer;
-
-  svg {
-    width: 12px;
-    height: 12px;
-  }
-
-  &:hover {
-    color: var(--forge-text);
-    border-color: var(--forge-border-strong);
-  }
-`;
-
-/* ---- content-first title line ---------------------------------------- */
-
-const TitleRow = styled.div`
-  display: inline-flex;
-  min-width: 0;
-  flex-shrink: 1;
-  overflow: hidden;
-  align-items: center;
-  gap: 4px;
-
-  h1 {
-    min-width: 0;
-    max-width: 34rem;
-    margin: 0;
-    overflow: hidden;
-    color: var(--forge-text);
-    font-size: 14px;
-    font-weight: 680;
-    letter-spacing: -0.01em;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
-`;
-
-const TitleRenameInput = styled.input`
-  flex: 1;
-  min-width: 0;
-  padding: 2px 8px;
-  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.52);
-  border-radius: 8px;
-  color: var(--forge-text);
-  background: var(--forge-surface);
-  font-size: 17px;
-  font-weight: 700;
-  letter-spacing: -0.015em;
-  outline: none;
-`;
-
-const TitleMenuWrap = styled.div`
-  position: relative;
-  flex: 0 0 auto;
-`;
-
-const TitleMenu = styled.div`
-  position: fixed;
-  top: ${({ $top }) => `${$top ?? 0}px`};
-  left: ${({ $left }) => `${$left ?? 0}px`};
-  z-index: 40;
-  display: grid;
-  width: 280px;
-  max-width: calc(100vw - 16px);
-  max-height: calc(100vh - 16px);
-  gap: 1px;
-  padding: 4px;
-  overflow-y: auto;
-  border: 1px solid var(--forge-border-strong);
-  border-radius: 9px;
-  background: var(--forge-surface-raised, var(--forge-surface));
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
-  box-sizing: border-box;
-  visibility: ${({ $positioned }) => ($positioned ? "visible" : "hidden")};
-`;
-
-const TitleMenuItem = styled.button`
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
-  border: 0;
-  border-radius: 6px;
-  color: var(--forge-text-soft);
-  background: transparent;
-  font-size: 11.5px;
-  font-weight: 550;
-  cursor: pointer;
-  text-align: left;
-
-  svg {
-    width: 13px;
-    height: 13px;
-    opacity: 0.8;
-  }
-
-  &:hover {
-    color: var(--forge-text);
-    background: var(--forge-surface-hover);
-  }
-`;
-
-const LifecycleTitleNotice = styled.em`
-  flex: 0 0 auto;
-  color: var(--forge-amber);
-  font-size: 9.5px;
-  font-style: normal;
-
-  &[data-kind="error"] { color: var(--forge-red); }
-`;
-
-/* Keep-warm wrappers: the active session's Chat and Shell both stay mounted;
-   the view not selected collapses to display:none. */
-const TerminalHostLayer = styled.div`
-  flex: 1;
-  min-height: 0;
-
-  &[data-visible="false"] {
-    display: none;
-  }
-`;
-
-const TrajectoryHostLayer = styled.div`
-  display: flex;
-  min-height: 0;
-  flex: 1;
-  flex-direction: column;
 `;
 
 /* Fleet view host: the tree/rollup panel on top (own scroll), the selected
@@ -3484,17 +2955,6 @@ const GraphHostLayer = styled.div`
   min-height: 0;
   flex: 1;
   flex-direction: column;
-`;
-
-const ChatHostLayer = styled.div`
-  display: flex;
-  min-height: 0;
-  flex: 1;
-  flex-direction: column;
-
-  &[data-visible="false"] {
-    display: none;
-  }
 `;
 
 const DraftBody = styled.div`
@@ -3654,79 +3114,6 @@ const HomeNewChat = styled.button`
   &:hover {
     background: rgba(var(--forge-tint-rgb), 0.24);
   }
-`;
-
-const PanelPickerBody = styled.div`
-  flex: 1;
-  display: grid;
-  min-height: 0;
-  place-content: center;
-  gap: 22px;
-  justify-items: center;
-`;
-
-const PanelPickerGrid = styled.div`
-  display: flex;
-  gap: 12px;
-`;
-
-const PanelPickerCard = styled.button`
-  display: grid;
-  width: 132px;
-  justify-items: center;
-  gap: 10px;
-  padding: 18px 12px 14px;
-  border: 1px solid var(--forge-border);
-  border-radius: 12px;
-  color: var(--forge-text-soft);
-  background: var(--forge-surface);
-  cursor: pointer;
-
-  strong {
-    font-size: 11.5px;
-    font-weight: 700;
-  }
-
-  &:hover {
-    color: var(--forge-text);
-    border-color: rgba(var(--forge-tint-soft-rgb), 0.45);
-    background: var(--forge-surface-hover);
-  }
-`;
-
-const EmptyState = styled.div`
-  display: flex;
-  max-width: 480px;
-  flex-direction: column;
-  align-items: center;
-  padding: 24px 16px;
-  text-align: center;
-
-  h2 {
-    margin: 20px 0 10px;
-    color: var(--forge-text);
-    font-size: 20px;
-    font-weight: 700;
-  }
-
-  p {
-    max-width: 42ch;
-    margin: 0;
-    color: var(--forge-text-muted);
-    font-size: 12.5px;
-    line-height: 1.65;
-  }
-`;
-
-const EmptyStateIcon = styled.span`
-  display: inline-grid;
-  width: 52px;
-  height: 52px;
-  place-items: center;
-  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.4);
-  border-radius: 14px;
-  color: var(--forge-accent-soft);
-  background: rgba(var(--forge-tint-rgb), 0.12);
 `;
 
 const DraftError = styled.div`

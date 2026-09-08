@@ -50,6 +50,10 @@ test("[pin] lifecycle invokes are hook-only and the lifecycle view is presentati
     read("./SessionLifecycleMenuItems.jsx"),
     read("./SessionsRail.jsx"),
     read("./SessionSurface.jsx"),
+    /* F9: the session title menu (fork/compact/retry/rename navigation) now
+       lives in the shared SessionView, so the hook-only guard must pin it
+       there too — a direct lifecycle invoke in the view must still fail. */
+    read("./SessionView.jsx"),
     read("../app/AppShell.jsx"),
   ];
   for (const command of ["ade_session_rename", "session_compact", "session_fork", "run_retry"]) {
@@ -85,7 +89,9 @@ test("[pin] receipts refresh authority; fork navigation uses only the receipt id
   const hook = read("./useSessionLifecycle.js");
   const controls = read("./SessionLifecycleMenuItems.jsx");
   const rail = read("./SessionsRail.jsx");
-  const surface = read("./SessionSurface.jsx");
+  /* F9: the session-side title block (with its fork navigation) moved from
+     SessionSurface into the shared SessionView. */
+  const surface = read("./SessionView.jsx");
   const dispatchIndex = hook.indexOf("receipt = await dispatch()");
   const refreshIndex = hook.indexOf("await refreshAuthority?.()", dispatchIndex);
 
@@ -141,7 +147,10 @@ test("[pin] AppShell owns the hook and mounts lifecycle controls in rail and hea
     assert.equal((shell.match(new RegExp(prop.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length, 2,
       `AppShell must feed ${prop} to both rail and surface`);
   }
-  for (const consumer of [rail, surface]) {
+  /* F9: the session-side title menu (and its SessionLifecycleMenuItems mount)
+     moved from SessionSurface into the shared SessionView; the rail keeps its
+     own. */
+  for (const consumer of [rail, read("./SessionView.jsx")]) {
     assert.match(consumer, /import SessionLifecycleMenuItems from "\.\/SessionLifecycleMenuItems\.jsx"/);
     assert.match(consumer, /<SessionLifecycleMenuItems/);
   }

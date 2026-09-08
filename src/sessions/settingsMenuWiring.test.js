@@ -18,10 +18,14 @@ import test from "node:test";
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), "utf8");
 
 const surface = () => read("./SessionSurface.jsx");
+/* F9: the one-line header — the Chat/Shell/Traj toggle, the gear anchor, and
+   the status pill — moved into the shared SessionView. The gear's Settings
+   menu PANEL (and its nine entry builder) stays owned by the host surface. */
+const view = () => read("./SessionView.jsx");
 const menuModule = () => read("./SessionSettingsMenu.jsx");
 const spaceSurface = () => read("./SpaceSurface.jsx");
 
-/* The segmented toggle markup in SessionSurface. */
+/* The segmented toggle markup, now in SessionView. */
 function toggleBlockOf(source) {
   const start = source.indexOf("<SessionViewToggle");
   const end = source.indexOf("</SessionViewToggle>", start);
@@ -29,10 +33,11 @@ function toggleBlockOf(source) {
   return source.slice(start, end);
 }
 
-/* The nine relocated entries, built for the menu-owning session. */
+/* The nine relocated entries, built for the menu-owning session — still in
+   SessionSurface, which owns the once-mounted Settings menu they ride into. */
 function entriesBlockOf(source) {
   const start = source.indexOf("const settingsMenuEntriesFor = (session) => {");
-  const end = source.indexOf("const floatingControls", start);
+  const end = source.indexOf("const renderAgentSurface", start);
   assert.ok(start !== -1 && end > start, "the settings menu entries builder must exist");
   return source.slice(start, end);
 }
@@ -50,7 +55,7 @@ const RELOCATED = [
 ];
 
 test("[pin] the view toggle keeps exactly Chat, Shell, Traj as static tabs", () => {
-  const toggle = toggleBlockOf(surface());
+  const toggle = toggleBlockOf(view());
   /* Three static tabs plus the one dynamic panel-tab template. */
   assert.equal((toggle.match(/role="tab"/g) || []).length, 4,
     "the tablist must hold Chat, Shell, Traj and the panel-tab template only");
@@ -104,7 +109,7 @@ test("[pin] every relocated entry keeps its draft guard inside the menu", () => 
 });
 
 test("[pin] the gear anchors the shared menu with active state, aria, and Escape dismissal", () => {
-  const source = surface();
+  const source = view();
   const menu = menuModule();
   /* One authority names the relocated modes; the gear's active state derives
      from the same selectView modes the entries dispatch. */
@@ -117,7 +122,7 @@ test("[pin] the gear anchors the shared menu with active state, aria, and Escape
   assert.ok(modesBlock.includes('"sshPty"'),
     "SETTINGS_MENU_MODES must include sshPty so the gear stays lit in the PTY view");
   assert.match(source,
-    /const settingsViewActive = Boolean\(session\)\s*&& activeTabIsChat\s*&& SETTINGS_MENU_MODES\.includes\(modeFor\(session\.id\)\)/,
+    /const settingsViewActive = Boolean\(session\)\s*&& activeTabIsChat\s*&& SETTINGS_MENU_MODES\.includes\(mode\)/,
     "the gear's active state must derive from the relocated-mode list");
   const gearStart = source.indexOf('aria-label="Agent settings"');
   assert.notEqual(gearStart, -1, "the gear button must be labeled Agent settings");
@@ -214,7 +219,9 @@ test("[pin] verify P1: an active space renders the focused member's view control
 });
 
 test("[pin] F2.1: one-line header — persona and workflow chip live in the Settings menu", () => {
-  const source = surface();
+  /* F9: the one-line header (WorkHeader/FloatingControls/TitleRow) moved into
+     the shared SessionView; neither relocated control may ride it there. */
+  const source = view();
   const menu = menuModule();
   /* The header row and its control cluster never wrap; long names ellipsize
      inside the title block. */

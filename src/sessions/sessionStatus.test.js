@@ -13,10 +13,11 @@ import {
 } from "./sessionStatus.js";
 
 const surfaceSource = readFileSync(new URL("./SessionSurface.jsx", import.meta.url), "utf8");
-// The work-header status pill was extracted into its own presentational
-// component (SurfaceStatusPill.jsx); its render seam (data-* provenance +
-// label fallback) is pinned there, while SessionSurface still owns the
-// statusPillView computation it feeds in.
+// F9 relocated the one-line header (status pill) and the chat host (shimmer
+// provenance data-attrs, transcript runStatus) from SessionSurface into the
+// shared SessionView. The pill's own render seam stays in SurfaceStatusPill;
+// SessionSurface still owns the surfaceRunStatusView computation it feeds in.
+const viewSource = readFileSync(new URL("./SessionView.jsx", import.meta.url), "utf8");
 const pillSource = readFileSync(new URL("./SurfaceStatusPill.jsx", import.meta.url), "utf8");
 
 test("[pin] listener adapter preserves optional fields and clears an absent whole status", () => {
@@ -167,17 +168,17 @@ test("[pin] pill marks line and local fallbacks as presentation-only", () => {
     /data-structured-status=\{view\.structuredStatus\}/,
     "the pill must expose structured absence independently of fallback text",
   );
-  // SessionSurface computes the fallback line from the same render seam and
+  // SessionView computes the fallback line from the same render seam and
   // hands it, plus the availability presentation, to the extracted pill.
   assert.match(
-    surfaceSource,
+    viewSource,
     /const statusLine = statusPillView\?\.label \|\| "";/,
-    "SessionSurface derives the pill's fallback line from the render seam",
+    "SessionView derives the pill's fallback line from the render seam",
   );
   assert.match(
-    surfaceSource,
+    viewSource,
     /<SurfaceStatusPill[\s\S]*?availability=\{availability\}[\s\S]*?statusLine=\{statusLine\}[\s\S]*?statusPillView=\{statusPillView\}/,
-    "SessionSurface feeds the pill the availability, fallback line, and render seam",
+    "SessionView feeds the pill the availability, fallback line, and render seam",
   );
   assert.match(
     pillSource,
@@ -239,22 +240,22 @@ test("[pin] shimmer never invents working when structured status is absent", () 
     "shimmer render seam must not fabricate Unknown when activity status is absent",
   );
   assert.match(
-    surfaceSource,
+    viewSource,
     /data-run-status-authority=\{runStatusView\.authority\}/,
     "presentation-only shimmer copy must be distinguishable in the rendered DOM",
   );
   assert.match(
-    surfaceSource,
+    viewSource,
     /data-run-status-source=\{runStatusView\.source\}/,
     "the shimmer source must come from its activity-only render seam",
   );
   assert.match(
-    surfaceSource,
+    viewSource,
     /data-run-structured-status=\{runStatusView\.structuredStatus\}/,
     "the shimmer host must expose that structured status was absent",
   );
   assert.match(
-    surfaceSource,
+    viewSource,
     /runStatus=\{runStatusView\.label\}/,
     "the transcript must receive only the activity render seam's label",
   );

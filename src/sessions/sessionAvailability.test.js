@@ -94,7 +94,10 @@ test("rail and session surface render the shared categorical presentation", () =
   const rail = readFileSync(new URL("./SessionsRail.jsx", import.meta.url), "utf8");
   const surface = readFileSync(new URL("./SessionSurface.jsx", import.meta.url), "utf8");
   // The active-session status pill now lives in SurfaceStatusPill.jsx; the
-  // typed availability category still flows surface → pill.
+  // typed availability category still flows view → pill. F9 relocated the
+  // header (toggle + status pill) from SessionSurface into SessionView, so the
+  // pill wiring is read there; Home/Continue rows stay on the surface.
+  const view = readFileSync(new URL("./SessionView.jsx", import.meta.url), "utf8");
   const pill = readFileSync(new URL("./SurfaceStatusPill.jsx", import.meta.url), "utf8");
 
   assert.match(
@@ -103,9 +106,9 @@ test("rail and session surface render the shared categorical presentation", () =
     "rail rows must render the typed availability affordance",
   );
   assert.match(
-    surface,
+    view,
     /const availability =[\s\S]*?sessionAvailabilityPresentation\(session\)[\s\S]*?<SurfaceStatusPill[\s\S]*?availability=\{availability\}/,
-    "SessionSurface computes the typed availability category and feeds it to the pill",
+    "SessionView computes the typed availability category and feeds it to the pill",
   );
   assert.match(
     pill,
