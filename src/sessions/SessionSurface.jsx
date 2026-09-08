@@ -22,6 +22,7 @@ import { Movie } from "@styled-icons/material-rounded/Movie";
 import { NotificationsActive } from "@styled-icons/material-rounded/NotificationsActive";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
+import { Settings } from "@styled-icons/material-rounded/Settings";
 import { Terminal as TerminalGlyph } from "@styled-icons/material-rounded/Terminal";
 import { Timeline } from "@styled-icons/material-rounded/Timeline";
 
@@ -66,8 +67,6 @@ import {
   initialSessionBindingState,
   sessionBindingAnnouncement,
 } from "./sessionTerminalBinding.js";
-import SessionPersonaSelect from "./SessionPersonaSelect.jsx";
-import WorkflowStatusChip from "./WorkflowStatusChip.jsx";
 import SessionTerminal from "./SessionTerminal.jsx";
 import SessionTrajectory from "./SessionTrajectory.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
@@ -82,6 +81,11 @@ import ProviderAdminPanel from "./ProviderAdminPanel.jsx";
 import MonitorPanel from "./MonitorPanel.jsx";
 import CheckpointPanel from "./CheckpointPanel.jsx";
 import WorkflowGraphView from "./WorkflowGraphView.jsx";
+import SessionSettingsMenu, {
+  SessionViewButton,
+  SessionViewToggle,
+  SettingsMenuItem,
+} from "./SessionSettingsMenu.jsx";
 import SessionLifecycleMenuItems from "./SessionLifecycleMenuItems.jsx";
 import { findFleetNode, fleetSessionIds } from "./fleetModel.js";
 import {
@@ -156,6 +160,23 @@ const PANEL_KINDS = {
   video: { label: "AI Video Editor", Icon: Movie },
 };
 
+/* View modes hosted by the Settings (gear) menu instead of the tab bar
+   (F2-UI): every SDK-backed agent-settings surface. The gear shows the
+   active state whenever one of these is the session's current view;
+   "sshPty" rides the SSH Profiles entry exactly as it rode its tab. */
+const SETTINGS_MENU_MODES = [
+  "fleet",
+  "peers",
+  "shells",
+  "capabilities",
+  "sshProfiles",
+  "sshPty",
+  "providers",
+  "monitors",
+  "checkpoints",
+  "graph",
+];
+
 function publishedCheckpointBranchId(session) {
   return typeof session?.branch_id === "string" && session.branch_id.length > 0
     ? session.branch_id
@@ -185,6 +206,41 @@ export default function SessionSurface({
   loomAgentTypes = [],
   loomPersonaBySession = {},
   onSelectPersona = null,
+  /* Loom registry + workflow catalog: relocated from the rail's Agent Types
+     and Workflows sections into the Settings menu (F2-UI Part B). The same
+     inline sections render here verbatim, so their honesty and
+     feature-absence behaviors are unchanged. */
+  loomWorkflowEntries = [],
+  loomArchivedEntries = null,
+  loomCliPresent = {},
+  loomInstallByType = {},
+  loomCancelByJob = {},
+  loomRegistryCursor = null,
+  loomListError = "",
+  loomUnavailable = false,
+  loomFeatureUnavailable = {},
+  loomFeatureErrors = {},
+  loomAuthoringConflict = null,
+  onRegisterAgentType = null,
+  onRefreshLoomRegistry = null,
+  onListArchivedLoom = null,
+  onValidateLoom = null,
+  onDraftLoom = null,
+  onReviseLoom = null,
+  onConfirmLoom = null,
+  onSetLoomArchived = null,
+  onRefreshAgentInstall = null,
+  onRetryAgentInstall = null,
+  onCancelAgentInstall = null,
+  workflowCatalog = { kind: "unread", entries: [] },
+  workflowRecords = [],
+  workflowInstanceById = {},
+  workflowListError = "",
+  onReadWorkflowInstance = null,
+  onRegisterWorkflow = null,
+  onPinWorkflow = null,
+  onSwitchWorkflow = null,
+  onAbandonWorkflow = null,
   workflowStatusBySession = {},
   workflowUnavailable = false,
   fleetBySession = {},
@@ -1936,6 +1992,20 @@ export default function SessionSurface({
       window.removeEventListener("keydown", onKey);
     };
   }, [titleMenuFor]);
+
+  /* Settings (gear) menu at the end of the view toggle: the full
+     agent-settings menu hosting the nine relocated SDK surfaces, the
+     persona/workflow-chip row, and the Agent Types and Workflows sections
+     that left the rail. The panel itself (anchored portal, position,
+     Escape/outside dismissal) is the shared SessionSettingsMenu, mounted
+     ONCE at the surface root and only hidden while closed so the relocated
+     editors keep their state across dismissal (F2 verify P2). This surface
+     tracks the menu-owning session: its gear anchors the panel and its nine
+     view entries ride in as children. */
+  const [settingsMenuSession, setSettingsMenuSession] = useState(null);
+  const settingsMenuButtonRef = useRef(null);
+  const closeSettingsMenu = useCallback(() => setSettingsMenuSession(null), []);
+
   const toggleSessionPin = useCallback(async (session) => {
     setTitleMenuFor("");
     try {
@@ -2090,6 +2160,170 @@ export default function SessionSurface({
     );
   };
 
+  /* ONE view-dispatch authority for the toggle tabs AND the Settings menu
+     entries: leave any panel tab for the chat tab, then set the session's
+     view mode. (No tabs state exists for the draft, so it never re-selects.) */
+  const activeChatTabFor = (sessionId) => {
+    const tabsState = sessionId !== "draft" ? tabsStateFor(sessionId) : null;
+    return !tabsState
+      || !tabsState.tabs.some((tab) => tab.id === tabsState.activeTabId)
+      || tabsState.activeTabId === "chat";
+  };
+  const selectViewOn = (sessionId, viewMode) => {
+    if (!activeChatTabFor(sessionId)) {
+      selectTab(sessionId, "chat");
+    }
+    setModeFor(sessionId, viewMode);
+  };
+
+  /* The Settings menu's nine relocated surface entries, built for the
+     menu-owning session and passed into the shared SessionSettingsMenu as
+     children. Each entry dispatches the byte-identical selectView mode its
+     tab did, behind the byte-identical draft guard, and closes the menu. */
+  const settingsMenuEntriesFor = (session) => {
+    const activeTabIsChat = activeChatTabFor(session.id);
+    const selectView = (viewMode) => selectViewOn(session.id, viewMode);
+    return (
+      <>
+        {session.id !== "draft" && (
+          <SettingsMenuItem
+            data-active={activeTabIsChat && modeFor(session.id) === "fleet" ? "true" : undefined}
+            onClick={() => {
+              selectView("fleet");
+              closeSettingsMenu();
+            }}
+            role="menuitem"
+            title="Subagents"
+            type="button"
+          >
+            <AccountTree aria-hidden="true" size={13} />
+            <span>Fleet</span>
+          </SettingsMenuItem>
+        )}
+        {session.id !== "draft" && (
+          <SettingsMenuItem
+            data-active={activeTabIsChat && modeFor(session.id) === "peers" ? "true" : undefined}
+            onClick={() => {
+              selectView("peers");
+              closeSettingsMenu();
+            }}
+            role="menuitem"
+            title="Peer messaging"
+            type="button"
+          >
+            <Forum aria-hidden="true" size={13} />
+            <span>Peers</span>
+          </SettingsMenuItem>
+        )}
+        {session.id !== "draft" && (
+          <SettingsMenuItem
+            data-active={activeTabIsChat && modeFor(session.id) === "shells" ? "true" : undefined}
+            onClick={() => {
+              selectView("shells");
+              closeSettingsMenu();
+            }}
+            role="menuitem"
+            title="Live shell registry"
+            type="button"
+          >
+            <TerminalGlyph aria-hidden="true" size={13} />
+            <span>Shells</span>
+          </SettingsMenuItem>
+        )}
+        {session.id !== "draft" && (
+          <SettingsMenuItem
+            data-active={activeTabIsChat && modeFor(session.id) === "capabilities" ? "true" : undefined}
+            onClick={() => {
+              selectView("capabilities");
+              closeSettingsMenu();
+            }}
+            role="menuitem"
+            title="Workspace hooks and session tools"
+            type="button"
+          >
+            <Build aria-hidden="true" size={13} />
+            <span>Hooks &amp; Tools</span>
+          </SettingsMenuItem>
+        )}
+        {session.id !== "draft" && (
+          <SettingsMenuItem
+            data-active={activeTabIsChat && ["sshProfiles", "sshPty"].includes(modeFor(session.id)) ? "true" : undefined}
+            onClick={() => {
+              selectView("sshProfiles");
+              closeSettingsMenu();
+            }}
+            role="menuitem"
+            title="SSH Profiles"
+            type="button"
+          >
+            <Language aria-hidden="true" size={13} />
+            <span>SSH Profiles</span>
+          </SettingsMenuItem>
+        )}
+        {session.id !== "draft" && (
+          <SettingsMenuItem
+            data-active={activeTabIsChat && modeFor(session.id) === "providers" ? "true" : undefined}
+            onClick={() => {
+              selectView("providers");
+              closeSettingsMenu();
+            }}
+            role="menuitem"
+            title="Provider management"
+            type="button"
+          >
+            <Build aria-hidden="true" size={13} />
+            <span>Providers</span>
+          </SettingsMenuItem>
+        )}
+        {session && session.id !== "draft" && (
+          <SettingsMenuItem
+            data-active={activeTabIsChat && modeFor(session.id) === "monitors" ? "true" : undefined}
+            onClick={() => {
+              selectView("monitors");
+              closeSettingsMenu();
+            }}
+            role="menuitem"
+            title="Monitors"
+            type="button"
+          >
+            <NotificationsActive aria-hidden="true" size={13} />
+            <span>Monitors</span>
+          </SettingsMenuItem>
+        )}
+        {session && session.id !== "draft" && (
+          <SettingsMenuItem
+            data-active={activeTabIsChat && modeFor(session.id) === "checkpoints" ? "true" : undefined}
+            onClick={() => {
+              selectView("checkpoints");
+              closeSettingsMenu();
+            }}
+            role="menuitem"
+            title="Checkpoint timeline"
+            type="button"
+          >
+            <History aria-hidden="true" size={13} />
+            <span>History</span>
+          </SettingsMenuItem>
+        )}
+        {session.id !== "draft" && (
+          <SettingsMenuItem
+            data-active={activeTabIsChat && modeFor(session.id) === "graph" ? "true" : undefined}
+            onClick={() => {
+              selectView("graph");
+              closeSettingsMenu();
+            }}
+            role="menuitem"
+            title="Live workflow graph"
+            type="button"
+          >
+            <Mediation aria-hidden="true" size={13} />
+            <span>Graph</span>
+          </SettingsMenuItem>
+        )}
+      </>
+    );
+  };
+
   /* Floating cluster, top-right of the workspace — ONLY view-scoped chrome:
      the segmented view control (with the session's panel tabs riding it),
      the exact harness status pill, and the theme toggle. */
@@ -2099,12 +2333,14 @@ export default function SessionSurface({
     const activeTabIsChat = !tabsState
       || !tabsState.tabs.some((tab) => tab.id === tabsState.activeTabId)
       || tabsState.activeTabId === "chat";
-    const selectView = (viewMode) => {
-      if (tabsState && !activeTabIsChat) {
-        selectTab(session.id, "chat");
-      }
-      setModeFor(session.id, viewMode);
-    };
+    const selectView = (viewMode) => selectViewOn(session.id, viewMode);
+    /* With only Chat/Shell/Traj left as tabs, the gear carries the active
+       state whenever the current view is one of the relocated
+       agent-settings surfaces, so the user can still see where they are. */
+    const settingsViewActive = Boolean(session)
+      && activeTabIsChat
+      && SETTINGS_MENU_MODES.includes(modeFor(session.id));
+    const settingsMenuOpen = Boolean(session) && settingsMenuSession?.id === session.id;
     /* status_segment_structured_v1: only state/detail can carry structured
        authority. The raw line/local bucket remain useful presentation, with
        provenance beside the rendered label instead of masquerading as it. */
@@ -2152,123 +2388,6 @@ export default function SessionSurface({
               <span>Traj</span>
             </SessionViewButton>
           )}
-          {session.id !== "draft" && (
-            <SessionViewButton
-              aria-selected={activeTabIsChat && modeFor(session.id) === "fleet"}
-              data-active={activeTabIsChat && modeFor(session.id) === "fleet" ? "true" : undefined}
-              onClick={() => selectView("fleet")}
-              role="tab"
-              title="Subagents"
-              type="button"
-            >
-              <AccountTree aria-hidden="true" size={13} />
-              <span>Fleet</span>
-            </SessionViewButton>
-          )}
-          {session.id !== "draft" && (
-            <SessionViewButton
-              aria-selected={activeTabIsChat && modeFor(session.id) === "peers"}
-              data-active={activeTabIsChat && modeFor(session.id) === "peers" ? "true" : undefined}
-              onClick={() => selectView("peers")}
-              role="tab"
-              title="Peer messaging"
-              type="button"
-            >
-              <Forum aria-hidden="true" size={13} />
-              <span>Peers</span>
-            </SessionViewButton>
-          )}
-          {session.id !== "draft" && (
-            <SessionViewButton
-              aria-selected={activeTabIsChat && modeFor(session.id) === "shells"}
-              data-active={activeTabIsChat && modeFor(session.id) === "shells" ? "true" : undefined}
-              onClick={() => selectView("shells")}
-              role="tab"
-              title="Live shell registry"
-              type="button"
-            >
-              <TerminalGlyph aria-hidden="true" size={13} />
-              <span>Shells</span>
-            </SessionViewButton>
-          )}
-          {session.id !== "draft" && (
-            <SessionViewButton
-              aria-selected={activeTabIsChat && modeFor(session.id) === "capabilities"}
-              data-active={activeTabIsChat && modeFor(session.id) === "capabilities" ? "true" : undefined}
-              onClick={() => selectView("capabilities")}
-              role="tab"
-              title="Workspace hooks and session tools"
-              type="button"
-            >
-              <Build aria-hidden="true" size={13} />
-              <span>Hooks &amp; Tools</span>
-            </SessionViewButton>
-          )}
-          {session.id !== "draft" && (
-            <SessionViewButton
-              aria-selected={activeTabIsChat && ["sshProfiles", "sshPty"].includes(modeFor(session.id))}
-              data-active={activeTabIsChat && ["sshProfiles", "sshPty"].includes(modeFor(session.id)) ? "true" : undefined}
-              onClick={() => selectView("sshProfiles")}
-              role="tab"
-              title="SSH Profiles"
-              type="button"
-            >
-              <Language aria-hidden="true" size={13} />
-              <span>SSH Profiles</span>
-            </SessionViewButton>
-          )}
-          {session.id !== "draft" && (
-            <SessionViewButton
-              aria-selected={activeTabIsChat && modeFor(session.id) === "providers"}
-              data-active={activeTabIsChat && modeFor(session.id) === "providers" ? "true" : undefined}
-              onClick={() => selectView("providers")}
-              role="tab"
-              title="Provider management"
-              type="button"
-            >
-              <Build aria-hidden="true" size={13} />
-              <span>Providers</span>
-            </SessionViewButton>
-          )}
-          {session && session.id !== "draft" && (
-            <SessionViewButton
-              aria-selected={activeTabIsChat && modeFor(session.id) === "monitors"}
-              data-active={activeTabIsChat && modeFor(session.id) === "monitors" ? "true" : undefined}
-              onClick={() => selectView("monitors")}
-              role="tab"
-              title="Monitors"
-              type="button"
-            >
-              <NotificationsActive aria-hidden="true" size={13} />
-              <span>Monitors</span>
-            </SessionViewButton>
-          )}
-          {session && session.id !== "draft" && (
-            <SessionViewButton
-              aria-selected={activeTabIsChat && modeFor(session.id) === "checkpoints"}
-              data-active={activeTabIsChat && modeFor(session.id) === "checkpoints" ? "true" : undefined}
-              onClick={() => selectView("checkpoints")}
-              role="tab"
-              title="Checkpoint timeline"
-              type="button"
-            >
-              <History aria-hidden="true" size={13} />
-              <span>History</span>
-            </SessionViewButton>
-          )}
-          {session.id !== "draft" && (
-            <SessionViewButton
-              aria-selected={activeTabIsChat && modeFor(session.id) === "graph"}
-              data-active={activeTabIsChat && modeFor(session.id) === "graph" ? "true" : undefined}
-              onClick={() => selectView("graph")}
-              role="tab"
-              title="Live workflow graph"
-              type="button"
-            >
-              <Mediation aria-hidden="true" size={13} />
-              <span>Graph</span>
-            </SessionViewButton>
-          )}
           {panelTabs.map((tab) => {
             const panel = PANEL_KINDS[tab.kind];
             const PanelIcon = panel?.Icon || ButtonAddIcon;
@@ -2309,6 +2428,24 @@ export default function SessionSurface({
               <ButtonAddIcon aria-hidden="true" />
             </SegAddButton>
           )}
+          {/* Settings (gear): anchors the shared agent-settings menu (mounted
+              once at the surface root). Every relocated surface entry
+              dispatches the exact same selectView mode its tab did, behind
+              the same draft guard it had. */}
+          <SessionViewButton
+            ref={settingsMenuOpen ? settingsMenuButtonRef : undefined}
+            aria-expanded={settingsMenuOpen}
+            aria-haspopup="menu"
+            aria-label="Agent settings"
+            data-active={settingsViewActive ? "true" : undefined}
+            onClick={() => setSettingsMenuSession(
+              (current) => (current?.id === session.id ? null : session),
+            )}
+            title="Agent settings"
+            type="button"
+          >
+            <Settings aria-hidden="true" size={13} />
+          </SessionViewButton>
         </SessionViewToggle>
         )}
         {session && session.id !== "draft" && (
@@ -2324,30 +2461,9 @@ export default function SessionSurface({
             <span>{availability?.label || statusLine}</span>
           </StatusPill>
         )}
-        {/* Persona binding control beside the status pill. A binding is NOT
-            readiness: the pill keeps sole authority over run state, and the
-            select's own labeling says persona-only. An UNSEEN receipt stays
-            undefined (binding unknown) — it is never collapsed to null, which
-            would falsely claim "No persona". */}
-        {session && session.id !== "draft" && (
-          <SessionPersonaSelect
-            agentTypes={loomAgentTypes}
-            binding={loomPersonaBySession[session.id]}
-            onSelect={onSelectPersona}
-            sessionId={session.id}
-          />
-        )}
-        {/* Workflow indicator beside the persona select. DISPLAY-ONLY, and
-            its state is ONLY what graph_status reported for this session
-            (never the workflows list, the persona, or lineage). An UNSEEN
-            read stays undefined — it is never collapsed into a "No
-            workflow" claim for a status we never read. */}
-        {session && session.id !== "draft" && (
-          <WorkflowStatusChip
-            statusView={workflowStatusBySession[session.id]}
-            unavailable={workflowUnavailable}
-          />
-        )}
+        {/* F2.1: the persona binding control and the display-only workflow
+            chip left this row for the Settings menu — the header is ONE
+            line: name … view toggle … status pill. */}
         <HeaderIconButton
           aria-label={appThemeIsLight ? "Switch to dark theme" : "Switch to light theme"}
           onClick={onToggleTheme}
@@ -2362,6 +2478,11 @@ export default function SessionSurface({
     );
   };
 
+  /* The three surface bodies (draft / home / open sessions) share ONE
+     return below so the Settings menu host keeps its mount — and the
+     relocated Loom/Workflow editors their state — across draft/home/session
+     transitions, exactly as the always-mounted rail sections did. */
+  let surfaceBody;
   if (draftOpen) {
     // Draft = the harness itself. Default view is the Chat composer —
     // selected and immediately typeable — with the plain haider TUI mounted
@@ -2378,8 +2499,7 @@ export default function SessionSurface({
       status: "idle",
     };
     const draftMode = modeFor("draft");
-    return (
-      <SessionSurfaceRoot>
+    surfaceBody = (
         <SessionPane data-active="true">
           {workHeader(draftSession)}
           <PaneContent>
@@ -2450,18 +2570,14 @@ export default function SessionSurface({
             )}
           </PaneContent>
         </SessionPane>
-      </SessionSurfaceRoot>
     );
-  }
-
-  if (!activeSessionId) {
+  } else if (!activeSessionId) {
     // Home: the flame hero with the plan tiers, plus recent sessions to
     // continue — including ones created directly in the haider CLI once the
     // bridge imports them.
     // Max 3 recents, like the CLI's own launcher list.
     const recentSessions = sessions.slice(0, 3);
-    return (
-      <SessionSurfaceRoot>
+    surfaceBody = (
         <SessionPane data-active="true">
           {workHeader(null, { showToggle: false })}
           <PaneContent>
@@ -2497,13 +2613,9 @@ export default function SessionSurface({
             </HomeBody>
           </PaneContent>
         </SessionPane>
-      </SessionSurfaceRoot>
     );
-  }
-
-  return (
-    <SessionSurfaceRoot>
-      {openSessions.map((session) => {
+  } else {
+    const sessionPanes = openSessions.map((session) => {
         const active = session.id === activeSessionId;
         const mode = modeFor(session.id);
         const { tabs, activeTabId } = tabsStateFor(session.id);
@@ -2978,7 +3090,64 @@ export default function SessionSurface({
             </PaneContent>
           </SessionPane>
         );
-      })}
+      });
+    surfaceBody = <>{sessionPanes}</>;
+  }
+
+  return (
+    <SessionSurfaceRoot>
+      {surfaceBody}
+      {/* ONE always-mounted Settings menu instance for the whole surface
+          (portal chrome and mount discipline live in SessionSettingsMenu):
+          dismissal only hides it, so the relocated Agent Types / Workflows
+          editors keep their drafts, filters, and conflict state. The nine
+          session-view entries ride in as children for the menu-owning
+          session; persona + workflow chip render from the same session. */}
+      <SessionSettingsMenu
+        activeSessionId={activeSessionId}
+        anchorRef={settingsMenuButtonRef}
+        loomAgentTypes={loomAgentTypes}
+        loomPersonaBySession={loomPersonaBySession}
+        onSelectPersona={onSelectPersona}
+        loomWorkflowEntries={loomWorkflowEntries}
+        loomArchivedEntries={loomArchivedEntries}
+        loomCliPresent={loomCliPresent}
+        loomInstallByType={loomInstallByType}
+        loomCancelByJob={loomCancelByJob}
+        loomRegistryCursor={loomRegistryCursor}
+        loomListError={loomListError}
+        loomUnavailable={loomUnavailable}
+        loomFeatureUnavailable={loomFeatureUnavailable}
+        loomFeatureErrors={loomFeatureErrors}
+        loomAuthoringConflict={loomAuthoringConflict}
+        onRegisterAgentType={onRegisterAgentType}
+        onRefreshLoomRegistry={onRefreshLoomRegistry}
+        onListArchivedLoom={onListArchivedLoom}
+        onValidateLoom={onValidateLoom}
+        onDraftLoom={onDraftLoom}
+        onReviseLoom={onReviseLoom}
+        onConfirmLoom={onConfirmLoom}
+        onSetLoomArchived={onSetLoomArchived}
+        onRefreshAgentInstall={onRefreshAgentInstall}
+        onRetryAgentInstall={onRetryAgentInstall}
+        onCancelAgentInstall={onCancelAgentInstall}
+        workflowCatalog={workflowCatalog}
+        workflowRecords={workflowRecords}
+        workflowInstanceById={workflowInstanceById}
+        workflowListError={workflowListError}
+        onReadWorkflowInstance={onReadWorkflowInstance}
+        onRegisterWorkflow={onRegisterWorkflow}
+        onPinWorkflow={onPinWorkflow}
+        onSwitchWorkflow={onSwitchWorkflow}
+        onAbandonWorkflow={onAbandonWorkflow}
+        workflowStatusBySession={workflowStatusBySession}
+        workflowUnavailable={workflowUnavailable}
+        onDismiss={closeSettingsMenu}
+        open={Boolean(settingsMenuSession)}
+        session={settingsMenuSession}
+      >
+        {settingsMenuSession ? settingsMenuEntriesFor(settingsMenuSession) : null}
+      </SessionSettingsMenu>
     </SessionSurfaceRoot>
   );
 }
@@ -3022,17 +3191,19 @@ const FloatingControls = styled.div`
   display: inline-flex;
   min-width: 0;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 8px;
 `;
 
 /* ONE row of workspace chrome, on every tab: title + menu left, cluster
-   right. Normal flow — content starts below it, no overlay clearances. */
+   right. Normal flow — content starts below it, no overlay clearances.
+   F2.1: a SINGLE line — nothing wraps; a long session name ellipsizes in
+   the title block instead. */
 const WorkHeader = styled.div`
   display: flex;
   flex: 0 0 auto;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px 10px;
   padding: 10px 16px 8px;
   border-bottom: 1px solid var(--forge-border);
@@ -3045,55 +3216,8 @@ const WorkHeaderSpacer = styled.span`
   flex: 1;
 `;
 
-const SessionViewToggle = styled.div`
-  display: inline-flex;
-  flex: 0 0 auto;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--forge-border);
-  border-radius: 999px;
-  background: var(--forge-surface-control);
-`;
-
-const SessionViewButton = styled.button`
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 11px;
-  border: 0;
-  border-radius: 999px;
-  color: var(--forge-text-muted);
-  background: transparent;
-  font-size: 10.5px;
-  font-weight: 700;
-  cursor: pointer;
-
-  svg {
-    flex: 0 0 auto;
-  }
-
-  &[data-active="true"] {
-    color: var(--forge-text);
-    background: rgba(var(--forge-tint-rgb), 0.22);
-    box-shadow: inset 0 0 0 1px rgba(var(--forge-tint-soft-rgb), 0.35);
-  }
-
-  &:hover:not([data-active="true"]):not(:disabled) {
-    color: var(--forge-text-soft);
-  }
-
-  &:disabled {
-    opacity: 0.55;
-    cursor: default;
-  }
-
-  > span {
-    max-width: 120px;
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-  }
-`;
+/* The segmented toggle and its buttons live in SessionSettingsMenu.jsx now,
+   shared with SpaceSurface so an active space renders the SAME view chrome. */
 
 /* Close affordance on a panel segment (design note 5: panels are workspace
    tabs riding behind the segmented control). */
@@ -3223,6 +3347,8 @@ const HeaderIconButton = styled.button`
 const TitleRow = styled.div`
   display: inline-flex;
   min-width: 0;
+  flex-shrink: 1;
+  overflow: hidden;
   align-items: center;
   gap: 4px;
 

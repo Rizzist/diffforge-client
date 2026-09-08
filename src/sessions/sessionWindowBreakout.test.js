@@ -65,7 +65,13 @@ async function sessionSurfaceModule() {
     ssr: { noExternal: ["styled-components", /^@xterm\//] },
   });
   try {
-    return await server.ssrLoadModule("/src/sessions/SessionSurface.jsx");
+    /* Load the surface AND the shared Settings menu from ONE module graph so
+       component identities can be compared against the rendered tree. */
+    const [surface, settingsMenu] = await Promise.all([
+      server.ssrLoadModule("/src/sessions/SessionSurface.jsx"),
+      server.ssrLoadModule("/src/sessions/SessionSettingsMenu.jsx"),
+    ]);
+    return { settingsMenu, surface };
   } finally {
     await server.close();
   }
@@ -582,7 +588,7 @@ test("native liveness and incarnation guard preserve a newer reopened window", a
 });
 
 test("session header pop-out affordance calls its production command prop", async () => {
-  const [{ default: React }, { default: SessionSurface }] = await Promise.all([
+  const [{ default: React }, { surface: { default: SessionSurface } }] = await Promise.all([
     import("react"),
     sessionSurfaceModule(),
   ]);
@@ -608,4 +614,47 @@ test("session header pop-out affordance calls its production command prop", asyn
   assert.ok(affordance, "the active session header must expose its pop-out affordance");
   affordance.props.onClick();
   assert.deepEqual(calls, [session]);
+});
+
+test("the Settings menu host stays mounted while CLOSED, so dismissal keeps its editors' state (F2 verify P2)", async () => {
+  const [{ default: React }, { settingsMenu, surface }] = await Promise.all([
+    import("react"),
+    sessionSurfaceModule(),
+  ]);
+  const SessionSurface = surface.default;
+  const SessionSettingsMenu = settingsMenu.default;
+  const session = {
+    id: "session-menu-closed",
+    provider: "haider",
+    provider_session_id: "provider-menu-closed",
+    status: "idle",
+    title: "Menu retention session",
+  };
+  /* Default state = the menu is DISMISSED (settingsMenuSession null). The
+     shared menu component must still be in the rendered tree: `open` is a
+     visibility prop, never a mount boundary, so closing the popover cannot
+     unmount the relocated Loom/Workflow editors and erase their drafts. */
+  const closedTree = renderFunctionComponent(React, () => SessionSurface({
+    activeSessionId: session.id,
+    draftOpen: false,
+    openSessions: [session],
+    sessions: [session],
+  }));
+  const closedHost = findElement(closedTree, (element) => element.type === SessionSettingsMenu);
+  assert.ok(closedHost, "the shared Settings menu must be mounted even while closed");
+  assert.equal(closedHost.props.open, false,
+    "the dismissed menu renders with open=false — hidden, not unmounted");
+  assert.equal(closedHost.props.children, null,
+    "no session owns the closed menu, so no view entries ride in");
+
+  /* The draft surface keeps the same always-mounted host (the three surface
+     bodies share one return), so draft<->session flips retain it too. */
+  const draftTree = renderFunctionComponent(React, () => SessionSurface({
+    activeSessionId: "",
+    draftOpen: true,
+    openSessions: [],
+    sessions: [session],
+  }));
+  assert.ok(findElement(draftTree, (element) => element.type === SessionSettingsMenu),
+    "the draft surface must keep the Settings menu host mounted as well");
 });

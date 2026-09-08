@@ -20,6 +20,7 @@ import {
   revealOrOpenSpaceSession,
   serializeSpaceLayout,
   setSpaceActiveTab,
+  setSpaceLeafViewKind,
   SpaceLayoutCanonicalDivergenceError,
   spaceLeafCount,
   spaceLeafIds,
@@ -322,4 +323,39 @@ test("[pin] a space root resolves to one stable window per leaf", () => {
       { leafId: "leaf-a-mirror", sessionId: "session-a", viewKind: "chat" },
     ],
   );
+});
+
+test("[pin] setSpaceLeafViewKind flips ONLY the named leaf's view (F2-repair P1)", () => {
+  const state = splitState();
+  const flipped = setSpaceLeafViewKind(state, "leaf-b", "shell");
+  assert.deepEqual(
+    spaceWindowLeaves(flipped),
+    [
+      { leafId: "leaf-a", sessionId: "session-a", viewKind: "chat" },
+      { leafId: "leaf-b", sessionId: "session-b", viewKind: "shell" },
+      { leafId: "leaf-c", sessionId: "session-c", viewKind: "chat" },
+    ],
+    "only the named leaf's viewKind changes; every other leaf is untouched",
+  );
+  /* No new semantics ride along: identity, membership, and focus hold. */
+  assert.deepEqual(flipped.members, state.members);
+  assert.equal(flipped.focusedLeaf, state.focusedLeaf);
+  assert.deepEqual(spaceLeafIds(flipped), spaceLeafIds(state));
+
+  /* Flipping back-and-forth round-trips, and a same-kind flip is the SAME
+     state object (no gratuitous save churn). */
+  const restored = setSpaceLeafViewKind(flipped, "leaf-b", "chat");
+  assert.equal(serializeSpaceLayout(restored), serializeSpaceLayout(state));
+  assert.equal(setSpaceLeafViewKind(state, "leaf-b", "chat"), state);
+
+  /* The flipped layout serializes canonically — the choice persists. */
+  const reloaded = deserializeSpaceLayout(serializeSpaceLayout(flipped), flipped.focusedLeaf);
+  assert.equal(spaceWindowLeaves(reloaded)[1].viewKind, "shell");
+
+  /* Honesty: unknown kinds and missing leaves are typed errors, never a
+     silent no-op or an invented leaf. */
+  assert.throws(() => setSpaceLeafViewKind(state, "leaf-b", "fleet"),
+    /Unsupported leaf viewKind 'fleet'\./);
+  assert.throws(() => setSpaceLeafViewKind(state, "leaf-missing", "shell"),
+    /Leaf 'leaf-missing' does not exist\./);
 });

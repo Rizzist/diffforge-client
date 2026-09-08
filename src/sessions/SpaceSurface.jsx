@@ -1,9 +1,10 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import styled from "styled-components";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { Forum } from "@styled-icons/material-rounded/Forum";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
+import { Settings } from "@styled-icons/material-rounded/Settings";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Timeline } from "@styled-icons/material-rounded/Timeline";
 import { Workspaces } from "@styled-icons/material-rounded/Workspaces";
@@ -11,6 +12,11 @@ import { Workspaces } from "@styled-icons/material-rounded/Workspaces";
 import SessionComposer from "./SessionComposer.jsx";
 import SessionTranscript from "./SessionTranscript.jsx";
 import SessionTrajectory from "./SessionTrajectory.jsx";
+import SessionSettingsMenu, {
+  SessionViewButton,
+  SessionViewToggle,
+} from "./SessionSettingsMenu.jsx";
+import { spaceLeafById } from "./spacesModel.js";
 import {
   createSpaceSessionSubmitFor,
   sessionsByIdMap,
@@ -56,10 +62,59 @@ export default function SpaceSurface({
   onPopOutLeaf = null,
   onDismissDeleteError,
   onHeaderDragStart = null,
+  onSetLeafView = null,
+  /* F2-repair P1: agent settings stay reachable while a space is active.
+     These feed the shared SessionSettingsMenu (Agent Types, Workflows,
+     persona + workflow chip for the focused member) — the SAME props, by
+     the same names, that SessionSurface passes it. activeSessionId is the
+     shell's ordinary active-session id, exactly what the rail sections
+     received during space use before F2 (empty while a space is active). */
+  activeSessionId = "",
+  loomAgentTypes = [],
+  loomPersonaBySession = {},
+  onSelectPersona = null,
+  loomWorkflowEntries = [],
+  loomArchivedEntries = null,
+  loomCliPresent = {},
+  loomInstallByType = {},
+  loomCancelByJob = {},
+  loomRegistryCursor = null,
+  loomListError = "",
+  loomUnavailable = false,
+  loomFeatureUnavailable = {},
+  loomFeatureErrors = {},
+  loomAuthoringConflict = null,
+  onRegisterAgentType = null,
+  onRefreshLoomRegistry = null,
+  onListArchivedLoom = null,
+  onValidateLoom = null,
+  onDraftLoom = null,
+  onReviseLoom = null,
+  onConfirmLoom = null,
+  onSetLoomArchived = null,
+  onRefreshAgentInstall = null,
+  onRetryAgentInstall = null,
+  onCancelAgentInstall = null,
+  workflowCatalog = { kind: "unread", entries: [] },
+  workflowRecords = [],
+  workflowInstanceById = {},
+  workflowListError = "",
+  onReadWorkflowInstance = null,
+  onRegisterWorkflow = null,
+  onPinWorkflow = null,
+  onSwitchWorkflow = null,
+  onAbandonWorkflow = null,
+  workflowStatusBySession = {},
+  workflowUnavailable = false,
 }) {
   const sessionsById = useMemo(() => sessionsByIdMap(sessions), [sessions]);
   const [dragLeafId, setDragLeafId] = useState("");
   const [dropHint, setDropHint] = useState(null); // { stackId, edge }
+  /* Settings (gear) menu — the same always-mounted shared panel the ordinary
+     surface hosts, so dismissing it never discards the relocated editors'
+     state while a space is active either. */
+  const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
+  const settingsAnchorRef = useRef(null);
   /* Composer state keyed by session ref so two panes of one session read the
      same draft, and a tab flip does not eat typed text, staged attachments, or
      oversized paste blocks. The composer is fully controlled: without these
@@ -104,6 +159,17 @@ export default function SpaceSurface({
       return { ...current, [sessionId]: resolved };
     });
   }, []);
+
+  /* Focused-member coordinates for the header controls: the leaf comes from
+     the model's own focus authority (state.focusedLeaf), the session row
+     from the live roster map. Absent either, the controls stay honest —
+     no toggle without a focused leaf, no persona row without a live row. */
+  const focusedLeaf = state?.root && state.focusedLeaf
+    ? spaceLeafById(state, state.focusedLeaf)
+    : null;
+  const focusedSession = focusedLeaf
+    ? sessionsById.get(focusedLeaf.sessionRef) ?? null
+    : null;
 
   const renderLeaf = (leaf) => {
     const presentation = spaceLeafPresentation(leaf, sessionsById);
@@ -307,6 +373,62 @@ export default function SpaceSurface({
             Layout save failed — retrying on the next change
           </SpaceHeaderNotice>
         )}
+        {/* F2-repair P1: the SAME segmented view chrome as the ordinary
+            surface, for the FOCUSED member. Chat/Shell/Traj flip the focused
+            leaf's viewKind through the spaces model (chat stays the join
+            default; shell is one toggle away); the gear anchors the shared
+            agent-settings menu, which stays reachable even in an empty
+            space. */}
+        <SpaceViewControls onMouseDown={(event) => event.stopPropagation()}>
+          <SessionViewToggle aria-label="Focused session view" role="tablist">
+            {focusedLeaf && (
+              <>
+                <SessionViewButton
+                  aria-selected={focusedLeaf.viewKind === "chat"}
+                  data-active={focusedLeaf.viewKind === "chat" ? "true" : undefined}
+                  onClick={() => onSetLeafView?.(focusedLeaf.id, "chat")}
+                  role="tab"
+                  type="button"
+                >
+                  <Forum aria-hidden="true" size={13} />
+                  <span>Chat</span>
+                </SessionViewButton>
+                <SessionViewButton
+                  aria-selected={focusedLeaf.viewKind === "shell"}
+                  data-active={focusedLeaf.viewKind === "shell" ? "true" : undefined}
+                  onClick={() => onSetLeafView?.(focusedLeaf.id, "shell")}
+                  role="tab"
+                  type="button"
+                >
+                  <Terminal aria-hidden="true" size={13} />
+                  <span>Shell</span>
+                </SessionViewButton>
+                <SessionViewButton
+                  aria-selected={focusedLeaf.viewKind === "trajectory"}
+                  data-active={focusedLeaf.viewKind === "trajectory" ? "true" : undefined}
+                  onClick={() => onSetLeafView?.(focusedLeaf.id, "trajectory")}
+                  role="tab"
+                  title="Trajectory"
+                  type="button"
+                >
+                  <Timeline aria-hidden="true" size={13} />
+                  <span>Traj</span>
+                </SessionViewButton>
+              </>
+            )}
+            <SessionViewButton
+              ref={settingsAnchorRef}
+              aria-expanded={settingsMenuOpen}
+              aria-haspopup="menu"
+              aria-label="Agent settings"
+              onClick={() => setSettingsMenuOpen((current) => !current)}
+              title="Agent settings"
+              type="button"
+            >
+              <Settings aria-hidden="true" size={13} />
+            </SessionViewButton>
+          </SessionViewToggle>
+        </SpaceViewControls>
         <SpaceHeaderPopOutAll
           disabled={!state?.root || !onPopOutAll}
           onClick={() => onPopOutAll?.()}
@@ -370,6 +492,56 @@ export default function SpaceSurface({
       ) : (
         <SpaceBody>{renderNode(state.root)}</SpaceBody>
       )}
+
+      {/* The always-mounted shared agent-settings menu (F2-repair P1+P2):
+          Agent Types, Workflows, and the focused member's persona/workflow
+          chip, with the same state-retention-across-dismissal discipline as
+          the ordinary surface. The nine SessionSurface view entries are
+          SessionSurface projections and do not render inside spaces (they
+          never did), so no children ride in here. */}
+      <SessionSettingsMenu
+        activeSessionId={activeSessionId}
+        anchorRef={settingsAnchorRef}
+        loomAgentTypes={loomAgentTypes}
+        loomPersonaBySession={loomPersonaBySession}
+        onSelectPersona={onSelectPersona}
+        loomWorkflowEntries={loomWorkflowEntries}
+        loomArchivedEntries={loomArchivedEntries}
+        loomCliPresent={loomCliPresent}
+        loomInstallByType={loomInstallByType}
+        loomCancelByJob={loomCancelByJob}
+        loomRegistryCursor={loomRegistryCursor}
+        loomListError={loomListError}
+        loomUnavailable={loomUnavailable}
+        loomFeatureUnavailable={loomFeatureUnavailable}
+        loomFeatureErrors={loomFeatureErrors}
+        loomAuthoringConflict={loomAuthoringConflict}
+        onRegisterAgentType={onRegisterAgentType}
+        onRefreshLoomRegistry={onRefreshLoomRegistry}
+        onListArchivedLoom={onListArchivedLoom}
+        onValidateLoom={onValidateLoom}
+        onDraftLoom={onDraftLoom}
+        onReviseLoom={onReviseLoom}
+        onConfirmLoom={onConfirmLoom}
+        onSetLoomArchived={onSetLoomArchived}
+        onRefreshAgentInstall={onRefreshAgentInstall}
+        onRetryAgentInstall={onRetryAgentInstall}
+        onCancelAgentInstall={onCancelAgentInstall}
+        workflowCatalog={workflowCatalog}
+        workflowRecords={workflowRecords}
+        workflowInstanceById={workflowInstanceById}
+        workflowListError={workflowListError}
+        onReadWorkflowInstance={onReadWorkflowInstance}
+        onRegisterWorkflow={onRegisterWorkflow}
+        onPinWorkflow={onPinWorkflow}
+        onSwitchWorkflow={onSwitchWorkflow}
+        onAbandonWorkflow={onAbandonWorkflow}
+        workflowStatusBySession={workflowStatusBySession}
+        workflowUnavailable={workflowUnavailable}
+        onDismiss={() => setSettingsMenuOpen(false)}
+        open={settingsMenuOpen}
+        session={focusedSession}
+      />
     </SpaceSurfaceRoot>
   );
 }
@@ -431,6 +603,15 @@ const SpaceHeaderNotice = styled.span`
     border: 1px solid color-mix(in srgb, var(--forge-red) 42%, transparent);
     color: var(--forge-red);
   }
+`;
+
+/* The focused member's view chrome sits right of the notices; it is an
+   interactive island inside the drag-region header. */
+const SpaceViewControls = styled.span`
+  display: inline-flex;
+  margin-left: auto;
+  flex: 0 0 auto;
+  align-items: center;
 `;
 
 const SpaceHeaderExit = styled.button`

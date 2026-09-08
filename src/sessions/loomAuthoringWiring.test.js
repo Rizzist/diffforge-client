@@ -141,9 +141,9 @@ test("[pin] Loom rail wording is honest about preview, not-confirmed, and defaul
     "unknown cancellation must render raw");
 });
 
-test("[pin] AppShell and SessionsRail wire every Wave 3 value/action into the inline Loom section", () => {
+test("[pin] AppShell and the Settings menu wire every Wave 3 value/action into the inline Loom section", () => {
   const shell = read("../app/AppShell.jsx");
-  const sessionsRail = read("./SessionsRail.jsx");
+  const surface = read("./SessionSettingsMenu.jsx");
   for (const prop of [
     "loomWorkflowEntries={loomApi.workflowEntries}",
     "loomArchivedEntries={loomApi.archivedEntries}",
@@ -177,6 +177,6 @@ test("[pin] AppShell and SessionsRail wire every Wave 3 value/action into the in
     "onSetArchived={onSetLoomArchived}",
     "onCancelInstall={onCancelAgentInstall}",
   ]) {
-    assert.ok(sessionsRail.includes(prop), `SessionsRail must pass ${prop}`);
+    assert.ok(surface.includes(prop), `SessionSettingsMenu must pass ${prop}`);
   }
 });

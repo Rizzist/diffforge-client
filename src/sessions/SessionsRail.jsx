@@ -28,8 +28,6 @@ import {
 import { SessionAvailabilityAffordance } from "./sessionAvailability.js";
 import { spaceRailRowAuthority } from "./spacesController.js";
 import SpacesRailSection from "./SpacesRailSection.jsx";
-import LoomRailSection from "./LoomRailSection.jsx";
-import WorkflowRailSection from "./WorkflowRailSection.jsx";
 import SessionLifecycleMenuItems from "./SessionLifecycleMenuItems.jsx";
 import { ModelBrandIcon } from "./modelBrand.jsx";
 
@@ -67,40 +65,6 @@ export default function SessionsRail({
   onEnterSpace = null,
   onExitSpace = null,
   onSelectSpaceSession = null,
-  loomAgentTypes = [],
-  loomWorkflowEntries = [],
-  loomArchivedEntries = null,
-  loomCliPresent = {},
-  loomInstallByType = {},
-  loomCancelByJob = {},
-  loomRegistryCursor = null,
-  loomListError = "",
-  loomUnavailable = false,
-  loomFeatureUnavailable = {},
-  loomFeatureErrors = {},
-  loomAuthoringConflict = null,
-  onRegisterAgentType = null,
-  onRefreshLoomRegistry = null,
-  onListArchivedLoom = null,
-  onValidateLoom = null,
-  onDraftLoom = null,
-  onReviseLoom = null,
-  onConfirmLoom = null,
-  onSetLoomArchived = null,
-  onRefreshAgentInstall = null,
-  onRetryAgentInstall = null,
-  onCancelAgentInstall = null,
-  workflowCatalog = { kind: "unread", entries: [] },
-  workflowRecords = [],
-  workflowInstanceById = {},
-  workflowStatusBySession = {},
-  workflowListError = "",
-  workflowUnavailable = false,
-  onReadWorkflowInstance = null,
-  onRegisterWorkflow = null,
-  onPinWorkflow = null,
-  onSwitchWorkflow = null,
-  onAbandonWorkflow = null,
   lifecyclePendingBySession = {},
   lifecycleErrorBySession = {},
   lifecycleUnavailableByAction = {},
@@ -204,10 +168,10 @@ export default function SessionsRail({
          before the scope resolves — doing so leaks a stale ordinary session as
          "active" while a space is opening or showing a typed error.
        - spaceScoped: the space's member scope has resolved. Only then can we
-         list members and derive the highlight from the model's focused leaf.
+         derive the highlight from the model's focused leaf.
      While spaceMode holds but the scope has not resolved, the session area is
-     honestly empty (opening / error) rather than showing the full session list
-     or a parallel selection. */
+     honestly empty (opening / error) rather than showing a session list with
+     a parallel selection. */
   /* One authority (unit-pinned in spacesController) decides space mode, the
      effective active id, and click routing — the rail never re-derives them. */
   const railAuthority = spaceRailRowAuthority({
@@ -218,13 +182,16 @@ export default function SessionsRail({
   });
   const spaceMode = railAuthority.spaceMode;
   const spaceScoped = railAuthority.spaceScoped;
-  const spaceMemberIds = spaceScoped ? new Set(spaceScope.memberIds || []) : null;
   /* In space mode the highlight/unseen authority is the space's focused leaf,
      NEVER activeSessionId; while the scope is pending it is simply absent. */
   const effectiveActiveId = railAuthority.effectiveActiveId;
   /* Rail search narrows every coordinate domain by title or opening message. */
+  /* A resolved space keeps the FULL session list — spaces organize, they do
+     not hide: clicking any row routes through the space handler, which
+     focuses a member or brings a non-member into the active space (chat
+     view). Media rows are not daemon sessions and cannot join a space. */
   const allSessions = spaceMode
-    ? (spaceScoped ? sessions.filter((session) => spaceMemberIds.has(session.id)) : [])
+    ? (spaceScoped ? [...sessions] : [])
     : [...sessions, ...mediaSessions];
   const query = searchQuery.trim().toLowerCase();
   const matches = query
@@ -524,46 +491,6 @@ export default function SessionsRail({
           onExitSpace={onExitSpace}
           onRenameSpace={onRenameSpace}
           spaces={spaces}
-        />
-        <LoomRailSection
-          activeSessionId={activeSessionId}
-          agentTypes={loomAgentTypes}
-          workflowEntries={loomWorkflowEntries}
-          archivedEntries={loomArchivedEntries}
-          cliPresent={loomCliPresent}
-          installByType={loomInstallByType}
-          cancelByJob={loomCancelByJob}
-          registryCursor={loomRegistryCursor}
-          listError={loomListError}
-          featureUnavailable={loomFeatureUnavailable}
-          featureErrors={loomFeatureErrors}
-          authoringConflict={loomAuthoringConflict}
-          onListArchived={onListArchivedLoom}
-          onValidate={onValidateLoom}
-          onAuthorDraft={onDraftLoom}
-          onAuthorRevise={onReviseLoom}
-          onAuthorConfirm={onConfirmLoom}
-          onSetArchived={onSetLoomArchived}
-          onRefreshInstall={onRefreshAgentInstall}
-          onRefreshRegistry={onRefreshLoomRegistry}
-          onRegister={onRegisterAgentType}
-          onRetryInstall={onRetryAgentInstall}
-          onCancelInstall={onCancelAgentInstall}
-          unavailable={loomUnavailable}
-        />
-        <WorkflowRailSection
-          activeSessionId={activeSessionId}
-          catalog={workflowCatalog}
-          instanceById={workflowInstanceById}
-          listError={workflowListError}
-          onAbandon={onAbandonWorkflow}
-          onPin={onPinWorkflow}
-          onReadInstance={onReadWorkflowInstance}
-          onRegisterWorkflow={onRegisterWorkflow}
-          onSwitch={onSwitchWorkflow}
-          statusBySession={workflowStatusBySession}
-          unavailable={workflowUnavailable}
-          workflows={workflowRecords}
         />
         {pinned.length > 0 && (
           <SessionGroup>

@@ -225,18 +225,18 @@ test("[pin] the main-session filter keys only off the published boolean", () => 
     "each published origin maps eligibility from the explicit boolean only");
 });
 
-test("[pin] SessionsRail mounts WorkflowRailSection right after LoomRailSection", () => {
-  const rail = read("./SessionsRail.jsx");
-  assert.match(rail, /import WorkflowRailSection from "\.\/WorkflowRailSection\.jsx"/,
-    "SessionsRail must import WorkflowRailSection");
-  const [loomMount, workflowMount, pinnedGroup] = orderOf(
-    rail,
+test("[pin] the shared Settings menu mounts WorkflowRailSection after LoomRailSection", () => {
+  const menu = read("./SessionSettingsMenu.jsx");
+  assert.match(menu, /import WorkflowRailSection from "\.\/WorkflowRailSection\.jsx"/,
+    "SessionSettingsMenu must import WorkflowRailSection");
+  const [panelMount, loomMount, workflowMount] = orderOf(
+    menu,
+    "<SettingsMenuPanel",
     "<LoomRailSection",
     "<WorkflowRailSection",
-    "{pinned.length > 0 && (",
   );
-  assert.ok(loomMount < workflowMount && workflowMount < pinnedGroup,
-    "WorkflowRailSection must render after LoomRailSection and before the session groups");
+  assert.ok(panelMount < loomMount && loomMount < workflowMount,
+    "WorkflowRailSection must render inside the Settings menu after LoomRailSection");
   for (const prop of [
     "catalog={workflowCatalog}",
     "workflows={workflowRecords}",
@@ -251,27 +251,34 @@ test("[pin] SessionsRail mounts WorkflowRailSection right after LoomRailSection"
     "onSwitch={onSwitchWorkflow}",
     "onAbandon={onAbandonWorkflow}",
   ]) {
-    assert.ok(rail.includes(prop), `SessionsRail must pass ${prop}`);
+    assert.ok(menu.includes(prop), `SessionSettingsMenu must pass ${prop}`);
   }
+  /* The rail carries spaces + sessions only — the Workflows section left it. */
+  const rail = read("./SessionsRail.jsx");
+  assert.ok(!rail.includes("WorkflowRailSection"),
+    "SessionsRail must no longer import or render WorkflowRailSection");
 });
 
-test("[pin] SessionSurface mounts the workflow chip beside the persona select, display-only", () => {
-  const surface = read("./SessionSurface.jsx");
-  assert.match(surface, /import WorkflowStatusChip from "\.\/WorkflowStatusChip\.jsx"/,
-    "SessionSurface must import WorkflowStatusChip");
-  const personaMount = surface.indexOf("<SessionPersonaSelect");
-  const chipMount = surface.indexOf("<WorkflowStatusChip");
+test("[pin] the Settings menu mounts the workflow chip beside the persona select, display-only (F2.1)", () => {
+  const menu = read("./SessionSettingsMenu.jsx");
+  assert.match(menu, /import WorkflowStatusChip from "\.\/WorkflowStatusChip\.jsx"/,
+    "SessionSettingsMenu must import WorkflowStatusChip");
+  const personaMount = menu.indexOf("<SessionPersonaSelect");
+  const chipMount = menu.indexOf("<WorkflowStatusChip");
   assert.ok(personaMount !== -1 && chipMount > personaMount && chipMount - personaMount < 1200,
     "the workflow chip must sit adjacent to the persona select");
-  const guardIndex = surface.lastIndexOf('session && session.id !== "draft"', chipMount);
+  const guardIndex = menu.lastIndexOf('session && session.id !== "draft"', chipMount);
   assert.ok(guardIndex !== -1 && chipMount - guardIndex < 500,
     "the chip must be guarded by session && session.id !== \"draft\"");
-  assert.ok(surface.includes("statusView={workflowStatusBySession[session.id]}"),
+  assert.ok(menu.includes("statusView={workflowStatusBySession[session.id]}"),
     "the chip must show only the graph_status read for the session");
   /* An unseen graph_status read must stay undefined — collapsing it would
      fabricate a "No workflow" claim for a status we never read. */
-  assert.doesNotMatch(surface, /workflowStatusBySession\[session\.id\]\s*(?:\|\||\?\?)/,
+  assert.doesNotMatch(menu, /workflowStatusBySession\[session\.id\]\s*(?:\|\||\?\?)/,
     "the statusView prop must never default an unseen read");
+  /* F2.1: the header row no longer hosts the chip. */
+  assert.ok(!read("./SessionSurface.jsx").includes("<WorkflowStatusChip"),
+    "the session header must no longer mount the workflow chip");
   const chip = read("./WorkflowStatusChip.jsx");
   assert.ok(chip.includes('"Workflow not read"') && chip.includes('"No workflow"'),
     "unread and none must be DISTINCT chip states");
@@ -304,11 +311,12 @@ test("[pin] AppShell owns useWorkflow beside useLoom and feeds both consumers", 
   ]) {
     assert.ok(shell.includes(prop), `AppShell must pass ${prop}`);
   }
-  /* The surface chip gets its two props too. */
+  /* Both menu hosts feed the shared Settings menu (Workflows section + chip):
+     one pass to SessionSurface, one to SpaceSurface (F2 verify P1). */
   assert.equal((shell.match(/workflowStatusBySession=\{workflowApi\.statusBySession\}/g) || []).length, 2,
-    "statusBySession must reach both the rail and the surface");
+    "statusBySession must reach SessionSurface and SpaceSurface");
   assert.equal((shell.match(/workflowUnavailable=\{workflowApi\.unavailable\}/g) || []).length, 2,
-    "unavailable must reach both the rail and the surface");
+    "unavailable must reach SessionSurface and SpaceSurface");
   /* The chip is display-only, so the shell owns the graph_status read for
      the active session. */
   assert.match(shell, /void readWorkflowStatus\(activeSessionId\)/,

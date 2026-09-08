@@ -364,6 +364,45 @@ export function setSpaceActiveTab(state, stackId, leafId) {
   return withFocusedLeaf(state, leafId);
 }
 
+/* F2-repair P1: the space surface's Chat/Shell/Traj control retargets what
+   an EXISTING leaf renders. Only the leaf's viewKind changes — identity
+   (id, sessionRef), viewState, membership, focus, and every other leaf are
+   untouched, so this invents no new space semantics beyond "the focused
+   view can be flipped", mirroring the ordinary surface's selectView. */
+function replaceLeafNode(node, leafId, replacement) {
+  if (!node) return node;
+  if (node.kind === "leaf") return node.id === leafId ? replacement : node;
+  if (node.kind === "stack") {
+    let changed = false;
+    const tabs = node.tabs.map((tab) => {
+      const next = replaceLeafNode(tab, leafId, replacement);
+      changed ||= next !== tab;
+      return next;
+    });
+    return changed ? { ...node, tabs } : node;
+  }
+  let changed = false;
+  const children = node.children.map((child) => {
+    const next = replaceLeafNode(child, leafId, replacement);
+    changed ||= next !== child;
+    return next;
+  });
+  return changed ? { ...node, children } : node;
+}
+
+export function setSpaceLeafViewKind(state, leafId, viewKind) {
+  validateSpaceState(state);
+  requireTrimmed(leafId, "Leaf id");
+  if (!VIEW_KINDS.has(viewKind)) {
+    throw new Error(`Unsupported leaf viewKind '${viewKind}'.`);
+  }
+  const leaf = findLeaf(state.root, leafId);
+  if (!leaf) throw new Error(`Leaf '${leafId}' does not exist.`);
+  if (leaf.viewKind === viewKind) return state;
+  const root = replaceLeafNode(state.root, leafId, { ...leaf, viewKind });
+  return validateSpaceState({ ...state, root });
+}
+
 export function focusedSpaceSessionRef(state) {
   validateSpaceState(state);
   if (state.focusedLeaf == null) return null;

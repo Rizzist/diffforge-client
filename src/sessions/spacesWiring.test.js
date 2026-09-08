@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { createSpaceSessionSubmitFor } from "./spacesController.js";
+import {
+  createSpaceSessionSubmitFor,
+  revealSessionInSpace,
+} from "./spacesController.js";
+import { createSpaceState, focusedSpaceSessionRef } from "./spacesModel.js";
 
 /* Regression guards for the space UI wiring findings (S1 verify round 2). The
    source checks pin consumer wiring that pure controller tests cannot observe;
@@ -33,8 +37,9 @@ test("[pin] finding 1: rail and shell consumers use the single space authority",
     "unseen state must use the authority's effective active id");
   assert.match(
     rail,
-    /const allSessions = spaceMode\s*\? \(spaceScoped \? sessions\.filter\([^\n]+\) : \[\]\)/,
-    "opening/error space mode must not fall back to the ordinary session list",
+    /const allSessions = spaceMode\s*\? \(spaceScoped \? \[\.\.\.sessions\] : \[\]\)/,
+    "a resolved space keeps the full session list (rows route through the space"
+      + " handler); opening/error space mode stays honestly empty",
   );
 
   const shell = read("../app/AppShell.jsx");
@@ -180,4 +185,39 @@ test("[pin] finding 7: no-attachment space submits reach invoke without throwing
     "failed submits must keep text, paste blocks, and attachments");
   assert.doesNotMatch(surface, /attachments: attachments\?\.length \? attachments : null/,
     "SpaceSurface must never reintroduce the null regression");
+});
+
+test("[pin] F2-UI: clicking a rail session brings it into the active space with a chat leaf", () => {
+  /* Behavioral half: the same op the rail click reaches (revealSession ->
+     revealSessionInSpace) JOINS a non-member and defaults its leaf to the
+     chat view; revealing an existing member focuses it without duplication. */
+  const joined = revealSessionInSpace(createSpaceState(), "session-b");
+  assert.ok(joined.members.includes("session-b"),
+    "a clicked non-member must become a member of the active space");
+  assert.equal(joined.root.kind, "stack");
+  assert.equal(joined.root.tabs.length, 1);
+  assert.equal(joined.root.tabs[0].sessionRef, "session-b");
+  assert.equal(joined.root.tabs[0].viewKind, "chat",
+    "the brought-in session's view must default to chat");
+  assert.equal(focusedSpaceSessionRef(joined), "session-b",
+    "the brought-in session must take focus");
+
+  const again = revealSessionInSpace(joined, "session-b");
+  assert.deepEqual(again.members, joined.members,
+    "revealing an existing member must not change membership");
+  assert.equal(again.root.tabs.length, 1,
+    "revealing an existing member must not open a duplicate leaf");
+
+  /* Wiring half: space-mode rail clicks route to the shell's space handler,
+     which dispatches this exact reveal op for the clicked session. */
+  const shell = read("../app/AppShell.jsx");
+  const handler = shell.slice(
+    shell.indexOf("const selectSpaceSessionFromRail = useCallback((session) => {"),
+    shell.indexOf("const railSpaceScope"),
+  );
+  assert.match(handler, /revealSpaceSessionOp\(session\.id\)/,
+    "the rail's space click handler must reveal/join through the spaces hook");
+  const rail = read("./SessionsRail.jsx");
+  assert.match(rail, /const allSessions = spaceMode\s*\? \(spaceScoped \? \[\.\.\.sessions\] : \[\]\)/,
+    "a resolved space must keep listing every ordinary session so any row can join");
 });

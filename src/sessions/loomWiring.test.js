@@ -77,18 +77,17 @@ test("[pin] useLoom shapes every view through loomModel and never synthesizes an
     "the receipt view maps an absent install_job_id to null, not a value");
 });
 
-test("[pin] SessionsRail mounts LoomRailSection right after SpacesRailSection", () => {
-  const rail = read("./SessionsRail.jsx");
-  assert.match(rail, /import LoomRailSection from "\.\/LoomRailSection\.jsx"/,
-    "SessionsRail must import LoomRailSection");
-  const [spacesMount, loomMount, pinnedGroup] = orderOf(
-    rail,
-    "<SpacesRailSection",
+test("[pin] the shared Settings menu mounts LoomRailSection for both surfaces (F2 relocation)", () => {
+  const menu = read("./SessionSettingsMenu.jsx");
+  assert.match(menu, /import LoomRailSection from "\.\/LoomRailSection\.jsx"/,
+    "SessionSettingsMenu must import LoomRailSection");
+  const [panelMount, loomMount] = orderOf(
+    menu,
+    "<SettingsMenuPanel",
     "<LoomRailSection",
-    "{pinned.length > 0 && (",
   );
-  assert.ok(spacesMount < loomMount && loomMount < pinnedGroup,
-    "LoomRailSection must render after SpacesRailSection and before the session groups");
+  assert.ok(panelMount < loomMount,
+    "LoomRailSection must render inside the Settings menu panel");
   for (const prop of [
     "agentTypes={loomAgentTypes}",
     "cliPresent={loomCliPresent}",
@@ -98,28 +97,40 @@ test("[pin] SessionsRail mounts LoomRailSection right after SpacesRailSection", 
     "onRetryInstall={onRetryAgentInstall}",
     "unavailable={loomUnavailable}",
   ]) {
-    assert.ok(rail.includes(prop), `SessionsRail must pass ${prop}`);
+    assert.ok(menu.includes(prop), `SessionSettingsMenu must pass ${prop}`);
   }
+  /* Both primary navigation routes host the menu (F2 verify P1). */
+  assert.ok(read("./SessionSurface.jsx").includes("<SessionSettingsMenu"),
+    "SessionSurface must mount the shared Settings menu");
+  assert.ok(read("./SpaceSurface.jsx").includes("<SessionSettingsMenu"),
+    "SpaceSurface must mount the shared Settings menu");
+  /* The rail carries spaces + sessions only — the Loom section left it. */
+  const rail = read("./SessionsRail.jsx");
+  assert.ok(!rail.includes("LoomRailSection"),
+    "SessionsRail must no longer import or render LoomRailSection");
 });
 
-test("[pin] SessionSurface mounts the persona select beside the status pill, sessions only", () => {
-  const surface = read("./SessionSurface.jsx");
-  assert.match(surface, /import SessionPersonaSelect from "\.\/SessionPersonaSelect\.jsx"/,
-    "SessionSurface must import SessionPersonaSelect");
-  const mountIndex = surface.indexOf("<SessionPersonaSelect");
+test("[pin] the persona select lives in the Settings menu, sessions only (F2.1)", () => {
+  const menu = read("./SessionSettingsMenu.jsx");
+  assert.match(menu, /import SessionPersonaSelect from "\.\/SessionPersonaSelect\.jsx"/,
+    "SessionSettingsMenu must import SessionPersonaSelect");
+  const mountIndex = menu.indexOf("<SessionPersonaSelect");
   assert.notEqual(mountIndex, -1, "SessionPersonaSelect must be rendered");
-  const guardIndex = surface.lastIndexOf('session && session.id !== "draft"', mountIndex);
+  const guardIndex = menu.lastIndexOf('session && session.id !== "draft"', mountIndex);
   assert.ok(guardIndex !== -1 && mountIndex - guardIndex < 400,
     "the persona select must be guarded by session && session.id !== \"draft\"");
-  const pillIndex = surface.indexOf("<StatusPill");
-  assert.ok(pillIndex !== -1 && mountIndex > pillIndex && mountIndex - pillIndex < 1200,
-    "the persona select must sit adjacent to the StatusPill in FloatingControls");
-  assert.ok(surface.includes("binding={loomPersonaBySession[session.id]}"),
-    "the surface must show only the receipt-backed binding for the session");
+  const loomIndex = menu.indexOf("<LoomRailSection");
+  assert.ok(loomIndex !== -1 && loomIndex > mountIndex && loomIndex - mountIndex < 1200,
+    "the persona select must sit adjacent to the Agent Types section");
+  assert.ok(menu.includes("binding={loomPersonaBySession[session.id]}"),
+    "the menu must show only the receipt-backed binding for the session");
   /* An unseen receipt must stay undefined — collapsing it to null/false
      would fabricate a "No persona" claim for an unread binding. */
-  assert.doesNotMatch(surface, /loomPersonaBySession\[session\.id\]\s*(?:\|\||\?\?)/,
+  assert.doesNotMatch(menu, /loomPersonaBySession\[session\.id\]\s*(?:\|\||\?\?)/,
     "the binding prop must never default an unseen receipt");
+  /* F2.1: the header row no longer hosts the control. */
+  assert.ok(!read("./SessionSurface.jsx").includes("<SessionPersonaSelect"),
+    "the session header must no longer mount the persona select");
 });
 
 test("[pin] AppShell owns useLoom and feeds both consumers", () => {

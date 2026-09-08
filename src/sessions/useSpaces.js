@@ -7,6 +7,7 @@ import {
   focusSpaceLeaf,
   serializeSpaceLayout,
   setSpaceActiveTab,
+  setSpaceLeafViewKind,
   spaceLeafById,
 } from "./spacesModel.js";
 import {
@@ -464,6 +465,13 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
     mutateSpace((state) => closeSpaceLeaf(state, leafId));
   }, [mutateSpace]);
 
+  /* F2-repair P1: the space surface's Chat/Shell/Traj control flips what an
+     existing leaf renders; the mutation persists through the same one-door
+     layout save as every other layout op. */
+  const setLeafView = useCallback((leafId, viewKind) => {
+    mutateSpace((state) => setSpaceLeafViewKind(state, leafId, viewKind));
+  }, [mutateSpace]);
+
   const dragOutLeaf = useCallback((leafId, targetLeafId, options) => {
     mutateSpace((state) => dragOutLeafInSpace(state, leafId, targetLeafId, options));
   }, [mutateSpace]);
@@ -539,6 +547,7 @@ export function useSpaces({ enabled = true, roster, sessions = [] }) {
     revealSession,
     saveError,
     selectTab,
+    setLeafView,
     spaces,
     spacesListError,
     spaceError,
